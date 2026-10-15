@@ -5,17 +5,18 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PromptLevel, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable,
+    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PromptLevel,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use kuery_core::catalog::TableInfo;
+use kuery_core::sql::quote_qualified;
 
 use crate::assets::AppIcon;
 use crate::commands::{
@@ -24,6 +25,7 @@ use crate::commands::{
 };
 use crate::connection::Db;
 use crate::connection_editor::ConnectionEditor;
+use crate::context_menus::{copy, item, reveal};
 use crate::explorer::{Explorer, ExplorerEvent};
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
@@ -40,6 +42,22 @@ enum Tab {
 }
 
 impl Tab {
+    fn id(&self) -> EntityId {
+        match self {
+            Tab::Query(query) => query.entity_id(),
+            Tab::Table(table) => table.entity_id(),
+        }
+    }
+
+    /// Whether closing it needs a question first (unsaved SQL, an open
+    /// transaction, pending row changes).
+    fn needs_attention(&self, cx: &App) -> bool {
+        match self {
+            Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
+            Tab::Table(table) => table.read(cx).has_pending(),
+        }
+    }
+
     fn db(&self, cx: &App) -> Option<Db> {
         match self {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
@@ -114,6 +132,9 @@ impl WorkspaceView {
                 }
                 ExplorerEvent::OpenSavedQuery(path) => {
                     this.open_saved_query(path.clone(), window, cx)
+                }
+                ExplorerEvent::NewQuery(db) => {
+                    this.open_query(db.clone(), None, None, None, window, cx)
                 }
                 ExplorerEvent::NewConnection => this.open_connection_editor(None, window, cx),
                 ExplorerEvent::EditConnection(id) => {
@@ -492,6 +513,37 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Closes the tabs `close` picks. Tabs that need a question are left for
+    /// last, and only the first of them asks (one prompt at a time).
+    fn close_tabs(
+        &mut self,
+        close: impl Fn(usize) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<EntityId> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| close(*index))
+            .map(|(_, tab)| tab.id())
+            .collect();
+        let mut waiting = None;
+        for id in targets {
+            let Some(index) = self.tabs.iter().position(|tab| tab.id() == id) else {
+                continue;
+            };
+            if self.tabs[index].needs_attention(cx) {
+                waiting.get_or_insert(id);
+            } else {
+                self.remove_tab(index, window, cx);
+            }
+        }
+        if let Some(index) = waiting.and_then(|id| self.tabs.iter().position(|t| t.id() == id)) {
+            self.close(index, window, cx);
+        }
+    }
+
     fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.tabs.remove(index);
@@ -826,7 +878,59 @@ impl WorkspaceView {
                     )
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
-                    ),
+                    )
+                    .context_menu({
+                        let this = cx.entity().downgrade();
+                        let count = self.tabs.len();
+                        let file = match tab {
+                            Tab::Query(query) => query.read(cx).file().map(PathBuf::from),
+                            Tab::Table(_) => None,
+                        };
+                        let table = match tab {
+                            Tab::Table(table) => {
+                                let table = &table.read(cx).info().table;
+                                Some(quote_qualified(&table.schema, &table.name))
+                            }
+                            Tab::Query(_) => None,
+                        };
+                        move |menu, _, _| {
+                            let mut menu = menu
+                                .item(item("Close", &this, move |this, window, cx| {
+                                    this.close(index, window, cx)
+                                }))
+                                .item(
+                                    item("Close Others", &this, move |this, window, cx| {
+                                        this.close_tabs(|i| i != index, window, cx)
+                                    })
+                                    .disabled(count < 2),
+                                )
+                                .item(
+                                    item(
+                                        "Close Tabs to the Right",
+                                        &this,
+                                        move |this, window, cx| {
+                                            this.close_tabs(|i| i > index, window, cx)
+                                        },
+                                    )
+                                    .disabled(index + 1 >= count),
+                                )
+                                .item(item("Close All", &this, |this, window, cx| {
+                                    this.close_tabs(|_| true, window, cx)
+                                }));
+                            if let Some(file) = &file {
+                                menu = menu
+                                    .separator()
+                                    .item(reveal(file.clone()))
+                                    .item(copy("Copy Path", file.display().to_string()));
+                            }
+                            if let Some(table) = &table {
+                                menu = menu
+                                    .separator()
+                                    .item(copy("Copy Table Name", table.clone()));
+                            }
+                            menu
+                        }
+                    }),
             );
         }
         strip.child(

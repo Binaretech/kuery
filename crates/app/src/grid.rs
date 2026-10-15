@@ -4,21 +4,26 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::{
-    AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString,
-    Styled as _, Window, div, px,
+    AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
 use kuery_core::browse::Direction;
 use kuery_core::catalog::ColumnInfo;
 use kuery_core::result_set::ResultSet;
 
 use crate::assets::AppIcon;
+use crate::context_menus::{Cell, copy_cell_items};
 use crate::theme::{self, color};
 
 /// Called by the grid when a header is clicked to sort.
 pub type OnSort = Rc<dyn Fn(String, Option<Direction>, &mut App)>;
+
+/// Adds the table tab's own items to a cell's context menu.
+pub type OnMenu = Rc<dyn Fn(PopupMenu, &Cell, &App) -> PopupMenu>;
 
 #[derive(Default)]
 pub struct BrowseDelegate {
@@ -32,11 +37,37 @@ pub struct BrowseDelegate {
     edits: HashMap<(usize, usize), Option<String>>,
     deleted: HashSet<usize>,
     on_sort: Option<OnSort>,
+    on_menu: Option<OnMenu>,
+    /// The cell last right-clicked, for the row's context menu.
+    menu_cell: Option<(usize, usize)>,
 }
 
 impl BrowseDelegate {
     pub fn set_on_sort(&mut self, on_sort: OnSort) {
         self.on_sort = Some(on_sort);
+    }
+
+    pub fn set_on_menu(&mut self, on_menu: OnMenu) {
+        self.on_menu = Some(on_menu);
+    }
+
+    /// What the cell shows: its staged edit if there is one.
+    fn shown(&self, row: usize, column: usize) -> Option<Option<&str>> {
+        match self.edits.get(&(row, column)) {
+            Some(value) => Some(value.as_deref()),
+            None => self.original(row, column),
+        }
+    }
+
+    fn cell(&self, row: usize, column: usize) -> Cell {
+        Cell {
+            row,
+            column,
+            columns: self.columns.iter().map(|c| c.name.clone()).collect(),
+            values: (0..self.columns.len())
+                .map(|index| self.shown(row, index).flatten().map(str::to_owned))
+                .collect(),
+        }
     }
 
     pub fn set_columns(&mut self, columns: Vec<ColumnInfo>, sort: Option<(String, Direction)>) {
@@ -183,11 +214,18 @@ impl TableDelegate for BrowseDelegate {
     ) -> impl IntoElement {
         let deleted = self.deleted.contains(&row_ix);
         let edited = self.edits.get(&(row_ix, col_ix));
-        let value = match edited {
-            Some(value) => Some(value.as_deref()),
-            None => self.original(row_ix, col_ix),
-        };
-        let mut cell = div().size_full().flex().items_center().overflow_hidden();
+        let value = self.shown(row_ix, col_ix);
+        let mut cell = div()
+            .size_full()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().menu_cell = Some((row_ix, col_ix));
+                }),
+            );
         if deleted {
             cell = cell
                 .bg(color(theme::RED).opacity(0.14))
@@ -214,6 +252,25 @@ impl TableDelegate for BrowseDelegate {
             None => div().into_any_element(),
         };
         cell.child(content)
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let column = match self.menu_cell {
+            Some((row, column)) if row == row_ix => column,
+            _ => 0,
+        };
+        let cell = self.cell(row_ix, column);
+        let menu = copy_cell_items(menu, &cell);
+        match &self.on_menu {
+            Some(on_menu) => on_menu(menu.separator(), &cell, cx),
+            None => menu,
+        }
     }
 
     fn render_empty(

@@ -12,8 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, Enter, InputEvent};
+use gpui_kit::component::input::{
+    Copy, Cut, Editor, EditorState, Enter, InputEvent, Paste, SelectAll,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::native_menu::NativeMenu;
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
@@ -904,6 +907,61 @@ impl QueryTab {
             )
     }
 
+    /// The SQL editor's right-click menu: run, edit, save and mode.
+    fn editor_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu + 'static {
+        let this = cx.weak_entity();
+        let editor = self.editor.clone();
+        move |menu, _, cx| {
+            let Some(tab) = this.upgrade() else {
+                return menu;
+            };
+            let tab = tab.read(cx);
+            let running = tab.is_running();
+            let mode = match &tab.write {
+                WriteState::On(write) => Some(write.kind),
+                _ => None,
+            };
+            let selection = !editor
+                .read(cx)
+                .selected_text()
+                .to_string()
+                .trim()
+                .is_empty();
+            menu.menu(
+                if selection { "Run Selection" } else { "Run" },
+                Box::new(RunQuery),
+            )
+            .menu_with_disabled("Cancel Query", !running, Box::new(CancelQuery))
+            .separator()
+            .menu("Cut", Box::new(Cut))
+            .menu("Copy", Box::new(Copy))
+            .menu("Paste", Box::new(Paste))
+            .menu("Select All", Box::new(SelectAll))
+            .separator()
+            .menu("Save Query", Box::new(SaveQuery))
+            .menu("Save Query As…", Box::new(SaveQueryAs))
+            .separator()
+            .submenu(
+                "Mode",
+                NativeMenu::new()
+                    .menu_with_check("Read-only", mode.is_none(), Box::new(UseReadOnly))
+                    .menu_with_check(
+                        "Write",
+                        mode == Some(WriteKind::Transactional),
+                        Box::new(UseWrite),
+                    )
+                    .menu_with_check(
+                        "Full Write",
+                        mode == Some(WriteKind::Full),
+                        Box::new(UseFullWrite),
+                    ),
+            )
+        }
+    }
+
     /// Read-only / Write / Full write selector in the toolbar.
     fn render_mode_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let environment = self.db.environment;
@@ -1365,7 +1423,12 @@ impl Render for QueryTab {
                             .when(!collapsed, |editor| {
                                 editor.h(self.editor_height).flex_shrink_0()
                             })
-                            .child(Editor::new(&self.editor).h_full().bordered(false)),
+                            .child(
+                                Editor::new(&self.editor)
+                                    .h_full()
+                                    .bordered(false)
+                                    .context_menu(self.editor_menu(cx)),
+                            ),
                     )
                     .when(!collapsed, |split| {
                         split.child(

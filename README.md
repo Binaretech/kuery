@@ -100,6 +100,26 @@ In both write modes:
 
 Table tabs keep their own staged row editing, which stays off on production.
 
+## Context menus
+
+Right-click shows what can be done with the thing under the pointer:
+
+- **Sidebar** — a connection: connect or disconnect, new query, refresh the
+  catalog, edit, copy its host and database, delete. A schema: new query,
+  refresh, copy its name. A table or view: open its data or definition, query
+  it in a new tab, copy its name or a `SELECT`. Functions, triggers and enums:
+  open them and copy names, signatures or values. Saved queries and folders:
+  open, reveal in the file manager, copy the path, delete (asks first).
+  History: open in a new tab, copy the SQL.
+- **Tabs** — close, close others, close tabs to the right, close all (tabs with
+  unsaved work are left for last and ask one at a time), and reveal or copy
+  the file of a saved query or the name of a table.
+- **Grids** — copy the value, the row (tab-separated or as JSON) or the column
+  name. In table tabs also edit the row, stage its deletion, or filter by the
+  value.
+- **SQL editor** — run (or run the selection), cancel, cut, copy, paste,
+  select all, save, and switch between Read-only, Write and Full write.
+
 ## Editor
 
 In the SQL editor `secondary-enter` runs the query (or the selection) and

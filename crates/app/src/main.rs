@@ -8,6 +8,7 @@ mod assets;
 mod commands;
 mod connection;
 mod connection_editor;
+mod context_menus;
 mod definition;
 mod explorer;
 mod grid;

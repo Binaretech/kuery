@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 
 use crate::assets::AppIcon;
+use crate::context_menus::REVEAL_LABEL;
 use crate::recent::{self, RecentProject};
 use crate::theme::{self, color};
 
@@ -145,14 +146,6 @@ impl Welcome {
             )
     }
 }
-
-const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
-    "Reveal in Finder"
-} else if cfg!(target_os = "windows") {
-    "Show in Explorer"
-} else {
-    "Open Containing Folder"
-};
 
 impl Render for Welcome {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

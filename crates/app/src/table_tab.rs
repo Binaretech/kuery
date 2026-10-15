@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -22,7 +23,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
+    StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, actions, div, px,
 };
 use kuery_core::browse::{Browse, Direction, Filter, FilterOp, Sort};
 use kuery_core::catalog::{ColumnInfo, TableDefinition, TableInfo};
@@ -33,6 +34,7 @@ actions!(kuery, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
 use crate::connection::Db;
+use crate::context_menus::{Cell, item};
 use crate::definition;
 use crate::grid::BrowseDelegate;
 use crate::query_tab::describe_error;
@@ -141,10 +143,16 @@ impl TableTab {
         let grid = cx.new(|cx| TableState::new(BrowseDelegate::default(), window, cx));
         let weak = cx.entity().downgrade();
         grid.update(cx, |grid, _| {
+            let sort = weak.clone();
             grid.delegate_mut()
                 .set_on_sort(Rc::new(move |column, direction, cx| {
-                    weak.update(cx, |tab, cx| tab.set_sort(column, direction, cx))
+                    sort.update(cx, |tab, cx| tab.set_sort(column, direction, cx))
                         .ok();
+                }));
+            let menu = weak.clone();
+            grid.delegate_mut()
+                .set_on_menu(Rc::new(move |popup, cell, cx| {
+                    cell_menu(&menu, popup, cell, cx)
                 }));
         });
         cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
@@ -491,6 +499,59 @@ impl TableTab {
             browse.page = 0;
         }
         self.load_page(cx);
+    }
+
+    /// Filters the table to rows where `column` has `value` (or is NULL).
+    /// Reuses a trailing filter row that is still empty.
+    fn filter_by(
+        &mut self,
+        column: String,
+        value: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_pending() {
+            return;
+        }
+        let Some(column_index) = self
+            .definition()
+            .and_then(|d| d.columns.iter().position(|c| c.name == column))
+        else {
+            return;
+        };
+        let reusable = self
+            .filters
+            .last()
+            .is_some_and(|row| row.value.read(cx).value().is_empty());
+        if !reusable {
+            self.add_filter(window, cx);
+        }
+        let Some(row) = self.filters.last() else {
+            return;
+        };
+        let op = if value.is_some() {
+            FilterOp::Equals
+        } else {
+            FilterOp::IsNull
+        };
+        let op_index = FilterOp::ALL.iter().position(|o| *o == op);
+        row.column.update(cx, |select, cx| {
+            select.set_selected_index(Some(IndexPath::new(column_index)), window, cx)
+        });
+        row.op.update(cx, |select, cx| {
+            select.set_selected_index(op_index.map(IndexPath::new), window, cx)
+        });
+        row.value.update(cx, |input, cx| {
+            input.set_value(value.unwrap_or_default(), window, cx)
+        });
+        self.show_filters = true;
+        self.apply_filters(cx);
+    }
+
+    /// Stages deleting the row, as Delete in the inspector does.
+    fn delete_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_edit(row, window, cx);
+        self.stage_delete(cx);
     }
 
     fn active_filters(&self) -> usize {
@@ -1328,4 +1389,42 @@ impl Render for TableTab {
                 col.child(self.render_footer(cx))
             })
     }
+}
+
+/// The table tab's items in a cell's context menu, after the copy items.
+fn cell_menu(tab: &WeakEntity<TableTab>, menu: PopupMenu, cell: &Cell, cx: &App) -> PopupMenu {
+    let Some(state) = tab.upgrade() else {
+        return menu;
+    };
+    let state = state.read(cx);
+    let writable = state.read_only_reason().is_none();
+    let locked = state.has_pending();
+    let row = cell.row;
+    let (column, value) = (
+        cell.column_name().to_string(),
+        cell.value().map(str::to_owned),
+    );
+    menu.item(item("Edit Row…", tab, move |tab, window, cx| {
+        tab.open_edit(row, window, cx)
+    }))
+    .item(
+        item("Delete Row", tab, move |tab, window, cx| {
+            tab.delete_row(row, window, cx)
+        })
+        .disabled(!writable),
+    )
+    .separator()
+    .item(
+        item(
+            if value.is_some() {
+                "Filter by This Value"
+            } else {
+                "Filter by NULL"
+            },
+            tab,
+            move |tab, window, cx| tab.filter_by(column.clone(), value.clone(), window, cx),
+        )
+        // Filters reload the page, which would drop staged changes.
+        .disabled(locked),
+    )
 }

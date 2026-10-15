@@ -11,12 +11,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel, Render, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
@@ -27,6 +28,7 @@ use kuery_pg::catalog;
 use crate::app;
 use crate::assets::AppIcon;
 use crate::connection::{Db, Reconnect};
+use crate::context_menus::{copy, item, reveal};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
@@ -48,6 +50,8 @@ pub enum ExplorerEvent {
     },
     /// A file from the project's saved queries.
     OpenSavedQuery(PathBuf),
+    /// An empty query tab on this connection.
+    NewQuery(Db),
     NewConnection,
     EditConnection(String),
 }
@@ -555,6 +559,94 @@ impl Explorer {
         }
     }
 
+    /// Closes the sidebar's connection. Tabs opened on it keep their own
+    /// handle to it until they close.
+    fn disconnect(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(node) = self.connections.get_mut(index) {
+            node.state = ConnectionState::Idle;
+            self.expanded.remove(&index.to_string());
+            cx.notify();
+        }
+    }
+
+    fn new_query(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(db) = self.db(index) {
+            cx.emit(ExplorerEvent::NewQuery(db));
+        }
+    }
+
+    fn query_table(&mut self, index: usize, table: &TableRef, cx: &mut Context<Self>) {
+        let Some(db) = self.db(index) else { return };
+        cx.emit(ExplorerEvent::OpenQuery {
+            db,
+            title: table.name.clone().into(),
+            sql: select_sql(table),
+        });
+    }
+
+    /// Asks, then removes the connection from the project and its password
+    /// from the keychain.
+    fn delete_connection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(spec) = self.connections.get(index).map(|n| n.spec.clone()) else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the connection \u{201c}{}\u{201d}?", spec.name),
+            Some("It is removed from the project and its password from the keychain."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                let removed = this.model.update(cx, |model, cx| {
+                    let mut project = model.project.clone();
+                    project.remove_connection(&spec.id);
+                    project.save()?;
+                    model.project = project;
+                    cx.notify();
+                    Ok::<_, String>(())
+                });
+                match removed {
+                    Ok(()) => {
+                        let _ = app::state(cx).secrets.delete(&spec.id);
+                    }
+                    Err(error) => eprintln!("kuery: {error}"),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks, then deletes a saved query file.
+    fn delete_saved_query(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete \u{201c}{name}\u{201d}?"),
+            Some("The file is deleted from the project. This cannot be undone."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!("kuery: could not delete {}: {error}", path.display());
+            }
+            this.update(cx, |this, cx| this.refresh_queries(cx)).ok();
+        })
+        .detach();
+    }
+
     // Render ---------------------------------------------------------------
 
     fn render_tree(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -700,6 +792,42 @@ impl Explorer {
                 .child(environment.short_label()),
         )
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(index, cx)))
+        .context_menu({
+            let this = cx.entity().downgrade();
+            let id = node.spec.id.clone();
+            let target = node.spec.target();
+            move |menu, _, _| {
+                let menu = if ready {
+                    menu.item(item("New Query", &this, move |this, _, cx| {
+                        this.new_query(index, cx)
+                    }))
+                    .item(item("Refresh Catalog", &this, move |this, _, cx| {
+                        this.load_catalog(index, cx)
+                    }))
+                    .item(item("Disconnect", &this, move |this, _, cx| {
+                        this.disconnect(index, cx)
+                    }))
+                } else {
+                    menu.item(item("Connect", &this, move |this, _, cx| {
+                        this.expanded.insert(index.to_string());
+                        this.expanded.insert(format!("{index}/public"));
+                        this.connect(index, cx)
+                    }))
+                };
+                let id = id.clone();
+                menu.separator()
+                    .item(item("Edit Connection…", &this, move |_, _, cx| {
+                        cx.emit(ExplorerEvent::EditConnection(id.clone()))
+                    }))
+                    .item(copy("Copy Host and Database", target.clone()))
+                    .separator()
+                    .item(item(
+                        "Delete Connection…",
+                        &this,
+                        move |this, window, cx| this.delete_connection(index, window, cx),
+                    ))
+            }
+        })
         .into_any_element()
     }
 
@@ -730,6 +858,20 @@ impl Explorer {
             .on_click({
                 let key = schema_key.clone();
                 cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx))
+            })
+            .context_menu({
+                let this = cx.entity().downgrade();
+                let name = schema.to_owned();
+                move |menu, _, _| {
+                    menu.item(item("New Query", &this, move |this, _, cx| {
+                        this.new_query(index, cx)
+                    }))
+                    .item(item("Refresh Catalog", &this, move |this, _, cx| {
+                        this.load_catalog(index, cx)
+                    }))
+                    .separator()
+                    .item(copy("Copy Name", name.clone()))
+                }
             })
             .into_any_element(),
         );
@@ -796,9 +938,38 @@ impl Explorer {
                                     counter(function.kind.label())
                                         .when(selected, |c| c.text_color(color(0xdde9ff))),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_function(index, function.clone(), cx)
-                                }))
+                                .on_click({
+                                    let function = function.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_function(index, function.clone(), cx)
+                                    })
+                                })
+                                .context_menu({
+                                    let this = cx.entity().downgrade();
+                                    move |menu, _, _| {
+                                        let open = function.clone();
+                                        menu.item(item(
+                                            "Open Definition",
+                                            &this,
+                                            move |this, _, cx| {
+                                                this.open_function(index, open.clone(), cx)
+                                            },
+                                        ))
+                                        .separator()
+                                        .item(copy(
+                                            "Copy Name",
+                                            quote_qualified(&function.schema, &function.name),
+                                        ))
+                                        .item(copy(
+                                            "Copy Signature",
+                                            format!(
+                                                "{}({})",
+                                                quote_qualified(&function.schema, &function.name),
+                                                function.arguments
+                                            ),
+                                        ))
+                                    }
+                                })
                                 .into_any_element(),
                         );
                     }
@@ -817,9 +988,27 @@ impl Explorer {
                                     counter(format!("on {}", trigger.table.name))
                                         .when(selected, |c| c.text_color(color(0xdde9ff))),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_trigger(index, trigger.clone(), cx)
-                                }))
+                                .on_click({
+                                    let trigger = trigger.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_trigger(index, trigger.clone(), cx)
+                                    })
+                                })
+                                .context_menu({
+                                    let this = cx.entity().downgrade();
+                                    move |menu, _, _| {
+                                        let open = trigger.clone();
+                                        menu.item(item(
+                                            "Open Table Definition",
+                                            &this,
+                                            move |this, _, cx| {
+                                                this.open_trigger(index, open.clone(), cx)
+                                            },
+                                        ))
+                                        .separator()
+                                        .item(copy("Copy Name", trigger.name.clone()))
+                                    }
+                                })
                                 .into_any_element(),
                         );
                     }
@@ -837,9 +1026,27 @@ impl Explorer {
                                     counter(info.values.len().to_string())
                                         .when(selected, |c| c.text_color(color(0xdde9ff))),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_enum(index, info.clone(), cx)
-                                }))
+                                .on_click({
+                                    let info = info.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_enum(index, info.clone(), cx)
+                                    })
+                                })
+                                .context_menu({
+                                    let this = cx.entity().downgrade();
+                                    move |menu, _, _| {
+                                        let open = info.clone();
+                                        menu.item(item("Show Values", &this, move |this, _, cx| {
+                                            this.open_enum(index, open.clone(), cx)
+                                        }))
+                                        .separator()
+                                        .item(copy(
+                                            "Copy Name",
+                                            quote_qualified(&info.schema, &info.name),
+                                        ))
+                                        .item(copy("Copy Values", info.values.join(", ")))
+                                    }
+                                })
                                 .into_any_element(),
                         );
                     }
@@ -866,9 +1073,37 @@ impl Explorer {
             ))
             .child(div().flex_1().truncate().child(info.table.name.clone()))
             .child(counter(rows).when(selected, |c| c.text_color(color(0xdde9ff))))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_table(index, info.clone(), TableView::Data, cx)
-            }))
+            .on_click({
+                let info = info.clone();
+                cx.listener(move |this, _, _, cx| {
+                    this.open_table(index, info.clone(), TableView::Data, cx)
+                })
+            })
+            .context_menu({
+                let this = cx.entity().downgrade();
+                move |menu, _, _| {
+                    let (data, definition, query) = (info.clone(), info.clone(), info.clone());
+                    let name = quote_qualified(&info.table.schema, &info.table.name);
+                    menu.item(item("Open Data", &this, move |this, _, cx| {
+                        this.open_table(index, data.clone(), TableView::Data, cx)
+                    }))
+                    .item(item("Open Definition", &this, move |this, _, cx| {
+                        this.open_table(index, definition.clone(), TableView::Definition, cx)
+                    }))
+                    .item(item("Query in New Tab", &this, move |this, _, cx| {
+                        this.query_table(index, &query.table, cx)
+                    }))
+                    .separator()
+                    .item(copy("Copy Name", name))
+                    .item(copy("Copy SELECT Statement", select_sql(&info.table)))
+                    .separator()
+                    .item(item(
+                        "Refresh Catalog",
+                        &this,
+                        move |this, _, cx| this.load_catalog(index, cx),
+                    ))
+                }
+            })
             .into_any_element()
     }
 
@@ -915,6 +1150,13 @@ impl Explorer {
                         }
                         cx.notify();
                     }))
+                    .context_menu({
+                        let path = root.join(&entry.relative);
+                        move |menu, _, _| {
+                            menu.item(reveal(path.clone()))
+                                .item(copy("Copy Path", path.display().to_string()))
+                        }
+                    })
                     .into_any_element(),
                 );
             } else {
@@ -928,16 +1170,57 @@ impl Explorer {
                     )
                     .child(icon(AppIcon::Code, 0xc49bff, selected))
                     .child(div().flex_1().truncate().child(entry.name()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_query = Some(relative.clone());
-                        cx.emit(ExplorerEvent::OpenSavedQuery(path.clone()));
-                        cx.notify();
-                    }))
+                    .on_click({
+                        let (path, relative) = (path.clone(), relative.clone());
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_query = Some(relative.clone());
+                            cx.emit(ExplorerEvent::OpenSavedQuery(path.clone()));
+                            cx.notify();
+                        })
+                    })
+                    .context_menu({
+                        let this = cx.entity().downgrade();
+                        move |menu, _, _| {
+                            let (open, delete) = (path.clone(), path.clone());
+                            let relative = relative.clone();
+                            menu.item(item("Open", &this, move |this, _, cx| {
+                                this.selected_query = Some(relative.clone());
+                                cx.emit(ExplorerEvent::OpenSavedQuery(open.clone()));
+                                cx.notify();
+                            }))
+                            .item(reveal(path.clone()))
+                            .item(copy("Copy Path", path.display().to_string()))
+                            .separator()
+                            .item(item(
+                                "Delete…",
+                                &this,
+                                move |this, window, cx| {
+                                    this.delete_saved_query(delete.clone(), window, cx)
+                                },
+                            ))
+                        }
+                    })
                     .into_any_element(),
                 );
             }
         }
         rows
+    }
+
+    /// Opens a History entry's SQL in a new tab on its connection.
+    fn open_history(&mut self, connection: &str, sql: &str, cx: &mut Context<Self>) {
+        let db = self
+            .connections
+            .iter()
+            .position(|c| c.spec.name == connection)
+            .and_then(|index| self.db(index));
+        if let Some(db) = db {
+            cx.emit(ExplorerEvent::OpenQuery {
+                db,
+                title: "History".into(),
+                sql: sql.to_string(),
+            });
+        }
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -997,24 +1280,32 @@ impl Explorer {
                                     .child(entry.outcome.clone()),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let db = this
-                            .connections
-                            .iter()
-                            .position(|c| c.spec.name == connection.as_ref())
-                            .and_then(|index| this.db(index));
-                        if let Some(db) = db {
-                            cx.emit(ExplorerEvent::OpenQuery {
-                                db,
-                                title: "History".into(),
-                                sql: sql.clone(),
-                            });
+                    .on_click({
+                        let (connection, sql) = (connection.clone(), sql.clone());
+                        cx.listener(move |this, _, _, cx| this.open_history(&connection, &sql, cx))
+                    })
+                    .context_menu({
+                        let this = cx.entity().downgrade();
+                        move |menu, _, _| {
+                            let (connection, open) = (connection.clone(), sql.clone());
+                            menu.item(item("Open in New Tab", &this, move |this, _, cx| {
+                                this.open_history(&connection, &open, cx)
+                            }))
+                            .item(copy("Copy SQL", sql.clone()))
                         }
-                    }))
+                    })
                     .into_any_element()
             })
             .collect()
     }
+}
+
+/// `select * from "schema"."table" limit 100;`, for a new query tab.
+fn select_sql(table: &TableRef) -> String {
+    format!(
+        "select *\nfrom {}\nlimit 100;\n",
+        quote_qualified(&table.schema, &table.name)
+    )
 }
 
 fn section_header(title: &'static str) -> gpui_kit::Div {

@@ -3,13 +3,15 @@
 //! The table is virtualized; only visible cells are requested and formatted.
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::{
-    AnyElement, App, Context, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
-    div, px,
+    AnyElement, App, Context, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
 use kuery_core::result_set::{Batch, ResultSet};
 
+use crate::context_menus::{Cell, copy_cell_items};
 use crate::theme;
 
 #[derive(Default)]
@@ -17,6 +19,8 @@ pub struct ResultsDelegate {
     set: ResultSet,
     columns: Vec<Column>,
     running: bool,
+    /// The cell last right-clicked, for the row's context menu.
+    menu_cell: Option<(usize, usize)>,
 }
 
 impl ResultsDelegate {
@@ -59,6 +63,17 @@ impl ResultsDelegate {
     pub fn memory_size(&self) -> usize {
         self.set.memory_size()
     }
+
+    fn cell(&self, row: usize, column: usize) -> Cell {
+        Cell {
+            row,
+            column,
+            columns: self.set.columns().to_vec(),
+            values: (0..self.set.columns().len())
+                .map(|index| self.set.cell(row, index).flatten().map(str::to_owned))
+                .collect(),
+        }
+    }
 }
 
 impl TableDelegate for ResultsDelegate {
@@ -96,7 +111,31 @@ impl TableDelegate for ResultsDelegate {
                 .into_any_element(),
             None => div().into_any_element(),
         };
-        cell
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _, _, _| {
+                    table.delegate_mut().menu_cell = Some((row_ix, col_ix));
+                }),
+            )
+            .child(cell)
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let column = match self.menu_cell {
+            Some((row, column)) if row == row_ix => column,
+            _ => 0,
+        };
+        copy_cell_items(menu, &self.cell(row_ix, column))
     }
 
     fn render_empty(
