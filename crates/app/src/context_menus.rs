@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::{ClipboardItem, Context, SharedString, WeakEntity, Window};
+use kuery_core::export::json_string;
 
 /// "Reveal in Finder" and its equivalents on the other platforms.
 pub const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
@@ -96,24 +97,6 @@ pub fn row_as_json(columns: &[String], values: &[Option<String>]) -> String {
     format!("{{{}}}", fields.join(", "))
 }
 
-fn json_string(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +114,5 @@ mod tests {
             row_as_json(&columns, &values),
             r#"{"id": "1", "note": "say \"hi\"\n\tok", "gone": null}"#
         );
-        assert_eq!(json_string("\u{1}"), r#""\u0001""#);
     }
 }

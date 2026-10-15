@@ -8,6 +8,7 @@
 //! panel has a Results tab (the grid) and an Output tab (a log of runs), and
 //! can be collapsed down to its tab strip.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use gpui_kit::{
     ParentElement as _, Pixels, PromptLevel, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Task, Window, actions, div, px,
 };
+use kuery_core::export::{self, Format};
 use kuery_pg::{Access, Event, QueryError, RunOptions, Session};
 
 use crate::assets::AppIcon;
@@ -50,6 +52,7 @@ actions!(
         UseReadOnly,
         UseWrite,
         UseFullWrite,
+        ExportResults,
         CommitTransaction,
         RollbackTransaction,
     ]
@@ -804,6 +807,73 @@ impl QueryTab {
         }));
     }
 
+    /// Asks where to save the results (the extension picks CSV, TSV or JSON)
+    /// and writes them off the UI thread.
+    fn export_results(&mut self, _: &ExportResults, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_running() {
+            return;
+        }
+        let set = self.table.read(cx).delegate().results().clone();
+        if set.columns().is_empty() {
+            self.log("EXPORT", "There are no results to export".into(), true, cx);
+            cx.notify();
+            return;
+        }
+        // `<project>/.kuery/queries` → `<project>`.
+        let directory = self
+            .queries_dir
+            .ancestors()
+            .nth(2)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.queries_dir.clone());
+        let suggested = format!("{}.csv", self.title.to_lowercase().replace(' ', "_"));
+        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut path))) = chosen.await else {
+                return;
+            };
+            if path.extension().is_none() {
+                path.set_extension(Format::Csv.extension());
+            }
+            let format = Format::from_path(&path);
+            let rows = set.rows();
+            let started = Instant::now();
+            let target = path.clone();
+            let written = cx
+                .background_spawn(async move {
+                    let file = std::fs::File::create(&target)?;
+                    let mut out = std::io::BufWriter::new(file);
+                    export::write(&set, format, &mut out)?;
+                    out.flush()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let (outcome, failed) = match written {
+                    Ok(()) => (
+                        format!(
+                            "Exported {} as {} to {} · {}",
+                            plural_rows(rows as u64),
+                            format.extension().to_uppercase(),
+                            path.display(),
+                            format_duration(started.elapsed())
+                        ),
+                        false,
+                    ),
+                    Err(error) => (
+                        format!("Could not export to {}: {error}", path.display()),
+                        true,
+                    ),
+                };
+                this.log("EXPORT", outcome, failed, cx);
+                this.panel_collapsed = false;
+                this.panel_tab = PanelTab::Output;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn toggle_results(&mut self, _: &ToggleResults, _: &mut Window, cx: &mut Context<Self>) {
         self.panel_collapsed = !self.panel_collapsed;
         cx.notify();
@@ -943,6 +1013,7 @@ impl QueryTab {
             .separator()
             .menu("Save Query", Box::new(SaveQuery))
             .menu("Save Query As…", Box::new(SaveQueryAs))
+            .menu_with_disabled("Export Results…", running, Box::new(ExportResults))
             .separator()
             .submenu(
                 "Mode",
@@ -1221,6 +1292,13 @@ impl QueryTab {
 
     fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (status, tone) = self.status(cx);
+        let has_results = !self
+            .table
+            .read(cx)
+            .delegate()
+            .results()
+            .columns()
+            .is_empty();
         let toggle_shortcut = if cfg!(target_os = "macos") {
             "⌘J"
         } else {
@@ -1285,6 +1363,17 @@ impl QueryTab {
                     .text_color(color(tone))
                     .truncate()
                     .child(status),
+            )
+            .child(
+                Button::new("export-results")
+                    .ghost()
+                    .xsmall()
+                    .label("Export…")
+                    .tooltip("Save the results as CSV, TSV or JSON")
+                    .disabled(self.is_running() || !has_results)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.export_results(&ExportResults, window, cx)
+                    })),
             )
             .child(
                 Button::new("toggle-results")
@@ -1406,6 +1495,7 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::use_read_only))
             .on_action(cx.listener(Self::use_write))
             .on_action(cx.listener(Self::use_full_write))
+            .on_action(cx.listener(Self::export_results))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))

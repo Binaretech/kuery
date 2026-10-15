@@ -64,6 +64,11 @@ impl ResultsDelegate {
         self.set.memory_size()
     }
 
+    /// Everything received so far.
+    pub fn results(&self) -> &ResultSet {
+        &self.set
+    }
+
     fn cell(&self, row: usize, column: usize) -> Cell {
         Cell {
             row,

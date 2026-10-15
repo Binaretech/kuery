@@ -1,11 +1,12 @@
 //! Kuery core, with no UI dependencies: read-only policy, statement
-//! analysis for write mode, columnar results, the catalog model, and
-//! generated SQL for browsing and editing tables.
+//! analysis for write mode, columnar results and their export, the catalog
+//! model, and generated SQL for browsing and editing tables.
 
 pub mod analysis;
 pub mod browse;
 pub mod catalog;
 pub mod edit;
+pub mod export;
 pub mod fuzzy;
 pub mod read_only;
 pub mod result_set;

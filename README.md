@@ -132,6 +132,12 @@ an Output tab that logs each run (SQL, rows and time, or the error); it
 collapses to its tab strip with `secondary-j`, its button or a double-click on
 the strip, and running a query brings it back.
 
+"Export…" in the panel (or `secondary-shift-e`, the palette or the editor's
+menu) saves the results to a file: the extension picks CSV (RFC 4180), TSV
+(tabs and line breaks escaped) or JSON (an array of objects; values as text,
+NULL as `null`). It writes in the background; a million rows take well under
+a second.
+
 Query tabs save with `secondary-s` into `.kuery/queries/`. The first line of
 a saved query, `-- connection: <name>`, records its connection and is not
 shown in the editor; opening the file from the sidebar's Queries list opens

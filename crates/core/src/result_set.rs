@@ -125,6 +125,28 @@ impl ResultSet {
     pub fn memory_size(&self) -> usize {
         self.batches.iter().map(Batch::memory_size).sum()
     }
+
+    /// Calls `f` with every row in order, batch by batch (no lookup per
+    /// cell). Stops at the first error.
+    pub fn try_for_each_row<E>(
+        &self,
+        mut f: impl FnMut(&[Option<&str>]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut row = Vec::with_capacity(self.columns.len());
+        for batch in &self.batches {
+            for offset in 0..batch.rows {
+                row.clear();
+                row.extend(
+                    batch
+                        .columns
+                        .iter()
+                        .map(|array| (!array.is_null(offset)).then(|| array.value(offset))),
+                );
+                f(&row)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

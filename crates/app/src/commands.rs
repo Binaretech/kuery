@@ -12,8 +12,8 @@ use gpui_kit::{Action, actions};
 
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
-    CancelQuery, CommitTransaction, RollbackTransaction, RunQuery, SaveQuery, SaveQueryAs,
-    ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
+    CancelQuery, CommitTransaction, ExportResults, RollbackTransaction, RunQuery, SaveQuery,
+    SaveQueryAs, ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
 };
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
@@ -170,6 +170,14 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ToggleResults),
         defaults: &["secondary-j"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.export",
+        title: "Export Results…",
+        category: "Query",
+        action: action!(ExportResults),
+        defaults: &["secondary-shift-e"],
         context: Some("QueryTab"),
     },
     Command {
