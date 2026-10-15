@@ -6,6 +6,8 @@
 //! palette and the keymap both read from here, so a command added once is
 //! searchable and bindable.
 
+use std::path::PathBuf;
+
 use gpui_kit::{Action, actions};
 
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
@@ -24,9 +26,17 @@ actions!(
         OpenKeymapFile,
         ReloadKeymap,
         OpenProject,
+        ClearRecentProjects,
         NewConnection,
     ]
 );
+
+/// Opens one of the recent projects (the File › Open Recent menu).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = dbadmin, no_json)]
+pub struct OpenRecentProject {
+    pub path: PathBuf,
+}
 
 pub struct Command {
     /// Stable id used in the keymap file, e.g. `tab.close`.
@@ -61,6 +71,14 @@ pub const COMMANDS: &[Command] = &[
         category: "Project",
         action: action!(OpenProject),
         defaults: &["secondary-o"],
+        context: None,
+    },
+    Command {
+        id: "project.clear_recent",
+        title: "Clear Recent Projects",
+        category: "Project",
+        action: action!(ClearRecentProjects),
+        defaults: &[],
         context: None,
     },
     Command {

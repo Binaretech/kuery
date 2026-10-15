@@ -39,11 +39,20 @@ that folder, so it can live in a code repository:
 
 Open a folder from the welcome window, with "Open Project…" (`secondary-o`),
 or from the command line with `cargo run -p dbadmin -- <folder>`; a folder
-without `.dbadmin/` becomes a new project. Each project opens in its own
-window, and recent projects are listed in the welcome window.
+without `.dbadmin/` becomes a new project. Opening a project from a project
+window asks whether it takes over that window (after confirming if tabs have
+unsaved changes) or gets a new one; a project that is already open is just
+brought to the front.
+
+Recent projects are listed in the welcome window (where each can be removed
+from the list or revealed in the file manager, and missing folders are marked),
+under File › Open Recent, in the project switcher on the title bar (click the
+project name) and in the command palette once you type. "Clear Recent
+Projects" empties the list; it lives in `recent.toml` in the user config
+directory.
 
 Connections are added and edited from the sidebar (`+` and the pencil next to
-each one), with "Test Connection" before saving. Passwords go to the system
+each one) in a dialog, with "Test Connection" before saving. Passwords go to the system
 keychain (Keychain on macOS, Credential Manager on Windows, Secret Service on
 Linux) under the connection's id, never into `project.toml`. A connection's
 `environment` (development, staging or production) is detected from the host
@@ -64,7 +73,8 @@ password is needed) and a couple of saved queries.
 Every command lives in one registry (`crates/app/src/commands.rs`) with a
 stable id, a title, its default shortcuts and the key context they apply in.
 The command palette (`secondary-k` or `secondary-shift-p`) searches them, plus
-the tables of the open connections, and runs the same action a shortcut would.
+the tables of the open connections and the recent projects, and runs the same
+action a shortcut would.
 
 Shortcuts can be changed in `keymap.toml` in the user config directory
 (`~/Library/Application Support/dbadmin` on macOS, `~/.config/dbadmin` on

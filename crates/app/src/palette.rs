@@ -1,14 +1,17 @@
 //! Command palette: fuzzy search over every command (with its shortcut) and,
-//! once you type, over the tables of the open connections.
+//! once you type, over the tables of the open connections and the recent
+//! projects.
 //!
 //! It does not run anything itself: it tells the workspace which command or
 //! table was picked, and the workspace dispatches the same action a shortcut
 //! would.
 
+use std::path::PathBuf;
+
 use dbadmin_core::catalog::TableInfo;
 use dbadmin_core::fuzzy;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
@@ -20,6 +23,7 @@ use crate::assets::AppIcon;
 use crate::commands::{COMMANDS, Command};
 use crate::connection::Db;
 use crate::keymap;
+use crate::recent::RecentProject;
 use crate::theme::{self, color};
 
 actions!(palette, [SelectNext, SelectPrevious, Confirm, Dismiss]);
@@ -45,12 +49,14 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum PaletteEvent {
     Run(&'static Command),
     OpenTable { db: Db, info: TableInfo },
+    OpenProject(PathBuf),
     Dismissed,
 }
 
 enum Item {
     Command(&'static Command),
     Table { db: Db, info: TableInfo },
+    Project(PathBuf),
 }
 
 struct Entry {
@@ -72,9 +78,15 @@ pub struct CommandPalette {
 impl EventEmitter<PaletteEvent> for CommandPalette {}
 
 impl CommandPalette {
-    pub fn new(tables: Vec<(Db, TableInfo)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search commands and tables…"));
+    pub fn new(
+        tables: Vec<(Db, TableInfo)>,
+        projects: Vec<RecentProject>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search commands, tables and projects…")
+        });
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => this.refilter(cx),
             InputEvent::PressEnter { .. } => this.confirm(cx),
@@ -98,6 +110,12 @@ impl CommandPalette {
             shortcut: None,
             item: Item::Table { db, info },
         }));
+        entries.extend(projects.into_iter().map(|project| Entry {
+            title: project.name.clone().into(),
+            detail: format!("Recent project · {}", project.display_path()).into(),
+            shortcut: None,
+            item: Item::Project(project.path),
+        }));
 
         let mut palette = Self {
             input,
@@ -117,7 +135,8 @@ impl CommandPalette {
             .entries
             .iter()
             .enumerate()
-            // Tables only show up once you type: they would bury the commands.
+            // Tables and projects only show up once you type: they would bury
+            // the commands.
             .filter(|(_, entry)| !query.is_empty() || matches!(entry.item, Item::Command(_)))
             .filter_map(|(index, entry)| {
                 let title = fuzzy::score(query, &entry.title);
@@ -173,6 +192,7 @@ impl CommandPalette {
                 db: db.clone(),
                 info: info.clone(),
             },
+            Item::Project(path) => PaletteEvent::OpenProject(path.clone()),
         });
     }
 
@@ -189,9 +209,12 @@ impl Render for CommandPalette {
             let entry = &self.entries[index];
             let selected = position == self.selected;
             let (icon, tone) = match &entry.item {
-                Item::Command(_) => (AppIcon::Code, theme::TEXT_SECONDARY),
-                Item::Table { info, .. } if info.kind.is_editable() => (AppIcon::Table, 0x4da3ff),
-                Item::Table { .. } => (AppIcon::Code, 0xc49bff),
+                Item::Command(_) => (Icon::new(AppIcon::Code), theme::TEXT_SECONDARY),
+                Item::Table { info, .. } if info.kind.is_editable() => {
+                    (Icon::new(AppIcon::Table), 0x4da3ff)
+                }
+                Item::Table { .. } => (Icon::new(AppIcon::Code), 0xc49bff),
+                Item::Project(_) => (Icon::new(IconName::FolderClosed), theme::ACCENT),
             };
             list = list.child(
                 h_flex()
@@ -202,7 +225,7 @@ impl Render for CommandPalette {
                     .rounded(px(6.))
                     .when(selected, |row| row.bg(color(theme::SELECTION)))
                     .when(!selected, |row| row.hover(|s| s.bg(color(0x2e2e32))))
-                    .child(Icon::new(icon).size(px(14.)).text_color(color(if selected {
+                    .child(icon.size(px(14.)).text_color(color(if selected {
                         0xffffff
                     } else {
                         tone

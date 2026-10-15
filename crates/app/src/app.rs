@@ -7,11 +7,11 @@ use std::sync::Arc;
 use dbadmin_pg::Engine;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Global, PathPromptOptions, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Global, IntoElement,
+    PathPromptOptions, PromptLevel, Render, Window, WindowBounds, WindowOptions, px, size,
 };
 
-use crate::commands::OpenProject;
+use crate::commands::{ClearRecentProjects, OpenProject, OpenRecentProject};
 use crate::project::{Project, ProjectModel};
 use crate::secrets::SecretStore;
 use crate::welcome::Welcome;
@@ -20,12 +20,55 @@ use crate::workspace::DbAdminView;
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub secrets: Arc<dyn SecretStore>,
-    /// Project windows by folder, so opening a project twice focuses it.
-    windows: Vec<(PathBuf, AnyWindowHandle)>,
-    welcome: Option<AnyWindowHandle>,
+    /// Open project windows, so opening a project twice focuses it.
+    windows: Vec<ProjectWindowEntry>,
+    welcome: Option<(AnyWindowHandle, Entity<Welcome>)>,
+}
+
+struct ProjectWindowEntry {
+    folder: PathBuf,
+    handle: AnyWindowHandle,
+    view: Entity<ProjectWindow>,
 }
 
 impl Global for AppState {}
+
+/// Root view of a project window. It holds the workspace instead of being
+/// it, so another project can take over the same window.
+pub struct ProjectWindow {
+    workspace: Entity<DbAdminView>,
+}
+
+impl ProjectWindow {
+    fn new(project: Project, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            workspace: Self::workspace(project, window, cx),
+        }
+    }
+
+    fn workspace(
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DbAdminView> {
+        window.set_window_title(&project.name);
+        let model = cx.new(|_| ProjectModel { project });
+        cx.new(|cx| DbAdminView::new(model, window, cx))
+    }
+
+    /// Swaps in `project`. The previous workspace, its tabs and its database
+    /// sessions are dropped.
+    fn replace(&mut self, project: Project, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace = Self::workspace(project, window, cx);
+        cx.notify();
+    }
+}
+
+impl Render for ProjectWindow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.workspace.clone()
+    }
+}
 
 pub fn init(engine: Arc<Engine>, secrets: Arc<dyn SecretStore>, cx: &mut App) {
     cx.set_global(AppState {
@@ -34,31 +77,121 @@ pub fn init(engine: Arc<Engine>, secrets: Arc<dyn SecretStore>, cx: &mut App) {
         windows: Vec::new(),
         welcome: None,
     });
-    cx.on_action(|_: &OpenProject, cx| prompt_open_project(cx));
+    cx.on_action(|_: &OpenProject, cx| request_open(None, cx.active_window(), cx));
+    cx.on_action(|action: &OpenRecentProject, cx| {
+        request_open(Some(action.path.clone()), cx.active_window(), cx)
+    });
+    cx.on_action(|_: &ClearRecentProjects, cx| {
+        crate::recent::clear();
+        recents_changed(cx);
+    });
 }
 
 pub fn state(cx: &App) -> &AppState {
     cx.global::<AppState>()
 }
 
-/// Asks for a folder and opens it as a project (creating `.dbadmin/` if it
-/// is not one yet).
-pub fn prompt_open_project(cx: &mut App) {
-    let paths = cx.prompt_for_paths(PathPromptOptions {
-        files: false,
-        directories: true,
-        multiple: false,
-        prompt: Some("Open".into()),
+/// Opens a project the way the user asked for it: `folder`, or one picked in
+/// a folder prompt when `None`. From a project window (`origin`) it asks
+/// whether the project replaces that window or gets a new one.
+///
+/// Deferred, because callers are often inside an update of `origin` itself
+/// (a palette pick, a click in the welcome window), where the window cannot
+/// be updated again to show a prompt.
+pub fn request_open(folder: Option<PathBuf>, origin: Option<AnyWindowHandle>, cx: &mut App) {
+    cx.defer(move |cx| open_requested(folder, origin, cx));
+}
+
+fn open_requested(folder: Option<PathBuf>, origin: Option<AnyWindowHandle>, cx: &mut App) {
+    let Some(folder) = folder else {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                cx.update(|cx| open_requested(Some(path), origin, cx));
+            }
+        })
+        .detach();
+        return;
+    };
+
+    let folder = canonical(&folder);
+    if focus_existing(&folder, cx) {
+        return;
+    }
+    let replaceable = origin.and_then(|origin| {
+        state(cx)
+            .windows
+            .iter()
+            .find(|entry| entry.handle == origin)
+            .map(|entry| (entry.handle, entry.view.clone()))
     });
+    let Some((handle, view)) = replaceable else {
+        if let Err(error) = open_project(&folder, cx) {
+            report_error(origin, &error, cx);
+        }
+        return;
+    };
+
+    let name = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string());
+    let answer = handle.update(cx, |_, window, cx| {
+        window.prompt(
+            PromptLevel::Info,
+            &format!("Open \u{201c}{name}\u{201d} in a new window or in this one?"),
+            None,
+            &["New Window", "This Window", "Cancel"],
+            cx,
+        )
+    });
+    let Ok(answer) = answer else { return };
     cx.spawn(async move |cx| {
-        if let Ok(Ok(Some(paths))) = paths.await
-            && let Some(path) = paths.into_iter().next()
-        {
-            cx.update(|cx| {
-                if let Err(error) = open_project(&path, cx) {
-                    eprintln!("dbadmin: {error}");
+        match answer.await {
+            Ok(0) => cx.update(|cx| {
+                if let Err(error) = open_project(&folder, cx) {
+                    report_error(Some(handle), &error, cx);
                 }
-            });
+            }),
+            Ok(1) => {
+                // Replacing the window drops its tabs: confirm first when
+                // some of them have changes that would be lost.
+                let unsaved =
+                    cx.update(|cx| view.read(cx).workspace.read(cx).has_unsaved_changes(cx));
+                if unsaved {
+                    let confirm = cx.update(|cx| {
+                        handle.update(cx, |_, window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                "Discard unsaved changes?",
+                                Some(
+                                    "Some tabs in this window have unsaved changes. \
+                                     They will be lost if the project opens here.",
+                                ),
+                                &["Discard and Open", "Cancel"],
+                                cx,
+                            )
+                        })
+                    });
+                    let Ok(confirm) = confirm else { return };
+                    if !matches!(confirm.await, Ok(0)) {
+                        return;
+                    }
+                }
+                cx.update(|cx| {
+                    if let Err(error) = replace_project(handle, &view, &folder, cx) {
+                        report_error(Some(handle), &error, cx);
+                    }
+                });
+            }
+            _ => {}
         }
     })
     .detach();
@@ -67,44 +200,107 @@ pub fn prompt_open_project(cx: &mut App) {
 /// Opens the project in `folder` in its own window, or focuses the window if
 /// it is already open.
 pub fn open_project(folder: &Path, cx: &mut App) -> Result<(), String> {
-    let folder = folder
-        .canonicalize()
-        .unwrap_or_else(|_| folder.to_path_buf());
-
-    let existing = cx
-        .global::<AppState>()
-        .windows
-        .iter()
-        .find(|(path, _)| *path == folder)
-        .map(|(_, window)| *window);
-    if let Some(window) = existing
-        && window
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
+    let folder = canonical(folder);
+    if focus_existing(&folder, cx) {
         return Ok(());
     }
 
     let project = Project::open_or_init(&folder)?;
-    crate::recent::add(&folder);
-    let title = project.name.clone();
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         ..TitleBar::window_options()
     };
-    let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
-        window.set_window_title(&title);
-        let model = cx.new(|_| ProjectModel { project });
-        cx.new(|cx| DbAdminView::new(model, window, cx))
+    let (handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| ProjectWindow::new(project, window, cx))
     })
     .map_err(|error| format!("Could not open a window: {error}"))?;
 
     let state = cx.global_mut::<AppState>();
-    state.windows.retain(|(path, _)| *path != folder);
-    state.windows.push((folder, window));
+    state.windows.retain(|entry| entry.folder != folder);
+    state.windows.push(ProjectWindowEntry {
+        folder: folder.clone(),
+        handle,
+        view,
+    });
+    crate::recent::add(&folder);
+    recents_changed(cx);
     close_welcome(cx);
     Ok(())
+}
+
+fn replace_project(
+    handle: AnyWindowHandle,
+    view: &Entity<ProjectWindow>,
+    folder: &Path,
+    cx: &mut App,
+) -> Result<(), String> {
+    let project = Project::open_or_init(folder)?;
+    handle
+        .update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.replace(project, window, cx))
+        })
+        .map_err(|_| "The window was closed".to_string())?;
+    if let Some(entry) = cx
+        .global_mut::<AppState>()
+        .windows
+        .iter_mut()
+        .find(|entry| entry.handle == handle)
+    {
+        entry.folder = folder.to_path_buf();
+    }
+    crate::recent::add(folder);
+    recents_changed(cx);
+    Ok(())
+}
+
+/// Brings the window of the project in `folder` to the front, if there is one.
+fn focus_existing(folder: &Path, cx: &mut App) -> bool {
+    let existing = state(cx)
+        .windows
+        .iter()
+        .find(|entry| entry.folder == folder)
+        .map(|entry| entry.handle);
+    existing.is_some_and(|handle| {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    })
+}
+
+fn canonical(folder: &Path) -> PathBuf {
+    folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf())
+}
+
+fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
+    let shown = origin.is_some_and(|handle| {
+        handle
+            .update(cx, |_, window, cx| {
+                // Nothing to wait for: the prompt only has an OK button.
+                drop(window.prompt(
+                    PromptLevel::Critical,
+                    "Could not open the project",
+                    Some(error),
+                    &["OK"],
+                    cx,
+                ));
+            })
+            .is_ok()
+    });
+    if !shown {
+        eprintln!("dbadmin: {error}");
+    }
+}
+
+/// Refreshes what shows the recent projects: the menu bar and the welcome
+/// window (deferred, since the change may come from the welcome window).
+pub fn recents_changed(cx: &mut App) {
+    crate::menus::set_menus(cx);
+    if let Some((_, welcome)) = state(cx).welcome.clone() {
+        cx.defer(move |cx| welcome.update(cx, |welcome, cx| welcome.reload(cx)));
+    }
 }
 
 pub fn open_welcome(cx: &mut App) {
@@ -113,16 +309,16 @@ pub fn open_welcome(cx: &mut App) {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         ..TitleBar::window_options()
     };
-    if let Ok((window, _)) = gpui_kit::open_window(options, cx, |window, cx| {
+    if let Ok((window, view)) = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("dbadmin");
         cx.new(|cx| Welcome::new(window, cx))
     }) {
-        cx.global_mut::<AppState>().welcome = Some(window);
+        cx.global_mut::<AppState>().welcome = Some((window, view));
     }
 }
 
 fn close_welcome(cx: &mut App) {
-    if let Some(window) = cx.global_mut::<AppState>().welcome.take() {
+    if let Some((window, _)) = cx.global_mut::<AppState>().welcome.take() {
         window
             .update(cx, |_, window, _| window.remove_window())
             .ok();

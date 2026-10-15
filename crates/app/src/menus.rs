@@ -6,8 +6,8 @@ use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
 use crate::commands::{
-    CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette, OpenKeymapFile, OpenProject,
-    PreviousTab, ReloadKeymap, ToggleSidebar,
+    ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
+    OpenKeymapFile, OpenProject, OpenRecentProject, PreviousTab, ReloadKeymap, ToggleSidebar,
 };
 use crate::query_tab::{SaveQuery, SaveQueryAs};
 
@@ -27,9 +27,26 @@ pub fn init(cx: &mut App) {
     });
 }
 
-/// Builds the menu bar. Called again after the keymap changes so the
-/// shortcuts shown next to each item stay current.
+/// Builds the menu bar. Called again after the keymap or the recent projects
+/// change, so shortcuts and the Open Recent list stay current.
 pub fn set_menus(cx: &mut App) {
+    let mut recent: Vec<MenuItem> = crate::recent::available()
+        .into_iter()
+        .map(|project| {
+            MenuItem::action(
+                format!("{} — {}", project.name, project.display_path()),
+                OpenRecentProject { path: project.path },
+            )
+        })
+        .collect();
+    if !recent.is_empty() {
+        recent.push(MenuItem::separator());
+    }
+    recent.push(MenuItem::action(
+        "Clear Recent Projects",
+        ClearRecentProjects,
+    ));
+
     cx.set_menus([
         Menu::new("dbadmin").items([
             MenuItem::action("Command Palette…", OpenCommandPalette),
@@ -43,6 +60,7 @@ pub fn set_menus(cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Project…", OpenProject),
+            MenuItem::submenu(Menu::new("Open Recent").items(recent)),
             MenuItem::separator(),
             MenuItem::action("New Query", NewQuery),
             MenuItem::action("New Connection…", NewConnection),

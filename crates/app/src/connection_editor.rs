@@ -1,4 +1,4 @@
-//! Connection editor, opened as a tab: add, edit, test and delete one of the
+//! Connection editor, shown in a dialog: add, edit, test and delete one of the
 //! project's connections. The password goes to the system keychain; the rest
 //! to `.dbadmin/project.toml`.
 
@@ -8,15 +8,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
-use gpui_kit::component::{Disableable as _, Icon, IndexPath, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, IndexPath, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Window, div, px,
+    AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Window, div, px,
 };
 
 use crate::app;
-use crate::assets::AppIcon;
 use crate::project::{ConnectionSpec, ProjectModel, new_id};
 use crate::secrets::SecretStore;
 use crate::theme::{self, color};
@@ -33,12 +32,6 @@ const SSL_MODES: [&str; 6] = [
     "verify-full",
 ];
 const ENVIRONMENTS: [&str; 4] = ["detect from host", "development", "staging", "production"];
-
-pub enum ConnectionEditorEvent {
-    /// Saved; the sidebar picks it up from the project model.
-    Saved,
-    Deleted,
-}
 
 enum TestState {
     Idle,
@@ -64,8 +57,6 @@ pub struct ConnectionEditor {
     error: Option<String>,
     confirm_delete: bool,
 }
-
-impl EventEmitter<ConnectionEditorEvent> for ConnectionEditor {}
 
 impl ConnectionEditor {
     pub fn new(
@@ -163,15 +154,33 @@ impl ConnectionEditor {
         editor
     }
 
-    pub fn title(&self, cx: &gpui_kit::App) -> SharedString {
-        match &self.id {
-            Some(_) => format!("Connection: {}", self.name.read(cx).value()).into(),
-            None => "New Connection".into(),
-        }
-    }
-
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    /// Opens the editor in a dialog over `window`: a new connection when `id`
+    /// is `None`. The dialog closes itself once the connection is saved or
+    /// deleted; the sidebar picks the change up from the project model.
+    pub fn open(
+        model: Entity<ProjectModel>,
+        id: Option<String>,
+        window: &mut Window,
+        cx: &mut gpui_kit::App,
+    ) {
+        let title = if id.is_some() {
+            "Edit Connection"
+        } else {
+            "New Connection"
+        };
+        let editor = cx.new(|cx| Self::new(model, id, window, cx));
+        let first_build = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first_build.replace(false) {
+                let name = editor.read(cx).name.focus_handle(cx);
+                window.focus(&name, cx);
+            }
+            dialog
+                .title(title)
+                .w(px(560.))
+                .overlay_closable(false)
+                .child(editor.clone())
+        });
     }
 
     /// Whether the keychain already has a password, read off the UI thread
@@ -251,6 +260,7 @@ impl ConnectionEditor {
         let state = app::state(cx);
         let (engine, secrets) = (state.engine.clone(), state.secrets.clone());
         let saved_id = self.id.clone();
+        self.error = None;
         self.test = TestState::Testing;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -286,7 +296,7 @@ impl ConnectionEditor {
         .detach();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let spec = match self.spec(cx) {
             Ok(spec) => spec,
             Err(error) => {
@@ -313,17 +323,15 @@ impl ConnectionEditor {
             Ok::<_, String>(())
         });
         match saved {
-            Ok(()) => {
-                self.id = Some(spec.id.clone());
-                self.error = None;
-                cx.emit(ConnectionEditorEvent::Saved);
+            Ok(()) => window.close_dialog(cx),
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
             }
-            Err(error) => self.error = Some(error),
         }
-        cx.notify();
     }
 
-    fn delete(&mut self, cx: &mut Context<Self>) {
+    fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.id.clone() else { return };
         if !self.confirm_delete {
             self.confirm_delete = true;
@@ -341,11 +349,13 @@ impl ConnectionEditor {
         match removed {
             Ok(()) => {
                 let _ = app::state(cx).secrets.delete(&id);
-                cx.emit(ConnectionEditorEvent::Deleted);
+                window.close_dialog(cx);
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 }
 
@@ -354,13 +364,15 @@ fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
         .gap_3()
         .child(
             div()
-                .w(px(130.))
+                .w(LABEL_WIDTH)
                 .flex_shrink_0()
                 .text_color(color(theme::TEXT_SECONDARY))
                 .child(label),
         )
-        .child(div().flex_1().max_w(px(380.)).child(control))
+        .child(div().flex_1().min_w_0().child(control))
 }
+
+const LABEL_WIDTH: gpui_kit::Pixels = px(104.);
 
 impl Render for ConnectionEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -369,52 +381,19 @@ impl Render for ConnectionEditor {
         } else {
             "Stored in the system keychain, not in the project"
         };
-        let test = match &self.test {
-            TestState::Idle => None,
-            TestState::Testing => Some(muted("Testing…").into_any_element()),
-            TestState::Passed(message) => Some(
-                div()
-                    .text_size(px(12.))
-                    .text_color(color(theme::GREEN))
-                    .child(message.clone())
-                    .into_any_element(),
-            ),
-            TestState::Failed(message) => Some(
-                div()
-                    .text_size(px(12.))
-                    .text_color(color(theme::RED))
-                    .child(message.clone())
-                    .into_any_element(),
-            ),
+        let status = match (&self.error, &self.test) {
+            (Some(error), _) => Some((error.clone(), theme::RED)),
+            (None, TestState::Idle) => None,
+            (None, TestState::Testing) => Some(("Testing…".to_string(), theme::TEXT_TERTIARY)),
+            (None, TestState::Passed(message)) => Some((message.clone(), theme::GREEN)),
+            (None, TestState::Failed(message)) => Some((message.clone(), theme::RED)),
         };
+        let indent = LABEL_WIDTH + px(12.);
 
         v_flex()
-            .size_full()
-            .p_8()
             .gap_4()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(
-                        Icon::new(AppIcon::Database)
-                            .size(px(22.))
-                            .text_color(color(theme::ACCENT)),
-                    )
-                    .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(if self.id.is_some() {
-                                        "Edit connection"
-                                    } else {
-                                        "New connection"
-                                    }),
-                            )
-                            .child(muted("PostgreSQL · saved in .dbadmin/project.toml")),
-                    ),
-            )
+            .text_size(px(13.))
+            .child(muted("PostgreSQL · saved in .dbadmin/project.toml"))
             .child(
                 v_flex()
                     .gap_3()
@@ -432,10 +411,32 @@ impl Render for ConnectionEditor {
                         muted("Production connections always open read-only and cannot edit rows."),
                     )),
             )
+            .children(status.map(|(message, tone)| {
+                div()
+                    .pl(indent)
+                    .text_size(px(12.))
+                    .text_color(color(tone))
+                    .child(message)
+            }))
             .child(
                 h_flex()
+                    .pt_2()
                     .gap_2()
-                    .pl(px(142.))
+                    .when(self.id.is_some(), |row| {
+                        row.child(
+                            Button::new("delete-connection")
+                                .ghost()
+                                .label(if self.confirm_delete {
+                                    "Click again to delete"
+                                } else {
+                                    "Delete"
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.delete(window, cx)),
+                                ),
+                        )
+                    })
+                    .child(div().flex_1())
                     .child(
                         Button::new("test-connection")
                             .label("Test Connection")
@@ -443,31 +444,16 @@ impl Render for ConnectionEditor {
                             .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
                     )
                     .child(
+                        Button::new("cancel-connection")
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
                         Button::new("save-connection")
                             .primary()
                             .label("Save")
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                    )
-                    .when(self.id.is_some(), |row| {
-                        row.child(div().w(px(24.))).child(
-                            Button::new("delete-connection")
-                                .ghost()
-                                .label(if self.confirm_delete {
-                                    "Click again to delete"
-                                } else {
-                                    "Delete Connection"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
-                        )
-                    }),
+                            .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                    ),
             )
-            .child(h_flex().pl(px(142.)).children(test))
-            .children(self.error.clone().map(|error| {
-                h_flex()
-                    .pl(px(142.))
-                    .text_size(px(12.))
-                    .text_color(color(theme::RED))
-                    .child(error)
-            }))
     }
 }

@@ -1,11 +1,15 @@
-//! Project window: custom title bar, the sidebar on the left, and query,
-//! table and connection tabs. Query and table tabs belong to the connection
+//! Project window: custom title bar, the sidebar on the left, and query
+//! and table tabs. Query and table tabs belong to the connection
 //! they were opened on.
 
 use std::path::PathBuf;
 
 use dbadmin_core::catalog::TableInfo;
-use gpui_kit::component::{ActiveTheme as _, Icon, TitleBar, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -15,15 +19,17 @@ use gpui_kit::{
 
 use crate::assets::AppIcon;
 use crate::commands::{
-    CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette, PreviousTab, ToggleSidebar,
+    ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
+    OpenProject, PreviousTab, ToggleSidebar,
 };
 use crate::connection::Db;
-use crate::connection_editor::{ConnectionEditor, ConnectionEditorEvent};
+use crate::connection_editor::ConnectionEditor;
 use crate::explorer::{Explorer, ExplorerEvent};
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
 use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab};
+use crate::recent::{self, RecentProject};
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
 use crate::ui::placeholder;
@@ -31,7 +37,6 @@ use crate::ui::placeholder;
 enum Tab {
     Query(Entity<QueryTab>),
     Table(Entity<TableTab>),
-    Connection(Entity<ConnectionEditor>),
 }
 
 impl Tab {
@@ -39,7 +44,6 @@ impl Tab {
         match self {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
-            Tab::Connection(_) => None,
         }
     }
 
@@ -52,7 +56,6 @@ impl Tab {
                 let handle = table.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
             }
-            Tab::Connection(_) => {}
         }
     }
 }
@@ -145,6 +148,15 @@ impl DbAdminView {
             focus_before_palette: None,
             focus_handle,
         }
+    }
+
+    /// Whether closing the window now would lose work: a query with unsaved
+    /// edits or a table with pending row changes.
+    pub fn has_unsaved_changes(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| match tab {
+            Tab::Query(query) => query.read(cx).is_dirty(),
+            Tab::Table(table) => table.read(cx).has_pending(),
+        })
     }
 
     fn open_query(
@@ -251,36 +263,7 @@ impl DbAdminView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(id) = &id {
-            let existing = self.tabs.iter().position(|tab| match tab {
-                Tab::Connection(editor) => editor.read(cx).id() == Some(id.as_str()),
-                _ => false,
-            });
-            if let Some(index) = existing {
-                self.activate(index, window, cx);
-                return;
-            }
-        }
-        let model = self.model.clone();
-        let editor = cx.new(|cx| ConnectionEditor::new(model, id, window, cx));
-        cx.subscribe_in(
-            &editor,
-            window,
-            |this, editor, event: &ConnectionEditorEvent, window, cx| match event {
-                ConnectionEditorEvent::Saved => cx.notify(),
-                ConnectionEditorEvent::Deleted => {
-                    if let Some(index) = this.tabs.iter().position(|tab| match tab {
-                        Tab::Connection(open) => open == editor,
-                        _ => false,
-                    }) {
-                        this.remove_tab(index, window, cx);
-                    }
-                }
-            },
-        )
-        .detach();
-        self.tabs.push(Tab::Connection(editor));
-        self.activate(self.tabs.len() - 1, window, cx);
+        ConnectionEditor::open(self.model.clone(), id, window, cx);
     }
 
     fn new_connection(&mut self, _: &NewConnection, window: &mut Window, cx: &mut Context<Self>) {
@@ -465,7 +448,8 @@ impl DbAdminView {
         }
         self.focus_before_palette = window.focused(cx);
         let tables = self.explorer.read(cx).open_tables();
-        let palette = cx.new(|cx| CommandPalette::new(tables, window, cx));
+        let projects = recent_projects_except(&self.model.read(cx).project.root);
+        let palette = cx.new(|cx| CommandPalette::new(tables, projects, window, cx));
         cx.subscribe_in(
             &palette,
             window,
@@ -480,6 +464,10 @@ impl DbAdminView {
                 PaletteEvent::OpenTable { db, info } => {
                     this.close_palette(window, cx);
                     this.open_table(db.clone(), info.clone(), TableView::Data, window, cx);
+                }
+                PaletteEvent::OpenProject(path) => {
+                    this.close_palette(window, cx);
+                    crate::app::request_open(Some(path.clone()), Some(window.window_handle()), cx);
                 }
             },
         )
@@ -512,6 +500,7 @@ impl DbAdminView {
         } else {
             "Ctrl+K"
         };
+        let root = project.root.clone();
         let initials: String = workspace_name
             .as_ref()
             .unwrap_or(&project_name)
@@ -565,33 +554,71 @@ impl DbAdminView {
                 .pr_3()
                 .text_size(px(12.5))
                 .child(
-                    h_flex()
-                        .gap_2()
+                    Button::new("project-switcher")
+                        .ghost()
+                        .compact()
+                        .small()
                         .child(
-                            div()
-                                .size(px(18.))
-                                .rounded(px(5.))
-                                .bg(color(0x1fa971))
-                                .text_color(color(0x04140c))
-                                .text_size(px(8.5))
-                                .font_weight(FontWeight::BOLD)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(initials),
-                        )
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(project_name.clone()),
-                        )
-                        .when_some(workspace_name.clone(), |row, workspace| {
-                            row.child(div().text_color(color(theme::TEXT_TERTIARY)).child("/"))
+                            h_flex()
+                                .gap_2()
                                 .child(
                                     div()
-                                        .text_color(color(theme::TEXT_SECONDARY))
-                                        .child(workspace),
+                                        .size(px(18.))
+                                        .rounded(px(5.))
+                                        .bg(color(0x1fa971))
+                                        .text_color(color(0x04140c))
+                                        .text_size(px(8.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(initials),
                                 )
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(project_name.clone()),
+                                )
+                                .when_some(workspace_name.clone(), |row, workspace| {
+                                    row.child(
+                                        div().text_color(color(theme::TEXT_TERTIARY)).child("/"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(color(theme::TEXT_SECONDARY))
+                                            .child(workspace),
+                                    )
+                                })
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(px(12.))
+                                        .text_color(color(theme::TEXT_TERTIARY)),
+                                ),
+                        )
+                        .dropdown_menu(move |menu, _, _| {
+                            // Read when the menu opens, not on every render.
+                            let recent_projects = recent_projects_except(&root);
+                            let mut menu = menu.label("Recent Projects");
+                            if recent_projects.is_empty() {
+                                menu = menu
+                                    .item(PopupMenuItem::new("No other projects").disabled(true));
+                            }
+                            for project in recent_projects.iter() {
+                                let path = project.path.clone();
+                                menu =
+                                    menu.item(PopupMenuItem::new(project.name.clone()).on_click(
+                                        move |_, window, cx| {
+                                            crate::app::request_open(
+                                                Some(path.clone()),
+                                                Some(window.window_handle()),
+                                                cx,
+                                            )
+                                        },
+                                    ));
+                            }
+                            menu.separator()
+                                .menu("Open Folder…", Box::new(OpenProject))
+                                .menu("Clear Recent Projects", Box::new(ClearRecentProjects))
                         }),
                 )
                 .child(connection)
@@ -630,7 +657,6 @@ impl DbAdminView {
                     let query = query.read(cx);
                     (AppIcon::Code, query.title(), query.is_dirty())
                 }
-                Tab::Connection(editor) => (AppIcon::Database, editor.read(cx).title(cx), false),
                 Tab::Table(table) => {
                     let table = table.read(cx);
                     (
@@ -712,12 +738,20 @@ impl DbAdminView {
         match self.tabs.get(self.active) {
             Some(Tab::Query(query)) => query.clone().into_any_element(),
             Some(Tab::Table(table)) => table.clone().into_any_element(),
-            Some(Tab::Connection(editor)) => editor.clone().into_any_element(),
             None => placeholder(
                 "Open a table or saved query from the sidebar, or add a connection with +",
             ),
         }
     }
+}
+
+/// Recent projects other than the one in `root`, newest first.
+fn recent_projects_except(root: &std::path::Path) -> Vec<RecentProject> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    recent::available()
+        .into_iter()
+        .filter(|project| project.path != root)
+        .collect()
 }
 
 impl Focusable for DbAdminView {
