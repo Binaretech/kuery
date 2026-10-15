@@ -196,6 +196,13 @@ KUERY_TLS_DATABASE_URL=postgres://kuery:kuery@localhost:54330/kuery \
 
 ## Fonts and icons
 
+Kuery's application icon is `crates/app/assets/branding/kuery.png` (1024 × 1024,
+with transparency). It is embedded in the welcome screen, sets the macOS Dock
+icon even during development, and is passed to X11 windows. Windows builds embed
+the multi-size `kuery.ico` as resource 1. The matching `kuery.icns` is available
+for macOS app bundles. The image was generated with the built-in ImageGen tool;
+the complete prompt is recorded in `crates/app/assets/branding/generation.txt`.
+
 The UI uses IBM Plex Sans, and the editor and table use JetBrains Mono, both
 licensed under the SIL Open Font License 1.1 (`crates/app/assets/fonts/*/OFL.txt`).
 They are embedded in the binary and registered with gpui's text system at

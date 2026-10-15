@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui_kit::component::TitleBar;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Global, IntoElement,
     PathPromptOptions, PromptLevel, Render, Window, WindowBounds, WindowOptions, px, size,
@@ -209,7 +208,7 @@ pub fn open_project(folder: &Path, cx: &mut App) -> Result<(), String> {
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..TitleBar::window_options()
+        ..crate::app_icon::window_options()
     };
     let (handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| ProjectWindow::new(project, window, cx))
@@ -307,7 +306,7 @@ pub fn open_welcome(cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(760.), px(520.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..TitleBar::window_options()
+        ..crate::app_icon::window_options()
     };
     if let Ok((window, view)) = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Kuery");

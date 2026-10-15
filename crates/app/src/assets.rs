@@ -1,4 +1,4 @@
-//! Assets embedded in the binary: fonts (OFL) and our own icons.
+//! Assets embedded in the binary: fonts (OFL), branding and our own icons.
 //!
 //! [`AppAssets`] serves our files first and delegates the rest to
 //! `gpui_kit::assets::Assets`, gpui-kit's default icon set.
@@ -47,6 +47,8 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/code.svg",
     "icons/pencil.svg",
 ];
+
+const BRANDING: &[(&str, &[u8])] = &[(crate::app_icon::PATH, crate::app_icon::PNG)];
 
 /// Kuery's own icons, for `Icon::new(AppIcon::Lock)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +120,7 @@ impl AssetSource for AppAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut names = KitAssets.list(path)?;
-        for (name, _) in FONTS.iter().chain(ICONS) {
+        for (name, _) in FONTS.iter().chain(ICONS).chain(BRANDING) {
             if name.starts_with(path) && !names.iter().any(|n| n == name) {
                 names.push((*name).into());
             }
@@ -131,6 +133,7 @@ fn own(path: &str) -> Option<&'static [u8]> {
     FONTS
         .iter()
         .chain(ICONS)
+        .chain(BRANDING)
         .find(|(name, _)| *name == path)
         .map(|(_, bytes)| *bytes)
 }

@@ -9,10 +9,9 @@ use gpui_kit::component::{Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
 };
 
-use crate::assets::AppIcon;
 use crate::context_menus::REVEAL_LABEL;
 use crate::recent::{self, RecentProject};
 use crate::theme::{self, color};
@@ -181,20 +180,7 @@ impl Render for Welcome {
                             .gap_3()
                             .border_r_1()
                             .border_color(color(theme::HAIRLINE))
-                            .child(
-                                div()
-                                    .size(px(48.))
-                                    .rounded(px(12.))
-                                    .bg(color(0x1fa971))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::new(AppIcon::Database)
-                                            .size(px(26.))
-                                            .text_color(color(0x04140c)),
-                                    ),
-                            )
+                            .child(img(crate::app_icon::PATH).size(px(64.)).flex_shrink_0())
                             .child(
                                 div()
                                     .text_size(px(22.))

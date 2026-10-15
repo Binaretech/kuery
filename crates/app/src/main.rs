@@ -4,6 +4,7 @@
 //! if needed); without an argument the welcome window lists recent projects.
 
 mod app;
+mod app_icon;
 mod assets;
 mod commands;
 mod connection;
@@ -42,6 +43,7 @@ fn main() {
         .with_assets(assets::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            app_icon::init();
             assets::load_fonts(cx).expect("register the embedded fonts");
             theme::apply(cx);
             app::init(engine.clone(), Arc::new(secrets::Keyring), cx);

@@ -1,0 +1,12 @@
+Tool: built-in ImageGen
+
+Use case: logo-brand.
+Asset type: final PNG desktop application icon for Kuery, a professional database and SQL query manager.
+Primary request: design a sophisticated minimal symbol combining layered DATABASE STORAGE and a subtly implied K. The mark must be understood first as an abstract database emblem, with the K discovered in its construction.
+Design concept: a compact cylindrical data stack made of THREE broad, flat, precisely spaced horizontal bands with gently elliptical curved ends. Integrate an angular branching channel through the right half of these layers: a carefully designed diagonal negative-space cut lets the upper and lower layers branch outward from a shared left structure, subtly suggesting the arms of K. The database tiers themselves create the identity; do not place a letter on top of a cylinder. Use one unified clever silhouette, generous negative space, balanced proportions, and broad shapes readable at 24 pixels. Flat editorial-quality identity design, refined architectural geometry, intentional line widths and optical spacing.
+Palette: solid electric blue #2f86ff symbol, solid deep graphite #151517 rounded-square tile. Restrained and professional.
+Composition: one single centered icon on square 1024x1024 canvas. The graphite tile occupies about 82 percent of canvas with equal transparent margins. The database/K symbol occupies about 60 percent of the tile with ample clear space around it. Smooth precise corners.
+Background: genuine alpha transparency outside the tile.
+Constraints: entirely flat 2D, uniform solid colors. No 3D, gradients, lighting, bevels, shadows, shine, texture, glow, tiny details, decorative circuits, extra nodes, table grids or ornaments. No literal typographic K, no ordinary letter monogram, no letter pasted over a database. No wordmark, readable text, mockup, scene, collage or watermark. One finished distinctive professional logo icon only.
+
+Exports: resized to 1024 x 1024 PNG with sips; ICNS and ICO contain PNG representations of the same artwork at standard desktop icon sizes.
