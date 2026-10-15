@@ -89,11 +89,16 @@ pub fn check(sql: &str) -> Result<(), Rejection> {
 
     match statements.as_slice() {
         [] => Err(Rejection::Empty),
-        [statement] => match statement.visit(&mut ReadOnlyVisitor) {
-            ControlFlow::Continue(()) => Ok(()),
-            ControlFlow::Break(rejection) => Err(rejection),
-        },
+        [statement] => check_statement(statement),
         many => Err(Rejection::MultipleStatements(many.len())),
+    }
+}
+
+/// Checks that one parsed statement only reads data.
+pub(crate) fn check_statement(statement: &Statement) -> Result<(), Rejection> {
+    match statement.visit(&mut ReadOnlyVisitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(rejection) => Err(rejection),
     }
 }
 
@@ -165,7 +170,7 @@ fn creates_table(body: &SetExpr) -> bool {
 }
 
 /// Short statement name for the error message, e.g. `DELETE`.
-fn statement_kind(statement: &Statement) -> String {
+pub(crate) fn statement_kind(statement: &Statement) -> String {
     let text = statement.to_string();
     let mut words = text.split_whitespace();
     let first = words.next().unwrap_or("This statement").to_uppercase();

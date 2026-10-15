@@ -134,6 +134,26 @@ impl DbAdminView {
         )
         .detach();
 
+        // The window's close button goes through the same check as Close Window.
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let Some(view) = this.upgrade() else {
+                return true;
+            };
+            if !view
+                .read(cx)
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
+            {
+                return true;
+            }
+            window.defer(cx, move |window, cx| {
+                view.update(cx, |view, cx| view.request_close_window(window, cx));
+            });
+            false
+        });
+
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         Self {
@@ -151,10 +171,10 @@ impl DbAdminView {
     }
 
     /// Whether closing the window now would lose work: a query with unsaved
-    /// edits or a table with pending row changes.
+    /// edits or an open transaction, or a table with pending row changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         self.tabs.iter().any(|tab| match tab {
-            Tab::Query(query) => query.read(cx).is_dirty(),
+            Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
         })
     }
@@ -334,6 +354,11 @@ impl DbAdminView {
             Some(Tab::Table(table)) if table.read(cx).has_pending() => {
                 self.activate(index, window, cx);
             }
+            Some(Tab::Query(query)) if query.read(cx).in_transaction() => {
+                let query = query.clone();
+                self.activate(index, window, cx);
+                self.confirm_close_transaction(query, window, cx);
+            }
             Some(Tab::Query(query)) if query.read(cx).is_dirty() => {
                 let query = query.clone();
                 self.activate(index, window, cx);
@@ -342,6 +367,86 @@ impl DbAdminView {
             Some(_) => self.remove_tab(index, window, cx),
             None => {}
         }
+    }
+
+    /// Asks whether to commit a query tab's open transaction before closing
+    /// it; then closes it as usual (which may ask to save the SQL too).
+    fn confirm_close_transaction(
+        &mut self,
+        query: Entity<QueryTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = query.read(cx).title();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Commit the open transaction in \u{201c}{name}\u{201d}?"),
+            Some("Closing the tab ends it. The changes are only kept if you commit them."),
+            &["Commit", "Roll Back", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let commit = match answer.await {
+                Ok(0) => true,
+                Ok(1) => false,
+                _ => return,
+            };
+            let ended = query.update(cx, |query, cx| query.end_transaction(commit, cx));
+            // A failed commit keeps the tab open, with the error in its Output.
+            if ended.await.is_err() {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                if let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| matches!(tab, Tab::Query(q) if *q == query))
+                {
+                    this.close(index, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Closes the window, asking first if tabs have open transactions: closing
+    /// drops their connections, which rolls them back.
+    fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
+            .count();
+        if open == 0 {
+            window.remove_window();
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Close the window and roll back?",
+            Some(&format!(
+                "{} not committed. Closing the window rolls {} back.",
+                if open == 1 {
+                    "A tab has a transaction that is".to_string()
+                } else {
+                    format!("{open} tabs have transactions that are")
+                },
+                if open == 1 { "it" } else { "them" }
+            )),
+            &["Roll Back and Close", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if let Ok(0) = answer.await {
+                cx.update(|window, _| window.remove_window()).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close_window(window, cx);
     }
 
     /// Asks whether to save a query with unsaved changes before closing it.
@@ -655,7 +760,11 @@ impl DbAdminView {
             let (icon, title, pending) = match tab {
                 Tab::Query(query) => {
                     let query = query.read(cx);
-                    (AppIcon::Code, query.title(), query.is_dirty())
+                    (
+                        AppIcon::Code,
+                        query.title(),
+                        query.is_dirty() || query.in_transaction(),
+                    )
                 }
                 Tab::Table(table) => {
                     let table = table.read(cx);
@@ -781,6 +890,7 @@ impl Render for DbAdminView {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::close_window))
             .bg(color(theme::GROUND))
             .text_color(color(theme::TEXT))
             .text_size(px(13.))

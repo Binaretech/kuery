@@ -1,4 +1,6 @@
-//! Query tab: SQL editor and streaming results, always read-only. A tab can
+//! Query tab: SQL editor and streaming results. Read-only unless write mode
+//! is on (see [`crate::write_mode`]): then the tab has a connection of its
+//! own, and changes stay in a transaction until Commit or Roll Back. A tab can
 //! be bound to a saved query file in the project; its first line,
 //! `-- connection: <name>`, is kept in the file but not shown in the editor.
 //!
@@ -9,31 +11,82 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use dbadmin_pg::{Event, QueryError, RunOptions};
+use dbadmin_pg::{Access, Event, QueryError, RunOptions, Session};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Enter, InputEvent};
 use gpui_kit::component::table::{DataTable, TableState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyBinding,
-    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Task, Window, actions, div, px,
+    ParentElement as _, Pixels, PromptLevel, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, Window, actions, div, px,
 };
 
 use crate::assets::AppIcon;
-use crate::connection::Db;
+use crate::connection::{Db, WritePolicy};
 use crate::explorer::HistoryEntry;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
+use crate::write_mode::{self, Review};
 
 actions!(
     dbadmin,
-    [RunQuery, CancelQuery, SaveQuery, SaveQueryAs, ToggleResults]
+    [
+        RunQuery,
+        CancelQuery,
+        SaveQuery,
+        SaveQueryAs,
+        ToggleResults,
+        ToggleWriteMode,
+        CommitTransaction,
+        RollbackTransaction,
+    ]
 );
+
+/// An open transaction with no runs for this long is rolled back.
+const IDLE_ROLLBACK: Duration = Duration::from_secs(10 * 60);
+/// The transaction bar counts down over the last stretch.
+const IDLE_WARNING: Duration = Duration::from_secs(2 * 60);
+
+/// Write mode of a tab.
+enum WriteState {
+    Off,
+    Connecting,
+    On(WriteSession),
+    Failed(String),
+}
+
+/// The tab's own read-write connection and its open transaction, if any.
+struct WriteSession {
+    session: Session,
+    /// Statements and rows changed since the transaction opened.
+    statements: usize,
+    affected: u64,
+    opened: Option<Instant>,
+    last_run: Instant,
+}
+
+impl WriteSession {
+    fn new(session: Session) -> Self {
+        Self {
+            session,
+            statements: 0,
+            affected: 0,
+            opened: None,
+            last_run: Instant::now(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.statements = 0;
+        self.affected = 0;
+        self.opened = None;
+    }
+}
 
 /// Editor keys that are not commands: `secondary-enter` runs the query (it is
 /// the `query.run` shortcut), so a new line moves to `secondary-shift-enter`.
@@ -90,6 +143,8 @@ enum RunState {
         rows: usize,
         elapsed: Duration,
         first_batch_after: Option<Duration>,
+        /// Rows changed, for runs in the write transaction.
+        changed: Option<u64>,
     },
     Failed(String),
 }
@@ -121,6 +176,11 @@ pub struct QueryTab {
     panel_collapsed: bool,
     panel_tab: PanelTab,
     output: Vec<OutputEntry>,
+    write: WriteState,
+    /// Whether the run in progress goes into the write transaction.
+    run_writes: bool,
+    /// Checks the open transaction for idleness while write mode is on.
+    idle_watch: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -174,6 +234,9 @@ impl QueryTab {
             panel_collapsed: false,
             panel_tab: PanelTab::Results,
             output: Vec::new(),
+            write: WriteState::Off,
+            run_writes: false,
+            idle_watch: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -247,7 +310,7 @@ impl QueryTab {
         cx.notify();
     }
 
-    fn run_query(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+    fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         let sql = {
             let editor = self.editor.read(cx);
             let selected = editor.selected_text().to_string();
@@ -257,7 +320,59 @@ impl QueryTab {
                 selected
             }
         };
+        match &self.write {
+            WriteState::Off | WriteState::Failed(_) => self.execute(sql, false, cx),
+            WriteState::Connecting => {}
+            WriteState::On(_) if !self.db.writes_allowed() => {
+                self.refuse(
+                    sql,
+                    "Writes on this connection are no longer allowed: turn write mode off, or \
+                     allow writes again"
+                        .into(),
+                    cx,
+                );
+            }
+            WriteState::On(_) => {
+                match write_mode::review(&sql, &self.db.name, self.db.environment) {
+                    Review::Run { writes } => self.execute(sql, writes, cx),
+                    Review::Refuse(reason) => self.refuse(sql, reason, cx),
+                    Review::Confirm { message, detail } => {
+                        let answer = window.prompt(
+                            PromptLevel::Warning,
+                            &message,
+                            Some(&detail),
+                            &["Run", "Cancel"],
+                            cx,
+                        );
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(0) = answer.await {
+                                this.update(cx, |this, cx| this.execute(sql, true, cx)).ok();
+                            }
+                        })
+                        .detach();
+                    }
+                }
+            }
+        }
+    }
 
+    /// Logs a script that write mode will not run.
+    fn refuse(&mut self, sql: String, reason: String, cx: &mut Context<Self>) {
+        self.last_sql = sql;
+        self.record(reason.clone(), true, cx);
+        self.run = RunState::Failed(reason);
+        self.panel_collapsed = false;
+        cx.notify();
+    }
+
+    /// Runs `sql`: in the write transaction if `writes`, otherwise read-only
+    /// (on the write connection when write mode is on, so it sees the
+    /// uncommitted changes).
+    fn execute(&mut self, sql: String, writes: bool, cx: &mut Context<Self>) {
+        let session = match &self.write {
+            WriteState::On(write) => write.session.clone(),
+            _ => self.db.session.clone(),
+        };
         // Dropping the previous task drops its receiver and cancels that query.
         self.run_task = None;
         self.table.update(cx, |table, cx| {
@@ -267,13 +382,24 @@ impl QueryTab {
         self.run = RunState::Running {
             started: Instant::now(),
         };
+        self.run_writes = writes;
         // A run brings its results into view.
         self.panel_collapsed = false;
         self.panel_tab = PanelTab::Results;
         cx.notify();
 
         self.last_sql = sql.clone();
-        let rx = self.db.session.run_read_only(sql, RunOptions::default());
+        let rx = if writes {
+            session.run_in_transaction(
+                sql,
+                RunOptions {
+                    statement_timeout: Duration::from_secs(60),
+                    ..RunOptions::default()
+                },
+            )
+        } else {
+            session.run_read_only(sql, RunOptions::default())
+        };
         self.run_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
                 if this
@@ -298,29 +424,60 @@ impl QueryTab {
             }),
             Event::Finished(summary) => {
                 self.finish_table(cx);
-                self.record(
-                    format!(
+                let changed = self.run_writes.then_some(summary.affected);
+                if let (true, WriteState::On(write)) = (self.run_writes, &mut self.write) {
+                    write.statements += summary.statements;
+                    write.affected += summary.affected;
+                    write.opened.get_or_insert_with(Instant::now);
+                    write.last_run = Instant::now();
+                }
+                let outcome = match changed {
+                    Some(changed) => format!(
+                        "{} · {} changed · {} · not committed",
+                        plural(summary.statements, "statement"),
+                        plural_rows(changed),
+                        format_duration(summary.elapsed)
+                    ),
+                    None => format!(
                         "{} rows · {}",
                         thousands(summary.rows as u64),
                         format_duration(summary.elapsed)
                     ),
-                    false,
-                    cx,
-                );
+                };
+                self.record(outcome, false, cx);
                 self.run = RunState::Done {
                     rows: summary.rows,
                     elapsed: summary.elapsed,
                     first_batch_after: summary.first_batch_after,
+                    changed,
                 };
             }
             Event::Failed(error) => {
                 self.finish_table(cx);
-                let message = describe_error(error);
+                let mut message = describe_error(error);
+                if let WriteState::On(write) = &mut self.write {
+                    write.last_run = Instant::now();
+                    if self.run_writes {
+                        if write.session.in_transaction() {
+                            message.push_str(" · this script was undone, earlier changes are kept");
+                        } else {
+                            write.reset();
+                            message.push_str(" · the transaction ended");
+                        }
+                    }
+                }
                 self.record(message.clone(), true, cx);
                 self.run = RunState::Failed(message);
             }
         }
         cx.notify();
+    }
+
+    /// Adds a line to the Output tab for something that is not a script run.
+    fn log(&mut self, sql: &str, outcome: String, failed: bool, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(&mut self.last_sql, sql.to_string());
+        self.record(outcome, failed, cx);
+        self.last_sql = previous;
     }
 
     fn record(&mut self, outcome: String, failed: bool, cx: &mut Context<Self>) {
@@ -357,9 +514,209 @@ impl QueryTab {
 
     fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
         if let RunState::Running { .. } = self.run {
-            self.db.session.cancel();
+            match &self.write {
+                WriteState::On(write) => write.session.cancel(),
+                _ => self.db.session.cancel(),
+            }
             cx.notify();
         }
+    }
+
+    /// Whether a transaction is waiting for Commit or Roll Back.
+    pub fn in_transaction(&self) -> bool {
+        matches!(&self.write, WriteState::On(write) if write.session.in_transaction())
+    }
+
+    fn toggle_write_mode(
+        &mut self,
+        _: &ToggleWriteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.write {
+            WriteState::Connecting => {}
+            WriteState::On(_) => self.leave_write_mode(window, cx),
+            WriteState::Off | WriteState::Failed(_) if self.db.writes_allowed() => {
+                self.enter_write_mode(cx)
+            }
+            WriteState::Off | WriteState::Failed(_) => {
+                let this = cx.weak_entity();
+                write_mode::allow_writes(self.db.clone(), window, cx, move |_, cx| {
+                    this.update(cx, |this, cx| this.enter_write_mode(cx)).ok();
+                });
+            }
+        }
+    }
+
+    /// Opens the tab's own read-write connection.
+    fn enter_write_mode(&mut self, cx: &mut Context<Self>) {
+        self.write = WriteState::Connecting;
+        cx.notify();
+        let engine = crate::app::state(cx).engine.clone();
+        let connecting = self.db.reconnect.open(&engine, Access::ReadWrite);
+        cx.spawn(async move |this, cx| {
+            let result = connecting.await;
+            this.update(cx, |this, cx| {
+                if !matches!(this.write, WriteState::Connecting) {
+                    return;
+                }
+                this.write = match result {
+                    Ok(session) => {
+                        this.watch_idle(cx);
+                        WriteState::On(WriteSession::new(session))
+                    }
+                    Err(error) => WriteState::Failed(error.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Back to read-only; asks first if a transaction is open.
+    fn leave_write_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.in_transaction() {
+            self.drop_write_session(cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Commit the open transaction?",
+            Some("Write mode is turning off. The changes are only kept if you commit them."),
+            &["Commit", "Roll Back", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let commit = match answer.await {
+                Ok(0) => true,
+                Ok(1) => false,
+                _ => return,
+            };
+            let Ok(ended) = this.update(cx, |this, cx| this.end_transaction(commit, cx)) else {
+                return;
+            };
+            if ended.await.is_ok() {
+                this.update(cx, |this, cx| this.drop_write_session(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn drop_write_session(&mut self, cx: &mut Context<Self>) {
+        // Dropping the session closes its connection.
+        self.write = WriteState::Off;
+        self.idle_watch = None;
+        cx.notify();
+    }
+
+    /// Production: stops allowing writes on this connection session.
+    fn stop_allowing_writes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.db.set_writes_allowed(false);
+        self.leave_write_mode(window, cx);
+    }
+
+    fn commit(&mut self, _: &CommitTransaction, _: &mut Window, cx: &mut Context<Self>) {
+        self.end_transaction(true, cx).detach();
+    }
+
+    fn rollback(&mut self, _: &RollbackTransaction, _: &mut Window, cx: &mut Context<Self>) {
+        self.end_transaction(false, cx).detach();
+    }
+
+    /// Commits or rolls back the open transaction, and logs it. Resolves to
+    /// an error if the commit failed (the transaction is over either way).
+    pub fn end_transaction(
+        &mut self,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), ()>> {
+        self.finish_transaction(commit, None, cx)
+    }
+
+    fn finish_transaction(
+        &mut self,
+        commit: bool,
+        note: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), ()>> {
+        let WriteState::On(write) = &self.write else {
+            return Task::ready(Ok(()));
+        };
+        if !write.session.in_transaction() {
+            return Task::ready(Ok(()));
+        }
+        let session = write.session.clone();
+        let (statements, affected) = (write.statements, write.affected);
+        cx.spawn(async move |this, cx| {
+            let result = if commit {
+                session.commit().await
+            } else {
+                session.rollback().await
+            };
+            this.update(cx, |this, cx| {
+                if let WriteState::On(write) = &mut this.write {
+                    write.reset();
+                }
+                let what = format!(
+                    "{} · {} changed",
+                    plural(statements, "statement"),
+                    plural_rows(affected)
+                );
+                let (outcome, failed) = match (&result, commit) {
+                    (Ok(()), true) => (format!("Committed · {what}"), false),
+                    (Ok(()), false) => (
+                        format!("Rolled back{} · {what} undone", note.unwrap_or_default()),
+                        false,
+                    ),
+                    (Err(error), _) => (
+                        format!(
+                            "{} failed: {} · nothing was committed",
+                            if commit { "Commit" } else { "Rollback" },
+                            describe_error(error.clone())
+                        ),
+                        true,
+                    ),
+                };
+                this.log(
+                    if commit { "COMMIT" } else { "ROLLBACK" },
+                    outcome,
+                    failed,
+                    cx,
+                );
+                cx.notify();
+            })
+            .ok();
+            result.map_err(|_| ())
+        })
+    }
+
+    /// Rolls back a transaction left open with no runs for [`IDLE_ROLLBACK`],
+    /// so it does not hold locks forever; refreshes the countdown meanwhile.
+    fn watch_idle(&mut self, cx: &mut Context<Self>) {
+        self.idle_watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let alive = this.update(cx, |this, cx| {
+                    let WriteState::On(write) = &this.write else {
+                        return;
+                    };
+                    if !write.session.in_transaction() || this.is_running() {
+                        return;
+                    }
+                    let idle = write.last_run.elapsed();
+                    if idle >= IDLE_ROLLBACK {
+                        this.finish_transaction(false, Some(" after 10 minutes idle"), cx)
+                            .detach();
+                    } else if idle + IDLE_WARNING >= IDLE_ROLLBACK {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     fn toggle_results(&mut self, _: &ToggleResults, _: &mut Window, cx: &mut Context<Self>) {
@@ -447,18 +804,7 @@ impl QueryTab {
                     .child(error)
             }))
             .child(div().flex_1())
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px_2()
-                    .py(px(3.))
-                    .rounded(px(6.))
-                    .bg(color(theme::ACCENT).opacity(0.16))
-                    .text_color(color(0x4da3ff))
-                    .text_size(px(12.))
-                    .child(Icon::new(AppIcon::Lock).size(px(12.)))
-                    .child("Read-only"),
-            )
+            .child(self.render_mode_toggle(cx))
             .when(running, |row| {
                 row.child(Button::new("cancel").small().label("Cancel").on_click(
                     cx.listener(|this, _, window, cx| this.cancel_query(&CancelQuery, window, cx)),
@@ -476,21 +822,171 @@ impl QueryTab {
             )
     }
 
-    fn render_read_only_banner(&self) -> impl IntoElement {
+    /// Read-only / write mode switch in the toolbar.
+    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let environment = self.db.environment;
+        let (label, tone, tooltip): (SharedString, u32, &str) = match &self.write {
+            WriteState::Off => ("Read-only".into(), 0x4da3ff, "Turn on write mode"),
+            WriteState::Connecting => ("Connecting…".into(), theme::TEXT_SECONDARY, ""),
+            WriteState::On(_) => (
+                format!("Write · {}", environment.short_label()).into(),
+                environment.color(),
+                "Back to read-only",
+            ),
+            WriteState::Failed(_) => ("Write mode failed".into(), theme::RED, "Try again"),
+        };
+        let on = matches!(self.write, WriteState::On(_));
         h_flex()
+            .id("write-mode")
+            .gap_1()
+            .px_2()
+            .py(px(3.))
+            .rounded(px(6.))
+            .bg(color(tone).opacity(if on { 0.22 } else { 0.14 }))
+            .text_color(color(tone))
+            .text_size(px(12.))
+            .font_weight(if on {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .hover(|s| s.bg(color(tone).opacity(0.3)))
+            .child(Icon::new(if on { AppIcon::Pencil } else { AppIcon::Lock }).size(px(12.)))
+            .child(label)
+            .when(!tooltip.is_empty(), |toggle| {
+                toggle.tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                })
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_write_mode(&ToggleWriteMode, window, cx)
+            }))
+    }
+
+    fn render_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let banner = h_flex()
             .h(px(28.))
             .px_4()
             .gap_2()
             .flex_shrink_0()
-            .bg(color(theme::READ_ONLY_BG))
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
-            .text_size(px(12.))
-            .text_color(color(theme::READ_ONLY_FG))
-            .child(Icon::new(AppIcon::Lock).size(px(13.)))
-            .child(
-                "Read-only query: runs in a READ ONLY transaction. INSERT, UPDATE, DELETE and DDL are blocked.",
-            )
+            .text_size(px(12.));
+        let environment = self.db.environment;
+        match &self.write {
+            WriteState::On(_) => {
+                let policy = environment.write_policy();
+                banner
+                    .bg(color(environment.color()).opacity(0.14))
+                    .text_color(color(environment.color()))
+                    .child(Icon::new(AppIcon::Pencil).size(px(13.)))
+                    .child(div().flex_1().truncate().child(format!(
+                        "Write mode on {} ({}) · changes stay in a transaction until you \
+                             commit · {}",
+                        self.db.name,
+                        environment.label(),
+                        write_mode::policy_hint(policy)
+                    )))
+                    .when(policy == WritePolicy::SessionUnlock, |banner| {
+                        banner.child(
+                            Button::new("stop-allowing-writes")
+                                .ghost()
+                                .xsmall()
+                                .label("Stop Allowing Writes")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.stop_allowing_writes(window, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
+            WriteState::Failed(error) => banner
+                .bg(color(theme::RED).opacity(0.14))
+                .text_color(color(theme::RED))
+                .child(
+                    div()
+                        .truncate()
+                        .child(format!("Could not open a write connection: {error}")),
+                )
+                .into_any_element(),
+            WriteState::Off | WriteState::Connecting => banner
+                .bg(color(theme::READ_ONLY_BG))
+                .text_color(color(theme::READ_ONLY_FG))
+                .child(Icon::new(AppIcon::Lock).size(px(13.)))
+                .child(
+                    "Read-only query: runs in a READ ONLY transaction. INSERT, UPDATE, DELETE and \
+                     DDL are blocked.",
+                )
+                .into_any_element(),
+        }
+    }
+
+    /// Shown while a transaction is open: what it holds, and Commit / Roll Back.
+    fn render_transaction_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let WriteState::On(write) = &self.write else {
+            return None;
+        };
+        if !write.session.in_transaction() {
+            return None;
+        }
+        let idle = write.last_run.elapsed();
+        let countdown = (idle + IDLE_WARNING >= IDLE_ROLLBACK).then(|| {
+            let left = IDLE_ROLLBACK.saturating_sub(idle).as_secs();
+            format!(" · rolls back in {}:{:02} if idle", left / 60, left % 60)
+        });
+        let open_for = write
+            .opened
+            .map(|opened| format!(" · open {}", format_duration(opened.elapsed())))
+            .unwrap_or_default();
+        let busy = self.is_running();
+        Some(
+            h_flex()
+                .h(px(34.))
+                .px_4()
+                .gap_2()
+                .flex_shrink_0()
+                .bg(color(theme::AMBER).opacity(0.1))
+                .border_b_1()
+                .border_color(color(theme::HAIRLINE))
+                .text_size(px(12.5))
+                .child(div().size(px(7.)).rounded_full().bg(color(theme::AMBER)))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Transaction open"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_color(color(theme::TEXT_SECONDARY))
+                        .child(format!(
+                            "{} · {} changed{open_for}{}",
+                            plural(write.statements, "statement"),
+                            plural_rows(write.affected),
+                            countdown.unwrap_or_default()
+                        )),
+                )
+                .child(
+                    Button::new("rollback")
+                        .small()
+                        .label("Roll Back")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.rollback(&RollbackTransaction, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("commit")
+                        .small()
+                        .primary()
+                        .label("Commit")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.commit(&CommitTransaction, window, cx)
+                        })),
+                ),
+        )
     }
 
     /// The run's status, shown next to the panel tabs.
@@ -508,9 +1004,22 @@ impl QueryTab {
                 theme::TEXT_SECONDARY,
             ),
             RunState::Done {
+                changed: Some(changed),
+                elapsed,
+                ..
+            } => (
+                format!(
+                    "{} changed · {} · not committed",
+                    plural_rows(*changed),
+                    format_duration(*elapsed)
+                ),
+                theme::AMBER,
+            ),
+            RunState::Done {
                 rows,
                 elapsed,
                 first_batch_after,
+                changed: None,
             } => (
                 format!(
                     "{} rows · {} · first rows in {} · {:.0} MB",
@@ -711,8 +1220,12 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::toggle_results))
+            .on_action(cx.listener(Self::toggle_write_mode))
+            .on_action(cx.listener(Self::commit))
+            .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))
-            .child(self.render_read_only_banner())
+            .child(self.render_banner(cx))
+            .children(self.render_transaction_bar(cx))
             .child(
                 v_flex()
                     .id("query-split")
@@ -762,6 +1275,22 @@ impl Render for QueryTab {
                         )
                     }),
             )
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{} {noun}s", thousands(count as u64))
+    }
+}
+
+fn plural_rows(count: u64) -> String {
+    if count == 1 {
+        "1 row".into()
+    } else {
+        format!("{} rows", thousands(count))
     }
 }
 

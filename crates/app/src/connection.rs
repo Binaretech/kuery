@@ -1,9 +1,15 @@
 //! Active connection and its environment.
 //!
 //! The environment decides whether writes are allowed: in production the session
-//! opens read-only and the explorer does not offer row editing.
+//! opens read-only and the explorer does not offer row editing. Write mode in
+//! a query tab follows [`WritePolicy`]; in production it needs writes allowed
+//! for the connection session first, which is never saved anywhere.
 
-use dbadmin_pg::{Access, Session};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use dbadmin_pg::{Access, ConnectError, Engine, Session};
 use gpui_kit::SharedString;
 
 use crate::theme;
@@ -66,6 +72,71 @@ impl Environment {
             Environment::Development | Environment::Staging => Access::ReadWrite,
         }
     }
+
+    pub fn write_policy(self) -> WritePolicy {
+        match self {
+            Environment::Development => WritePolicy::ConfirmDangerous,
+            Environment::Staging => WritePolicy::ConfirmWrites,
+            Environment::Production => WritePolicy::SessionUnlock,
+        }
+    }
+}
+
+/// How much write mode asks before running a script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePolicy {
+    /// Only statements that are easy to regret (see `dbadmin_core::analysis`).
+    ConfirmDangerous,
+    /// Every script that writes.
+    ConfirmWrites,
+    /// Writes must be allowed for the connection session (typing its name),
+    /// and then every script that writes is confirmed too. Scripts that
+    /// cannot be analysed are refused.
+    SessionUnlock,
+}
+
+impl WritePolicy {
+    /// Whether a script that writes needs confirmation.
+    pub fn confirms(self, dangerous: bool) -> bool {
+        match self {
+            WritePolicy::ConfirmDangerous => dangerous,
+            WritePolicy::ConfirmWrites | WritePolicy::SessionUnlock => true,
+        }
+    }
+
+    /// Whether a script dbadmin cannot analyse may run after a warning.
+    pub fn allows_unanalysed(self) -> bool {
+        self != WritePolicy::SessionUnlock
+    }
+}
+
+/// Opens more connections like the one in [`Db`], for write mode. It holds
+/// the connection string, password included, only in memory.
+#[derive(Clone)]
+pub struct Reconnect {
+    conninfo: Arc<str>,
+}
+
+impl Reconnect {
+    pub fn new(conninfo: String) -> Self {
+        Self {
+            conninfo: conninfo.into(),
+        }
+    }
+
+    pub fn open(
+        &self,
+        engine: &Engine,
+        access: Access,
+    ) -> impl Future<Output = Result<Session, ConnectError>> + Send + use<> {
+        engine.connect_with(self.conninfo.to_string(), access)
+    }
+}
+
+impl fmt::Debug for Reconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Reconnect(…)")
+    }
 }
 
 /// An open connection, shared by the sidebar and the tabs opened from it.
@@ -77,11 +148,43 @@ pub struct Db {
     pub session: Session,
     /// `host:port/database`, without credentials.
     pub target: SharedString,
+    pub reconnect: Reconnect,
+    /// Production only: writes allowed for this connection session. Shared by
+    /// every tab on it, gone when it disconnects or the app quits.
+    writes_allowed: Arc<AtomicBool>,
 }
 
 impl Db {
+    pub fn new(
+        name: SharedString,
+        environment: Environment,
+        session: Session,
+        target: SharedString,
+        reconnect: Reconnect,
+    ) -> Self {
+        Self {
+            name,
+            environment,
+            session,
+            target,
+            reconnect,
+            writes_allowed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn can_write(&self) -> bool {
         self.session.access() == Access::ReadWrite
+    }
+
+    /// Whether write mode can be turned on without allowing it first.
+    pub fn writes_allowed(&self) -> bool {
+        self.environment.write_policy() != WritePolicy::SessionUnlock
+            || self.writes_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Allows (or stops allowing) writes for this connection session.
+    pub fn set_writes_allowed(&self, allowed: bool) {
+        self.writes_allowed.store(allowed, Ordering::SeqCst);
     }
 }
 
@@ -167,5 +270,16 @@ mod tests {
             Environment::Production
         );
         assert_eq!(Environment::Production.access(), Access::ReadOnly);
+    }
+
+    #[test]
+    fn write_policies_ask_more_the_closer_to_production() {
+        let dev = Environment::Development.write_policy();
+        assert!(!dev.confirms(false) && dev.confirms(true) && dev.allows_unanalysed());
+        let staging = Environment::Staging.write_policy();
+        assert!(staging.confirms(false) && staging.allows_unanalysed());
+        let production = Environment::Production.write_policy();
+        assert_eq!(production, WritePolicy::SessionUnlock);
+        assert!(production.confirms(false) && !production.allows_unanalysed());
     }
 }

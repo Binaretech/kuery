@@ -25,6 +25,7 @@ mod theme;
 mod ui;
 mod welcome;
 mod workspace;
+mod write_mode;
 
 use std::path::PathBuf;
 use std::sync::Arc;

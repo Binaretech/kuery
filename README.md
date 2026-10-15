@@ -4,7 +4,8 @@ Desktop database manager (macOS, Windows and Linux) built with gpui.
 
 Status: early prototype. Several connections per project, a sidebar tree
 (connections → schemas → tables, views, functions, triggers, enums), SQL
-query tabs that always run read-only with streamed results, and table tabs
+query tabs that run read-only with streamed results (or, in write mode,
+inside a transaction you commit), and table tabs
 with server-side filtering, sorting and paging, the table definition, and
 row editing through staged changes (never on production connections).
 
@@ -12,8 +13,8 @@ row editing through staged changes (never on production connections).
 
 | Crate | What it does |
 |---|---|
-| `crates/core` | Read-only policy (`sqlparser`), columnar results (Arrow), the catalog model, and escaped SQL for browsing and editing tables. No UI. |
-| `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, and transactional row changes. |
+| `crates/core` | Read-only policy and write-mode statement analysis (`sqlparser`), columnar results (Arrow), the catalog model, and escaped SQL for browsing and editing tables. No UI. |
+| `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, transactional row changes, and write transactions with a savepoint per run. |
 | `crates/app` | The gpui app (`gpui-kit`, pinned version). Custom fonts and icons in `crates/app/assets`. |
 
 ## Development
@@ -58,6 +59,35 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 `environment` (development, staging or production) is detected from the host
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
+
+## Write mode
+
+Query tabs are read-only until you turn on write mode with the switch in the
+toolbar ("Read-only" / "Write") or "Toggle Write Mode" in the command palette:
+
+- The tab opens a connection of its own. The first script that writes opens a
+  transaction that stays open until **Commit** or **Roll Back** in the
+  transaction bar, which shows the statements and rows changed so far. Reads in
+  that tab see the uncommitted changes; other tabs and sessions do not.
+- Every run gets a savepoint: if a script fails, only its own changes are
+  undone and the transaction stays usable.
+- Scripts are analysed first. `BEGIN`, `COMMIT` and friends are refused (the
+  transaction belongs to the tab), and `UPDATE`/`DELETE` without `WHERE`,
+  `TRUNCATE`, `DROP`, dropping columns and `GRANT`/`REVOKE` are flagged.
+- What is confirmed depends on the environment: development asks before risky
+  statements, staging before every change, production before every change and
+  refuses SQL it cannot analyse.
+- Production needs writes allowed first, by typing the connection's name. That
+  lasts for the connection session only (until it disconnects or the app
+  quits), is never saved in the project, and "Stop Allowing Writes" ends it.
+- Writes have a 60 s `statement_timeout` and a 5 s `lock_timeout`. A
+  transaction with no runs for 10 minutes is rolled back (the bar counts down
+  over the last two). Closing the tab asks whether to commit; closing the
+  window or turning write mode off with a transaction open asks first too.
+
+Table tabs keep their own staged row editing, which stays off on production.
+
+## Editor
 
 In the SQL editor `secondary-enter` runs the query (or the selection) and
 `secondary-shift-enter` inserts a new line. Command shortcuts are also bound

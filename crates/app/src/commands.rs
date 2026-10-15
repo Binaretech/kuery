@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use gpui_kit::{Action, actions};
 
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
-use crate::query_tab::{CancelQuery, RunQuery, SaveQuery, SaveQueryAs, ToggleResults};
+use crate::query_tab::{
+    CancelQuery, CommitTransaction, RollbackTransaction, RunQuery, SaveQuery, SaveQueryAs,
+    ToggleResults, ToggleWriteMode,
+};
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
 actions!(
@@ -167,6 +170,30 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ToggleResults),
         defaults: &["secondary-j"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.toggle_write_mode",
+        title: "Toggle Write Mode",
+        category: "Query",
+        action: action!(ToggleWriteMode),
+        defaults: &[],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.commit",
+        title: "Commit Transaction",
+        category: "Query",
+        action: action!(CommitTransaction),
+        defaults: &[],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.rollback",
+        title: "Roll Back Transaction",
+        category: "Query",
+        action: action!(RollbackTransaction),
+        defaults: &[],
         context: Some("QueryTab"),
     },
     Command {

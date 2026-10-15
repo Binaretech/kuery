@@ -26,7 +26,7 @@ use gpui_kit::{
 
 use crate::app;
 use crate::assets::AppIcon;
-use crate::connection::Db;
+use crate::connection::{Db, Reconnect};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
@@ -325,13 +325,14 @@ impl Explorer {
         let password = cx.background_spawn(async move { secrets.get(&id) });
         cx.spawn(async move |this, cx| {
             let result = match password.await {
-                Ok(password) => engine
-                    .connect_with(
-                        spec.conninfo(password.as_deref()),
-                        spec.environment().access(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string()),
+                Ok(password) => {
+                    let conninfo = spec.conninfo(password.as_deref());
+                    engine
+                        .connect_with(conninfo.clone(), spec.environment().access())
+                        .await
+                        .map(|session| (session, conninfo))
+                        .map_err(|error| error.to_string())
+                }
                 Err(error) => Err(error),
             };
             this.update(cx, |this, cx| {
@@ -343,13 +344,14 @@ impl Explorer {
                     return;
                 }
                 match result {
-                    Ok(session) => {
-                        let db = Db {
-                            name: spec.name.clone().into(),
-                            environment: spec.environment(),
+                    Ok((session, conninfo)) => {
+                        let db = Db::new(
+                            spec.name.clone().into(),
+                            spec.environment(),
                             session,
-                            target: spec.target().into(),
-                        };
+                            spec.target().into(),
+                            Reconnect::new(conninfo),
+                        );
                         node.state = ConnectionState::Ready {
                             db: db.clone(),
                             catalog: CatalogState::Loading,
