@@ -43,6 +43,7 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/trash.svg",
     "icons/shield-check.svg",
     "icons/code.svg",
+    "icons/pencil.svg",
 ];
 
 /// dbadmin's own icons, for `Icon::new(AppIcon::Lock)`.
@@ -58,11 +59,12 @@ pub enum AppIcon {
     Trash,
     Shield,
     Code,
+    Pencil,
 }
 
 #[cfg(test)]
 impl AppIcon {
-    const ALL: [AppIcon; 10] = [
+    const ALL: [AppIcon; 11] = [
         AppIcon::Lock,
         AppIcon::Database,
         AppIcon::Table,
@@ -73,6 +75,7 @@ impl AppIcon {
         AppIcon::Trash,
         AppIcon::Shield,
         AppIcon::Code,
+        AppIcon::Pencil,
     ];
 }
 
@@ -89,6 +92,7 @@ impl IconNamed for AppIcon {
             AppIcon::Trash => "icons/trash.svg",
             AppIcon::Shield => "icons/shield-check.svg",
             AppIcon::Code => "icons/code.svg",
+            AppIcon::Pencil => "icons/pencil.svg",
         }
         .into()
     }

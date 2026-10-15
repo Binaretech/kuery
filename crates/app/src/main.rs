@@ -1,44 +1,39 @@
-//! dbadmin: a technical prototype of the user interface built with gpui.
+//! dbadmin: a desktop database manager built with gpui.
 //!
-//! Connections come from `dbadmin.toml` (or `DBADMIN_CONFIG`); without a file,
-//! `DBADMIN_DATABASE_URL` picks a single database (by default, the Postgres
-//! from `dev/compose.yaml`).
+//! `dbadmin [folder]` opens the project in `folder` (creating its `.dbadmin/`
+//! if needed); without an argument the welcome window lists recent projects.
 
+mod app;
 mod assets;
 mod commands;
-mod config;
 mod connection;
+mod connection_editor;
 mod definition;
 mod explorer;
 mod grid;
 mod keymap;
 mod menus;
 mod palette;
+mod paths;
+mod project;
 mod query_tab;
+mod recent;
 mod results;
+mod secrets;
 mod table_tab;
 mod theme;
 mod ui;
+mod welcome;
 mod workspace;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dbadmin_pg::Engine;
-use gpui_kit::component::TitleBar;
-use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
-
-use crate::config::Config;
-use crate::workspace::DbAdminView;
 
 fn main() {
     let engine = Arc::new(Engine::new().expect("start the Postgres runtime"));
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("dbadmin: {error}");
-            std::process::exit(1);
-        }
-    };
+    let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
         .with_assets(assets::AppAssets)
@@ -46,6 +41,7 @@ fn main() {
             gpui_kit::init(cx);
             assets::load_fonts(cx).expect("register the embedded fonts");
             theme::apply(cx);
+            app::init(engine.clone(), Arc::new(secrets::Keyring), cx);
             menus::init(cx);
             // After gpui_kit::init, so the keymap can keep its bindings.
             keymap::init(cx);
@@ -56,15 +52,15 @@ fn main() {
             })
             .detach();
 
-            let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..TitleBar::window_options()
+            let opened = match &folder {
+                Some(folder) => app::open_project(folder, cx)
+                    .map_err(|error| eprintln!("dbadmin: {error}"))
+                    .is_ok(),
+                None => false,
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| DbAdminView::new(engine.clone(), config.clone(), window, cx))
-            })
-            .expect("open the main window");
+            if !opened {
+                app::open_welcome(cx);
+            }
             cx.activate(true);
         });
 }

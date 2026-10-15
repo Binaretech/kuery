@@ -1,18 +1,20 @@
 //! Sidebar: the project's connections as a tree (connection → schema →
-//! tables, views, functions, triggers and enums), plus the query history.
+//! tables, views, functions, triggers and enums), its saved queries, and the
+//! query history.
 //!
-//! The sidebar owns the connections: it opens each one when it is first
-//! expanded (the first one opens on start) and hands an open [`Db`] to the
-//! tabs it asks the workspace to open.
+//! The sidebar owns the open connections: it opens each one when it is first
+//! expanded (the first one opens on start), reading its password from the
+//! system keychain, and hands an open [`Db`] to the tabs it asks the
+//! workspace to open. The connection list follows the project model.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use dbadmin_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
 use dbadmin_core::sql::quote_qualified;
-use dbadmin_pg::{Engine, catalog};
+use dbadmin_pg::catalog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,9 +24,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
+use crate::app;
 use crate::assets::AppIcon;
-use crate::config::{Config, ConnectionConfig};
-use crate::connection::{Db, describe_target};
+use crate::connection::Db;
+use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
@@ -43,6 +46,10 @@ pub enum ExplorerEvent {
         title: SharedString,
         sql: String,
     },
+    /// A file from the project's saved queries.
+    OpenSavedQuery(PathBuf),
+    NewConnection,
+    EditConnection(String),
 }
 
 /// A query that ran in this session, newest first in the History list.
@@ -68,13 +75,14 @@ enum CatalogState {
 }
 
 struct ConnectionNode {
-    config: ConnectionConfig,
+    spec: ConnectionSpec,
     state: ConnectionState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Explorer,
+    Queries,
     History,
 }
 
@@ -178,8 +186,12 @@ impl SchemaObjects {
 }
 
 pub struct Explorer {
-    engine: Arc<Engine>,
+    model: Entity<ProjectModel>,
     connections: Vec<ConnectionNode>,
+    queries: Vec<QueryEntry>,
+    /// Collapsed query folders, by relative path.
+    collapsed_folders: HashSet<PathBuf>,
+    selected_query: Option<PathBuf>,
     /// Keys of expanded nodes: `"0"`, `"0/public"`, `"0/public/tables"`.
     expanded: HashSet<String>,
     selected: Option<String>,
@@ -191,12 +203,7 @@ pub struct Explorer {
 impl EventEmitter<ExplorerEvent> for Explorer {}
 
 impl Explorer {
-    pub fn new(
-        engine: Arc<Engine>,
-        config: &Config,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(model: Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search objects…"));
         cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -205,17 +212,24 @@ impl Explorer {
         })
         .detach();
 
+        cx.observe(&model, |this, _, cx| this.sync_project(cx))
+            .detach();
+
+        let project = model.read(cx).project.clone();
         let mut explorer = Self {
-            engine,
-            connections: config
+            model,
+            connections: project
                 .connections
                 .iter()
                 .cloned()
-                .map(|config| ConnectionNode {
-                    config,
+                .map(|spec| ConnectionNode {
+                    spec,
                     state: ConnectionState::Idle,
                 })
                 .collect(),
+            queries: project.queries(),
+            collapsed_folders: HashSet::new(),
+            selected_query: None,
             expanded: HashSet::new(),
             selected: None,
             search,
@@ -279,7 +293,7 @@ impl Explorer {
             let index = self
                 .connections
                 .iter()
-                .position(|c| c.config.name == connection)?;
+                .position(|c| c.spec.name == connection)?;
             Some(format!("{index}/{}/table/{}", table.schema, table.name))
         });
         cx.notify();
@@ -303,23 +317,38 @@ impl Explorer {
             return;
         }
         node.state = ConnectionState::Connecting;
-        let config = node.config.clone();
-        let connect = self
-            .engine
-            .connect_with(config.url.clone(), config.environment.access());
+        let spec = node.spec.clone();
+        let state = app::state(cx);
+        let (engine, secrets) = (state.engine.clone(), state.secrets.clone());
+        // The keychain may ask the user for permission: read it off the UI thread.
+        let id = spec.id.clone();
+        let password = cx.background_spawn(async move { secrets.get(&id) });
         cx.spawn(async move |this, cx| {
-            let result = connect.await;
+            let result = match password.await {
+                Ok(password) => engine
+                    .connect_with(
+                        spec.conninfo(password.as_deref()),
+                        spec.environment().access(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, cx| {
-                let Some(node) = this.connections.get_mut(index) else {
+                let Some(index) = this.index_of(&spec.id) else {
                     return;
                 };
+                let node = &mut this.connections[index];
+                if node.spec != spec {
+                    return;
+                }
                 match result {
                     Ok(session) => {
                         let db = Db {
-                            name: config.name.clone().into(),
-                            environment: config.environment,
+                            name: spec.name.clone().into(),
+                            environment: spec.environment(),
                             session,
-                            target: describe_target(&config.url).into(),
+                            target: spec.target().into(),
                         };
                         node.state = ConnectionState::Ready {
                             db: db.clone(),
@@ -328,7 +357,7 @@ impl Explorer {
                         this.load_catalog(index, cx);
                         cx.emit(ExplorerEvent::Connected(db));
                     }
-                    Err(error) => node.state = ConnectionState::Failed(error.to_string()),
+                    Err(error) => node.state = ConnectionState::Failed(error),
                 }
                 cx.notify();
             })
@@ -336,6 +365,65 @@ impl Explorer {
         })
         .detach();
         cx.notify();
+    }
+
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.connections.iter().position(|node| node.spec.id == id)
+    }
+
+    /// Follows the project model: keeps open connections whose settings did
+    /// not change, and refreshes the saved queries.
+    fn sync_project(&mut self, cx: &mut Context<Self>) {
+        let project = self.model.read(cx).project.clone();
+        let old_ids: Vec<String> = self.connections.iter().map(|n| n.spec.id.clone()).collect();
+        let mut old: Vec<ConnectionNode> = std::mem::take(&mut self.connections);
+        self.connections = project
+            .connections
+            .iter()
+            .map(|spec| match old.iter().position(|n| n.spec == *spec) {
+                Some(position) => old.swap_remove(position),
+                None => ConnectionNode {
+                    spec: spec.clone(),
+                    state: ConnectionState::Idle,
+                },
+            })
+            .collect();
+        let new_ids: Vec<String> = self.connections.iter().map(|n| n.spec.id.clone()).collect();
+        // Tree keys use positions: if existing connections moved, start fresh.
+        if !new_ids.starts_with(&old_ids[..old_ids.len().min(new_ids.len())])
+            || new_ids.len() < old_ids.len()
+        {
+            self.expanded.clear();
+            self.selected = None;
+        }
+        self.queries = project.queries();
+        cx.notify();
+    }
+
+    pub fn refresh_queries(&mut self, cx: &mut Context<Self>) {
+        self.queries = self.model.read(cx).project.queries();
+        cx.notify();
+    }
+
+    pub fn reveal_query(&mut self, relative: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.selected_query = relative;
+        cx.notify();
+    }
+
+    /// The open connection with this name, if any.
+    pub fn db_by_name(&self, name: &str) -> Option<Db> {
+        let index = self.connections.iter().position(|n| n.spec.name == name)?;
+        self.db(index)
+    }
+
+    /// Starts opening the named connection if it is not open yet. Returns
+    /// whether such a connection exists.
+    pub fn ensure_connected(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.connections.iter().position(|n| n.spec.name == name) else {
+            return false;
+        };
+        self.connect(index, cx);
+        true
     }
 
     fn load_catalog(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -485,7 +573,24 @@ impl Explorer {
                 ConnectionState::Connecting => {
                     rows.push(note_row(1, "Connecting…", theme::TEXT_TERTIARY))
                 }
-                ConnectionState::Failed(error) => rows.push(note_row(1, error.clone(), theme::RED)),
+                ConnectionState::Failed(error) => {
+                    rows.push(note_row(1, error.clone(), theme::RED));
+                    let id = node.spec.id.clone();
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("fix-{index}")))
+                            .ml(px(40.))
+                            .mb_1()
+                            .text_size(px(12.))
+                            .text_color(color(0x4da3ff))
+                            .hover(|s| s.text_color(color(0x80bdff)))
+                            .child("Edit connection…")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(ExplorerEvent::EditConnection(id.clone()))
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 ConnectionState::Ready { catalog, .. } => match catalog {
                     CatalogState::Loading => {
                         rows.push(note_row(1, "Loading catalog…", theme::TEXT_TERTIARY))
@@ -515,7 +620,7 @@ impl Explorer {
         expanded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let environment = node.config.environment;
+        let environment = node.spec.environment();
         let dot = match &node.state {
             ConnectionState::Idle => div()
                 .size(px(8.))
@@ -548,7 +653,26 @@ impl Explorer {
                 .flex_1()
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
-                .child(node.config.name.clone()),
+                .child(node.spec.name.clone()),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("edit-{index}")))
+                .px_1()
+                .rounded(px(4.))
+                .hover(|s| s.bg(color(0x3a3a3e)))
+                .child(
+                    Icon::new(AppIcon::Pencil)
+                        .size(px(11.))
+                        .text_color(color(theme::TEXT_TERTIARY)),
+                )
+                .on_click({
+                    let id = node.spec.id.clone();
+                    cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ExplorerEvent::EditConnection(id.clone()));
+                    })
+                }),
         )
         .when(ready, |row| {
             row.child(
@@ -751,6 +875,74 @@ impl Explorer {
             .into_any_element()
     }
 
+    fn render_queries(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.queries.is_empty() {
+            return vec![note_row(
+                0,
+                "No saved queries yet. Save a query tab (⌘S) to keep it in .dbadmin/queries.",
+                theme::TEXT_TERTIARY,
+            )];
+        }
+        let root = self.model.read(cx).project.queries_dir();
+        let mut rows = Vec::new();
+        for (position, entry) in self.queries.iter().enumerate() {
+            // Hidden if any parent folder is collapsed.
+            let hidden = entry
+                .relative
+                .ancestors()
+                .skip(1)
+                .any(|parent| self.collapsed_folders.contains(parent));
+            if hidden {
+                continue;
+            }
+            let selected = self.selected_query.as_ref() == Some(&entry.relative);
+            let relative = entry.relative.clone();
+            if entry.is_dir {
+                let open = !self.collapsed_folders.contains(&entry.relative);
+                rows.push(
+                    tree_row(
+                        SharedString::from(format!("query-dir-{position}")),
+                        entry.depth(),
+                        Some(open),
+                        false,
+                    )
+                    .child(
+                        Icon::new(IconName::FolderClosed)
+                            .size(px(14.))
+                            .text_color(color(theme::ACCENT)),
+                    )
+                    .child(div().flex_1().truncate().child(entry.name()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed_folders.remove(&relative) {
+                            this.collapsed_folders.insert(relative.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            } else {
+                let path = root.join(&entry.relative);
+                rows.push(
+                    tree_row(
+                        SharedString::from(format!("query-{position}")),
+                        entry.depth(),
+                        None,
+                        selected,
+                    )
+                    .child(icon(AppIcon::Code, 0xc49bff, selected))
+                    .child(div().flex_1().truncate().child(entry.name()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_query = Some(relative.clone());
+                        cx.emit(ExplorerEvent::OpenSavedQuery(path.clone()));
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+
     fn render_history(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.history.is_empty() {
             return vec![note_row(
@@ -812,7 +1004,7 @@ impl Explorer {
                         let db = this
                             .connections
                             .iter()
-                            .position(|c| c.config.name == connection.as_ref())
+                            .position(|c| c.spec.name == connection.as_ref())
                             .and_then(|index| this.db(index));
                         if let Some(db) = db {
                             cx.emit(ExplorerEvent::OpenQuery {
@@ -826,6 +1018,34 @@ impl Explorer {
             })
             .collect()
     }
+}
+
+fn section_header(title: &'static str) -> gpui_kit::Div {
+    h_flex()
+        .px_4()
+        .pt_1()
+        .pb_1()
+        .gap_1()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color(theme::TEXT_TERTIARY))
+        .child(div().flex_1().child(title))
+}
+
+fn header_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_1()
+        .rounded(px(4.))
+        .text_size(px(12.))
+        .text_color(color(theme::TEXT_SECONDARY))
+        .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
+        .child(label)
+        .on_click(on_click)
 }
 
 /// A clickable tree row with indentation and an optional disclosure chevron.
@@ -902,6 +1122,7 @@ impl Render for Explorer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.mode {
             Mode::Explorer => self.render_tree(cx),
+            Mode::Queries => self.render_queries(cx),
             Mode::History => self.render_history(cx),
         };
         let open = self
@@ -934,6 +1155,16 @@ impl Render for Explorer {
                                     })),
                             )
                             .child(
+                                segment_body("Queries", self.mode == Mode::Queries)
+                                    .flex_1()
+                                    .justify_center()
+                                    .id("mode-queries")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mode = Mode::Queries;
+                                        this.refresh_queries(cx);
+                                    })),
+                            )
+                            .child(
                                 segment_body("History", self.mode == Mode::History)
                                     .flex_1()
                                     .justify_center()
@@ -949,15 +1180,29 @@ impl Render for Explorer {
                     }),
             )
             .when(self.mode == Mode::Explorer, |col| {
+                col.child(section_header("Connections").child(header_button(
+                    "new-connection",
+                    "+",
+                    cx.listener(|_, _, _, cx| cx.emit(ExplorerEvent::NewConnection)),
+                )))
+            })
+            .when(self.mode == Mode::Queries, |col| {
                 col.child(
-                    div()
-                        .px_4()
-                        .pt_1()
-                        .pb_1()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(theme::TEXT_TERTIARY))
-                        .child("Connections"),
+                    section_header("Saved queries")
+                        .child(header_button(
+                            "reveal-queries",
+                            "Show",
+                            cx.listener(|this, _, _, cx| {
+                                let dir = this.model.read(cx).project.queries_dir();
+                                let _ = std::fs::create_dir_all(&dir);
+                                cx.reveal_path(&dir);
+                            }),
+                        ))
+                        .child(header_button(
+                            "refresh-queries",
+                            "↻",
+                            cx.listener(|this, _, _, cx| this.refresh_queries(cx)),
+                        )),
                 )
             })
             .child(

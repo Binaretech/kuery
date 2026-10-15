@@ -29,7 +29,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
 };
 
-actions!(dbadmin, [ReloadTable]);
+actions!(dbadmin, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
 use crate::connection::Db;
@@ -1323,6 +1323,7 @@ impl Render for TableTab {
             .size_full()
             .key_context("TableTab")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &SaveTableChanges, _, cx| this.apply_pending(cx)))
             .on_action(cx.listener(|this, _: &ReloadTable, _, cx| {
                 if !this.has_pending() {
                     this.load_page(cx);

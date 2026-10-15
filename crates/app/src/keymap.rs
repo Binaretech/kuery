@@ -141,26 +141,9 @@ fn open_file(cx: &mut App) {
 
 /// `DBADMIN_KEYMAP`, or `keymap.toml` in the platform's config directory.
 fn keymap_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("DBADMIN_KEYMAP") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var_os("HOME")
+    std::env::var_os("DBADMIN_KEYMAP")
         .map(PathBuf::from)
-        .unwrap_or_default();
-    let dir = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/dbadmin")
-    } else if cfg!(target_os = "windows") {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or(home)
-            .join("dbadmin")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
-            .join("dbadmin")
-    };
-    dir.join("keymap.toml")
+        .unwrap_or_else(|| crate::paths::config_dir().join("keymap.toml"))
 }
 
 fn template() -> String {
@@ -206,32 +189,35 @@ fn parse(text: &str) -> Result<Vec<(String, Option<String>)>, String> {
         .collect())
 }
 
-/// Defaults overridden by the user's entries: a shortcut the user assigns or
-/// unbinds no longer runs its default command.
+/// Defaults overridden by the user's entries. A shortcut can run different
+/// commands in different contexts (`secondary-s` saves a query in a query tab
+/// and the pending changes in a table tab); binding it to a command replaces
+/// what it did in that command's context, and unbinding removes it everywhere.
 fn resolve(user: &[(String, Option<String>)]) -> (Vec<(String, &'static Command)>, Vec<String>) {
-    let mut by_keys: BTreeMap<String, &'static Command> = BTreeMap::new();
+    let mut by_keys: BTreeMap<(Option<&'static str>, String), &'static Command> = BTreeMap::new();
     for command in COMMANDS {
         for keys in command.defaults {
-            by_keys.insert(normalize(keys, IS_MAC), command);
+            by_keys.insert((command.context, normalize(keys, IS_MAC)), command);
         }
     }
     let mut problems = Vec::new();
     for (keys, command) in user {
         let normalized = normalize(keys, IS_MAC);
         match command {
-            None => {
-                by_keys.remove(&normalized);
-            }
+            None => by_keys.retain(|(_, bound), _| *bound != normalized),
             Some(id) => match commands::find(id) {
                 Some(command) => {
-                    by_keys.insert(normalized, command);
+                    by_keys.insert((command.context, normalized), command);
                 }
                 None => problems.push(format!("\"{keys}\": unknown command \"{id}\"")),
             },
         }
     }
     // Keep the registry's order so the first shortcut shown is the default one.
-    let mut resolved: Vec<(String, &'static Command)> = by_keys.into_iter().collect();
+    let mut resolved: Vec<(String, &'static Command)> = by_keys
+        .into_iter()
+        .map(|((_, keys), command)| (keys, command))
+        .collect();
     resolved.sort_by_key(|(keys, command)| {
         let position = COMMANDS
             .iter()
@@ -392,6 +378,26 @@ mod tests {
     fn command_for<'a>(resolved: &'a [(String, &'static Command)], keys: &str) -> Option<&'a str> {
         let keys = normalize(keys, IS_MAC);
         resolved.iter().find(|(k, _)| *k == keys).map(|(_, c)| c.id)
+    }
+
+    fn commands_for(resolved: &[(String, &'static Command)], keys: &str) -> Vec<&'static str> {
+        let keys = normalize(keys, IS_MAC);
+        resolved
+            .iter()
+            .filter(|(k, _)| *k == keys)
+            .map(|(_, c)| c.id)
+            .collect()
+    }
+
+    #[test]
+    fn one_shortcut_can_mean_different_things_in_different_contexts() {
+        let (resolved, _) = resolve(&[]);
+        let mut save = commands_for(&resolved, "secondary-s");
+        save.sort();
+        assert_eq!(save, ["query.save", "table.save"]);
+
+        let (resolved, _) = resolve(&[("secondary-s".to_string(), None)]);
+        assert!(commands_for(&resolved, "secondary-s").is_empty());
     }
 
     #[test]

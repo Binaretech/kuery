@@ -8,5 +8,6 @@ dbadmin-core.workspace = true
 dbadmin-pg.workspace = true
 anyhow.workspace = true
 gpui-kit.workspace = true
+keyring.workspace = true
 serde.workspace = true
 toml.workspace = true

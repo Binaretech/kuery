@@ -14,6 +14,7 @@ anyhow = "1"
 arrow-array = "60"
 async-channel = "2"
 futures = "0.3"
+keyring = "4"
 serde = { version = "1", features = ["derive"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 thiserror = "2"

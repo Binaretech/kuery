@@ -6,9 +6,10 @@ use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
 use crate::commands::{
-    CloseTab, NewQuery, NextTab, OpenCommandPalette, OpenKeymapFile, PreviousTab, ReloadKeymap,
-    ToggleSidebar,
+    CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette, OpenKeymapFile, OpenProject,
+    PreviousTab, ReloadKeymap, ToggleSidebar,
 };
+use crate::query_tab::{SaveQuery, SaveQueryAs};
 
 actions!(
     dbadmin,
@@ -41,7 +42,13 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Quit dbadmin", Quit),
         ]),
         Menu::new("File").items([
+            MenuItem::action("Open Project…", OpenProject),
+            MenuItem::separator(),
             MenuItem::action("New Query", NewQuery),
+            MenuItem::action("New Connection…", NewConnection),
+            MenuItem::separator(),
+            MenuItem::action("Save", SaveQuery),
+            MenuItem::action("Save As…", SaveQueryAs),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
             MenuItem::action("Close Window", CloseWindow),

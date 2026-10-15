@@ -1,10 +1,13 @@
-//! Query tab: SQL editor and streaming results, always read-only.
+//! Query tab: SQL editor and streaming results, always read-only. A tab can
+//! be bound to a saved query file in the project; its first line,
+//! `-- connection: <name>`, is kept in the file but not shown in the editor.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dbadmin_pg::{Event, QueryError, RunOptions};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -17,18 +20,16 @@ use gpui_kit::{
 use crate::assets::AppIcon;
 use crate::connection::Db;
 use crate::explorer::HistoryEntry;
+use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
 
-actions!(dbadmin, [RunQuery, CancelQuery]);
+actions!(dbadmin, [RunQuery, CancelQuery, SaveQuery, SaveQueryAs]);
 
 pub const EXAMPLE_SQL: &str = "-- Read-only: runs inside BEGIN TRANSACTION READ ONLY.\n\
--- ⌘↵ / Ctrl+↵ to run.\n\
-select o.id, o.status, o.total, o.currency, o.created_at, c.email, o.shipping\n\
-from orders o\n\
-join customers c on c.id = o.customer_id\n\
-order by o.created_at desc;\n";
+-- ⌘↵ / Ctrl+↵ to run, ⌘S to save it in the project.\n\
+select current_database(), current_user, version();\n";
 
 enum RunState {
     Idle,
@@ -46,11 +47,22 @@ enum RunState {
 /// Emitted after every run, for the sidebar's History.
 pub struct QueryRan(pub HistoryEntry);
 
+/// Emitted after the query is written to a file.
+pub struct QuerySaved(pub PathBuf);
+
 pub struct QueryTab {
     db: Db,
     /// SQL of the run in progress or the last one.
     last_sql: String,
     title: SharedString,
+    /// The saved query this tab edits, if any.
+    file: Option<PathBuf>,
+    /// Where "Save As" proposes to put the file.
+    queries_dir: PathBuf,
+    /// Editor text as last saved (or as opened), to tell unsaved changes.
+    saved_text: String,
+    dirty: bool,
+    save_error: Option<String>,
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
     run: RunState,
@@ -63,21 +75,43 @@ impl QueryTab {
         db: Db,
         title: impl Into<SharedString>,
         sql: &str,
+        file: Option<PathBuf>,
+        queries_dir: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let sql = sql.to_string();
+        let saved_text = sql.clone();
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("sql")
                 .line_number(true)
                 .default_value(sql)
         });
+        cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let dirty = *editor.read(cx).text() != this.saved_text;
+                if dirty != this.dirty {
+                    this.dirty = dirty;
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
         let table = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
+        let title = match &file {
+            Some(path) => file_title(path),
+            None => title.into(),
+        };
         Self {
             db,
             last_sql: String::new(),
-            title: title.into(),
+            title,
+            file,
+            queries_dir,
+            saved_text,
+            dirty: false,
+            save_error: None,
             editor,
             table,
             run: RunState::Idle,
@@ -88,6 +122,71 @@ impl QueryTab {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Saves to the tab's file, or asks where if it has none.
+    pub fn request_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save(&SaveQuery, window, cx);
+    }
+
+    fn save(&mut self, _: &SaveQuery, window: &mut Window, cx: &mut Context<Self>) {
+        match self.file.clone() {
+            Some(path) => self.write(path, cx),
+            None => self.save_as(&SaveQueryAs, window, cx),
+        }
+    }
+
+    fn save_as(&mut self, _: &SaveQueryAs, _: &mut Window, cx: &mut Context<Self>) {
+        let _ = std::fs::create_dir_all(&self.queries_dir);
+        let directory = self
+            .file
+            .as_ref()
+            .and_then(|f| f.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.queries_dir.clone());
+        let suggested = format!("{}.sql", self.title.to_lowercase().replace(' ', "_"));
+        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut path))) = chosen.await {
+                if path.extension().is_none() {
+                    path.set_extension("sql");
+                }
+                this.update(cx, |this, cx| this.write(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Writes the editor text, with the connection line on top, to `path`.
+    fn write(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text().to_string();
+        let contents = with_connection_header(&text, &self.db.name);
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::write(&path, contents));
+        match written {
+            Ok(()) => {
+                self.title = file_title(&path);
+                self.file = Some(path.clone());
+                self.saved_text = text;
+                self.dirty = false;
+                self.save_error = None;
+                cx.emit(QuerySaved(path));
+            }
+            Err(error) => {
+                self.save_error = Some(format!("Could not save {}: {error}", path.display()))
+            }
+        }
+        cx.notify();
     }
 
     fn run_query(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
@@ -199,6 +298,23 @@ impl QueryTab {
         matches!(self.run, RunState::Running { .. })
     }
 
+    /// `local-dev · reports/monthly_sales.sql · edited`.
+    fn subtitle(&self) -> String {
+        let place = match &self.file {
+            Some(path) => path
+                .strip_prefix(&self.queries_dir)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| path.display().to_string()),
+            None => "not saved".into(),
+        };
+        let edited = if self.dirty && self.file.is_some() {
+            " · edited"
+        } else {
+            ""
+        };
+        format!("{} · {place}{edited}", self.db.name)
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.is_running();
         let run_shortcut = if cfg!(target_os = "macos") {
@@ -230,9 +346,16 @@ impl QueryTab {
                         div()
                             .text_size(px(11.))
                             .text_color(color(theme::TEXT_TERTIARY))
-                            .child(format!("{} — Read-only", self.db.target)),
+                            .child(self.subtitle()),
                     ),
             )
+            .children(self.save_error.clone().map(|error| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(color(theme::RED))
+                    .truncate()
+                    .child(error)
+            }))
             .child(div().flex_1())
             .child(
                 h_flex()
@@ -340,6 +463,7 @@ pub fn describe_error(error: QueryError) -> String {
 }
 
 impl EventEmitter<QueryRan> for QueryTab {}
+impl EventEmitter<QuerySaved> for QueryTab {}
 
 impl Focusable for QueryTab {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -360,6 +484,8 @@ impl Render for QueryTab {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::cancel_query))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
             .child(self.render_toolbar(cx))
             .child(self.render_read_only_banner())
             .child(
@@ -376,4 +502,12 @@ impl Render for QueryTab {
                     .child(DataTable::new(&self.table).stripe(true).bordered(false)),
             )
     }
+}
+
+/// `reports/monthly_sales.sql` → `monthly_sales`.
+fn file_title(path: &Path) -> SharedString {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Query".into())
+        .into()
 }

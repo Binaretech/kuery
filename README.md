@@ -20,36 +20,44 @@ row editing through staged changes (never on production connections).
 
 ```bash
 docker compose -p dbadmin-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database
-cargo run -p dbadmin                                      # the app
+cargo run -p dbadmin -- .                                 # the app, on this repo's project
 cargo test --workspace                                    # tests without a database
 cargo test -p dbadmin-pg -- --ignored                     # tests against the dev Postgres
 cargo run --release -p dbadmin-pg --example stream_bench  # streaming without a UI
 ```
 
-## Connections
+## Projects
 
-The app reads the project and its connections from `dbadmin.toml` in the
-working directory (or the file in `DBADMIN_CONFIG`). The one in the repo points
-at the dev Postgres:
+A project is a folder. dbadmin keeps everything for it in `.dbadmin/` inside
+that folder, so it can live in a code repository:
 
-```toml
-[project]
-name = "Checkout v2"
-workspace = "Online Store"
-
-[[connections]]
-name = "local-dev"
-url = "postgres://dbadmin:dbadmin@localhost:54329/dbadmin"
-environment = "development"   # development, staging or production
+```text
+<folder>/.dbadmin/
+├─ project.toml      project name and connections (no passwords)
+└─ queries/          saved queries as .sql files, in any folder layout
 ```
 
-`environment` is optional: local hosts count as development and everything
-else as production. Production connections open read-only (the session also
-sets `default_transaction_read_only`) and the explorer offers no row editing.
-Without a config file, `DBADMIN_DATABASE_URL` (and optionally
-`DBADMIN_ENVIRONMENT`) defines a single connection; see `.env.example`.
-Passwords currently live in the URL; keeping them in the OS keychain is still
-to do.
+Open a folder from the welcome window, with "Open Project…" (`secondary-o`),
+or from the command line with `cargo run -p dbadmin -- <folder>`; a folder
+without `.dbadmin/` becomes a new project. Each project opens in its own
+window, and recent projects are listed in the welcome window.
+
+Connections are added and edited from the sidebar (`+` and the pencil next to
+each one), with "Test Connection" before saving. Passwords go to the system
+keychain (Keychain on macOS, Credential Manager on Windows, Secret Service on
+Linux) under the connection's id, never into `project.toml`. A connection's
+`environment` (development, staging or production) is detected from the host
+if not set; production connections open read-only (the session also sets
+`default_transaction_read_only`) and the explorer offers no row editing.
+
+Query tabs save with `secondary-s` into `.dbadmin/queries/`. The first line of
+a saved query, `-- connection: <name>`, records its connection and is not
+shown in the editor; opening the file from the sidebar's Queries list opens
+that connection first if needed.
+
+The repository is itself a project: `cargo run -p dbadmin -- .` opens it with
+connections to the dev Postgres (which trusts local connections, so no
+password is needed) and a couple of saved queries.
 
 ## Commands and shortcuts
 

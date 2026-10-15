@@ -9,8 +9,8 @@
 use gpui_kit::{Action, actions};
 
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
-use crate::query_tab::{CancelQuery, RunQuery};
-use crate::table_tab::ReloadTable;
+use crate::query_tab::{CancelQuery, RunQuery, SaveQuery, SaveQueryAs};
+use crate::table_tab::{ReloadTable, SaveTableChanges};
 
 actions!(
     dbadmin,
@@ -23,6 +23,8 @@ actions!(
         ToggleSidebar,
         OpenKeymapFile,
         ReloadKeymap,
+        OpenProject,
+        NewConnection,
     ]
 );
 
@@ -51,6 +53,22 @@ pub const COMMANDS: &[Command] = &[
         category: "View",
         action: action!(OpenCommandPalette),
         defaults: &["secondary-k", "secondary-shift-p"],
+        context: None,
+    },
+    Command {
+        id: "project.open",
+        title: "Open Project…",
+        category: "Project",
+        action: action!(OpenProject),
+        defaults: &["secondary-o"],
+        context: None,
+    },
+    Command {
+        id: "connection.new",
+        title: "New Connection…",
+        category: "Project",
+        action: action!(NewConnection),
+        defaults: &[],
         context: None,
     },
     Command {
@@ -102,6 +120,22 @@ pub const COMMANDS: &[Command] = &[
         context: Some("QueryTab"),
     },
     Command {
+        id: "query.save",
+        title: "Save Query",
+        category: "Query",
+        action: action!(SaveQuery),
+        defaults: &["secondary-s"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.save_as",
+        title: "Save Query As…",
+        category: "Query",
+        action: action!(SaveQueryAs),
+        defaults: &["secondary-shift-s"],
+        context: Some("QueryTab"),
+    },
+    Command {
         id: "query.cancel",
         title: "Cancel Query",
         category: "Query",
@@ -115,6 +149,14 @@ pub const COMMANDS: &[Command] = &[
         category: "Table",
         action: action!(ReloadTable),
         defaults: &["secondary-r"],
+        context: Some("TableTab"),
+    },
+    Command {
+        id: "table.save",
+        title: "Save Table Changes",
+        category: "Table",
+        action: action!(SaveTableChanges),
+        defaults: &["secondary-s"],
         context: Some("TableTab"),
     },
     Command {
