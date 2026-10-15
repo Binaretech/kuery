@@ -1,0 +1,5 @@
+# gpui (vía gpui-kit 0.7) usa APIs estabilizadas después de Rust 1.93.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

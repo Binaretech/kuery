@@ -1,0 +1,9 @@
+[package]
+name = "dbadmin-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true

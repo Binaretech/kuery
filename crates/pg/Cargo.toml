@@ -1,0 +1,15 @@
+[package]
+name = "dbadmin-pg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dbadmin-core.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

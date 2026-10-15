@@ -1,0 +1,13 @@
+# Postgres local para desarrollo y para la prueba técnica.
+# Credenciales solo de desarrollo; ver .env.example en la raíz.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dbadmin
+      POSTGRES_PASSWORD: dbadmin
+      POSTGRES_DB: dbadmin
+    ports:
+      - "54329:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro

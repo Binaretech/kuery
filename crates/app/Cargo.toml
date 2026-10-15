@@ -1,0 +1,10 @@
+[package]
+name = "dbadmin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dbadmin-core.workspace = true
+dbadmin-pg.workspace = true
+anyhow.workspace = true
+gpui-kit.workspace = true
