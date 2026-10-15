@@ -13,7 +13,7 @@ use gpui_kit::{Action, actions};
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
     CancelQuery, CommitTransaction, RollbackTransaction, RunQuery, SaveQuery, SaveQueryAs,
-    ToggleResults, ToggleWriteMode,
+    ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
 };
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
@@ -173,10 +173,26 @@ pub const COMMANDS: &[Command] = &[
         context: Some("QueryTab"),
     },
     Command {
-        id: "query.toggle_write_mode",
-        title: "Toggle Write Mode",
+        id: "query.read_only",
+        title: "Read-only Mode",
         category: "Query",
-        action: action!(ToggleWriteMode),
+        action: action!(UseReadOnly),
+        defaults: &[],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.write",
+        title: "Write Mode (Transactional)",
+        category: "Query",
+        action: action!(UseWrite),
+        defaults: &[],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.full_write",
+        title: "Full Write Mode",
+        category: "Query",
+        action: action!(UseFullWrite),
         defaults: &[],
         context: Some("QueryTab"),
     },

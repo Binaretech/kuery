@@ -1,9 +1,11 @@
 //! Write mode for query tabs: what a script needs before it runs, and the
 //! dialog that allows writes on a production connection for its session.
 //!
-//! The flow, per tab: write mode opens a connection of its own; scripts that
-//! write run inside a transaction that stays open until Commit or Roll Back;
-//! each environment decides what needs confirmation (see [`WritePolicy`]).
+//! The flow, per tab: write mode opens a connection of its own. In
+//! transactional write ([`WriteKind::Transactional`]) scripts that write run
+//! inside a transaction that stays open until Commit or Roll Back; in full
+//! write ([`WriteKind::Full`]) each script is kept as soon as it finishes.
+//! Each environment decides what needs confirmation (see [`WritePolicy`]).
 
 use std::rc::Rc;
 
@@ -17,7 +19,7 @@ use gpui_kit::{
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::read_only::Rejection;
 
-use crate::connection::{Db, Environment, WritePolicy};
+use crate::connection::{Db, Environment, WriteKind, WritePolicy};
 use crate::theme::{self, color};
 use crate::ui::muted;
 
@@ -35,7 +37,7 @@ pub enum Review {
 /// Most statements listed in a confirmation.
 const LISTED: usize = 8;
 
-pub fn review(sql: &str, connection: &str, environment: Environment) -> Review {
+pub fn review(sql: &str, connection: &str, environment: Environment, kind: WriteKind) -> Review {
     let policy = environment.write_policy();
     let analysis = match analysis::analyze(sql) {
         Ok(analysis) => analysis,
@@ -44,8 +46,12 @@ pub fn review(sql: &str, connection: &str, environment: Environment) -> Review {
             return Review::Confirm {
                 message: "Kuery could not analyse this SQL".into(),
                 detail: format!(
-                    "{error}.\n\nIt will run in the open transaction without the usual \
-                     checks. Read it again before running it."
+                    "{error}.\n\n{} without the usual checks. Read it again before \
+                     running it.",
+                    match kind {
+                        WriteKind::Transactional => "It will run in the open transaction",
+                        WriteKind::Full => "It will be applied right away",
+                    }
                 ),
             };
         }
@@ -56,11 +62,18 @@ pub fn review(sql: &str, connection: &str, environment: Environment) -> Review {
         }
     };
     if let Some(statement) = analysis.transaction_control() {
-        return Review::Refuse(format!(
-            "{} is not needed: write mode keeps the transaction open until you use \
-             Commit or Roll Back",
-            statement.summary
-        ));
+        return Review::Refuse(match kind {
+            WriteKind::Transactional => format!(
+                "{} is not needed: write mode keeps the transaction open until you use \
+                 Commit or Roll Back",
+                statement.summary
+            ),
+            WriteKind::Full => format!(
+                "{} is not needed: full write applies each script as one unit. For a \
+                 transaction you commit, switch to Write",
+                statement.summary
+            ),
+        });
     }
     if !analysis.writes() {
         return Review::Run { writes: false };
@@ -89,13 +102,21 @@ pub fn review(sql: &str, connection: &str, environment: Environment) -> Review {
         lines.extend(dangers);
     }
     lines.push(String::new());
-    lines.push("Changes stay in a transaction until you commit them.".into());
+    lines.push(match kind {
+        WriteKind::Transactional => "Changes stay in a transaction until you commit them.".into(),
+        WriteKind::Full => {
+            "The script is applied as soon as it finishes, all of it or nothing. There is no \
+             Roll Back."
+                .into()
+        }
+    });
+    let changes = plural(writes.len(), "change");
+    let environment = environment.label();
     Review::Confirm {
-        message: format!(
-            "Run {} on {connection} ({})?",
-            plural(writes.len(), "change"),
-            environment.label()
-        ),
+        message: match kind {
+            WriteKind::Transactional => format!("Run {changes} on {connection} ({environment})?"),
+            WriteKind::Full => format!("Apply {changes} to {connection} ({environment}) now?"),
+        },
         detail: lines.join("\n"),
     }
 }
@@ -117,15 +138,20 @@ pub fn policy_hint(policy: WritePolicy) -> &'static str {
     }
 }
 
-/// Asks to type the connection name, then allows writes on it until it
-/// disconnects or the app quits. `allowed` runs after that.
+/// Asks to type the connection name, then allows writes of `kind` on it
+/// until it disconnects or the app quits. `allowed` runs after that.
 pub fn allow_writes(
     db: Db,
+    kind: WriteKind,
     window: &mut Window,
     cx: &mut App,
     allowed: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    let dialog = cx.new(|cx| AllowWrites::new(db, Rc::new(allowed), window, cx));
+    let title = match kind {
+        WriteKind::Transactional => "Allow writes on production",
+        WriteKind::Full => "Allow full writes on production",
+    };
+    let dialog = cx.new(|cx| AllowWrites::new(db, kind, Rc::new(allowed), window, cx));
     let first_build = std::cell::Cell::new(true);
     window.open_dialog(cx, move |modal, window, cx| {
         if first_build.replace(false) {
@@ -133,7 +159,7 @@ pub fn allow_writes(
             window.focus(&input, cx);
         }
         modal
-            .title("Allow writes on production")
+            .title(title)
             .w(px(500.))
             .overlay_closable(false)
             .child(dialog.clone())
@@ -145,13 +171,20 @@ type OnAllowed = Rc<dyn Fn(&mut Window, &mut App)>;
 
 struct AllowWrites {
     db: Db,
+    kind: WriteKind,
     input: Entity<InputState>,
     allowed: OnAllowed,
     error: Option<String>,
 }
 
 impl AllowWrites {
-    fn new(db: Db, allowed: OnAllowed, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        db: Db,
+        kind: WriteKind,
+        allowed: OnAllowed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(db.name.clone()));
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
@@ -161,6 +194,7 @@ impl AllowWrites {
         .detach();
         Self {
             db,
+            kind,
             input,
             allowed,
             error: None,
@@ -173,7 +207,7 @@ impl AllowWrites {
             cx.notify();
             return;
         }
-        self.db.set_writes_allowed(true);
+        self.db.allow(self.kind);
         window.close_dialog(cx);
         (self.allowed)(window, cx);
     }
@@ -184,15 +218,27 @@ impl Render for AllowWrites {
         v_flex()
             .gap_3()
             .text_size(px(13.))
-            .child(div().child(format!(
-                "{} ({}) is a production database. Query tabs on it will be able to \
-                 change data until it disconnects or you quit Kuery. Nothing is saved \
-                 in the project.",
-                self.db.name, self.db.target
-            )))
-            .child(muted(
-                "Every change is still confirmed and stays in a transaction until you commit it.",
-            ))
+            .child(div().child(match self.kind {
+                WriteKind::Transactional => format!(
+                    "{} ({}) is a production database. Query tabs on it will be able to \
+                     change data until it disconnects or you quit Kuery. Nothing is saved \
+                     in the project.",
+                    self.db.name, self.db.target
+                ),
+                WriteKind::Full => format!(
+                    "Full write applies each script to {} ({}) as soon as it finishes, \
+                     with no Roll Back. This lasts until it disconnects or you quit Kuery, \
+                     and is never saved in the project.",
+                    self.db.name, self.db.target
+                ),
+            }))
+            .child(muted(match self.kind {
+                WriteKind::Transactional => {
+                    "Every change is still confirmed and stays in a transaction until you \
+                     commit it."
+                }
+                WriteKind::Full => "Every change is still confirmed before it is applied.",
+            }))
             .child(
                 v_flex()
                     .gap_1()
@@ -222,7 +268,10 @@ impl Render for AllowWrites {
                     .child(
                         Button::new("allow-writes")
                             .danger()
-                            .label("Allow Writes")
+                            .label(match self.kind {
+                                WriteKind::Transactional => "Allow Writes",
+                                WriteKind::Full => "Allow Full Writes",
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
@@ -234,7 +283,7 @@ mod tests {
     use super::*;
 
     fn review_in(environment: Environment, sql: &str) -> Review {
-        review(sql, "db", environment)
+        review(sql, "db", environment, WriteKind::Transactional)
     }
 
     #[test]
@@ -317,5 +366,23 @@ mod tests {
         };
         assert_eq!(detail.matches("• INSERT INTO t").count(), LISTED);
         assert!(detail.contains("… and 4 more"));
+    }
+
+    #[test]
+    fn full_write_says_changes_apply_right_away() {
+        let Review::Confirm { message, detail } = review(
+            "insert into t values (1)",
+            "db",
+            Environment::Staging,
+            WriteKind::Full,
+        ) else {
+            panic!("staging confirms writes");
+        };
+        assert_eq!(message, "Apply 1 change to db (STAGING) now?");
+        assert!(detail.contains("There is no Roll Back"), "{detail}");
+        assert!(matches!(
+            review("begin", "db", Environment::Development, WriteKind::Full),
+            Review::Refuse(message) if message.contains("switch to Write")
+        ));
     }
 }

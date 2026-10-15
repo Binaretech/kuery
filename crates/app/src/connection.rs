@@ -90,9 +90,27 @@ pub enum WritePolicy {
     /// Every script that writes.
     ConfirmWrites,
     /// Writes must be allowed for the connection session (typing its name),
-    /// and then every script that writes is confirmed too. Scripts that
-    /// cannot be analysed are refused.
+    /// full writes a second time, and then every script that writes is
+    /// confirmed too. Scripts that cannot be analysed are refused.
     SessionUnlock,
+}
+
+/// How a query tab in write mode keeps its changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// In a transaction that stays open until Commit or Roll Back.
+    Transactional,
+    /// Each script is kept as soon as it finishes, all of it or nothing.
+    Full,
+}
+
+impl WriteKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            WriteKind::Transactional => "Write",
+            WriteKind::Full => "Full write",
+        }
+    }
 }
 
 impl WritePolicy {
@@ -149,9 +167,10 @@ pub struct Db {
     /// `host:port/database`, without credentials.
     pub target: SharedString,
     pub reconnect: Reconnect,
-    /// Production only: writes allowed for this connection session. Shared by
-    /// every tab on it, gone when it disconnects or the app quits.
+    /// Production only: what is allowed for this connection session. Shared
+    /// by every tab on it, gone when it disconnects or the app quits.
     writes_allowed: Arc<AtomicBool>,
+    full_writes_allowed: Arc<AtomicBool>,
 }
 
 impl Db {
@@ -169,6 +188,7 @@ impl Db {
             target,
             reconnect,
             writes_allowed: Arc::new(AtomicBool::new(false)),
+            full_writes_allowed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -176,15 +196,41 @@ impl Db {
         self.session.access() == Access::ReadWrite
     }
 
-    /// Whether write mode can be turned on without allowing it first.
-    pub fn writes_allowed(&self) -> bool {
-        self.environment.write_policy() != WritePolicy::SessionUnlock
-            || self.writes_allowed.load(Ordering::SeqCst)
+    /// Whether writes of this kind can run without allowing them first. Full
+    /// writes need writes allowed too.
+    pub fn allows(&self, kind: WriteKind) -> bool {
+        allows(
+            self.environment.write_policy(),
+            self.writes_allowed.load(Ordering::SeqCst),
+            self.full_writes_allowed.load(Ordering::SeqCst),
+            kind,
+        )
     }
 
-    /// Allows (or stops allowing) writes for this connection session.
-    pub fn set_writes_allowed(&self, allowed: bool) {
-        self.writes_allowed.store(allowed, Ordering::SeqCst);
+    /// Allows writes of this kind for the connection session.
+    pub fn allow(&self, kind: WriteKind) {
+        match kind {
+            WriteKind::Transactional => &self.writes_allowed,
+            WriteKind::Full => &self.full_writes_allowed,
+        }
+        .store(true, Ordering::SeqCst);
+    }
+
+    /// Stops allowing any writes for the connection session.
+    pub fn revoke_writes(&self) {
+        self.writes_allowed.store(false, Ordering::SeqCst);
+        self.full_writes_allowed.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether `kind` may run, given what the connection session allows.
+fn allows(policy: WritePolicy, writes: bool, full_writes: bool, kind: WriteKind) -> bool {
+    if policy != WritePolicy::SessionUnlock {
+        return true;
+    }
+    match kind {
+        WriteKind::Transactional => writes,
+        WriteKind::Full => writes && full_writes,
     }
 }
 
@@ -270,6 +316,19 @@ mod tests {
             Environment::Production
         );
         assert_eq!(Environment::Production.access(), Access::ReadOnly);
+    }
+
+    #[test]
+    fn production_full_writes_need_both_permissions() {
+        use WriteKind::*;
+        let dev = WritePolicy::ConfirmDangerous;
+        let production = WritePolicy::SessionUnlock;
+        assert!(allows(dev, false, false, Full));
+        assert!(!allows(production, false, false, Transactional));
+        assert!(allows(production, true, false, Transactional));
+        assert!(!allows(production, true, false, Full));
+        assert!(!allows(production, false, true, Full));
+        assert!(allows(production, true, true, Full));
     }
 
     #[test]

@@ -13,8 +13,11 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Enter, InputEvent};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::table::{DataTable, TableState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
@@ -25,7 +28,7 @@ use gpui_kit::{
 use kuery_pg::{Access, Event, QueryError, RunOptions, Session};
 
 use crate::assets::AppIcon;
-use crate::connection::{Db, WritePolicy};
+use crate::connection::{Db, WriteKind, WritePolicy};
 use crate::explorer::HistoryEntry;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
@@ -41,7 +44,9 @@ actions!(
         SaveQuery,
         SaveQueryAs,
         ToggleResults,
-        ToggleWriteMode,
+        UseReadOnly,
+        UseWrite,
+        UseFullWrite,
         CommitTransaction,
         RollbackTransaction,
     ]
@@ -63,6 +68,7 @@ enum WriteState {
 /// The tab's own read-write connection and its open transaction, if any.
 struct WriteSession {
     session: Session,
+    kind: WriteKind,
     /// Statements and rows changed since the transaction opened.
     statements: usize,
     affected: u64,
@@ -71,9 +77,10 @@ struct WriteSession {
 }
 
 impl WriteSession {
-    fn new(session: Session) -> Self {
+    fn new(session: Session, kind: WriteKind) -> Self {
         Self {
             session,
+            kind,
             statements: 0,
             affected: 0,
             opened: None,
@@ -143,8 +150,10 @@ enum RunState {
         rows: usize,
         elapsed: Duration,
         first_batch_after: Option<Duration>,
-        /// Rows changed, for runs in the write transaction.
+        /// Rows changed, for runs that write.
         changed: Option<u64>,
+        /// Whether those changes are already kept (full write).
+        applied: bool,
     },
     Failed(String),
 }
@@ -323,17 +332,16 @@ impl QueryTab {
         match &self.write {
             WriteState::Off | WriteState::Failed(_) => self.execute(sql, false, cx),
             WriteState::Connecting => {}
-            WriteState::On(_) if !self.db.writes_allowed() => {
-                self.refuse(
-                    sql,
-                    "Writes on this connection are no longer allowed: turn write mode off, or \
-                     allow writes again"
-                        .into(),
-                    cx,
+            WriteState::On(write) if !self.db.allows(write.kind) => {
+                let reason = format!(
+                    "{} on this connection is no longer allowed: switch to Read-only, or \
+                     allow it again",
+                    write.kind.label()
                 );
+                self.refuse(sql, reason, cx);
             }
-            WriteState::On(_) => {
-                match write_mode::review(&sql, &self.db.name, self.db.environment) {
+            WriteState::On(write) => {
+                match write_mode::review(&sql, &self.db.name, self.db.environment, write.kind) {
                     Review::Run { writes } => self.execute(sql, writes, cx),
                     Review::Refuse(reason) => self.refuse(sql, reason, cx),
                     Review::Confirm { message, detail } => {
@@ -365,13 +373,13 @@ impl QueryTab {
         cx.notify();
     }
 
-    /// Runs `sql`: in the write transaction if `writes`, otherwise read-only
-    /// (on the write connection when write mode is on, so it sees the
-    /// uncommitted changes).
+    /// Runs `sql`. If `writes`, in the write transaction or applied right
+    /// away, depending on the write mode; otherwise read-only (on the write
+    /// connection when write mode is on, so it sees uncommitted changes).
     fn execute(&mut self, sql: String, writes: bool, cx: &mut Context<Self>) {
-        let session = match &self.write {
-            WriteState::On(write) => write.session.clone(),
-            _ => self.db.session.clone(),
+        let (session, kind) = match &self.write {
+            WriteState::On(write) => (write.session.clone(), Some(write.kind)),
+            _ => (self.db.session.clone(), None),
         };
         // Dropping the previous task drops its receiver and cancels that query.
         self.run_task = None;
@@ -389,16 +397,14 @@ impl QueryTab {
         cx.notify();
 
         self.last_sql = sql.clone();
-        let rx = if writes {
-            session.run_in_transaction(
-                sql,
-                RunOptions {
-                    statement_timeout: Duration::from_secs(60),
-                    ..RunOptions::default()
-                },
-            )
-        } else {
-            session.run_read_only(sql, RunOptions::default())
+        let write_options = RunOptions {
+            statement_timeout: Duration::from_secs(60),
+            ..RunOptions::default()
+        };
+        let rx = match (writes, kind) {
+            (true, Some(WriteKind::Full)) => session.run_autocommit(sql, write_options),
+            (true, _) => session.run_in_transaction(sql, write_options),
+            (false, _) => session.run_read_only(sql, RunOptions::default()),
         };
         self.run_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
@@ -425,18 +431,25 @@ impl QueryTab {
             Event::Finished(summary) => {
                 self.finish_table(cx);
                 let changed = self.run_writes.then_some(summary.affected);
+                let mut applied = false;
                 if let (true, WriteState::On(write)) = (self.run_writes, &mut self.write) {
-                    write.statements += summary.statements;
-                    write.affected += summary.affected;
-                    write.opened.get_or_insert_with(Instant::now);
                     write.last_run = Instant::now();
+                    match write.kind {
+                        WriteKind::Transactional => {
+                            write.statements += summary.statements;
+                            write.affected += summary.affected;
+                            write.opened.get_or_insert_with(Instant::now);
+                        }
+                        WriteKind::Full => applied = true,
+                    }
                 }
                 let outcome = match changed {
                     Some(changed) => format!(
-                        "{} · {} changed · {} · not committed",
+                        "{} · {} changed · {} · {}",
                         plural(summary.statements, "statement"),
                         plural_rows(changed),
-                        format_duration(summary.elapsed)
+                        format_duration(summary.elapsed),
+                        if applied { "applied" } else { "not committed" }
                     ),
                     None => format!(
                         "{} rows · {}",
@@ -450,6 +463,7 @@ impl QueryTab {
                     elapsed: summary.elapsed,
                     first_batch_after: summary.first_batch_after,
                     changed,
+                    applied,
                 };
             }
             Event::Failed(error) => {
@@ -457,7 +471,9 @@ impl QueryTab {
                 let mut message = describe_error(error);
                 if let WriteState::On(write) = &mut self.write {
                     write.last_run = Instant::now();
-                    if self.run_writes {
+                    if self.run_writes && write.kind == WriteKind::Full {
+                        message.push_str(" · nothing was applied");
+                    } else if self.run_writes {
                         if write.session.in_transaction() {
                             message.push_str(" · this script was undone, earlier changes are kept");
                         } else {
@@ -527,29 +543,78 @@ impl QueryTab {
         matches!(&self.write, WriteState::On(write) if write.session.in_transaction())
     }
 
-    fn toggle_write_mode(
-        &mut self,
-        _: &ToggleWriteMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match &self.write {
-            WriteState::Connecting => {}
-            WriteState::On(_) => self.leave_write_mode(window, cx),
-            WriteState::Off | WriteState::Failed(_) if self.db.writes_allowed() => {
-                self.enter_write_mode(cx)
-            }
-            WriteState::Off | WriteState::Failed(_) => {
-                let this = cx.weak_entity();
-                write_mode::allow_writes(self.db.clone(), window, cx, move |_, cx| {
-                    this.update(cx, |this, cx| this.enter_write_mode(cx)).ok();
+    fn use_read_only(&mut self, _: &UseReadOnly, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(None, window, cx);
+    }
+
+    fn use_write(&mut self, _: &UseWrite, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(Some(WriteKind::Transactional), window, cx);
+    }
+
+    fn use_full_write(&mut self, _: &UseFullWrite, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(Some(WriteKind::Full), window, cx);
+    }
+
+    /// Switches between read-only (`None`) and the write modes. On
+    /// production, asks to allow what is missing first (full write needs
+    /// writes allowed, then full writes allowed).
+    fn set_mode(&mut self, target: Option<WriteKind>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = match &self.write {
+            WriteState::Connecting => return,
+            WriteState::On(write) => Some(write.kind),
+            WriteState::Off | WriteState::Failed(_) => None,
+        };
+        if target == current {
+            return;
+        }
+        let Some(kind) = target else {
+            self.leave_write_mode(window, cx);
+            return;
+        };
+        if !self.db.allows(kind) {
+            let missing = if self.db.allows(WriteKind::Transactional) {
+                WriteKind::Full
+            } else {
+                WriteKind::Transactional
+            };
+            let this = cx.weak_entity();
+            write_mode::allow_writes(self.db.clone(), missing, window, cx, move |window, cx| {
+                // Once the dialog is gone: this may open the next one.
+                let this = this.clone();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |this, cx| this.set_mode(Some(kind), window, cx))
+                        .ok();
                 });
+            });
+            return;
+        }
+        match &mut self.write {
+            WriteState::On(write) if kind == WriteKind::Full && write.session.in_transaction() => {
+                self.settle_transaction_then(
+                    "Full write keeps no transaction open. The changes are only kept if you \
+                     commit them.",
+                    window,
+                    cx,
+                    |this, cx| {
+                        if let WriteState::On(write) = &mut this.write {
+                            write.kind = WriteKind::Full;
+                        }
+                        cx.notify();
+                    },
+                );
+            }
+            WriteState::On(write) => {
+                write.kind = kind;
+                cx.notify();
+            }
+            WriteState::Off | WriteState::Failed(_) | WriteState::Connecting => {
+                self.enter_write_mode(kind, cx)
             }
         }
     }
 
     /// Opens the tab's own read-write connection.
-    fn enter_write_mode(&mut self, cx: &mut Context<Self>) {
+    fn enter_write_mode(&mut self, kind: WriteKind, cx: &mut Context<Self>) {
         self.write = WriteState::Connecting;
         cx.notify();
         let engine = crate::app::state(cx).engine.clone();
@@ -563,7 +628,7 @@ impl QueryTab {
                 this.write = match result {
                     Ok(session) => {
                         this.watch_idle(cx);
-                        WriteState::On(WriteSession::new(session))
+                        WriteState::On(WriteSession::new(session, kind))
                     }
                     Err(error) => WriteState::Failed(error.to_string()),
                 };
@@ -580,10 +645,27 @@ impl QueryTab {
             self.drop_write_session(cx);
             return;
         }
+        self.settle_transaction_then(
+            "Write mode is turning off. The changes are only kept if you commit them.",
+            window,
+            cx,
+            |this, cx| this.drop_write_session(cx),
+        );
+    }
+
+    /// Asks to commit or roll back the open transaction, then runs `then`
+    /// (unless the user cancels or the commit fails).
+    fn settle_transaction_then(
+        &mut self,
+        detail: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
         let answer = window.prompt(
             PromptLevel::Warning,
             "Commit the open transaction?",
-            Some("Write mode is turning off. The changes are only kept if you commit them."),
+            Some(detail),
             &["Commit", "Roll Back", "Cancel"],
             cx,
         );
@@ -597,7 +679,7 @@ impl QueryTab {
                 return;
             };
             if ended.await.is_ok() {
-                this.update(cx, |this, cx| this.drop_write_session(cx)).ok();
+                this.update(cx, then).ok();
             }
         })
         .detach();
@@ -612,7 +694,7 @@ impl QueryTab {
 
     /// Production: stops allowing writes on this connection session.
     fn stop_allowing_writes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.db.set_writes_allowed(false);
+        self.db.revoke_writes();
         self.leave_write_mode(window, cx);
     }
 
@@ -804,7 +886,7 @@ impl QueryTab {
                     .child(error)
             }))
             .child(div().flex_1())
-            .child(self.render_mode_toggle(cx))
+            .child(self.render_mode_selector(cx))
             .when(running, |row| {
                 row.child(Button::new("cancel").small().label("Cancel").on_click(
                     cx.listener(|this, _, window, cx| this.cancel_query(&CancelQuery, window, cx)),
@@ -822,22 +904,27 @@ impl QueryTab {
             )
     }
 
-    /// Read-only / write mode switch in the toolbar.
-    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Read-only / Write / Full write selector in the toolbar.
+    fn render_mode_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let environment = self.db.environment;
-        let (label, tone, tooltip): (SharedString, u32, &str) = match &self.write {
-            WriteState::Off => ("Read-only".into(), 0x4da3ff, "Turn on write mode"),
-            WriteState::Connecting => ("Connecting…".into(), theme::TEXT_SECONDARY, ""),
-            WriteState::On(_) => (
-                format!("Write · {}", environment.short_label()).into(),
-                environment.color(),
-                "Back to read-only",
-            ),
-            WriteState::Failed(_) => ("Write mode failed".into(), theme::RED, "Try again"),
+        let current = match &self.write {
+            WriteState::On(write) => Some(write.kind),
+            _ => None,
         };
-        let on = matches!(self.write, WriteState::On(_));
-        h_flex()
-            .id("write-mode")
+        let (label, tone): (SharedString, u32) = match &self.write {
+            WriteState::Off => ("Read-only".into(), 0x4da3ff),
+            WriteState::Connecting => ("Connecting…".into(), theme::TEXT_SECONDARY),
+            WriteState::On(write) => (
+                format!("{} · {}", write.kind.label(), environment.short_label()).into(),
+                match write.kind {
+                    WriteKind::Transactional => environment.color(),
+                    WriteKind::Full => theme::RED,
+                },
+            ),
+            WriteState::Failed(_) => ("Write mode failed".into(), theme::RED),
+        };
+        let on = current.is_some();
+        let pill = h_flex()
             .gap_1()
             .px_2()
             .py(px(3.))
@@ -850,17 +937,37 @@ impl QueryTab {
             } else {
                 FontWeight::NORMAL
             })
-            .hover(|s| s.bg(color(tone).opacity(0.3)))
             .child(Icon::new(if on { AppIcon::Pencil } else { AppIcon::Lock }).size(px(12.)))
             .child(label)
-            .when(!tooltip.is_empty(), |toggle| {
-                toggle.tooltip(move |window, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
-                })
+            .child(Icon::new(IconName::ChevronDown).size(px(11.)));
+
+        let this = cx.weak_entity();
+        Button::new("write-mode")
+            .ghost()
+            .compact()
+            .child(pill)
+            .dropdown_menu(move |menu, _, _| {
+                let item = |label: &'static str, mode: Option<WriteKind>, hint: &'static str| {
+                    let this = this.clone();
+                    PopupMenuItem::new(format!("{label}  ·  {hint}"))
+                        .checked(current == mode)
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| this.set_mode(mode, window, cx))
+                                .ok();
+                        })
+                };
+                menu.item(item("Read-only", None, "nothing can change"))
+                    .item(item(
+                        "Write",
+                        Some(WriteKind::Transactional),
+                        "in a transaction you commit",
+                    ))
+                    .item(item(
+                        "Full write",
+                        Some(WriteKind::Full),
+                        "each script applied right away",
+                    ))
             })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_write_mode(&ToggleWriteMode, window, cx)
-            }))
     }
 
     fn render_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -874,19 +981,34 @@ impl QueryTab {
             .text_size(px(12.));
         let environment = self.db.environment;
         match &self.write {
-            WriteState::On(_) => {
+            WriteState::On(write) => {
                 let policy = environment.write_policy();
+                let hint = write_mode::policy_hint(policy);
+                let (tone, text) = match write.kind {
+                    WriteKind::Transactional => (
+                        environment.color(),
+                        format!(
+                            "Write mode on {} ({}) · changes stay in a transaction until you \
+                             commit · {hint}",
+                            self.db.name,
+                            environment.label()
+                        ),
+                    ),
+                    WriteKind::Full => (
+                        theme::RED,
+                        format!(
+                            "Full write on {} ({}) · each script is applied when it finishes, \
+                             with no Roll Back · {hint}",
+                            self.db.name,
+                            environment.label()
+                        ),
+                    ),
+                };
                 banner
-                    .bg(color(environment.color()).opacity(0.14))
-                    .text_color(color(environment.color()))
+                    .bg(color(tone).opacity(0.14))
+                    .text_color(color(tone))
                     .child(Icon::new(AppIcon::Pencil).size(px(13.)))
-                    .child(div().flex_1().truncate().child(format!(
-                        "Write mode on {} ({}) · changes stay in a transaction until you \
-                             commit · {}",
-                        self.db.name,
-                        environment.label(),
-                        write_mode::policy_hint(policy)
-                    )))
+                    .child(div().flex_1().truncate().child(text))
                     .when(policy == WritePolicy::SessionUnlock, |banner| {
                         banner.child(
                             Button::new("stop-allowing-writes")
@@ -1006,20 +1128,23 @@ impl QueryTab {
             RunState::Done {
                 changed: Some(changed),
                 elapsed,
+                applied,
                 ..
             } => (
                 format!(
-                    "{} changed · {} · not committed",
+                    "{} changed · {} · {}",
                     plural_rows(*changed),
-                    format_duration(*elapsed)
+                    format_duration(*elapsed),
+                    if *applied { "applied" } else { "not committed" }
                 ),
-                theme::AMBER,
+                if *applied { theme::GREEN } else { theme::AMBER },
             ),
             RunState::Done {
                 rows,
                 elapsed,
                 first_batch_after,
                 changed: None,
+                ..
             } => (
                 format!(
                     "{} rows · {} · first rows in {} · {:.0} MB",
@@ -1220,7 +1345,9 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::toggle_results))
-            .on_action(cx.listener(Self::toggle_write_mode))
+            .on_action(cx.listener(Self::use_read_only))
+            .on_action(cx.listener(Self::use_write))
+            .on_action(cx.listener(Self::use_full_write))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))

@@ -18,6 +18,8 @@
 //!   stays open until [`Session::commit`] or [`Session::rollback`]. Each run
 //!   gets a savepoint, so a failing script undoes only itself and the
 //!   transaction stays usable. Write mode uses a session of its own per tab.
+//! - [`Session::run_autocommit`] runs a script and keeps its changes as soon
+//!   as it finishes: all of it, or none of it if a statement fails.
 //!
 //! TLS honours the URL's `sslmode` (see [`tls`]).
 
@@ -222,6 +224,8 @@ pub enum QueryError {
     Connection(String),
     #[error("This connection is read-only: changes cannot be applied")]
     WritesDisabled,
+    #[error("A transaction is open: commit it or roll it back first")]
+    TransactionOpen,
     #[error(
         "Expected to change {expected} row but {actual} changed: the row no longer exists or someone modified it. No changes were applied."
     )]
@@ -343,6 +347,31 @@ impl Session {
         let inner = self.inner.clone();
         self.inner.handle.spawn(async move {
             let event = match stream_in_write_transaction(&inner, &sql, &options, &tx).await {
+                Ok(summary) => Event::Finished(summary),
+                Err(error) => Event::Failed(error),
+            };
+            let _ = tx.send(event).await;
+        });
+        rx
+    }
+
+    /// Runs a script that may write and keeps its changes when it finishes,
+    /// with no transaction left open. PostgreSQL runs a script of several
+    /// statements as one implicit transaction, so a failing statement undoes
+    /// the whole script; a single statement can be one that refuses to run
+    /// inside a transaction block (`VACUUM`, `CREATE INDEX CONCURRENTLY`).
+    ///
+    /// Refused while [`Self::run_in_transaction`] has a transaction open. The
+    /// SQL is not analysed here. Only on [`Access::ReadWrite`] sessions.
+    pub fn run_autocommit(
+        &self,
+        sql: String,
+        options: RunOptions,
+    ) -> async_channel::Receiver<Event> {
+        let (tx, rx) = async_channel::bounded(4);
+        let inner = self.inner.clone();
+        self.inner.handle.spawn(async move {
+            let event = match stream_autocommit(&inner, &sql, &options, &tx).await {
                 Ok(summary) => Event::Finished(summary),
                 Err(error) => Event::Failed(error),
             };
@@ -494,6 +523,38 @@ async fn stream_in_write_transaction(
             Err(original) => original,
             Ok(_) => error.into(),
         });
+    }
+    outcome
+}
+
+/// Runs `sql` outside any explicit transaction, so its changes are kept.
+async fn stream_autocommit(
+    inner: &Inner,
+    sql: &str,
+    options: &RunOptions,
+    tx: &async_channel::Sender<Event>,
+) -> Result<Summary, QueryError> {
+    if inner.access != Access::ReadWrite {
+        return Err(QueryError::WritesDisabled);
+    }
+    let _busy = inner.busy.lock().await;
+    if inner.in_transaction.load(Ordering::SeqCst) {
+        return Err(QueryError::TransactionOpen);
+    }
+    let client = &inner.client;
+    let started = Instant::now();
+    // Session-wide: there is no transaction to scope them to. Reads on this
+    // session set their own statement timeout.
+    client
+        .batch_execute(&format!(
+            "set statement_timeout = {}; set lock_timeout = {}",
+            options.statement_timeout.as_millis(),
+            options.lock_timeout.as_millis()
+        ))
+        .await?;
+    let outcome = stream_rows(client, sql, options, tx, started).await;
+    if matches!(outcome, Err(QueryError::Cancelled)) {
+        let _ = inner.connector.cancel(inner.cancel.clone()).await;
     }
     outcome
 }
@@ -1237,6 +1298,62 @@ mod tests {
             .await;
             assert_eq!(result.err(), Some(QueryError::WritesDisabled));
             assert!(!reader.in_transaction());
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn autocommit_keeps_whole_scripts_or_nothing() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let writer = write_session(&engine).await;
+            let other = session(&engine).await;
+            let table = scratch_table("autocommit");
+            let options = RunOptions::default();
+
+            let summary = finish(writer.run_autocommit(
+                format!("create table {table} (n int); insert into {table} values (1), (2)"),
+                options.clone(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(summary.affected, 2);
+            assert!(!writer.in_transaction());
+            // Kept right away: another session sees it.
+            assert_eq!(
+                scalar(&other, &format!("select count(*) from {table}")).await,
+                "2"
+            );
+
+            // A failing statement undoes the whole script.
+            let failed = finish(writer.run_autocommit(
+                format!("insert into {table} values (3); select 1/0"),
+                options.clone(),
+            ))
+            .await;
+            assert!(matches!(failed, Err(QueryError::Database { code, .. }) if code == "22012"));
+            assert_eq!(
+                scalar(&other, &format!("select count(*) from {table}")).await,
+                "2"
+            );
+
+            // Statements that cannot run in a transaction block work alone.
+            finish(writer.run_autocommit(format!("vacuum {table}"), options.clone()))
+                .await
+                .unwrap();
+
+            // Not while a transaction is open on the session.
+            finish(writer.run_in_transaction(format!("delete from {table}"), options.clone()))
+                .await
+                .unwrap();
+            let refused =
+                finish(writer.run_autocommit(format!("drop table {table}"), options.clone())).await;
+            assert_eq!(refused.err(), Some(QueryError::TransactionOpen));
+            writer.rollback().await.unwrap();
+
+            finish(writer.run_autocommit(format!("drop table {table}"), options))
+                .await
+                .unwrap();
         });
     }
 }

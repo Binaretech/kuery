@@ -62,24 +62,37 @@ if not set; production connections open read-only (the session also sets
 
 ## Write mode
 
-Query tabs are read-only until you turn on write mode with the switch in the
-toolbar ("Read-only" / "Write") or "Toggle Write Mode" in the command palette:
+Each query tab has three modes, chosen in the toolbar selector or from the
+command palette ("Read-only Mode", "Write Mode (Transactional)", "Full Write
+Mode"):
 
-- The tab opens a connection of its own. The first script that writes opens a
+- **Read-only** (the default): nothing can change, as described above.
+- **Write**: changes stay in a transaction until you commit them (below).
+- **Full write**: each script is applied as soon as it finishes, all of it or
+  nothing (PostgreSQL runs a multi-statement script as one implicit
+  transaction), with no Roll Back. A single statement may be one that cannot
+  run in a transaction block, such as `VACUUM`. Switching to it with a
+  transaction open asks to commit or roll back first.
+
+In both write modes:
+
+- The tab opens a connection of its own. In Write, the first script that writes opens a
   transaction that stays open until **Commit** or **Roll Back** in the
   transaction bar, which shows the statements and rows changed so far. Reads in
   that tab see the uncommitted changes; other tabs and sessions do not.
-- Every run gets a savepoint: if a script fails, only its own changes are
-  undone and the transaction stays usable.
+- In Write, every run gets a savepoint: if a script fails, only its own changes
+  are undone and the transaction stays usable.
 - Scripts are analysed first. `BEGIN`, `COMMIT` and friends are refused (the
   transaction belongs to the tab), and `UPDATE`/`DELETE` without `WHERE`,
   `TRUNCATE`, `DROP`, dropping columns and `GRANT`/`REVOKE` are flagged.
 - What is confirmed depends on the environment: development asks before risky
   statements, staging before every change, production before every change and
   refuses SQL it cannot analyse.
-- Production needs writes allowed first, by typing the connection's name. That
-  lasts for the connection session only (until it disconnects or the app
-  quits), is never saved in the project, and "Stop Allowing Writes" ends it.
+- Production needs writes allowed first, by typing the connection's name, and
+  full write needs a second, separate permission (typing the name again). Both
+  last for the connection session only (until it disconnects or the app
+  quits), are never saved in the project, and "Stop Allowing Writes" ends
+  them.
 - Writes have a 60 s `statement_timeout` and a 5 s `lock_timeout`. A
   transaction with no runs for 10 minutes is rolled back (the bar counts down
   over the last two). Closing the tab asks whether to commit; closing the
