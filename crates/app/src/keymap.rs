@@ -31,7 +31,7 @@ struct KeymapState {
     base: Vec<KeyBinding>,
     path: PathBuf,
     /// Display form of each command's shortcuts, e.g. `tab.close` → `["⌘W"]`.
-    shortcuts: HashMap<&'static str, Vec<String>>,
+    shortcuts: Shortcuts,
     problems: Vec<String>,
 }
 
@@ -71,30 +71,10 @@ pub fn reload(cx: &mut App) {
     problems.extend(resolve_problems);
 
     let mut bindings = cx.global::<KeymapState>().base.clone();
-    let mut shortcuts: HashMap<&'static str, Vec<String>> = HashMap::new();
-    for (keys, command) in &resolved {
-        let context = command
-            .context
-            .and_then(|c| KeyBindingContextPredicate::parse(c).ok())
-            .map(Rc::new);
-        match KeyBinding::load(
-            keys,
-            (command.action)(),
-            context,
-            false,
-            None,
-            &DummyKeyboardMapper,
-        ) {
-            Ok(binding) => {
-                bindings.push(binding);
-                shortcuts
-                    .entry(command.id)
-                    .or_default()
-                    .push(display(keys, IS_MAC));
-            }
-            Err(_) => problems.push(format!("\"{keys}\" is not a valid shortcut")),
-        }
-    }
+    let (command_bindings, shortcuts, binding_problems) = command_bindings(&resolved);
+    bindings.extend(command_bindings);
+    problems.extend(binding_problems);
+    bindings.extend(crate::query_tab::bindings());
     bindings.extend(palette::bindings());
 
     cx.clear_key_bindings();
@@ -104,6 +84,58 @@ pub fn reload(cx: &mut App) {
     state.problems = problems;
     // The menu bar shows shortcuts, so it is rebuilt with the new ones.
     crate::menus::set_menus(cx);
+}
+
+type Shortcuts = HashMap<&'static str, Vec<String>>;
+
+/// The bindings for the resolved shortcuts, the display form of each
+/// command's shortcuts, and the shortcuts that could not be parsed.
+fn command_bindings(
+    resolved: &[(String, &'static Command)],
+) -> (Vec<KeyBinding>, Shortcuts, Vec<String>) {
+    let mut bindings = Vec::new();
+    let mut shortcuts = Shortcuts::new();
+    let mut problems = Vec::new();
+    for (keys, command) in resolved {
+        let mut valid = true;
+        for context in binding_contexts(command.context) {
+            let context = context
+                .and_then(|c| KeyBindingContextPredicate::parse(&c).ok())
+                .map(Rc::new);
+            match KeyBinding::load(
+                keys,
+                (command.action)(),
+                context,
+                false,
+                None,
+                &DummyKeyboardMapper,
+            ) {
+                Ok(binding) => bindings.push(binding),
+                Err(_) => valid = false,
+            }
+        }
+        if valid {
+            shortcuts
+                .entry(command.id)
+                .or_default()
+                .push(display(keys, IS_MAC));
+        } else {
+            problems.push(format!("\"{keys}\" is not a valid shortcut"));
+        }
+    }
+    (bindings, shortcuts, problems)
+}
+
+/// Where a command's shortcut is bound: its own context, and again for a text
+/// field focused inside it. Inputs bind keys of their own (`secondary-enter`
+/// inserts a line), and the deeper context wins, so without the second
+/// binding a shortcut would do nothing while typing in the SQL editor.
+fn binding_contexts(context: Option<&str>) -> [Option<String>; 2] {
+    let input = match context {
+        Some(context) => format!("{context} > Input"),
+        None => "Input".to_string(),
+    };
+    [context.map(str::to_owned), Some(input)]
 }
 
 /// The first shortcut of a command, for the palette and tooltips.
@@ -387,6 +419,60 @@ mod tests {
             .filter(|(k, _)| *k == keys)
             .map(|(_, c)| c.id)
             .collect()
+    }
+
+    /// What a keystroke runs with the focus in the SQL editor of a query tab.
+    fn action_in_query_editor(keys: &str) -> Option<String> {
+        use gpui_kit::component::input::Enter;
+        use gpui_kit::{KeyContext, Keymap, Keystroke};
+
+        // The editor's own binding, registered before ours as at startup.
+        let mut bindings = vec![KeyBinding::new(
+            "secondary-enter",
+            Enter {
+                secondary: true,
+                shift: false,
+            },
+            Some("Input"),
+        )];
+        let (resolved, _) = resolve(&[]);
+        bindings.extend(command_bindings(&resolved).0);
+        bindings.extend(crate::query_tab::bindings());
+        let keymap = Keymap::new(bindings);
+        let stack = ["DbAdmin", "QueryTab", "Input mode=editor"]
+            .map(|context| KeyContext::parse(context).unwrap());
+        let keys = keys.replace("secondary", if IS_MAC { "cmd" } else { "ctrl" });
+        let (matched, _) = keymap.bindings_for_input(&[Keystroke::parse(&keys).unwrap()], &stack);
+        matched
+            .first()
+            .map(|binding| binding.action().name().to_string())
+    }
+
+    #[test]
+    fn secondary_enter_runs_the_query_from_the_editor() {
+        assert_eq!(
+            action_in_query_editor("secondary-enter").as_deref(),
+            Some("dbadmin::RunQuery")
+        );
+        assert_eq!(
+            action_in_query_editor("secondary-shift-enter").as_deref(),
+            Some("input::Enter")
+        );
+    }
+
+    #[test]
+    fn shortcuts_also_apply_inside_text_fields() {
+        assert_eq!(
+            binding_contexts(Some("QueryTab")),
+            [Some("QueryTab".into()), Some("QueryTab > Input".into())]
+        );
+        assert_eq!(binding_contexts(None), [None, Some("Input".into())]);
+        for context in binding_contexts(Some("QueryTab")).into_iter().flatten() {
+            assert!(
+                KeyBindingContextPredicate::parse(&context).is_ok(),
+                "{context}"
+            );
+        }
     }
 
     #[test]

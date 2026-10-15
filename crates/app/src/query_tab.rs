@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 
 use dbadmin_pg::{Event, QueryError, RunOptions};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::input::{Editor, EditorState, Enter, InputEvent};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window,
-    actions, div, px,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyBinding,
+    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Task, Window, actions, div, px,
 };
 
 use crate::assets::AppIcon;
@@ -34,6 +34,19 @@ actions!(
     dbadmin,
     [RunQuery, CancelQuery, SaveQuery, SaveQueryAs, ToggleResults]
 );
+
+/// Editor keys that are not commands: `secondary-enter` runs the query (it is
+/// the `query.run` shortcut), so a new line moves to `secondary-shift-enter`.
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new(
+        "secondary-shift-enter",
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        Some("QueryTab > Input"),
+    )]
+}
 
 const DEFAULT_EDITOR_HEIGHT: Pixels = px(240.);
 const MIN_EDITOR_HEIGHT: Pixels = px(60.);
@@ -65,7 +78,7 @@ impl Render for SplitDrag {
 }
 
 pub const EXAMPLE_SQL: &str = "-- Read-only: runs inside BEGIN TRANSACTION READ ONLY.\n\
--- ⌘↵ / Ctrl+↵ to run, ⌘S to save it in the project.\n\
+-- ⌘↵ / Ctrl+↵ to run, ⌘⇧↵ for a new line, ⌘S to save it in the project.\n\
 select current_database(), current_user, version();\n";
 
 enum RunState {

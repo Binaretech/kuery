@@ -59,6 +59,10 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
 
+In the SQL editor `secondary-enter` runs the query (or the selection) and
+`secondary-shift-enter` inserts a new line. Command shortcuts are also bound
+inside text fields, so a field's own keys never shadow them.
+
 In a query tab the editor and the bottom panel are split by a divider you can
 drag (double-click it to reset). The panel has a Results tab with the grid and
 an Output tab that logs each run (SQL, rows and time, or the error); it
