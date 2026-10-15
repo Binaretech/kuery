@@ -10,8 +10,8 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
-    Styled as _, Task, Window, actions, div, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Task, Window, actions, div, px,
 };
 
 use crate::assets::AppIcon;
@@ -22,13 +22,6 @@ use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
 
 actions!(dbadmin, [RunQuery, CancelQuery]);
-
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-enter", RunQuery, None),
-        KeyBinding::new("secondary-.", CancelQuery, None),
-    ]);
-}
 
 pub const EXAMPLE_SQL: &str = "-- Read-only: runs inside BEGIN TRANSACTION READ ONLY.\n\
 -- ⌘↵ / Ctrl+↵ to run.\n\
@@ -181,6 +174,11 @@ impl QueryTab {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    pub fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
     }
 
     fn finish_table(&mut self, cx: &mut Context<Self>) {

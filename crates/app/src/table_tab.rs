@@ -24,10 +24,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
 };
+
+actions!(dbadmin, [ReloadTable]);
 
 use crate::assets::AppIcon;
 use crate::connection::Db;
@@ -125,6 +127,7 @@ pub struct TableTab {
     page_task: Option<Task<()>>,
     count_task: Option<Task<()>>,
     apply_task: Option<Task<()>>,
+    focus_handle: FocusHandle,
 }
 
 impl TableTab {
@@ -209,6 +212,7 @@ impl TableTab {
             page_task: None,
             count_task: None,
             apply_task: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -1270,6 +1274,12 @@ fn describe_key(key: &[KeyValue]) -> String {
         .join(", ")
 }
 
+impl Focusable for TableTab {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for TableTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
@@ -1311,6 +1321,13 @@ impl Render for TableTab {
 
         v_flex()
             .size_full()
+            .key_context("TableTab")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &ReloadTable, _, cx| {
+                if !this.has_pending() {
+                    this.load_page(cx);
+                }
+            }))
             .child(self.render_toolbar(cx))
             .children(read_only_banner)
             .when(self.show_filters && self.view == TableView::Data, |col| {

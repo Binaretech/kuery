@@ -5,12 +5,15 @@
 //! from `dev/compose.yaml`).
 
 mod assets;
+mod commands;
 mod config;
 mod connection;
 mod definition;
 mod explorer;
 mod grid;
+mod keymap;
 mod menus;
+mod palette;
 mod query_tab;
 mod results;
 mod table_tab;
@@ -43,8 +46,9 @@ fn main() {
             gpui_kit::init(cx);
             assets::load_fonts(cx).expect("register the embedded fonts");
             theme::apply(cx);
-            query_tab::bind_keys(cx);
             menus::init(cx);
+            // After gpui_kit::init, so the keymap can keep its bindings.
+            keymap::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

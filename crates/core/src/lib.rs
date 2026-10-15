@@ -4,6 +4,7 @@
 pub mod browse;
 pub mod catalog;
 pub mod edit;
+pub mod fuzzy;
 pub mod read_only;
 pub mod result_set;
 pub mod sql;

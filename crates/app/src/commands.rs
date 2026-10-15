@@ -1,0 +1,210 @@
+//! Every command the app exposes, in one registry.
+//!
+//! A command has a stable id (what the user keymap refers to), a title and
+//! category for the command palette, the gpui action it dispatches, its
+//! default shortcuts, and the key context where those shortcuts apply. The
+//! palette and the keymap both read from here, so a command added once is
+//! searchable and bindable.
+
+use gpui_kit::{Action, actions};
+
+use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
+use crate::query_tab::{CancelQuery, RunQuery};
+use crate::table_tab::ReloadTable;
+
+actions!(
+    dbadmin,
+    [
+        OpenCommandPalette,
+        CloseTab,
+        NextTab,
+        PreviousTab,
+        NewQuery,
+        ToggleSidebar,
+        OpenKeymapFile,
+        ReloadKeymap,
+    ]
+);
+
+pub struct Command {
+    /// Stable id used in the keymap file, e.g. `tab.close`.
+    pub id: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
+    pub action: fn() -> Box<dyn Action>,
+    /// Default shortcuts. `secondary` is ⌘ on macOS and Ctrl elsewhere.
+    pub defaults: &'static [&'static str],
+    /// Key context the shortcuts apply in (`None` = anywhere in the window).
+    pub context: Option<&'static str>,
+}
+
+macro_rules! action {
+    ($action:expr) => {
+        || Box::new($action)
+    };
+}
+
+pub const COMMANDS: &[Command] = &[
+    Command {
+        id: "palette.open",
+        title: "Command Palette",
+        category: "View",
+        action: action!(OpenCommandPalette),
+        defaults: &["secondary-k", "secondary-shift-p"],
+        context: None,
+    },
+    Command {
+        id: "tab.new_query",
+        title: "New Query",
+        category: "Tab",
+        action: action!(NewQuery),
+        defaults: &["secondary-t"],
+        context: None,
+    },
+    Command {
+        id: "tab.close",
+        title: "Close Tab",
+        category: "Tab",
+        action: action!(CloseTab),
+        defaults: &["secondary-w"],
+        context: None,
+    },
+    Command {
+        id: "tab.next",
+        title: "Next Tab",
+        category: "Tab",
+        action: action!(NextTab),
+        defaults: &["ctrl-tab", "secondary-shift-]"],
+        context: None,
+    },
+    Command {
+        id: "tab.previous",
+        title: "Previous Tab",
+        category: "Tab",
+        action: action!(PreviousTab),
+        defaults: &["ctrl-shift-tab", "secondary-shift-["],
+        context: None,
+    },
+    Command {
+        id: "sidebar.toggle",
+        title: "Toggle Sidebar",
+        category: "View",
+        action: action!(ToggleSidebar),
+        defaults: &["secondary-b"],
+        context: None,
+    },
+    Command {
+        id: "query.run",
+        title: "Run Query",
+        category: "Query",
+        action: action!(RunQuery),
+        defaults: &["secondary-enter"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.cancel",
+        title: "Cancel Query",
+        category: "Query",
+        action: action!(CancelQuery),
+        defaults: &["secondary-."],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "table.reload",
+        title: "Reload Table",
+        category: "Table",
+        action: action!(ReloadTable),
+        defaults: &["secondary-r"],
+        context: Some("TableTab"),
+    },
+    Command {
+        id: "keymap.open",
+        title: "Open Keymap File",
+        category: "Preferences",
+        action: action!(OpenKeymapFile),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "keymap.reload",
+        title: "Reload Keymap",
+        category: "Preferences",
+        action: action!(ReloadKeymap),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "window.close",
+        title: "Close Window",
+        category: "Window",
+        action: action!(CloseWindow),
+        defaults: &["secondary-shift-w"],
+        context: None,
+    },
+    Command {
+        id: "window.minimize",
+        title: "Minimize",
+        category: "Window",
+        action: action!(Minimize),
+        #[cfg(target_os = "macos")]
+        defaults: &["cmd-m"],
+        #[cfg(not(target_os = "macos"))]
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "window.zoom",
+        title: "Zoom",
+        category: "Window",
+        action: action!(Zoom),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "window.fullscreen",
+        title: "Toggle Full Screen",
+        category: "Window",
+        action: action!(ToggleFullScreen),
+        #[cfg(target_os = "macos")]
+        defaults: &["ctrl-cmd-f"],
+        #[cfg(not(target_os = "macos"))]
+        defaults: &["f11"],
+        context: None,
+    },
+    Command {
+        id: "app.quit",
+        title: "Quit",
+        category: "App",
+        action: action!(Quit),
+        defaults: &["secondary-q"],
+        context: None,
+    },
+];
+
+pub fn find(id: &str) -> Option<&'static Command> {
+    COMMANDS.iter().find(|command| command.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn ids_are_unique_and_dotted() {
+        let mut seen = HashSet::new();
+        for command in COMMANDS {
+            assert!(seen.insert(command.id), "duplicated id {}", command.id);
+            assert!(command.id.contains('.'), "{}", command.id);
+        }
+    }
+
+    #[test]
+    fn close_tab_is_secondary_w() {
+        assert_eq!(find("tab.close").unwrap().defaults, &["secondary-w"]);
+        assert_eq!(
+            find("window.close").unwrap().defaults,
+            &["secondary-shift-w"]
+        );
+    }
+}

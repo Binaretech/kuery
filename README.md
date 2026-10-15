@@ -51,6 +51,28 @@ Without a config file, `DBADMIN_DATABASE_URL` (and optionally
 Passwords currently live in the URL; keeping them in the OS keychain is still
 to do.
 
+## Commands and shortcuts
+
+Every command lives in one registry (`crates/app/src/commands.rs`) with a
+stable id, a title, its default shortcuts and the key context they apply in.
+The command palette (`secondary-k` or `secondary-shift-p`) searches them, plus
+the tables of the open connections, and runs the same action a shortcut would.
+
+Shortcuts can be changed in `keymap.toml` in the user config directory
+(`~/Library/Application Support/dbadmin` on macOS, `~/.config/dbadmin` on
+Linux, `%APPDATA%\dbadmin` on Windows; `DBADMIN_KEYMAP` overrides the path).
+"Open Keymap File" creates it with every command listed, and "Reload Keymap"
+applies changes without restarting:
+
+```toml
+[bindings]
+"cmd-w" = "tab.close"     # shortcut = command id
+"secondary-t" = ""        # an empty command unbinds a default shortcut
+```
+
+`secondary` is `cmd` on macOS and `ctrl` elsewhere. By default
+`secondary-w` closes the active tab and `secondary-shift-w` the window.
+
 ## Writing data
 
 SQL query tabs never write. Rows are edited only from a table tab: each change

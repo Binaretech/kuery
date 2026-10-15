@@ -1,14 +1,21 @@
-//! Native application menus (the menu bar on macOS) and the window shortcuts
-//! that go with them: quit, close, minimize, zoom, full screen and editing.
+//! Native application menus (the menu bar on macOS) and the window actions
+//! behind them. Shortcuts are not set here: they come from the keymap, and the
+//! menu bar shows whatever the keymap binds to each action.
 
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
-use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
+use gpui_kit::{App, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
+
+use crate::commands::{
+    CloseTab, NewQuery, NextTab, OpenCommandPalette, OpenKeymapFile, PreviousTab, ReloadKeymap,
+    ToggleSidebar,
+};
 
 actions!(
     dbadmin,
     [Quit, CloseWindow, Minimize, Zoom, ToggleFullScreen]
 );
 
+/// Registers the app- and window-level actions.
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
@@ -17,25 +24,28 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &ToggleFullScreen, cx| {
         with_active_window(cx, |window| window.toggle_fullscreen())
     });
+}
 
-    cx.bind_keys([
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-m", Minimize, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("f11", ToggleFullScreen, None),
-    ]);
-
+/// Builds the menu bar. Called again after the keymap changes so the
+/// shortcuts shown next to each item stay current.
+pub fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("dbadmin").items([
+            MenuItem::action("Command Palette…", OpenCommandPalette),
+            MenuItem::separator(),
+            MenuItem::action("Open Keymap File", OpenKeymapFile),
+            MenuItem::action("Reload Keymap", ReloadKeymap),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Quit dbadmin", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("Close Window", CloseWindow)]),
+        Menu::new("File").items([
+            MenuItem::action("New Query", NewQuery),
+            MenuItem::separator(),
+            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", Undo, OsAction::Undo),
             MenuItem::os_action("Redo", Redo, OsAction::Redo),
@@ -45,9 +55,16 @@ pub fn init(cx: &mut App) {
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
+        Menu::new("View").items([
+            MenuItem::action("Command Palette…", OpenCommandPalette),
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+        ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
+            MenuItem::separator(),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::action("Previous Tab", PreviousTab),
             MenuItem::separator(),
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
         ]),

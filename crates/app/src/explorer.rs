@@ -241,6 +241,27 @@ impl Explorer {
         selected.or_else(|| (0..self.connections.len()).find_map(|index| self.db(index)))
     }
 
+    /// Tables and views of every connection whose catalog is loaded, for the
+    /// command palette.
+    pub fn open_tables(&self) -> Vec<(Db, TableInfo)> {
+        self.connections
+            .iter()
+            .filter_map(|node| match &node.state {
+                ConnectionState::Ready {
+                    db,
+                    catalog: CatalogState::Loaded(overview),
+                } => Some((db, overview)),
+                _ => None,
+            })
+            .flat_map(|(db, overview)| {
+                overview
+                    .tables
+                    .iter()
+                    .map(move |info| (db.clone(), info.clone()))
+            })
+            .collect()
+    }
+
     pub fn record(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
         self.history.insert(0, entry);
         self.history.truncate(200);
