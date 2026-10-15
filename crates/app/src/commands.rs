@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use gpui_kit::{Action, actions};
 
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
-use crate::query_tab::{CancelQuery, RunQuery, SaveQuery, SaveQueryAs};
+use crate::query_tab::{CancelQuery, RunQuery, SaveQuery, SaveQueryAs, ToggleResults};
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
 actions!(
@@ -159,6 +159,14 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(CancelQuery),
         defaults: &["secondary-."],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.toggle_results",
+        title: "Toggle Results Panel",
+        category: "Query",
+        action: action!(ToggleResults),
+        defaults: &["secondary-j"],
         context: Some("QueryTab"),
     },
     Command {

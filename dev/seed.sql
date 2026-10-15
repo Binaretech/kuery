@@ -41,7 +41,7 @@ create index orders_customer_id_idx on orders (customer_id);
 create index orders_created_at_idx on orders (created_at desc);
 analyze;
 
--- Extra structure for the explorer: CHECK, trigger, RLS, enum arrays,
+-- Extra structure for the explorer: CHECK, trigger, enum arrays,
 -- views and a table without a primary key.
 alter table orders add constraint orders_total_positive check (total >= 0);
 alter table orders add column updated_at timestamptz not null default now();
@@ -54,17 +54,6 @@ end $$;
 
 create trigger orders_set_updated_at before update on orders
     for each row execute function set_updated_at();
-
-create role authenticated nologin;
-create role backoffice nologin;
-
-alter table orders enable row level security;
-create policy "Customers see their orders" on orders for select to authenticated
-    using (customer_id::text = current_setting('app.customer_id', true));
-create policy "Create own order" on orders for insert to authenticated
-    with check (customer_id::text = current_setting('app.customer_id', true));
-create policy "Backoffice manages statuses" on orders for update to backoffice
-    using (true);
 
 create type user_role as enum ('admin', 'editor', 'viewer');
 
@@ -79,10 +68,6 @@ insert into profiles (user_id, roles)
 select id, case when row_number() over () = 1 then '{admin}'::user_role[] else '{viewer}' end
 from customers
 limit 50;
-
-alter table profiles enable row level security;
-create policy "Users see their own profile" on profiles for select to authenticated
-    using (user_id::text = current_setting('app.customer_id', true));
 
 create view v_daily_sales as
 select date_trunc('day', created_at)::date as day, count(*) as orders, sum(total) as revenue

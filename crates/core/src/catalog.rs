@@ -1,4 +1,4 @@
-//! Catalog model: tables, columns, keys, indexes, constraints, RLS policies
+//! Catalog model: tables, columns, keys, indexes, constraints
 //! and triggers. Each engine's driver fills it in.
 
 use std::fmt;
@@ -56,8 +56,6 @@ pub struct TableInfo {
     pub kind: TableKind,
     /// Planner estimate; `None` if the table has never been analyzed.
     pub estimated_rows: Option<u64>,
-    pub rls_enabled: bool,
-    pub policy_count: u32,
     pub comment: Option<String>,
 }
 
@@ -121,17 +119,6 @@ pub struct ConstraintInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PolicyInfo {
-    pub name: String,
-    /// `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `ALL`.
-    pub command: String,
-    pub roles: Vec<String>,
-    pub permissive: bool,
-    pub using: Option<String>,
-    pub with_check: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct TriggerInfo {
     pub name: String,
     pub definition: String,
@@ -144,7 +131,6 @@ pub struct TableDefinition {
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
     pub constraints: Vec<ConstraintInfo>,
-    pub policies: Vec<PolicyInfo>,
     pub triggers: Vec<TriggerInfo>,
 }
 

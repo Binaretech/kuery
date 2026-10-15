@@ -758,8 +758,6 @@ mod tests {
             let tables = catalog::tables(session.clone()).await.unwrap();
             let find = |name: &str| tables.iter().find(|t| t.table.name == name).unwrap();
             assert_eq!(find("orders").kind, TableKind::Table);
-            assert!(find("orders").rls_enabled);
-            assert_eq!(find("orders").policy_count, 3);
             assert_eq!(find("v_daily_sales").kind, TableKind::View);
             assert_eq!(
                 find("profiles").comment.as_deref(),
@@ -794,13 +792,6 @@ mod tests {
                     .constraints
                     .iter()
                     .any(|c| c.kind == ConstraintKind::Check)
-            );
-            assert_eq!(orders.policies.len(), 3);
-            assert!(
-                orders
-                    .policies
-                    .iter()
-                    .any(|p| p.command == "SELECT" && p.roles == ["authenticated"])
             );
             assert_eq!(orders.triggers.len(), 1);
 

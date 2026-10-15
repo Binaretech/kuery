@@ -1,10 +1,10 @@
-//! PostgreSQL catalog: tables, columns, keys, indexes, constraints, RLS
-//! policies and triggers, read from `pg_catalog`.
+//! PostgreSQL catalog: tables, columns, keys, indexes, constraints and
+//! triggers, read from `pg_catalog`.
 
 use dbadmin_core::catalog::{
     CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, EnumInfo, ForeignKeyRef,
-    FunctionInfo, IndexInfo, PolicyInfo, RoutineKind, TableDefinition, TableInfo, TableKind,
-    TableRef, TriggerInfo, TriggerRef,
+    FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef,
+    TriggerInfo, TriggerRef,
 };
 use dbadmin_core::result_set::ResultSet;
 use dbadmin_core::sql::{quote_literal, quote_qualified};
@@ -16,8 +16,6 @@ select n.nspname,
        c.relname,
        c.relkind::text,
        case when c.reltuples < 0 then null else c.reltuples::bigint end,
-       c.relrowsecurity,
-       (select count(*) from pg_catalog.pg_policy p where p.polrelid = c.oid),
        pg_catalog.obj_description(c.oid, 'pg_class')
 from pg_catalog.pg_class c
 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
@@ -148,9 +146,7 @@ pub async fn tables(session: Session) -> Result<Vec<TableInfo>, QueryError> {
                 _ => TableKind::Table,
             },
             estimated_rows: row.optional(3).and_then(|v| v.parse().ok()),
-            rls_enabled: row.flag(4),
-            policy_count: row.text(5).parse().unwrap_or(0),
-            comment: row.optional(6),
+            comment: row.optional(4),
         })
         .collect())
 }
@@ -169,7 +165,6 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
     let columns = session.fetch_trusted(columns_sql(&relation)).await?;
     let indexes = session.fetch_trusted(indexes_sql(&relation)).await?;
     let constraints = session.fetch_trusted(constraints_sql(&relation)).await?;
-    let policies = session.fetch_trusted(policies_sql(&relation)).await?;
     let triggers = session.fetch_trusted(triggers_sql(&relation)).await?;
 
     Ok(TableDefinition {
@@ -209,21 +204,6 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
                     _ => ConstraintKind::Other,
                 },
                 definition: row.text(2),
-            })
-            .collect(),
-        policies: rows(&policies)
-            .map(|row| PolicyInfo {
-                name: row.text(0),
-                command: row.text(1),
-                permissive: row.flag(2),
-                roles: row
-                    .text(3)
-                    .split(',')
-                    .filter(|r| !r.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                using: row.optional(4),
-                with_check: row.optional(5),
             })
             .collect(),
         triggers: rows(&triggers)
@@ -290,23 +270,6 @@ select conname, contype::text, pg_catalog.pg_get_constraintdef(oid, true)
 from pg_catalog.pg_constraint
 where conrelid = {relation}
 order by case contype when 'p' then 0 when 'f' then 1 when 'u' then 2 else 3 end, conname"
-    )
-}
-
-fn policies_sql(relation: &str) -> String {
-    format!(
-        r"
-select polname,
-       case polcmd when 'r' then 'SELECT' when 'a' then 'INSERT' when 'w' then 'UPDATE'
-                   when 'd' then 'DELETE' else 'ALL' end,
-       polpermissive,
-       coalesce((select string_agg(case when r = 0 then 'public' else pg_catalog.pg_get_userbyid(r) end, ',')
-                 from unnest(polroles) r), ''),
-       pg_catalog.pg_get_expr(polqual, polrelid),
-       pg_catalog.pg_get_expr(polwithcheck, polrelid)
-from pg_catalog.pg_policy
-where polrelid = {relation}
-order by polname"
     )
 }
 

@@ -1,6 +1,10 @@
 //! Query tab: SQL editor and streaming results, always read-only. A tab can
 //! be bound to a saved query file in the project; its first line,
 //! `-- connection: <name>`, is kept in the file but not shown in the editor.
+//!
+//! The editor and the bottom panel are split by a draggable divider. The
+//! panel has a Results tab (the grid) and an Output tab (a log of runs), and
+//! can be collapsed down to its tab strip.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,12 +13,13 @@ use dbadmin_pg::{Event, QueryError, RunOptions};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::table::{DataTable, TableState};
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Task, Window, actions, div, px,
+    App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
+    Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window,
+    actions, div, px,
 };
 
 use crate::assets::AppIcon;
@@ -25,7 +30,39 @@ use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
 
-actions!(dbadmin, [RunQuery, CancelQuery, SaveQuery, SaveQueryAs]);
+actions!(
+    dbadmin,
+    [RunQuery, CancelQuery, SaveQuery, SaveQueryAs, ToggleResults]
+);
+
+const DEFAULT_EDITOR_HEIGHT: Pixels = px(240.);
+const MIN_EDITOR_HEIGHT: Pixels = px(60.);
+/// Room kept for the bottom panel when the divider is dragged down.
+const MIN_PANEL_HEIGHT: Pixels = px(110.);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    Results,
+    Output,
+}
+
+/// One run, as the Output tab lists it.
+struct OutputEntry {
+    run: usize,
+    connection: SharedString,
+    sql: String,
+    outcome: String,
+    failed: bool,
+}
+
+/// Dragged value for the divider between the editor and the panel.
+struct SplitDrag;
+
+impl Render for SplitDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
 
 pub const EXAMPLE_SQL: &str = "-- Read-only: runs inside BEGIN TRANSACTION READ ONLY.\n\
 -- ⌘↵ / Ctrl+↵ to run, ⌘S to save it in the project.\n\
@@ -67,6 +104,10 @@ pub struct QueryTab {
     table: Entity<TableState<ResultsDelegate>>,
     run: RunState,
     run_task: Option<Task<()>>,
+    editor_height: Pixels,
+    panel_collapsed: bool,
+    panel_tab: PanelTab,
+    output: Vec<OutputEntry>,
     focus_handle: FocusHandle,
 }
 
@@ -116,6 +157,10 @@ impl QueryTab {
             table,
             run: RunState::Idle,
             run_task: None,
+            editor_height: DEFAULT_EDITOR_HEIGHT,
+            panel_collapsed: false,
+            panel_tab: PanelTab::Results,
+            output: Vec::new(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -209,6 +254,9 @@ impl QueryTab {
         self.run = RunState::Running {
             started: Instant::now(),
         };
+        // A run brings its results into view.
+        self.panel_collapsed = false;
+        self.panel_tab = PanelTab::Results;
         cx.notify();
 
         self.last_sql = sql.clone();
@@ -263,6 +311,13 @@ impl QueryTab {
     }
 
     fn record(&mut self, outcome: String, failed: bool, cx: &mut Context<Self>) {
+        self.output.push(OutputEntry {
+            run: self.output.len() + 1,
+            connection: self.db.name.clone(),
+            sql: self.last_sql.clone(),
+            outcome: outcome.clone(),
+            failed,
+        });
         cx.emit(QueryRan(HistoryEntry {
             connection: self.db.name.clone(),
             sql: self.last_sql.clone(),
@@ -290,6 +345,28 @@ impl QueryTab {
     fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
         if let RunState::Running { .. } = self.run {
             self.db.session.cancel();
+            cx.notify();
+        }
+    }
+
+    fn toggle_results(&mut self, _: &ToggleResults, _: &mut Window, cx: &mut Context<Self>) {
+        self.panel_collapsed = !self.panel_collapsed;
+        cx.notify();
+    }
+
+    /// Clicking a panel tab selects it, and expands a collapsed panel.
+    fn select_panel_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
+        self.panel_tab = tab;
+        self.panel_collapsed = false;
+        cx.notify();
+    }
+
+    fn on_split_drag(&mut self, event: &DragMoveEvent<SplitDrag>, cx: &mut Context<Self>) {
+        let bounds = event.bounds;
+        let max = (bounds.size.height - MIN_PANEL_HEIGHT).max(MIN_EDITOR_HEIGHT);
+        let height = (event.event.position.y - bounds.top()).clamp(MIN_EDITOR_HEIGHT, max);
+        if height != self.editor_height {
+            self.editor_height = height;
             cx.notify();
         }
     }
@@ -403,11 +480,12 @@ impl QueryTab {
             )
     }
 
-    fn render_results_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The run's status, shown next to the panel tabs.
+    fn status(&self, cx: &App) -> (String, u32) {
         let loaded = self.table.read(cx).delegate().rows();
         let memory = self.table.read(cx).delegate().memory_size() as f64 / 1_048_576.0;
-        let (text, tone) = match &self.run {
-            RunState::Idle => ("Ready".to_string(), theme::TEXT_SECONDARY),
+        match &self.run {
+            RunState::Idle => ("Ready".to_string(), theme::TEXT_TERTIARY),
             RunState::Running { started } => (
                 format!(
                     "{} rows · {:.1} s · streaming…",
@@ -433,25 +511,155 @@ impl QueryTab {
                 theme::TEXT_SECONDARY,
             ),
             RunState::Failed(message) => (message.clone(), theme::RED),
+        }
+    }
+
+    fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (status, tone) = self.status(cx);
+        let toggle_shortcut = if cfg!(target_os = "macos") {
+            "⌘J"
+        } else {
+            "Ctrl+J"
+        };
+        let tab = |id: &'static str, label: SharedString, tab: PanelTab, cx: &mut Context<Self>| {
+            let active = self.panel_tab == tab && !self.panel_collapsed;
+            div()
+                .id(id)
+                .h_full()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_1()
+                .border_b_2()
+                .border_color(if active {
+                    color(theme::ACCENT)
+                } else {
+                    color(theme::ACCENT).opacity(0.)
+                })
+                .text_color(color(if active {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_SECONDARY
+                }))
+                .font_weight(FontWeight::MEDIUM)
+                .hover(|s| s.text_color(color(theme::TEXT)))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.select_panel_tab(tab, cx)))
+        };
+        let output_label: SharedString = if self.output.is_empty() {
+            "Output".into()
+        } else {
+            format!("Output · {}", self.output.len()).into()
         };
 
         h_flex()
-            .h(px(36.))
-            .px_4()
-            .gap_3()
+            .id("panel-header")
+            .h(px(34.))
+            .pl_1()
+            .pr_2()
+            .gap_1()
             .flex_shrink_0()
             .bg(color(0x1c1c1e))
             .border_t_1()
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Results"))
+            .text_size(px(12.5))
+            .child(tab(
+                "panel-results",
+                "Results".into(),
+                PanelTab::Results,
+                cx,
+            ))
+            .child(tab("panel-output", output_label, PanelTab::Output, cx))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .pl_2()
                     .text_size(px(12.))
                     .text_color(color(tone))
                     .truncate()
-                    .child(text),
+                    .child(status),
             )
+            .child(
+                Button::new("toggle-results")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(if self.panel_collapsed {
+                        AppIcon::PanelBottomOpen
+                    } else {
+                        AppIcon::PanelBottomClose
+                    }))
+                    .tooltip(format!(
+                        "{} panel  {toggle_shortcut}",
+                        if self.panel_collapsed { "Show" } else { "Hide" }
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_results(&ToggleResults, window, cx)
+                    })),
+            )
+            // Double-clicking the strip collapses or expands the panel.
+            .on_click(
+                cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
+                    if event.click_count() == 2 {
+                        this.toggle_results(&ToggleResults, window, cx);
+                    }
+                }),
+            )
+    }
+
+    fn render_output(&self, mono: SharedString) -> impl IntoElement {
+        let mut list = v_flex();
+        for entry in self.output.iter().rev() {
+            list = list.child(
+                v_flex()
+                    .px_4()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(color(theme::HAIRLINE))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_size(px(11.5))
+                            .child(
+                                div()
+                                    .text_color(color(theme::TEXT_TERTIARY))
+                                    .child(format!("#{} · {}", entry.run, entry.connection)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(if entry.failed {
+                                        theme::RED
+                                    } else {
+                                        theme::GREEN
+                                    }))
+                                    .child(entry.outcome.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(11.5))
+                            .text_color(color(theme::TEXT_SECONDARY))
+                            .line_clamp(4)
+                            .child(entry.sql.trim().to_string()),
+                    ),
+            );
+        }
+        if self.output.is_empty() {
+            list = list.child(
+                div()
+                    .p_4()
+                    .text_color(color(theme::TEXT_TERTIARY))
+                    .child("Each run is logged here: its SQL, rows and time, or the error."),
+            );
+        }
+        div()
+            .id("query-output")
+            .size_full()
+            .overflow_y_scroll()
+            .child(list)
     }
 }
 
@@ -478,6 +686,9 @@ impl Render for QueryTab {
             window.request_animation_frame();
         }
 
+        let collapsed = self.panel_collapsed;
+        let mono = cx.theme().mono_font_family.clone();
+
         v_flex()
             .size_full()
             .key_context("QueryTab")
@@ -486,20 +697,57 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
+            .on_action(cx.listener(Self::toggle_results))
             .child(self.render_toolbar(cx))
             .child(self.render_read_only_banner())
             .child(
-                div()
-                    .h(px(220.))
-                    .flex_shrink_0()
-                    .child(Editor::new(&self.editor).h_full().bordered(false)),
-            )
-            .child(self.render_results_header(cx))
-            .child(
-                div()
+                v_flex()
+                    .id("query-split")
                     .flex_1()
                     .min_h_0()
-                    .child(DataTable::new(&self.table).stripe(true).bordered(false)),
+                    .on_drag_move(cx.listener(|this, event, _, cx| this.on_split_drag(event, cx)))
+                    .child(
+                        div()
+                            .when(collapsed, |editor| editor.flex_1().min_h_0())
+                            .when(!collapsed, |editor| {
+                                editor.h(self.editor_height).flex_shrink_0()
+                            })
+                            .child(Editor::new(&self.editor).h_full().bordered(false)),
+                    )
+                    .when(!collapsed, |split| {
+                        split.child(
+                            // A thin band above the panel, easy to grab.
+                            div()
+                                .id("query-divider")
+                                .h(px(5.))
+                                .w_full()
+                                .flex_shrink_0()
+                                .cursor(CursorStyle::ResizeRow)
+                                .hover(|s| s.bg(color(theme::ACCENT).opacity(0.45)))
+                                .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| SplitDrag))
+                                .on_click(cx.listener(
+                                    |this, event: &gpui_kit::ClickEvent, _, cx| {
+                                        // Double-click puts the divider back where it started.
+                                        if event.click_count() == 2 {
+                                            this.editor_height = DEFAULT_EDITOR_HEIGHT;
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                        )
+                    })
+                    .child(self.render_panel_header(cx))
+                    .when(!collapsed, |split| {
+                        split.child(
+                            div().flex_1().min_h_0().child(match self.panel_tab {
+                                PanelTab::Results => DataTable::new(&self.table)
+                                    .stripe(true)
+                                    .bordered(false)
+                                    .into_any_element(),
+                                PanelTab::Output => self.render_output(mono).into_any_element(),
+                            }),
+                        )
+                    }),
             )
     }
 }

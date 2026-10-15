@@ -768,20 +768,6 @@ impl TableTab {
         let writable = self.read_only_reason().is_none() && self.definition().is_some();
         let locked = self.has_pending();
 
-        let rls = if self.info.rls_enabled {
-            h_flex()
-                .gap_1()
-                .text_color(color(theme::GREEN))
-                .child(Icon::new(AppIcon::Shield).size(px(13.)))
-                .child(format!("RLS · {} policies", self.info.policy_count))
-        } else {
-            h_flex()
-                .gap_1()
-                .text_color(color(theme::AMBER))
-                .child(Icon::new(AppIcon::Shield).size(px(13.)))
-                .child("RLS disabled")
-        };
-
         h_flex()
             .h(px(44.))
             .px_3()
@@ -833,12 +819,12 @@ impl TableTab {
                     }),
             )
             .child(div().flex_1())
-            .child(div().text_size(px(12.)).child(rls))
             .child(
                 Button::new("refresh")
                     .small()
                     .ghost()
-                    .label("Reload")
+                    .icon(Icon::new(AppIcon::Reload))
+                    .tooltip("Reload")
                     .disabled(locked)
                     .on_click(cx.listener(|this, _, _, cx| this.load_page(cx))),
             )

@@ -1,5 +1,4 @@
-//! A table's "Definition" view: columns, indexes, constraints, RLS policies
-//! and triggers.
+//! A table's "Definition" view: columns, indexes, constraints and triggers.
 
 use dbadmin_core::catalog::{ConstraintKind, TableDefinition, TableInfo};
 use gpui_kit::component::{Icon, h_flex, v_flex};
@@ -34,14 +33,6 @@ pub fn render(
             info.estimated_rows
                 .map(thousands)
                 .unwrap_or_else(|| "not analyzed".into()),
-        ))
-        .child(summary_item(
-            "Row-level security",
-            if info.rls_enabled {
-                format!("Enabled · {} policies", info.policy_count)
-            } else {
-                "Disabled".into()
-            },
         ))
         .child(summary_item("Primary key", {
             let pk = definition.primary_key();
@@ -185,49 +176,6 @@ pub fn render(
         );
     }
 
-    let mut policies = v_flex();
-    for policy in &definition.policies {
-        let tone = match policy.command.as_str() {
-            "SELECT" => 0x5dd8ff,
-            "INSERT" => theme::GREEN,
-            "UPDATE" => theme::AMBER,
-            "DELETE" => theme::RED,
-            _ => theme::TEXT_SECONDARY,
-        };
-        let mut expressions = v_flex().gap(px(2.));
-        if let Some(using) = &policy.using {
-            expressions = expressions.child(code(format!("using ({using})")));
-        }
-        if let Some(check) = &policy.with_check {
-            expressions = expressions.child(code(format!("with check ({check})")));
-        }
-        policies = policies.child(
-            group_row()
-                .child(div().w(px(70.)).child(tag(policy.command.clone(), tone)))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(2.))
-                        .child(div().child(policy.name.clone()))
-                        .child(expressions),
-                )
-                .child(muted(format!(
-                    "{}{}",
-                    if policy.permissive {
-                        ""
-                    } else {
-                        "RESTRICTIVE · "
-                    },
-                    if policy.roles.is_empty() {
-                        "public".to_string()
-                    } else {
-                        policy.roles.join(", ")
-                    }
-                ))),
-        );
-    }
-
     let mut triggers = v_flex();
     for trigger in &definition.triggers {
         triggers = triggers.child(
@@ -294,19 +242,6 @@ pub fn render(
                         empty("No constraints").into_any_element()
                     } else {
                         constraints.into_any_element()
-                    },
-                ))
-                .child(group(
-                    "RLS policies",
-                    Some(if info.rls_enabled {
-                        "RLS enabled".into()
-                    } else {
-                        "RLS disabled".into()
-                    }),
-                    if definition.policies.is_empty() {
-                        empty("No policies").into_any_element()
-                    } else {
-                        policies.into_any_element()
                     },
                 ))
                 .child(group(

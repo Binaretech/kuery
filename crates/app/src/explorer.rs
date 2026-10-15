@@ -683,7 +683,7 @@ impl Explorer {
                     .text_size(px(11.))
                     .text_color(color(theme::TEXT_TERTIARY))
                     .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
-                    .child("↻")
+                    .child(Icon::new(AppIcon::Reload).size(px(11.)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.load_catalog(index, cx);
@@ -863,11 +863,6 @@ impl Explorer {
                 selected,
             ))
             .child(div().flex_1().truncate().child(info.table.name.clone()))
-            .children(info.rls_enabled.then(|| {
-                Icon::new(AppIcon::Shield)
-                    .size(px(11.))
-                    .text_color(color(if selected { 0xffffff } else { theme::GREEN }))
-            }))
             .child(counter(rows).when(selected, |c| c.text_color(color(0xdde9ff))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_table(index, info.clone(), TableView::Data, cx)
@@ -1034,7 +1029,7 @@ fn section_header(title: &'static str) -> gpui_kit::Div {
 
 fn header_button(
     id: &'static str,
-    label: &'static str,
+    label: impl IntoElement,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -1200,7 +1195,7 @@ impl Render for Explorer {
                         ))
                         .child(header_button(
                             "refresh-queries",
-                            "↻",
+                            Icon::new(AppIcon::Reload).size(px(12.)),
                             cx.listener(|this, _, _, cx| this.refresh_queries(cx)),
                         )),
                 )

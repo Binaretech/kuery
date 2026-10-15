@@ -59,6 +59,12 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
 
+In a query tab the editor and the bottom panel are split by a divider you can
+drag (double-click it to reset). The panel has a Results tab with the grid and
+an Output tab that logs each run (SQL, rows and time, or the error); it
+collapses to its tab strip with `secondary-j`, its button or a double-click on
+the strip, and running a query brings it back.
+
 Query tabs save with `secondary-s` into `.dbadmin/queries/`. The first line of
 a saved query, `-- connection: <name>`, records its connection and is not
 shown in the editor; opening the file from the sidebar's Queries list opens
@@ -127,7 +133,7 @@ The UI uses IBM Plex Sans, and the editor and table use JetBrains Mono, both
 licensed under the SIL Open Font License 1.1 (`crates/app/assets/fonts/*/OFL.txt`).
 They are embedded in the binary and registered with gpui's text system at
 startup. The icons missing from gpui-kit's default set (lock, database, table,
-key, link, funnel, sort, trash, shield, code) come from Lucide (ISC, `crates/app/assets/icons/LICENSE-LUCIDE`) and are served
+key, link, funnel, sort, trash, code, pencil, refresh, bottom panel) come from Lucide (ISC, `crates/app/assets/icons/LICENSE-LUCIDE`) and are served
 by `AppAssets`, which delegates the rest to `gpui_kit::assets::Assets`.
 
 ## CI

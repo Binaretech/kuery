@@ -41,7 +41,9 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/funnel.svg",
     "icons/arrow-down-up.svg",
     "icons/trash.svg",
-    "icons/shield-check.svg",
+    "icons/refresh-cw.svg",
+    "icons/panel-bottom-close.svg",
+    "icons/panel-bottom-open.svg",
     "icons/code.svg",
     "icons/pencil.svg",
 ];
@@ -57,14 +59,16 @@ pub enum AppIcon {
     Filter,
     Sort,
     Trash,
-    Shield,
+    Reload,
+    PanelBottomClose,
+    PanelBottomOpen,
     Code,
     Pencil,
 }
 
 #[cfg(test)]
 impl AppIcon {
-    const ALL: [AppIcon; 11] = [
+    const ALL: [AppIcon; 13] = [
         AppIcon::Lock,
         AppIcon::Database,
         AppIcon::Table,
@@ -73,7 +77,9 @@ impl AppIcon {
         AppIcon::Filter,
         AppIcon::Sort,
         AppIcon::Trash,
-        AppIcon::Shield,
+        AppIcon::Reload,
+        AppIcon::PanelBottomClose,
+        AppIcon::PanelBottomOpen,
         AppIcon::Code,
         AppIcon::Pencil,
     ];
@@ -90,7 +96,9 @@ impl IconNamed for AppIcon {
             AppIcon::Filter => "icons/funnel.svg",
             AppIcon::Sort => "icons/arrow-down-up.svg",
             AppIcon::Trash => "icons/trash.svg",
-            AppIcon::Shield => "icons/shield-check.svg",
+            AppIcon::Reload => "icons/refresh-cw.svg",
+            AppIcon::PanelBottomClose => "icons/panel-bottom-close.svg",
+            AppIcon::PanelBottomOpen => "icons/panel-bottom-open.svg",
             AppIcon::Code => "icons/code.svg",
             AppIcon::Pencil => "icons/pencil.svg",
         }
