@@ -48,7 +48,7 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/pencil.svg",
 ];
 
-/// dbadmin's own icons, for `Icon::new(AppIcon::Lock)`.
+/// Kuery's own icons, for `Icon::new(AppIcon::Lock)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppIcon {
     Lock,

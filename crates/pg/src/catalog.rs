@@ -1,13 +1,13 @@
 //! PostgreSQL catalog: tables, columns, keys, indexes, constraints and
 //! triggers, read from `pg_catalog`.
 
-use dbadmin_core::catalog::{
+use kuery_core::catalog::{
     CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, EnumInfo, ForeignKeyRef,
     FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef,
     TriggerInfo, TriggerRef,
 };
-use dbadmin_core::result_set::ResultSet;
-use dbadmin_core::sql::{quote_literal, quote_qualified};
+use kuery_core::result_set::ResultSet;
+use kuery_core::sql::{quote_literal, quote_qualified};
 
 use crate::{QueryError, Session};
 

@@ -4,18 +4,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dbadmin_pg::Engine;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Global, IntoElement,
     PathPromptOptions, PromptLevel, Render, Window, WindowBounds, WindowOptions, px, size,
 };
+use kuery_pg::Engine;
 
 use crate::commands::{ClearRecentProjects, OpenProject, OpenRecentProject};
 use crate::project::{Project, ProjectModel};
 use crate::secrets::SecretStore;
 use crate::welcome::Welcome;
-use crate::workspace::DbAdminView;
+use crate::workspace::WorkspaceView;
 
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -36,7 +36,7 @@ impl Global for AppState {}
 /// Root view of a project window. It holds the workspace instead of being
 /// it, so another project can take over the same window.
 pub struct ProjectWindow {
-    workspace: Entity<DbAdminView>,
+    workspace: Entity<WorkspaceView>,
 }
 
 impl ProjectWindow {
@@ -50,10 +50,10 @@ impl ProjectWindow {
         project: Project,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<DbAdminView> {
+    ) -> Entity<WorkspaceView> {
         window.set_window_title(&project.name);
         let model = cx.new(|_| ProjectModel { project });
-        cx.new(|cx| DbAdminView::new(model, window, cx))
+        cx.new(|cx| WorkspaceView::new(model, window, cx))
     }
 
     /// Swaps in `project`. The previous workspace, its tabs and its database
@@ -290,7 +290,7 @@ fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
             .is_ok()
     });
     if !shown {
-        eprintln!("dbadmin: {error}");
+        eprintln!("kuery: {error}");
     }
 }
 
@@ -310,7 +310,7 @@ pub fn open_welcome(cx: &mut App) {
         ..TitleBar::window_options()
     };
     if let Ok((window, view)) = gpui_kit::open_window(options, cx, |window, cx| {
-        window.set_window_title("dbadmin");
+        window.set_window_title("Kuery");
         cx.new(|cx| Welcome::new(window, cx))
     }) {
         cx.global_mut::<AppState>().welcome = Some((window, view));

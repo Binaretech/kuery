@@ -256,7 +256,7 @@ where
 {
     handle.spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("dbadmin-pg: connection closed: {error}");
+            eprintln!("kuery-pg: connection closed: {error}");
         }
     });
 }
@@ -434,10 +434,10 @@ mod tests {
     #[test]
     fn other_parameters_reach_tokio_postgres() {
         let target = Target::parse(
-            "postgres://u:p@h:6543/db?application_name=dbadmin&sslmode=require&connect_timeout=5",
+            "postgres://u:p@h:6543/db?application_name=kuery&sslmode=require&connect_timeout=5",
         )
         .unwrap();
-        assert_eq!(target.config.get_application_name(), Some("dbadmin"));
+        assert_eq!(target.config.get_application_name(), Some("kuery"));
         assert_eq!(
             target.config.get_connect_timeout(),
             Some(&std::time::Duration::from_secs(5))

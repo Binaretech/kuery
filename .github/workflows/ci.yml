@@ -52,33 +52,33 @@ jobs:
         run: cargo test --workspace --locked
 
   postgres:
-    name: dbadmin-pg tests against Postgres
+    name: kuery-pg tests against Postgres
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: dbadmin
-          POSTGRES_PASSWORD: dbadmin
-          POSTGRES_DB: dbadmin
+          POSTGRES_USER: kuery
+          POSTGRES_PASSWORD: kuery
+          POSTGRES_DB: kuery
         ports:
           - 54329:5432
         options: >-
-          --health-cmd "pg_isready -U dbadmin"
+          --health-cmd "pg_isready -U kuery"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
     env:
-      PGPASSWORD: dbadmin
-      DBADMIN_DATABASE_URL: postgres://dbadmin:dbadmin@localhost:54329/dbadmin
-      DBADMIN_TLS_DATABASE_URL: postgres://dbadmin:dbadmin@localhost:54330/dbadmin
+      PGPASSWORD: kuery
+      KUERY_DATABASE_URL: postgres://kuery:kuery@localhost:54329/kuery
+      KUERY_TLS_DATABASE_URL: postgres://kuery:kuery@localhost:54330/kuery
     steps:
       - uses: actions/checkout@v5
 
       - name: Sample data
         run: |
-          psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed.sql
-          psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed-analytics.sql
+          psql -h localhost -p 54329 -U kuery -d kuery -v ON_ERROR_STOP=1 -q -f dev/seed.sql
+          psql -h localhost -p 54329 -U kuery -d kuery -v ON_ERROR_STOP=1 -q -f dev/seed-analytics.sql
 
       # A second Postgres with TLS (the image's self-signed certificate) for
       # the sslmode tests. Services do not accept server arguments, so it is
@@ -86,13 +86,13 @@ jobs:
       - name: Postgres with TLS
         run: |
           docker run -d --name postgres-tls -p 54330:5432 \
-            -e POSTGRES_USER=dbadmin -e POSTGRES_PASSWORD=dbadmin -e POSTGRES_DB=dbadmin \
+            -e POSTGRES_USER=kuery -e POSTGRES_PASSWORD=kuery -e POSTGRES_DB=kuery \
             postgres:16 \
             -c ssl=on \
             -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
             -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
           for _ in $(seq 60); do
-            if psql "$DBADMIN_TLS_DATABASE_URL?sslmode=require" -tAc "show ssl" 2>/dev/null | grep -q on; then
+            if psql "$KUERY_TLS_DATABASE_URL?sslmode=require" -tAc "show ssl" 2>/dev/null | grep -q on; then
               exit 0
             fi
             sleep 1
@@ -105,5 +105,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Ignored dbadmin-pg tests
-        run: cargo test -p dbadmin-pg --locked -- --ignored
+      - name: Ignored kuery-pg tests
+        run: cargo test -p kuery-pg --locked -- --ignored

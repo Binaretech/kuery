@@ -1,11 +1,11 @@
 //! A table's "Definition" view: columns, indexes, constraints and triggers.
 
-use dbadmin_core::catalog::{ConstraintKind, TableDefinition, TableInfo};
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
+use kuery_core::catalog::{ConstraintKind, TableDefinition, TableInfo};
 
 use crate::assets::AppIcon;
 use crate::theme::{self, color};

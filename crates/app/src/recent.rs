@@ -20,7 +20,7 @@ pub struct RecentProject {
     pub path: PathBuf,
     /// The project's name, or the folder name if it cannot be read.
     pub name: String,
-    /// False when the folder (or its `.dbadmin/`) is gone.
+    /// False when the folder (or its `.kuery/`) is gone.
     pub available: bool,
 }
 
@@ -122,10 +122,7 @@ mod tests {
 
     fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir()
-            .join(format!(
-                "dbadmin-recent-{name}-{}",
-                crate::project::new_id()
-            ))
+            .join(format!("kuery-recent-{name}-{}", crate::project::new_id()))
             .join("recent.toml")
     }
 
@@ -154,7 +151,7 @@ mod tests {
 
     #[test]
     fn missing_folders_are_listed_as_unavailable() {
-        let missing = entry(PathBuf::from("/definitely/not/a/dbadmin/project"));
+        let missing = entry(PathBuf::from("/definitely/not/a/kuery/project"));
         assert!(!missing.available);
         assert_eq!(missing.name, "project");
     }

@@ -1,0 +1,35 @@
+# Kuery project.
+# Connection passwords are kept in the system keychain, not in this file.
+# These point at the dev Postgres in dev/compose.yaml, which trusts local
+# connections, so no password is needed.
+
+[project]
+name = "Checkout v2"
+workspace = "Online Store"
+
+[[connections]]
+id = "local-dev"
+name = "local-dev"
+host = "localhost"
+port = 54329
+database = "kuery"
+user = "kuery"
+environment = "development"
+
+[[connections]]
+id = "local-analytics"
+name = "local-analytics"
+host = "localhost"
+port = 54329
+database = "analytics"
+user = "kuery"
+environment = "staging"
+
+[[connections]]
+id = "prod-replica"
+name = "prod-replica"
+host = "localhost"
+port = 54329
+database = "kuery"
+user = "kuery"
+environment = "production"

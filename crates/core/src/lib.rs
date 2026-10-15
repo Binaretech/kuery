@@ -1,4 +1,4 @@
-//! dbadmin core, with no UI dependencies: read-only policy, statement
+//! Kuery core, with no UI dependencies: read-only policy, statement
 //! analysis for write mode, columnar results, the catalog model, and
 //! generated SQL for browsing and editing tables.
 

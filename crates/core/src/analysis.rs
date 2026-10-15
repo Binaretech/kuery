@@ -23,7 +23,7 @@ pub enum StatementKind {
     Data,
     /// `CREATE`, `ALTER`, `DROP`, `COMMENT`, `GRANT`, `REVOKE`.
     Schema,
-    /// `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints: dbadmin owns the transaction.
+    /// `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints: Kuery owns the transaction.
     Transaction,
     /// Anything else that is not a plain read (`SET`, `CALL`, `VACUUM`…).
     Other,

@@ -1,10 +1,10 @@
 [package]
-name = "dbadmin-pg"
+name = "kuery-pg"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-dbadmin-core.workspace = true
+kuery-core.workspace = true
 async-channel.workspace = true
 futures.workspace = true
 thiserror.workspace = true

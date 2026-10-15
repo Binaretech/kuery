@@ -11,10 +11,7 @@ use crate::commands::{
 };
 use crate::query_tab::{SaveQuery, SaveQueryAs};
 
-actions!(
-    dbadmin,
-    [Quit, CloseWindow, Minimize, Zoom, ToggleFullScreen]
-);
+actions!(kuery, [Quit, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
 
 /// Registers the app- and window-level actions.
 pub fn init(cx: &mut App) {
@@ -48,7 +45,7 @@ pub fn set_menus(cx: &mut App) {
     ));
 
     cx.set_menus([
-        Menu::new("dbadmin").items([
+        Menu::new("Kuery").items([
             MenuItem::action("Command Palette…", OpenCommandPalette),
             MenuItem::separator(),
             MenuItem::action("Open Keymap File", OpenKeymapFile),
@@ -56,7 +53,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Quit dbadmin", Quit),
+            MenuItem::action("Quit Kuery", Quit),
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Project…", OpenProject),

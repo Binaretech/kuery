@@ -9,10 +9,6 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dbadmin_core::browse::{Browse, Direction, Filter, FilterOp, Sort};
-use dbadmin_core::catalog::{ColumnInfo, TableDefinition, TableInfo};
-use dbadmin_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange, WriteStatement};
-use dbadmin_pg::{RunOptions, catalog};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
@@ -28,8 +24,12 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
 };
+use kuery_core::browse::{Browse, Direction, Filter, FilterOp, Sort};
+use kuery_core::catalog::{ColumnInfo, TableDefinition, TableInfo};
+use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange, WriteStatement};
+use kuery_pg::{RunOptions, catalog};
 
-actions!(dbadmin, [ReloadTable, SaveTableChanges]);
+actions!(kuery, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
 use crate::connection::Db;

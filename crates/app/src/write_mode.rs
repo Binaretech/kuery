@@ -7,8 +7,6 @@
 
 use std::rc::Rc;
 
-use dbadmin_core::analysis::{self, StatementKind};
-use dbadmin_core::read_only::Rejection;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
@@ -16,6 +14,8 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
     Styled as _, Window, div, px,
 };
+use kuery_core::analysis::{self, StatementKind};
+use kuery_core::read_only::Rejection;
 
 use crate::connection::{Db, Environment, WritePolicy};
 use crate::theme::{self, color};
@@ -42,7 +42,7 @@ pub fn review(sql: &str, connection: &str, environment: Environment) -> Review {
         Err(Rejection::Empty) => return Review::Refuse("There is no statement to run".into()),
         Err(error) if policy.allows_unanalysed() => {
             return Review::Confirm {
-                message: "dbadmin could not analyse this SQL".into(),
+                message: "Kuery could not analyse this SQL".into(),
                 detail: format!(
                     "{error}.\n\nIt will run in the open transaction without the usual \
                      checks. Read it again before running it."
@@ -151,12 +151,7 @@ struct AllowWrites {
 }
 
 impl AllowWrites {
-    fn new(
-        db: Db,
-        allowed: OnAllowed,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn new(db: Db, allowed: OnAllowed, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(db.name.clone()));
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
@@ -191,7 +186,7 @@ impl Render for AllowWrites {
             .text_size(px(13.))
             .child(div().child(format!(
                 "{} ({}) is a production database. Query tabs on it will be able to \
-                 change data until it disconnects or you quit dbadmin. Nothing is saved \
+                 change data until it disconnects or you quit Kuery. Nothing is saved \
                  in the project.",
                 self.db.name, self.db.target
             )))
@@ -301,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn the_transaction_belongs_to_dbadmin() {
+    fn the_transaction_belongs_to_kuery() {
         assert!(matches!(
             review_in(Environment::Development, "update t set a = 1 where id = 1; commit"),
             Review::Refuse(message) if message.starts_with("COMMIT is not needed")

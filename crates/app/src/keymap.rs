@@ -1,7 +1,7 @@
 //! Keyboard shortcuts: the defaults from the command registry plus the user's
 //! keymap file, which can rebind or unbind any of them.
 //!
-//! The file lives in the user's config directory (`DBADMIN_KEYMAP` overrides
+//! The file lives in the user's config directory (`KUERY_KEYMAP` overrides
 //! the path):
 //!
 //! ```toml
@@ -171,16 +171,16 @@ fn open_file(cx: &mut App) {
     cx.open_with_system(&path);
 }
 
-/// `DBADMIN_KEYMAP`, or `keymap.toml` in the platform's config directory.
+/// `KUERY_KEYMAP`, or `keymap.toml` in the platform's config directory.
 fn keymap_path() -> PathBuf {
-    std::env::var_os("DBADMIN_KEYMAP")
+    std::env::var_os("KUERY_KEYMAP")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::config_dir().join("keymap.toml"))
 }
 
 fn template() -> String {
     let mut text = String::from(
-        "# dbadmin keymap.\n\
+        "# Kuery keymap.\n\
          # Bind a shortcut to a command id, or to \"\" to unbind a default shortcut.\n\
          # Modifiers: cmd, ctrl, alt, shift, and secondary (cmd on macOS, ctrl elsewhere).\n\
          # Several keys in a row are separated by spaces, e.g. \"secondary-k secondary-t\".\n\
@@ -439,7 +439,7 @@ mod tests {
         bindings.extend(command_bindings(&resolved).0);
         bindings.extend(crate::query_tab::bindings());
         let keymap = Keymap::new(bindings);
-        let stack = ["DbAdmin", "QueryTab", "Input mode=editor"]
+        let stack = ["Workspace", "QueryTab", "Input mode=editor"]
             .map(|context| KeyContext::parse(context).unwrap());
         let keys = keys.replace("secondary", if IS_MAC { "cmd" } else { "ctrl" });
         let (matched, _) = keymap.bindings_for_input(&[Keystroke::parse(&keys).unwrap()], &stack);
@@ -452,7 +452,7 @@ mod tests {
     fn secondary_enter_runs_the_query_from_the_editor() {
         assert_eq!(
             action_in_query_editor("secondary-enter").as_deref(),
-            Some("dbadmin::RunQuery")
+            Some("kuery::RunQuery")
         );
         assert_eq!(
             action_in_query_editor("secondary-shift-enter").as_deref(),

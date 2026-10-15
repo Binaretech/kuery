@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use dbadmin_pg::{Access, Event, QueryError, RunOptions, Session};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Enter, InputEvent};
 use gpui_kit::component::table::{DataTable, TableState};
@@ -23,6 +22,7 @@ use gpui_kit::{
     ParentElement as _, Pixels, PromptLevel, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Task, Window, actions, div, px,
 };
+use kuery_pg::{Access, Event, QueryError, RunOptions, Session};
 
 use crate::assets::AppIcon;
 use crate::connection::{Db, WritePolicy};
@@ -34,7 +34,7 @@ use crate::ui::{format_duration, thousands};
 use crate::write_mode::{self, Review};
 
 actions!(
-    dbadmin,
+    kuery,
     [
         RunQuery,
         CancelQuery,

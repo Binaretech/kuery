@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 
-use dbadmin_core::catalog::TableInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -16,6 +15,7 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PromptLevel, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+use kuery_core::catalog::TableInfo;
 
 use crate::assets::AppIcon;
 use crate::commands::{
@@ -60,7 +60,7 @@ impl Tab {
     }
 }
 
-pub struct DbAdminView {
+pub struct WorkspaceView {
     model: Entity<ProjectModel>,
     explorer: Entity<Explorer>,
     /// Saved queries waiting for their connection to open: (connection, file).
@@ -75,7 +75,7 @@ pub struct DbAdminView {
     focus_handle: FocusHandle,
 }
 
-impl DbAdminView {
+impl WorkspaceView {
     pub fn new(model: Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe_in(&model, window, |_, model, window, cx| {
             window.set_window_title(&model.read(cx).project.name);
@@ -244,7 +244,7 @@ impl DbAdminView {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
-                eprintln!("dbadmin: could not read {}: {error}", path.display());
+                eprintln!("kuery: could not read {}: {error}", path.display());
                 return;
             }
         };
@@ -863,13 +863,13 @@ fn recent_projects_except(root: &std::path::Path) -> Vec<RecentProject> {
         .collect()
 }
 
-impl Focusable for DbAdminView {
+impl Focusable for WorkspaceView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for DbAdminView {
+impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep focus inside the workspace (closing a tab drops the focused
         // element), or window-wide shortcuts would have nowhere to go.
@@ -881,7 +881,7 @@ impl Render for DbAdminView {
         v_flex()
             .relative()
             .size_full()
-            .key_context("DbAdmin")
+            .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))

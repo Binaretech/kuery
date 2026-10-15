@@ -1,6 +1,6 @@
-//! dbadmin: a desktop database manager built with gpui.
+//! Kuery: a desktop database manager built with gpui.
 //!
-//! `dbadmin [folder]` opens the project in `folder` (creating its `.dbadmin/`
+//! `kuery [folder]` opens the project in `folder` (creating its `.kuery/`
 //! if needed); without an argument the welcome window lists recent projects.
 
 mod app;
@@ -30,9 +30,10 @@ mod write_mode;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dbadmin_pg::Engine;
+use kuery_pg::Engine;
 
 fn main() {
+    paths::migrate_legacy_config_dir();
     let engine = Arc::new(Engine::new().expect("start the Postgres runtime"));
     let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
@@ -55,7 +56,7 @@ fn main() {
 
             let opened = match &folder {
                 Some(folder) => app::open_project(folder, cx)
-                    .map_err(|error| eprintln!("dbadmin: {error}"))
+                    .map_err(|error| eprintln!("kuery: {error}"))
                     .is_ok(),
                 None => false,
             };

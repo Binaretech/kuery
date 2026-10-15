@@ -1333,44 +1333,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "dbadmin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dbadmin-core",
- "dbadmin-pg",
- "gpui-kit",
- "keyring",
- "serde",
- "toml 1.1.8+spec-1.1.0",
-]
-
-[[package]]
-name = "dbadmin-core"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "sqlparser",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "dbadmin-pg"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "dbadmin-core",
- "futures",
- "rustls",
- "rustls-native-certs",
- "thiserror 2.0.21",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3603,6 +3565,44 @@ checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
  "bitflags 2.13.2",
  "libc",
+]
+
+[[package]]
+name = "kuery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "keyring",
+ "kuery-core",
+ "kuery-pg",
+ "serde",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "kuery-core"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "sqlparser",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "kuery-pg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "futures",
+ "kuery-core",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
 ]
 
 [[package]]

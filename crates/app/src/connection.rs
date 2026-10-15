@@ -9,8 +9,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use dbadmin_pg::{Access, ConnectError, Engine, Session};
 use gpui_kit::SharedString;
+use kuery_pg::{Access, ConnectError, Engine, Session};
 
 use crate::theme;
 
@@ -22,7 +22,7 @@ pub enum Environment {
 }
 
 impl Environment {
-    /// `DBADMIN_ENVIRONMENT` wins if set; otherwise local databases are
+    /// `KUERY_ENVIRONMENT` wins if set; otherwise local databases are
     /// development and any other is treated as production. An unknown value
     /// also counts as production.
     pub fn detect(url: &str, explicit: Option<&str>) -> Self {
@@ -85,7 +85,7 @@ impl Environment {
 /// How much write mode asks before running a script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
-    /// Only statements that are easy to regret (see `dbadmin_core::analysis`).
+    /// Only statements that are easy to regret (see `kuery_core::analysis`).
     ConfirmDangerous,
     /// Every script that writes.
     ConfirmWrites,
@@ -104,7 +104,7 @@ impl WritePolicy {
         }
     }
 
-    /// Whether a script dbadmin cannot analyse may run after a warning.
+    /// Whether a script Kuery cannot analyse may run after a warning.
     pub fn allows_unanalysed(self) -> bool {
         self != WritePolicy::SessionUnlock
     }
@@ -224,8 +224,8 @@ mod tests {
     #[test]
     fn hides_credentials_in_the_target() {
         assert_eq!(
-            describe_target("postgres://dbadmin:secret@localhost:54329/dbadmin?sslmode=disable"),
-            "localhost:54329/dbadmin"
+            describe_target("postgres://kuery:secret@localhost:54329/kuery?sslmode=disable"),
+            "localhost:54329/kuery"
         );
     }
 

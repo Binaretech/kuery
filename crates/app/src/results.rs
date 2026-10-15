@@ -2,13 +2,13 @@
 //!
 //! The table is virtualized; only visible cells are requested and formatted.
 
-use dbadmin_core::result_set::{Batch, ResultSet};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::{
     AnyElement, App, Context, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
     div, px,
 };
+use kuery_core::result_set::{Batch, ResultSet};
 
 use crate::theme;
 

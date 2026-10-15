@@ -1,8 +1,8 @@
-//! A project is a folder. Everything dbadmin keeps for it lives in
-//! `<folder>/.dbadmin/`, so it can sit inside a code repository:
+//! A project is a folder. Everything Kuery keeps for it lives in
+//! `<folder>/.kuery/`, so it can sit inside a code repository:
 //!
 //! ```text
-//! <folder>/.dbadmin/
+//! <folder>/.kuery/
 //! ├─ project.toml      name and connections (no passwords)
 //! └─ queries/          saved queries, plain .sql files, any folder layout
 //! ```
@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::connection::Environment;
 
-pub const DIR: &str = ".dbadmin";
+pub const DIR: &str = ".kuery";
+/// Where projects kept their files before the app was called Kuery. Opening
+/// such a project renames the folder to [`DIR`].
+const LEGACY_DIR: &str = ".dbadmin";
 const FILE: &str = "project.toml";
 const QUERIES: &str = "queries";
 
@@ -73,7 +76,7 @@ impl ConnectionSpec {
             format!("port={}", self.port),
             format!("dbname={}", quote(&self.database)),
             format!("user={}", quote(&self.user)),
-            "application_name=dbadmin".to_string(),
+            "application_name=Kuery".to_string(),
         ];
         if let Some(password) = password.filter(|p| !p.is_empty()) {
             parts.push(format!("password={}", quote(password)));
@@ -117,7 +120,7 @@ struct ProjectSection {
     workspace: Option<String>,
 }
 
-const HEADER: &str = "# dbadmin project.\n\
+const HEADER: &str = "# Kuery project.\n\
                       # Connection passwords are kept in the system keychain, not in this file.\n\n";
 
 impl Project {
@@ -130,10 +133,11 @@ impl Project {
     }
 
     pub fn is_project(root: &Path) -> bool {
-        root.join(DIR).join(FILE).is_file()
+        root.join(DIR).join(FILE).is_file() || root.join(LEGACY_DIR).join(FILE).is_file()
     }
 
     pub fn open(root: &Path) -> Result<Self, String> {
+        migrate_legacy_dir(root)?;
         let path = root.join(DIR).join(FILE);
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
@@ -157,10 +161,10 @@ impl Project {
         })
     }
 
-    /// Creates `.dbadmin/` in `root` with an empty project.
+    /// Creates `.kuery/` in `root` with an empty project.
     pub fn init(root: &Path, name: &str) -> Result<Self, String> {
         if Self::is_project(root) {
-            return Err(format!("{} already has a dbadmin project", root.display()));
+            return Err(format!("{} already has a Kuery project", root.display()));
         }
         let project = Self {
             root: root.to_path_buf(),
@@ -326,6 +330,21 @@ pub fn with_connection_header(sql: &str, connection: &str) -> String {
     format!("-- connection: {connection}\n{body}")
 }
 
+/// Renames `.dbadmin/` to `.kuery/`, unless `.kuery/` already exists.
+fn migrate_legacy_dir(root: &Path) -> Result<(), String> {
+    let (legacy, current) = (root.join(LEGACY_DIR), root.join(DIR));
+    if current.exists() || !legacy.join(FILE).is_file() {
+        return Ok(());
+    }
+    std::fs::rename(&legacy, &current).map_err(|error| {
+        format!(
+            "Could not rename {} to {}: {error}",
+            legacy.display(),
+            current.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +353,7 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("dbadmin-test-{name}-{}", new_id()));
+            let path = std::env::temp_dir().join(format!("kuery-test-{name}-{}", new_id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -352,8 +371,8 @@ mod tests {
             name: name.into(),
             host: "localhost".into(),
             port: 54329,
-            database: "dbadmin".into(),
-            user: "dbadmin".into(),
+            database: "kuery".into(),
+            user: "kuery".into(),
             sslmode: None,
             environment: None,
         }
@@ -363,13 +382,13 @@ mod tests {
     fn creates_saves_and_reopens_a_project() {
         let dir = TempDir::new("project");
         let mut project = Project::open_or_init(&dir.0).unwrap();
-        assert!(dir.0.join(".dbadmin/project.toml").is_file());
-        assert!(dir.0.join(".dbadmin/queries").is_dir());
-        assert!(project.name.starts_with("dbadmin-test-project"));
+        assert!(dir.0.join(".kuery/project.toml").is_file());
+        assert!(dir.0.join(".kuery/queries").is_dir());
+        assert!(project.name.starts_with("kuery-test-project"));
 
         project.upsert_connection(spec("local-dev")).unwrap();
         project.save().unwrap();
-        let text = std::fs::read_to_string(dir.0.join(".dbadmin/project.toml")).unwrap();
+        let text = std::fs::read_to_string(dir.0.join(".kuery/project.toml")).unwrap();
         assert!(text.contains("system keychain"));
         assert!(!text.contains("password ="), "{text}");
 
@@ -407,10 +426,10 @@ mod tests {
         spec.sslmode = Some("require".into());
         assert_eq!(
             spec.conninfo(Some(r"p\ss")),
-            r"host='localhost' port=54329 dbname='dbadmin' user='o\'brien' application_name=dbadmin password='p\\ss' sslmode='require'"
+            r"host='localhost' port=54329 dbname='kuery' user='o\'brien' application_name=Kuery password='p\\ss' sslmode='require'"
         );
         assert!(!spec.conninfo(None).contains("password"));
-        assert_eq!(spec.target(), "localhost:54329/dbadmin");
+        assert_eq!(spec.target(), "localhost:54329/kuery");
         assert_eq!(spec.environment(), Environment::Development);
     }
 
@@ -454,5 +473,20 @@ mod tests {
             with_connection_header("-- connection: a\nselect 1", "b"),
             "-- connection: b\nselect 1"
         );
+    }
+
+    #[test]
+    fn opening_a_project_from_before_the_rename_moves_its_folder() {
+        let dir = TempDir::new("legacy");
+        let legacy = dir.0.join(LEGACY_DIR);
+        std::fs::create_dir_all(legacy.join(QUERIES)).unwrap();
+        std::fs::write(legacy.join(FILE), "[project]\nname = \"Old\"\n").unwrap();
+        std::fs::write(legacy.join(QUERIES).join("a.sql"), "select 1;\n").unwrap();
+
+        assert!(Project::is_project(&dir.0));
+        let project = Project::open(&dir.0).unwrap();
+        assert_eq!(project.name, "Old");
+        assert!(!legacy.exists());
+        assert!(project.queries_dir().join("a.sql").is_file());
     }
 }

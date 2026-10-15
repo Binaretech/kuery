@@ -1,18 +1,18 @@
 //! Measures streaming of a large query without a UI.
 //!
-//! `cargo run --release -p dbadmin-pg --example stream_bench -- "select * from orders"`
+//! `cargo run --release -p kuery-pg --example stream_bench -- "select * from orders"`
 
 use std::time::Instant;
 
-use dbadmin_core::result_set::ResultSet;
-use dbadmin_pg::{Engine, Event, RunOptions};
+use kuery_core::result_set::ResultSet;
+use kuery_pg::{Engine, Event, RunOptions};
 
 fn main() -> anyhow::Result<()> {
     let sql = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "select * from orders".into());
-    let url = std::env::var("DBADMIN_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://dbadmin:dbadmin@localhost:54329/dbadmin".into());
+    let url = std::env::var("KUERY_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://kuery:kuery@localhost:54329/kuery".into());
 
     let engine = Engine::new()?;
     let session = futures::executor::block_on(engine.connect(url))?;

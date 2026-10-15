@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-dbadmin-core = { path = "crates/core" }
-dbadmin-pg = { path = "crates/pg" }
+kuery-core = { path = "crates/core" }
+kuery-pg = { path = "crates/pg" }
 
 anyhow = "1"
 arrow-array = "60"

@@ -206,10 +206,10 @@ impl Render for Welcome {
                                 div()
                                     .text_size(px(22.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("dbadmin"),
+                                    .child("Kuery"),
                             )
                             .child(div().text_color(color(theme::TEXT_SECONDARY)).child(
-                                "A project is a folder. Its connections and saved queries live in .dbadmin/ inside it.",
+                                "A project is a folder. Its connections and saved queries live in .kuery/ inside it.",
                             ))
                             .child(div().h(px(8.)))
                             .child(

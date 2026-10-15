@@ -1,6 +1,6 @@
 //! Connection editor, shown in a dialog: add, edit, test and delete one of the
 //! project's connections. The password goes to the system keychain; the rest
-//! to `.dbadmin/project.toml`.
+//! to `.kuery/project.toml`.
 
 use std::sync::Arc;
 
@@ -278,7 +278,7 @@ impl ConnectionEditor {
             let result = engine
                 .connect_with(
                     spec.conninfo(password.as_deref()),
-                    dbadmin_pg::Access::ReadOnly,
+                    kuery_pg::Access::ReadOnly,
                 )
                 .await;
             this.update(cx, |this, cx| {
@@ -393,7 +393,7 @@ impl Render for ConnectionEditor {
         v_flex()
             .gap_4()
             .text_size(px(13.))
-            .child(muted("PostgreSQL · saved in .dbadmin/project.toml"))
+            .child(muted("PostgreSQL · saved in .kuery/project.toml"))
             .child(
                 v_flex()
                     .gap_3()

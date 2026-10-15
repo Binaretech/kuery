@@ -4,11 +4,11 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: dbadmin
-      POSTGRES_PASSWORD: dbadmin
-      POSTGRES_DB: dbadmin
+      POSTGRES_USER: kuery
+      POSTGRES_PASSWORD: kuery
+      POSTGRES_DB: kuery
       # Local throwaway database: trust connections so the repo's own
-      # .dbadmin project works without keychain passwords.
+      # .kuery project works without keychain passwords.
       POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "54329:5432"

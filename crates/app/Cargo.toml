@@ -1,11 +1,11 @@
 [package]
-name = "dbadmin"
+name = "kuery"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-dbadmin-core.workspace = true
-dbadmin-pg.workspace = true
+kuery-core.workspace = true
+kuery-pg.workspace = true
 anyhow.workspace = true
 gpui-kit.workspace = true
 keyring.workspace = true

@@ -8,8 +8,6 @@
 
 use std::path::PathBuf;
 
-use dbadmin_core::catalog::TableInfo;
-use dbadmin_core::fuzzy;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -18,6 +16,8 @@ use gpui_kit::{
     KeyBinding, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, actions, div, px,
 };
+use kuery_core::catalog::TableInfo;
+use kuery_core::fuzzy;
 
 use crate::assets::AppIcon;
 use crate::commands::{COMMANDS, Command};

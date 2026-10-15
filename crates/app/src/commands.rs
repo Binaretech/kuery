@@ -18,7 +18,7 @@ use crate::query_tab::{
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
 actions!(
-    dbadmin,
+    kuery,
     [
         OpenCommandPalette,
         CloseTab,
@@ -36,7 +36,7 @@ actions!(
 
 /// Opens one of the recent projects (the File › Open Recent menu).
 #[derive(Clone, PartialEq, Debug, Action)]
-#[action(namespace = dbadmin, no_json)]
+#[action(namespace = kuery, no_json)]
 pub struct OpenRecentProject {
     pub path: PathBuf,
 }

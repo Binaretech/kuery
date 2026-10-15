@@ -4,15 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use dbadmin_core::browse::Direction;
-use dbadmin_core::catalog::ColumnInfo;
-use dbadmin_core::result_set::ResultSet;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::{
     AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString,
     Styled as _, Window, div, px,
 };
+use kuery_core::browse::Direction;
+use kuery_core::catalog::ColumnInfo;
+use kuery_core::result_set::ResultSet;
 
 use crate::assets::AppIcon;
 use crate::theme::{self, color};

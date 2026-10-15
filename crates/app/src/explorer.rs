@@ -10,11 +10,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use dbadmin_core::catalog::{
-    CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
-};
-use dbadmin_core::sql::quote_qualified;
-use dbadmin_pg::catalog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -23,6 +18,11 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+use kuery_core::catalog::{
+    CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
+};
+use kuery_core::sql::quote_qualified;
+use kuery_pg::catalog;
 
 use crate::app;
 use crate::assets::AppIcon;
@@ -876,7 +876,7 @@ impl Explorer {
         if self.queries.is_empty() {
             return vec![note_row(
                 0,
-                "No saved queries yet. Save a query tab (⌘S) to keep it in .dbadmin/queries.",
+                "No saved queries yet. Save a query tab (⌘S) to keep it in .kuery/queries.",
                 theme::TEXT_TERTIARY,
             )];
         }
