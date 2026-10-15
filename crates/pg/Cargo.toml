@@ -10,6 +10,9 @@ futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-postgres-rustls.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

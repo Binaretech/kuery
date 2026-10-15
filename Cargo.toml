@@ -18,6 +18,10 @@ sqlparser = { version = "0.63", features = ["visitor"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 tokio-postgres = "0.7"
+# TLS con rustls y el proveedor `ring` (sin aws-lc, que en Windows pide cmake y NASM).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+tokio-postgres-rustls = "0.14"
 
 # gpui-kit fija su propia versión de gpui; se actualiza a propósito, nunca por accidente.
 gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql"] }

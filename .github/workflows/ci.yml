@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Tests y clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Lo que gpui necesita para enlazar en Linux (X11, Wayland y fuentes).
+      - name: Dependencias del sistema
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev
+
+      # La versión sale de rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formato
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  postgres:
+    name: Tests de dbadmin-pg contra Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dbadmin
+          POSTGRES_PASSWORD: dbadmin
+          POSTGRES_DB: dbadmin
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U dbadmin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGPASSWORD: dbadmin
+      DBADMIN_DATABASE_URL: postgres://dbadmin:dbadmin@localhost:54329/dbadmin
+      DBADMIN_TLS_DATABASE_URL: postgres://dbadmin:dbadmin@localhost:54330/dbadmin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Datos de ejemplo
+        run: psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed.sql
+
+      # Un segundo Postgres con TLS (certificado autofirmado de la imagen) para
+      # los tests de sslmode. Los servicios no aceptan argumentos para el
+      # servidor, así que se arranca a mano.
+      - name: Postgres con TLS
+        run: |
+          docker run -d --name postgres-tls -p 54330:5432 \
+            -e POSTGRES_USER=dbadmin -e POSTGRES_PASSWORD=dbadmin -e POSTGRES_DB=dbadmin \
+            postgres:16 \
+            -c ssl=on \
+            -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
+            -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+          for _ in $(seq 60); do
+            if psql "$DBADMIN_TLS_DATABASE_URL?sslmode=require" -tAc "show ssl" 2>/dev/null | grep -q on; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs postgres-tls
+          exit 1
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests ignorados de dbadmin-pg
+        run: cargo test -p dbadmin-pg --locked -- --ignored

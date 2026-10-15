@@ -3,6 +3,7 @@
 //! `DBADMIN_DATABASE_URL` elige la base de datos (por defecto, el Postgres de
 //! `dev/compose.yaml`).
 
+mod assets;
 mod results;
 mod theme;
 mod workspace;
@@ -22,9 +23,10 @@ fn main() {
     let url = std::env::var("DBADMIN_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into());
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            assets::load_fonts(cx).expect("registra las fuentes embebidas");
             theme::apply(cx);
             workspace::bind_keys(cx);
             cx.on_window_closed(|cx, _| {

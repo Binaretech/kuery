@@ -81,12 +81,15 @@ impl TableDelegate for ResultsDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let mono = cx.theme().mono_font_family.clone();
         let cell: AnyElement = match self.set.cell(row_ix, col_ix) {
             Some(Some(text)) => div()
+                .font_family(mono)
                 .truncate()
                 .child(SharedString::from(text.to_owned()))
                 .into_any_element(),
             Some(None) => div()
+                .font_family(mono)
                 .italic()
                 .text_color(cx.theme().muted_foreground)
                 .child("NULL")

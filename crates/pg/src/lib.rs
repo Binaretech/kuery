@@ -8,6 +8,10 @@
 //! 1. [`dbadmin_core::read_only::check`] rechaza el SQL que podría escribir.
 //! 2. La query se ejecuta dentro de `BEGIN TRANSACTION READ ONLY`, de modo que
 //!    la propia base de datos la bloquea si algo se escapa del análisis.
+//!
+//! El TLS respeta el `sslmode` de la URL (ver [`tls`]).
+
+mod tls;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -18,7 +22,9 @@ use dbadmin_core::result_set::{Batch, BatchBuilder};
 use futures::{TryStreamExt as _, pin_mut};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
+
+use crate::tls::{Connector, Target};
 
 /// Runtime de fondo donde viven las conexiones.
 pub struct Engine {
@@ -43,12 +49,9 @@ impl Engine {
     ) -> impl Future<Output = Result<Session, ConnectError>> + Send + use<> {
         let handle = self.runtime.handle().clone();
         let task = self.runtime.spawn(async move {
-            let (client, connection) = tokio_postgres::connect(&url, NoTls).await?;
-            handle.spawn(async move {
-                if let Err(error) = connection.await {
-                    eprintln!("dbadmin-pg: conexión cerrada: {error}");
-                }
-            });
+            let target = Target::parse(&url)?;
+            let connector = target.connector()?;
+            let client = connector.connect(&target.config, &handle).await?;
             let server_version = client
                 .simple_query("show server_version")
                 .await?
@@ -61,6 +64,7 @@ impl Engine {
             Ok(Session {
                 inner: Arc::new(Inner {
                     cancel: client.cancel_token(),
+                    connector,
                     client,
                     busy: Mutex::new(()),
                     handle,
@@ -79,10 +83,28 @@ impl Engine {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    #[error("{0}")]
+    #[error("{}", with_causes(.0))]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("URL de conexión no válida: {0}")]
+    Config(String),
+    #[error("TLS: {0}")]
+    Tls(String),
     #[error("el runtime de la conexión falló: {0}")]
     Runtime(String),
+}
+
+/// "error performing TLS handshake" no dice nada sin la causa de rustls.
+fn with_causes(error: &tokio_postgres::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text = format!("{text}: {cause_text}");
+        }
+        source = cause.source();
+    }
+    text
 }
 
 /// Conexión abierta. Clonarla es barato; ejecuta una query cada vez.
@@ -94,6 +116,7 @@ pub struct Session {
 struct Inner {
     client: Client,
     cancel: CancelToken,
+    connector: Connector,
     busy: Mutex<()>,
     handle: tokio::runtime::Handle,
     server_version: String,
@@ -193,9 +216,9 @@ impl Session {
 
     /// Pide al servidor que cancele la query en curso.
     pub fn cancel(&self) {
-        let token = self.inner.cancel.clone();
+        let cancel = self.inner.connector.cancel(self.inner.cancel.clone());
         self.inner.handle.spawn(async move {
-            let _ = token.cancel_query(NoTls).await;
+            let _ = cancel.await;
         });
     }
 }
@@ -226,7 +249,7 @@ async fn stream_in_read_only_transaction(
 
     let outcome = stream_rows(client, sql, options, tx, started).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
-        let _ = inner.cancel.cancel_query(NoTls).await;
+        let _ = inner.connector.cancel(inner.cancel.clone()).await;
     }
     // Nunca hay nada que confirmar: siempre se termina con rollback.
     let _ = client.batch_execute("rollback").await;
@@ -293,6 +316,9 @@ async fn send(tx: &async_channel::Sender<Event>, event: Event) -> Result<(), Que
 mod tests {
     //! Requieren el Postgres de `dev/compose.yaml`:
     //! `cargo test -p dbadmin-pg -- --ignored`
+    //!
+    //! Los de TLS necesitan además un Postgres con `ssl = on` en
+    //! `DBADMIN_TLS_DATABASE_URL` (sin `sslmode`); si no está, no hacen nada.
 
     use super::*;
 
@@ -333,7 +359,14 @@ mod tests {
     }
 
     async fn order_count(session: &Session) -> usize {
-        let rx = session.run_read_only("select count(*) from orders".into(), RunOptions::default());
+        scalar(session, "select count(*) from orders")
+            .await
+            .parse()
+            .unwrap()
+    }
+
+    async fn scalar(session: &Session, sql: &str) -> String {
+        let rx = session.run_read_only(sql.into(), RunOptions::default());
         let mut set = None;
         while let Ok(event) = rx.recv().await {
             match event {
@@ -344,7 +377,85 @@ mod tests {
                 _ => {}
             }
         }
-        set.unwrap().cell(0, 0).unwrap().unwrap().parse().unwrap()
+        set.unwrap().cell(0, 0).unwrap().unwrap().to_owned()
+    }
+
+    fn tls_database_url(sslmode: &str) -> Option<String> {
+        match std::env::var("DBADMIN_TLS_DATABASE_URL") {
+            Ok(url) => {
+                let separator = if url.contains('?') { '&' } else { '?' };
+                Some(format!("{url}{separator}sslmode={sslmode}"))
+            }
+            Err(_) => {
+                eprintln!("DBADMIN_TLS_DATABASE_URL no está definida: se omite el test");
+                None
+            }
+        }
+    }
+
+    const USES_TLS: &str = "select ssl from pg_stat_ssl where pid = pg_backend_pid()";
+
+    #[test]
+    #[ignore = "necesita un Postgres con TLS"]
+    fn sslmode_require_encrypts_the_connection() {
+        let Some(url) = tls_database_url("require") else {
+            return;
+        };
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = engine.connect(url).await.expect("conecta con TLS");
+            assert_eq!(scalar(&session, USES_TLS).await, "t");
+        });
+    }
+
+    #[test]
+    #[ignore = "necesita un Postgres con TLS"]
+    fn sslmode_disable_skips_tls() {
+        let Some(url) = tls_database_url("disable") else {
+            return;
+        };
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = engine.connect(url).await.expect("conecta sin TLS");
+            assert_eq!(scalar(&session, USES_TLS).await, "f");
+        });
+    }
+
+    #[test]
+    #[ignore = "necesita un Postgres con TLS"]
+    fn verify_full_rejects_an_untrusted_certificate() {
+        // El certificado del servidor de pruebas es autofirmado.
+        let Some(url) = tls_database_url("verify-full") else {
+            return;
+        };
+        let engine = Engine::new().unwrap();
+        let result = engine.runtime.block_on(engine.connect(url));
+        let Err(error) = result else {
+            panic!("no debería aceptar un certificado autofirmado");
+        };
+        assert!(error.to_string().contains("certificate"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "necesita un Postgres con TLS"]
+    fn cancels_over_tls() {
+        let Some(url) = tls_database_url("require") else {
+            return;
+        };
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = engine.connect(url).await.expect("conecta con TLS");
+            let rx = session.run_read_only("select pg_sleep(10)".into(), RunOptions::default());
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            session.cancel();
+            let (_, _, _, last) = collect(rx).await;
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                matches!(&last, Event::Failed(QueryError::Database { code, .. }) if code == "57014"),
+                "{last:?}"
+            );
+        });
     }
 
     #[test]

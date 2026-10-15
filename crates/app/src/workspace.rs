@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, TitleBar, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -18,6 +18,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
 };
 
+use crate::assets::AppIcon;
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 
@@ -62,6 +63,9 @@ enum RunState {
 }
 
 pub struct DbAdminView {
+    /// El runtime de las conexiones vive lo que vive la vista: si se suelta,
+    /// tokio cancela las tareas de la sesión.
+    _engine: Arc<Engine>,
     connection: Connection,
     target: SharedString,
     editor: Entity<EditorState>,
@@ -105,6 +109,7 @@ impl DbAdminView {
         .detach();
 
         Self {
+            _engine: engine,
             connection: Connection::Connecting,
             target: describe_target(&url).into(),
             editor,
@@ -353,7 +358,11 @@ impl DbAdminView {
                     .gap_2()
                     .rounded(px(6.))
                     .hover(|style| style.bg(color(0x2e2e32)))
-                    .child(div().size(px(6.)).rounded_full().bg(color(theme::ACCENT)))
+                    .child(
+                        Icon::new(AppIcon::Table)
+                            .size(px(14.))
+                            .text_color(color(theme::ACCENT)),
+                    )
                     .child(name.clone())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_table(name.clone(), window, cx)
@@ -405,6 +414,11 @@ impl DbAdminView {
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
             .child(
+                Icon::new(AppIcon::Database)
+                    .size(px(16.))
+                    .text_color(color(theme::TEXT_SECONDARY)),
+            )
+            .child(
                 v_flex()
                     .child(
                         div()
@@ -420,13 +434,15 @@ impl DbAdminView {
             )
             .child(div().flex_1())
             .child(
-                div()
+                h_flex()
+                    .gap_1()
                     .px_2()
                     .py(px(3.))
                     .rounded(px(6.))
                     .bg(color(theme::ACCENT).opacity(0.16))
                     .text_color(color(0x4da3ff))
                     .text_size(px(12.))
+                    .child(Icon::new(AppIcon::Lock).size(px(12.)))
                     .child("Solo lectura"),
             )
             .when(running, |row| {
@@ -458,6 +474,7 @@ impl DbAdminView {
             .border_color(color(theme::HAIRLINE))
             .text_size(px(12.))
             .text_color(color(theme::READ_ONLY_FG))
+            .child(Icon::new(AppIcon::Lock).size(px(13.)))
             .child(
                 "Query de solo lectura: se ejecuta en una transacción READ ONLY. INSERT, UPDATE, DELETE y DDL están bloqueados.",
             )

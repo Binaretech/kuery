@@ -1,8 +1,11 @@
 //! Colores del diseño (grafito oscuro, acento azul) sobre el tema oscuro de
-//! gpui-component.
+//! gpui-component, con IBM Plex Sans en la interfaz y JetBrains Mono en el
+//! editor y la tabla.
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{App, Hsla, px, rgb};
+
+use crate::assets::{MONO_FAMILY, SANS_FAMILY};
 
 pub const GROUND: u32 = 0x151517;
 pub const SIDEBAR: u32 = 0x232326;
@@ -54,4 +57,11 @@ pub fn apply(cx: &mut App) {
     theme.table_active = color(SELECTION);
     theme.table_active_border = color(SELECTION);
     theme.table_row_border = color(GROUND);
+
+    // Las fuentes van por `Theme::update` para que lleguen también a la capa
+    // base y a los estilos de texto por defecto.
+    Theme::update(cx, |theme| {
+        theme.font_family = SANS_FAMILY.into();
+        theme.mono_font_family = MONO_FAMILY.into();
+    });
 }
