@@ -1,6 +1,6 @@
-//! Tabla de resultados: un `TableDelegate` sobre el [`ResultSet`] columnar.
+//! Results table: a `TableDelegate` over the columnar [`ResultSet`].
 //!
-//! La tabla está virtualizada; solo se piden y formatean las celdas visibles.
+//! The table is virtualized; only visible cells are requested and formatted.
 
 use dbadmin_core::result_set::{Batch, ResultSet};
 use gpui_kit::component::ActiveTheme as _;
@@ -20,7 +20,7 @@ pub struct ResultsDelegate {
 }
 
 impl ResultsDelegate {
-    /// Prepara una query nueva: vacía la tabla y la marca como en curso.
+    /// Prepares a new query: clears the table and marks it as running.
     pub fn start(&mut self) {
         *self = Self {
             running: true,
@@ -111,9 +111,9 @@ impl TableDelegate for ResultsDelegate {
             .justify_center()
             .text_color(theme::color(theme::TEXT_TERTIARY))
             .child(if self.running {
-                "Ejecutando…"
+                "Running…"
             } else {
-                "Sin filas"
+                "No rows"
             })
     }
 

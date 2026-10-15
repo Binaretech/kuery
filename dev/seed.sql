@@ -1,4 +1,4 @@
--- Datos de ejemplo: 20 000 clientes y 1 000 000 de pedidos.
+-- Sample data: 20,000 customers and 1,000,000 orders.
 create type order_status as enum ('pending', 'paid', 'refunded', 'cancelled');
 
 create table customers (
@@ -10,8 +10,8 @@ create table customers (
 );
 
 insert into customers (email, full_name, country, created_at)
-select 'cliente' || g || '@example.com',
-       'Cliente ' || g,
+select 'customer' || g || '@example.com',
+       'Customer ' || g,
        (array['ES', 'PT', 'FR', 'DE', 'IT'])[1 + g % 5],
        now() - (g || ' minutes')::interval
 from generate_series(1, 20000) g;
@@ -39,4 +39,72 @@ from cs, generate_series(1, 1000000) g;
 
 create index orders_customer_id_idx on orders (customer_id);
 create index orders_created_at_idx on orders (created_at desc);
+analyze;
+
+-- Extra structure for the explorer: CHECK, trigger, RLS, enum arrays,
+-- views and a table without a primary key.
+alter table orders add constraint orders_total_positive check (total >= 0);
+alter table orders add column updated_at timestamptz not null default now();
+
+create function set_updated_at() returns trigger language plpgsql as $$
+begin
+    new.updated_at := now();
+    return new;
+end $$;
+
+create trigger orders_set_updated_at before update on orders
+    for each row execute function set_updated_at();
+
+create role authenticated nologin;
+create role backoffice nologin;
+
+alter table orders enable row level security;
+create policy "Customers see their orders" on orders for select to authenticated
+    using (customer_id::text = current_setting('app.customer_id', true));
+create policy "Create own order" on orders for insert to authenticated
+    with check (customer_id::text = current_setting('app.customer_id', true));
+create policy "Backoffice manages statuses" on orders for update to backoffice
+    using (true);
+
+create type user_role as enum ('admin', 'editor', 'viewer');
+
+create table profiles (
+    user_id uuid primary key references customers (id) on delete cascade,
+    created_at timestamptz not null default now(),
+    roles user_role[] not null default '{viewer}'
+);
+comment on table profiles is 'Profile and roles of each customer';
+
+insert into profiles (user_id, roles)
+select id, case when row_number() over () = 1 then '{admin}'::user_role[] else '{viewer}' end
+from customers
+limit 50;
+
+alter table profiles enable row level security;
+create policy "Users see their own profile" on profiles for select to authenticated
+    using (user_id::text = current_setting('app.customer_id', true));
+
+create view v_daily_sales as
+select date_trunc('day', created_at)::date as day, count(*) as orders, sum(total) as revenue
+from orders
+where status = 'paid'
+group by 1;
+
+-- No primary key: it can be viewed, but not edited row by row.
+create table audit_log (
+    at timestamptz not null default now(),
+    actor text,
+    action text not null
+);
+insert into audit_log (actor, action) values ('admin', 'seed'), (null, 'vacuum');
+
+-- For the driver's write tests.
+create table playground_items (
+    id bigint generated always as identity primary key,
+    name text not null,
+    quantity integer not null default 0,
+    note text
+);
+insert into playground_items (name, quantity) values ('screw', 100), ('nut', 250);
+
 analyze;

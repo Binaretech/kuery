@@ -1,23 +1,24 @@
-//! TLS de las conexiones: rustls con la semántica de `sslmode` de libpq.
+//! Connection TLS: rustls with libpq's `sslmode` semantics.
 //!
-//! | `sslmode`         | Cifra                 | Verifica la cadena          | Verifica el host |
-//! |-------------------|-----------------------|-----------------------------|------------------|
-//! | `disable`         | no                    | —                           | —                |
-//! | `allow`, `prefer` | si el servidor acepta | no                          | no               |
-//! | `require`         | sí                    | solo con `sslrootcert`      | no               |
-//! | `verify-ca`       | sí                    | sí                          | no               |
-//! | `verify-full`     | sí                    | sí                          | sí               |
+//! | `sslmode`         | Encrypts                | Verifies the chain          | Verifies the host |
+//! |-------------------|-------------------------|-----------------------------|-------------------|
+//! | `disable`         | no                      | —                           | —                 |
+//! | `allow`, `prefer` | if the server accepts   | no                          | no                |
+//! | `require`         | yes                     | only with `sslrootcert`     | no                |
+//! | `verify-ca`       | yes                     | yes                         | no                |
+//! | `verify-full`     | yes                     | yes                         | yes               |
 //!
-//! Sin `sslmode`, una base de datos local (`localhost`, `127.0.0.1`, `::1` o
-//! un socket Unix) va sin TLS, como el Postgres de `dev/compose.yaml`; el resto
-//! usa `prefer`, el valor por defecto de libpq. La cadena se verifica contra
-//! los certificados raíz del sistema o, si la URL trae `sslrootcert`, contra
-//! los de ese fichero PEM.
+//! Without `sslmode`, a local database (`localhost`, `127.0.0.1`, `::1` or a
+//! Unix socket) connects without TLS, like the Postgres in `dev/compose.yaml`;
+//! everything else uses `prefer`, libpq's default. The chain is verified
+//! against the system root certificates or, if the URL has `sslrootcert`,
+//! against the ones in that PEM file.
 //!
-//! tokio-postgres solo entiende `disable`, `prefer` y `require` y rechaza
-//! `sslrootcert`, así que esos dos parámetros se leen aquí y se quitan de la
-//! URL antes de pasársela. Solo se interpretan en URLs (`postgres://…`); en el
-//! formato `clave=valor` la cadena llega tal cual a tokio-postgres.
+//! tokio-postgres only understands `disable`, `prefer` and `require` and
+//! rejects `sslrootcert`, so those two parameters are read here and stripped
+//! from the URL before handing it over. They are only interpreted in URLs
+//! (`postgres://…`); in the `key=value` format the string reaches
+//! tokio-postgres as is.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::ConnectError;
 
-/// Los valores de `sslmode` de libpq.
+/// libpq's `sslmode` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Disable,
@@ -52,22 +53,22 @@ impl Mode {
     fn parse(value: &str) -> Result<Self, ConnectError> {
         Ok(match value {
             "disable" => Mode::Disable,
-            // tokio-postgres no sabe empezar sin TLS y reintentar con él;
-            // `prefer` también admite las dos cosas.
+            // tokio-postgres cannot start without TLS and retry with it;
+            // `prefer` also accepts both.
             "allow" | "prefer" => Mode::Prefer,
             "require" => Mode::Require,
             "verify-ca" => Mode::VerifyCa,
             "verify-full" => Mode::VerifyFull,
             other => {
                 return Err(ConnectError::Config(format!(
-                    "sslmode desconocido: {other:?} (disable, allow, prefer, require, verify-ca o verify-full)"
+                    "unknown sslmode: {other:?} (disable, allow, prefer, require, verify-ca or verify-full)"
                 )));
             }
         })
     }
 }
 
-/// Lo que hace falta para abrir una conexión a partir de su URL.
+/// What it takes to open a connection from its URL.
 pub(crate) struct Target {
     pub config: Config,
     pub mode: Mode,
@@ -80,12 +81,12 @@ impl Target {
         let mut config = Config::from_str(&url)?;
         let root_cert = root_cert.map(PathBuf::from);
         let mode = match ssl_mode.as_deref().map(Mode::parse).transpose()? {
-            // Como libpq: con un fichero de raíces, `require` también verifica la cadena.
+            // Like libpq: with a root certificate file, `require` also verifies the chain.
             Some(Mode::Require) if root_cert.is_some() => Mode::VerifyCa,
             Some(mode) => mode,
             None if is_local(&config) => Mode::Disable,
             None => match config.get_ssl_mode() {
-                // `sslmode` en formato clave=valor, que tokio-postgres ya leyó.
+                // `sslmode` in key=value format, which tokio-postgres already read.
                 SslMode::Disable => Mode::Disable,
                 SslMode::Require => Mode::Require,
                 _ => Mode::Prefer,
@@ -130,7 +131,7 @@ impl Target {
                 let certs = CertificateDer::pem_file_iter(path)
                     .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
                     .map_err(|error| {
-                        ConnectError::Tls(format!("no se pudo leer {}: {error}", path.display()))
+                        ConnectError::Tls(format!("could not read {}: {error}", path.display()))
                     })?;
                 roots.add_parsable_certificates(certs);
             }
@@ -140,7 +141,7 @@ impl Target {
         }
         if roots.is_empty() {
             return Err(ConnectError::Tls(
-                "no hay certificados raíz con los que verificar el servidor".into(),
+                "there are no root certificates to verify the server with".into(),
             ));
         }
         WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
@@ -149,7 +150,7 @@ impl Target {
     }
 }
 
-/// Saca `sslmode` y `sslrootcert` de la query de una URL `postgres://`.
+/// Extracts `sslmode` and `sslrootcert` from the query of a `postgres://` URL.
 fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
     let is_url = url.starts_with("postgres://") || url.starts_with("postgresql://");
     let Some((base, query)) = url.split_once('?').filter(|_| is_url) else {
@@ -207,7 +208,7 @@ fn tls_error(error: impl std::fmt::Display) -> ConnectError {
     ConnectError::Tls(error.to_string())
 }
 
-/// Conector de una sesión; también hace falta para cancelar sus queries.
+/// A session's connector; also needed to cancel its queries.
 #[derive(Clone)]
 pub(crate) enum Connector {
     Plain,
@@ -215,7 +216,7 @@ pub(crate) enum Connector {
 }
 
 impl Connector {
-    /// Conecta y deja la conexión corriendo en `handle`.
+    /// Connects and leaves the connection running on `handle`.
     pub async fn connect(
         &self,
         config: &Config,
@@ -255,13 +256,13 @@ where
 {
     handle.spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("dbadmin-pg: conexión cerrada: {error}");
+            eprintln!("dbadmin-pg: connection closed: {error}");
         }
     });
 }
 
-/// `prefer` y `require`: cifra, pero acepta cualquier certificado (como libpq).
-/// Las firmas del handshake sí se comprueban.
+/// `prefer` and `require`: encrypts, but accepts any certificate (like libpq).
+/// Handshake signatures are still checked.
 #[derive(Debug)]
 struct EncryptOnly(Arc<CryptoProvider>);
 
@@ -310,7 +311,7 @@ impl ServerCertVerifier for EncryptOnly {
     }
 }
 
-/// `verify-ca`: la cadena tiene que ser válida, el nombre del host da igual.
+/// `verify-ca`: the chain must be valid; the host name does not matter.
 #[derive(Debug)]
 struct IgnoreHostname(Arc<WebPkiServerVerifier>);
 
@@ -447,7 +448,7 @@ mod tests {
     #[test]
     fn rejects_unknown_modes() {
         let Err(error) = Target::parse("postgres://u:p@h/db?sslmode=always") else {
-            panic!("debería fallar");
+            panic!("should fail");
         };
         assert!(error.to_string().contains("always"), "{error}");
     }

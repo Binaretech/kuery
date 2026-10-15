@@ -1,6 +1,6 @@
-//! Colores del diseño (grafito oscuro, acento azul) sobre el tema oscuro de
-//! gpui-component, con IBM Plex Sans en la interfaz y JetBrains Mono en el
-//! editor y la tabla.
+//! Design colors (dark graphite, blue accent) on top of gpui-component's dark
+//! theme, with IBM Plex Sans for the interface and JetBrains Mono for the
+//! editor and the table.
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{App, Hsla, px, rgb};
@@ -58,8 +58,8 @@ pub fn apply(cx: &mut App) {
     theme.table_active_border = color(SELECTION);
     theme.table_row_border = color(GROUND);
 
-    // Las fuentes van por `Theme::update` para que lleguen también a la capa
-    // base y a los estilos de texto por defecto.
+    // Fonts go through `Theme::update` so they also reach the base layer and
+    // the default text styles.
     Theme::update(cx, |theme| {
         theme.font_family = SANS_FAMILY.into();
         theme.mono_font_family = MONO_FAMILY.into();

@@ -16,7 +16,7 @@ env:
 
 jobs:
   build:
-    name: Tests y clippy (${{ matrix.os }})
+    name: Tests and clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -25,8 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Lo que gpui necesita para enlazar en Linux (X11, Wayland y fuentes).
-      - name: Dependencias del sistema
+      # What gpui needs to link on Linux (X11, Wayland and fonts).
+      - name: System dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -35,13 +35,13 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libxcb1-dev libvulkan-dev
 
-      # La versión sale de rust-toolchain.toml.
+      # The version comes from rust-toolchain.toml.
       - name: Toolchain
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Formato
+      - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
@@ -52,7 +52,7 @@ jobs:
         run: cargo test --workspace --locked
 
   postgres:
-    name: Tests de dbadmin-pg contra Postgres
+    name: dbadmin-pg tests against Postgres
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -75,13 +75,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Datos de ejemplo
-        run: psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed.sql
+      - name: Sample data
+        run: |
+          psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed.sql
+          psql -h localhost -p 54329 -U dbadmin -d dbadmin -v ON_ERROR_STOP=1 -q -f dev/seed-analytics.sql
 
-      # Un segundo Postgres con TLS (certificado autofirmado de la imagen) para
-      # los tests de sslmode. Los servicios no aceptan argumentos para el
-      # servidor, así que se arranca a mano.
-      - name: Postgres con TLS
+      # A second Postgres with TLS (the image's self-signed certificate) for
+      # the sslmode tests. Services do not accept server arguments, so it is
+      # started by hand.
+      - name: Postgres with TLS
         run: |
           docker run -d --name postgres-tls -p 54330:5432 \
             -e POSTGRES_USER=dbadmin -e POSTGRES_PASSWORD=dbadmin -e POSTGRES_DB=dbadmin \
@@ -103,5 +105,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Tests ignorados de dbadmin-pg
+      - name: Ignored dbadmin-pg tests
         run: cargo test -p dbadmin-pg --locked -- --ignored

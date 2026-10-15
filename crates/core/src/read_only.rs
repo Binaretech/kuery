@@ -1,8 +1,8 @@
-//! Política de solo lectura.
+//! Read-only policy.
 //!
-//! Primera capa de defensa: analiza el SQL antes de enviarlo y rechaza todo lo
-//! que pueda escribir. La segunda capa la pone el driver, que ejecuta la query
-//! dentro de una transacción `READ ONLY`.
+//! First line of defense: parses the SQL before sending it and rejects anything
+//! that could write. The second line is the driver, which runs the query inside
+//! a `READ ONLY` transaction.
 
 use std::fmt;
 use std::ops::ControlFlow;
@@ -11,7 +11,7 @@ use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, Visit, Visitor
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-/// Funciones que tienen efectos aunque se llamen desde un `SELECT`.
+/// Functions that have side effects even when called from a `SELECT`.
 const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "dblink",
     "dblink_exec",
@@ -38,41 +38,43 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
-    /// El SQL no se pudo analizar.
+    /// The SQL could not be parsed.
     Parse(String),
-    /// No hay ninguna sentencia (vacío o solo comentarios).
+    /// There is no statement (empty or only comments).
     Empty,
-    /// Hay más de una sentencia; en solo lectura se ejecuta una cada vez.
+    /// More than one statement; read-only mode runs one at a time.
     MultipleStatements(usize),
-    /// Sentencia que no es de lectura (INSERT, CREATE, SET…).
+    /// A statement that is not a read (INSERT, CREATE, SET…).
     Statement(String),
-    /// `SELECT … FOR UPDATE` y similares bloquean filas.
+    /// `SELECT … FOR UPDATE` and similar clauses lock rows.
     LockingClause,
-    /// `SELECT … INTO` crea una tabla.
+    /// `SELECT … INTO` creates a table.
     SelectInto,
-    /// Llamada a una función con efectos.
+    /// A call to a function with side effects.
     Function(String),
 }
 
 impl fmt::Display for Rejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Rejection::Parse(message) => write!(f, "No se pudo analizar el SQL: {message}"),
-            Rejection::Empty => write!(f, "No hay ninguna sentencia que ejecutar"),
-            Rejection::MultipleStatements(n) => write!(
-                f,
-                "Hay {n} sentencias; en solo lectura se ejecuta una cada vez"
-            ),
+            Rejection::Parse(message) => write!(f, "Could not parse the SQL: {message}"),
+            Rejection::Empty => write!(f, "There is no statement to run"),
+            Rejection::MultipleStatements(n) => {
+                write!(f, "Found {n} statements; read-only mode runs one at a time")
+            }
             Rejection::Statement(kind) => {
-                write!(f, "{kind} no está permitido en una query de solo lectura")
+                write!(f, "{kind} is not allowed in a read-only query")
             }
             Rejection::LockingClause => write!(
                 f,
-                "FOR UPDATE / FOR SHARE bloquea filas y no está permitido en solo lectura"
+                "FOR UPDATE / FOR SHARE locks rows and is not allowed in read-only mode"
             ),
-            Rejection::SelectInto => write!(f, "SELECT … INTO crea una tabla y no está permitido"),
+            Rejection::SelectInto => write!(f, "SELECT … INTO creates a table and is not allowed"),
             Rejection::Function(name) => {
-                write!(f, "La función {name}() tiene efectos y no está permitida")
+                write!(
+                    f,
+                    "The function {name}() has side effects and is not allowed"
+                )
             }
         }
     }
@@ -80,7 +82,7 @@ impl fmt::Display for Rejection {
 
 impl std::error::Error for Rejection {}
 
-/// Comprueba que `sql` es exactamente una sentencia que solo lee datos.
+/// Checks that `sql` is exactly one statement that only reads data.
 pub fn check(sql: &str) -> Result<(), Rejection> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
@@ -101,8 +103,8 @@ impl Visitor for ReadOnlyVisitor {
     type Break = Rejection;
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Rejection> {
-        // Visita también las sentencias anidadas: un DELETE dentro de un CTE o
-        // de un EXPLAIN ANALYZE llega aquí como sentencia propia.
+        // Nested statements are visited too: a DELETE inside a CTE or an
+        // EXPLAIN ANALYZE arrives here as its own statement.
         let allowed = matches!(
             statement,
             Statement::Query(_)
@@ -138,7 +140,7 @@ impl Visitor for ReadOnlyVisitor {
     }
 
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Rejection> {
-        // Funciones usadas como tabla: `select * from dblink(...)`.
+        // Functions used as a table: `select * from dblink(...)`.
         check_function_name(relation)
     }
 }
@@ -153,7 +155,7 @@ fn check_function_name(name: &ObjectName) -> ControlFlow<Rejection> {
     }
 }
 
-/// `SELECT … INTO tabla`, también dentro de UNION/INTERSECT.
+/// `SELECT … INTO table`, also inside UNION/INTERSECT.
 fn creates_table(body: &SetExpr) -> bool {
     match body {
         SetExpr::Select(select) => select.into.is_some(),
@@ -162,11 +164,11 @@ fn creates_table(body: &SetExpr) -> bool {
     }
 }
 
-/// Nombre corto de la sentencia para el mensaje de error, p. ej. `DELETE`.
+/// Short statement name for the error message, e.g. `DELETE`.
 fn statement_kind(statement: &Statement) -> String {
     let text = statement.to_string();
     let mut words = text.split_whitespace();
-    let first = words.next().unwrap_or("Esta sentencia").to_uppercase();
+    let first = words.next().unwrap_or("This statement").to_uppercase();
     match first.as_str() {
         "CREATE" | "ALTER" | "DROP" => match words.next() {
             Some(object) => format!("{first} {}", object.to_uppercase()),
@@ -181,11 +183,11 @@ mod tests {
     use super::*;
 
     fn allowed(sql: &str) {
-        assert_eq!(check(sql), Ok(()), "debería permitirse: {sql}");
+        assert_eq!(check(sql), Ok(()), "should be allowed: {sql}");
     }
 
     fn rejected(sql: &str) -> Rejection {
-        check(sql).expect_err(&format!("debería rechazarse: {sql}"))
+        check(sql).expect_err(&format!("should be rejected: {sql}"))
     }
 
     #[test]
@@ -198,7 +200,7 @@ mod tests {
         allowed("explain select * from orders");
         allowed("explain analyze select * from orders");
         allowed("show search_path");
-        allowed("-- comentario\nselect now()");
+        allowed("-- comment\nselect now()");
         allowed("select * from orders;");
     }
 
@@ -222,7 +224,7 @@ mod tests {
 
     #[test]
     fn rejects_session_and_transaction_control() {
-        // `SET transaction_read_only = off` desactivaría la segunda capa.
+        // `SET transaction_read_only = off` would disable the second line of defense.
         assert!(matches!(
             rejected("set transaction_read_only = off"),
             Rejection::Statement(_)
@@ -287,12 +289,12 @@ mod tests {
     #[test]
     fn rejects_empty_and_invalid_sql() {
         assert_eq!(rejected(""), Rejection::Empty);
-        assert_eq!(rejected("-- solo un comentario"), Rejection::Empty);
+        assert_eq!(rejected("-- just a comment"), Rejection::Empty);
         assert!(matches!(
             rejected("selec * fron orders"),
             Rejection::Parse(_)
         ));
-        // Lo que el analizador no entiende se rechaza, aunque sea una lectura.
+        // Anything the parser does not understand is rejected, even if it is a read.
         assert!(matches!(rejected("table orders"), Rejection::Parse(_)));
     }
 }

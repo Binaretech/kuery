@@ -14,16 +14,18 @@ anyhow = "1"
 arrow-array = "60"
 async-channel = "2"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 thiserror = "2"
+toml = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 tokio-postgres = "0.7"
-# TLS con rustls y el proveedor `ring` (sin aws-lc, que en Windows pide cmake y NASM).
+# TLS with rustls and the `ring` provider (no aws-lc, which needs cmake and NASM on Windows).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 tokio-postgres-rustls = "0.14"
 
-# gpui-kit fija su propia versión de gpui; se actualiza a propósito, nunca por accidente.
+# gpui-kit pins its own gpui version; upgrade it on purpose, never by accident.
 gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql"] }
 
 [profile.dev.package."*"]

@@ -1,4 +1,4 @@
-# gpui (vía gpui-kit 0.7) usa APIs estabilizadas después de Rust 1.93.
+# gpui (via gpui-kit 0.7) uses APIs stabilized after Rust 1.93.
 [toolchain]
 channel = "1.99.0"
 profile = "minimal"

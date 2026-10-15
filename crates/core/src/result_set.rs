@@ -1,16 +1,16 @@
-//! Resultados en formato columnar.
+//! Results in columnar format.
 //!
-//! Las filas llegan por lotes y se guardan como columnas de Arrow, no como
-//! `Vec<Vec<String>>`: cada columna es un único buffer de texto con offsets, así
-//! que un millón de filas son pocas asignaciones y la interfaz solo formatea las
-//! celdas visibles.
+//! Rows arrive in batches and are stored as Arrow columns, not as
+//! `Vec<Vec<String>>`: each column is a single text buffer with offsets, so a
+//! million rows take only a few allocations and the UI only formats the visible
+//! cells.
 
 use std::sync::Arc;
 
 use arrow_array::builder::StringBuilder;
 use arrow_array::{Array, StringArray};
 
-/// Un lote de filas, columna a columna.
+/// A batch of rows, column by column.
 #[derive(Debug, Clone)]
 pub struct Batch {
     columns: Vec<Arc<StringArray>>,
@@ -22,13 +22,13 @@ impl Batch {
         self.rows
     }
 
-    /// Bytes que ocupan los buffers de Arrow del lote.
+    /// Bytes used by the batch's Arrow buffers.
     pub fn memory_size(&self) -> usize {
         self.columns.iter().map(|c| c.get_array_memory_size()).sum()
     }
 }
 
-/// Acumula filas hasta formar un [`Batch`].
+/// Accumulates rows until they form a [`Batch`].
 pub struct BatchBuilder {
     columns: Vec<StringBuilder>,
     rows: usize,
@@ -44,7 +44,7 @@ impl BatchBuilder {
         }
     }
 
-    /// Añade una fila. `value(i)` devuelve la celda de la columna `i`, `None` es NULL.
+    /// Adds a row. `value(i)` returns the cell for column `i`; `None` is NULL.
     pub fn push_row<'a>(&mut self, mut value: impl FnMut(usize) -> Option<&'a str>) {
         for (index, column) in self.columns.iter_mut().enumerate() {
             column.append_option(value(index));
@@ -69,12 +69,12 @@ impl BatchBuilder {
     }
 }
 
-/// Resultado de una query: nombres de columna y lotes recibidos hasta ahora.
+/// A query result: column names and the batches received so far.
 #[derive(Debug, Clone, Default)]
 pub struct ResultSet {
     columns: Vec<String>,
     batches: Vec<Batch>,
-    /// Primera fila de cada lote, para localizar una fila con búsqueda binaria.
+    /// First row of each batch, to locate a row with binary search.
     batch_starts: Vec<usize>,
     rows: usize,
 }
@@ -105,7 +105,7 @@ impl ResultSet {
         self.batches.push(batch);
     }
 
-    /// Valor de una celda. `None` si la fila no existe, `Some(None)` si es NULL.
+    /// A cell's value. `None` if the row does not exist, `Some(None)` if it is NULL.
     pub fn cell(&self, row: usize, column: usize) -> Option<Option<&str>> {
         if row >= self.rows {
             return None;
@@ -121,7 +121,7 @@ impl ResultSet {
         })
     }
 
-    /// Bytes que ocupan los datos en memoria.
+    /// Bytes the data takes up in memory.
     pub fn memory_size(&self) -> usize {
         self.batches.iter().map(Batch::memory_size).sum()
     }

@@ -1,16 +1,16 @@
-//! Recursos embebidos en el binario: fuentes (OFL) e iconos propios.
+//! Assets embedded in the binary: fonts (OFL) and our own icons.
 //!
-//! [`AppAssets`] sirve primero lo nuestro y delega el resto en
-//! `gpui_kit::assets::Assets`, el set de iconos por defecto de gpui-kit.
+//! [`AppAssets`] serves our files first and delegates the rest to
+//! `gpui_kit::assets::Assets`, gpui-kit's default icon set.
 
 use std::borrow::Cow;
 
 use gpui_kit::assets::{Assets as KitAssets, IconNamed};
 use gpui_kit::{App, AssetSource, Result, SharedString};
 
-/// Familia de la interfaz.
+/// User interface font family.
 pub const SANS_FAMILY: &str = "IBM Plex Sans";
-/// Familia del editor y de la tabla.
+/// Editor and table font family.
 pub const MONO_FAMILY: &str = "JetBrains Mono";
 
 macro_rules! embed {
@@ -30,16 +30,50 @@ const FONTS: &[(&str, &[u8])] = embed![
     "fonts/jetbrains-mono/JetBrainsMono-Bold.ttf",
 ];
 
-// Lucide (ISC, ver assets/icons/LICENSE-LUCIDE): están en el catálogo completo
-// de gpui-kit pero no en el set por defecto.
-const ICONS: &[(&str, &[u8])] = embed!["icons/lock.svg", "icons/database.svg", "icons/table.svg"];
+// Lucide (ISC, see assets/icons/LICENSE-LUCIDE): these are in gpui-kit's full
+// catalog but not in its default set.
+const ICONS: &[(&str, &[u8])] = embed![
+    "icons/lock.svg",
+    "icons/database.svg",
+    "icons/table.svg",
+    "icons/key-round.svg",
+    "icons/link.svg",
+    "icons/funnel.svg",
+    "icons/arrow-down-up.svg",
+    "icons/trash.svg",
+    "icons/shield-check.svg",
+    "icons/code.svg",
+];
 
-/// Iconos propios de dbadmin, para `Icon::new(AppIcon::Lock)`.
+/// dbadmin's own icons, for `Icon::new(AppIcon::Lock)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppIcon {
     Lock,
     Database,
     Table,
+    Key,
+    Link,
+    Filter,
+    Sort,
+    Trash,
+    Shield,
+    Code,
+}
+
+#[cfg(test)]
+impl AppIcon {
+    const ALL: [AppIcon; 10] = [
+        AppIcon::Lock,
+        AppIcon::Database,
+        AppIcon::Table,
+        AppIcon::Key,
+        AppIcon::Link,
+        AppIcon::Filter,
+        AppIcon::Sort,
+        AppIcon::Trash,
+        AppIcon::Shield,
+        AppIcon::Code,
+    ];
 }
 
 impl IconNamed for AppIcon {
@@ -48,6 +82,13 @@ impl IconNamed for AppIcon {
             AppIcon::Lock => "icons/lock.svg",
             AppIcon::Database => "icons/database.svg",
             AppIcon::Table => "icons/table.svg",
+            AppIcon::Key => "icons/key-round.svg",
+            AppIcon::Link => "icons/link.svg",
+            AppIcon::Filter => "icons/funnel.svg",
+            AppIcon::Sort => "icons/arrow-down-up.svg",
+            AppIcon::Trash => "icons/trash.svg",
+            AppIcon::Shield => "icons/shield-check.svg",
+            AppIcon::Code => "icons/code.svg",
         }
         .into()
     }
@@ -82,7 +123,7 @@ fn own(path: &str) -> Option<&'static [u8]> {
         .map(|(_, bytes)| *bytes)
 }
 
-/// Registra las fuentes embebidas en el text system de gpui.
+/// Registers the embedded fonts with gpui's text system.
 pub fn load_fonts(cx: &App) -> Result<()> {
     cx.text_system().add_fonts(
         FONTS
@@ -98,13 +139,13 @@ mod tests {
 
     #[test]
     fn serves_our_icons_and_falls_back_to_the_kit() {
-        for icon in [AppIcon::Lock, AppIcon::Database, AppIcon::Table] {
+        for icon in AppIcon::ALL {
             let svg = AppAssets.load(&icon.path()).unwrap().unwrap();
             assert!(svg.starts_with(b"<svg"), "{icon:?}");
         }
         let search = gpui_kit::assets::IconName::Search.path();
         assert!(AppAssets.load(&search).unwrap().is_some());
-        assert!(AppAssets.load("icons/no-existe.svg").is_err());
+        assert!(AppAssets.load("icons/does-not-exist.svg").is_err());
     }
 
     #[test]

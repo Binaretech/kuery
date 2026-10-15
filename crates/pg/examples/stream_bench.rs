@@ -1,4 +1,4 @@
-//! Mide el streaming de una query grande sin interfaz.
+//! Measures streaming of a large query without a UI.
 //!
 //! `cargo run --release -p dbadmin-pg --example stream_bench -- "select * from orders"`
 
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 Event::Finished(summary) => {
                     println!(
-                        "{} filas en {} lotes · primer lote {:?} · total {:?}",
+                        "{} rows in {} batches · first batch {:?} · total {:?}",
                         summary.rows, batches, summary.first_batch_after, summary.elapsed
                     );
                 }
@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
     println!(
-        "{} columnas · {:.1} MB en Arrow · {:?} hasta tener todo en memoria",
+        "{} columns · {:.1} MB in Arrow · {:?} until everything is in memory",
         set.columns().len(),
         set.memory_size() as f64 / 1_048_576.0,
         started.elapsed()
