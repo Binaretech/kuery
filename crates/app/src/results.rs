@@ -2,6 +2,8 @@
 //!
 //! The table is virtualized; only visible cells are requested and formatted.
 
+use std::rc::Rc;
+
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
@@ -15,6 +17,9 @@ use kuery_core::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
 use crate::context_menus::{Cell, copy_cell_items};
 use crate::theme;
 
+/// Items a tab adds to a row's context menu, above the copy items.
+pub type RowMenu = Rc<dyn Fn(PopupMenu, usize, &App) -> PopupMenu>;
+
 #[derive(Default)]
 pub struct ResultsDelegate {
     set: ResultSet,
@@ -22,6 +27,7 @@ pub struct ResultsDelegate {
     running: bool,
     /// The cell last right-clicked, for the row's context menu.
     menu_cell: Option<(usize, usize)>,
+    row_menu: Option<RowMenu>,
 }
 
 impl ResultsDelegate {
@@ -29,8 +35,13 @@ impl ResultsDelegate {
     pub fn start(&mut self) {
         *self = Self {
             running: true,
+            row_menu: self.row_menu.take(),
             ..Self::default()
         };
+    }
+
+    pub fn set_row_menu(&mut self, menu: Option<RowMenu>) {
+        self.row_menu = menu;
     }
 
     pub fn set_columns(&mut self, names: Vec<String>) {
@@ -161,11 +172,15 @@ impl TableDelegate for ResultsDelegate {
         row_ix: usize,
         menu: PopupMenu,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let column = match self.menu_cell {
             Some((row, column)) if row == row_ix => column,
             _ => 0,
+        };
+        let menu = match &self.row_menu {
+            Some(row_menu) => row_menu(menu, row_ix, cx).separator(),
+            None => menu,
         };
         copy_cell_items(menu, &self.cell(row_ix, column))
     }

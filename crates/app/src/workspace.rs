@@ -72,7 +72,8 @@ impl Tab {
         match self {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
-            Tab::RedisKey(_) | Tab::RedisConsole(_) => false,
+            Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::RedisConsole(_) => false,
         }
     }
 
@@ -395,7 +396,8 @@ impl WorkspaceView {
             _ => false,
         });
         let index = existing.unwrap_or_else(|| {
-            let tab = cx.new(|cx| KeyTab::new(db, database, key, window, cx));
+            let project = self.model.read(cx).project.root.clone();
+            let tab = cx.new(|cx| KeyTab::new(db, database, key, project, window, cx));
             self.tabs.push(Tab::RedisKey(tab));
             self.tabs.len() - 1
         });
@@ -409,7 +411,8 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab = cx.new(|cx| ConsoleTab::new(db, database, window, cx));
+        let project = self.model.read(cx).project.root.clone();
+        let tab = cx.new(|cx| ConsoleTab::new(db, database, project, window, cx));
         self.tabs.push(Tab::RedisConsole(tab));
         let index = self.tabs.len() - 1;
         self.activate(index, window, cx);
@@ -446,6 +449,9 @@ impl WorkspaceView {
         match self.tabs.get(index) {
             // A table with unsaved changes is not closed by accident.
             Some(Tab::Table(table)) if table.read(cx).has_pending() => {
+                self.activate(index, window, cx);
+            }
+            Some(Tab::RedisKey(key)) if key.read(cx).has_pending() => {
                 self.activate(index, window, cx);
             }
             Some(Tab::Query(query)) if query.read(cx).in_transaction() => {
@@ -1071,12 +1077,36 @@ impl WorkspaceView {
             }
             Some(Tab::RedisConsole(console)) => {
                 let tab = console.read(cx);
+                let writing = tab.is_writing();
                 left = left.child(
                     h_flex()
                         .gap(px(5.))
-                        .child(Icon::new(AppIcon::Lock).size(px(11.)))
-                        .child("Read-only"),
+                        .child(
+                            Icon::new(if writing {
+                                AppIcon::Pencil
+                            } else {
+                                AppIcon::Lock
+                            })
+                            .size(px(11.)),
+                        )
+                        .child(if writing { "Write" } else { "Read-only" }),
                 );
+                if let Some(redis) = &redis
+                    && redis.environment == Environment::Production
+                    && redis.allows_writes()
+                {
+                    let console = console.clone();
+                    left = left.child(
+                        div()
+                            .id("stop-allowing-redis-writes")
+                            .text_color(color(0xc7c7cc))
+                            .hover(|s| s.text_color(color(theme::TEXT)))
+                            .child("Stop allowing writes")
+                            .on_click(move |_, _, cx| {
+                                console.update(cx, |console, cx| console.stop_allowing_writes(cx))
+                            }),
+                    );
+                }
                 right = h_flex()
                     .gap_4()
                     .flex_shrink_0()
@@ -1195,11 +1225,14 @@ impl WorkspaceView {
                         table.has_pending(),
                     )
                 }
-                Tab::RedisKey(key) => (
-                    AppIcon::Key,
-                    SharedString::from(key.read(cx).key().to_string()),
-                    false,
-                ),
+                Tab::RedisKey(key) => {
+                    let key = key.read(cx);
+                    (
+                        AppIcon::Key,
+                        SharedString::from(key.key().to_string()),
+                        key.has_pending(),
+                    )
+                }
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
             };
             let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {

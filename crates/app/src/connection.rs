@@ -224,7 +224,8 @@ impl Db {
 }
 
 /// An open Redis connection, shared by the sidebar and the tabs opened from
-/// it. Redis tabs only read for now, so there is nothing to allow.
+/// it. Redis has no transactions, so writes are allowed or not: on
+/// production only once allowed for the connection session.
 #[derive(Clone)]
 pub struct RedisDb {
     pub name: SharedString,
@@ -232,6 +233,40 @@ pub struct RedisDb {
     pub session: kuery_redis::Session,
     /// `host:port/database`, without credentials.
     pub target: SharedString,
+    /// Production only: whether writes were allowed for this connection
+    /// session. Shared by every tab on it, gone when it disconnects.
+    writes_allowed: Arc<AtomicBool>,
+}
+
+impl RedisDb {
+    pub fn new(
+        name: SharedString,
+        environment: Environment,
+        session: kuery_redis::Session,
+        target: SharedString,
+    ) -> Self {
+        Self {
+            name,
+            environment,
+            session,
+            target,
+            writes_allowed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether writes can run without allowing them first.
+    pub fn allows_writes(&self) -> bool {
+        self.environment.write_policy() != WritePolicy::SessionUnlock
+            || self.writes_allowed.load(Ordering::SeqCst)
+    }
+
+    pub fn allow_writes(&self) {
+        self.writes_allowed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn revoke_writes(&self) {
+        self.writes_allowed.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Whether `kind` may run, given what the connection session allows.

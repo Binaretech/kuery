@@ -42,3 +42,12 @@ host = "localhost"
 port = 63799
 database = "0"
 environment = "development"
+
+[[connections]]
+id = "prod-cache"
+name = "prod-cache"
+driver = "redis"
+host = "localhost"
+port = 63799
+database = "0"
+environment = "production"

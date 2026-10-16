@@ -263,6 +263,30 @@ pub struct KeyInfo {
     pub encoding: Option<String>,
 }
 
+/// A key as it is now, shown before a command changes or replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPreview {
+    pub key: String,
+    pub kind: KeyKind,
+    /// Milliseconds to live; `None` when the key does not expire.
+    pub ttl_ms: Option<i64>,
+    /// Bytes for strings, entries for everything else.
+    pub length: Option<u64>,
+    /// The start of the value, on one line (`…` when there is more).
+    pub sample: String,
+}
+
+impl KeyPreview {
+    pub fn exists(&self) -> bool {
+        self.kind != KeyKind::Missing
+    }
+}
+
+/// Characters of a value a preview keeps.
+const SAMPLE: usize = 80;
+/// Entries of a collection a preview keeps.
+const SAMPLE_ENTRIES: usize = 3;
+
 /// Where a page of a key's value starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
@@ -454,6 +478,22 @@ impl Session {
         })
     }
 
+    /// What `keys` hold now, in order, for the confirmation before a write.
+    pub fn preview_keys(
+        &self,
+        db: i64,
+        keys: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<KeyPreview>, Error>> + Send + use<> {
+        self.spawn(move |inner| async move {
+            let mut connection = inner.connection(db).await?;
+            let mut previews = Vec::with_capacity(keys.len());
+            for key in keys {
+                previews.push(preview(&mut connection, key).await?);
+            }
+            Ok(previews)
+        })
+    }
+
     /// A page of the key's value, up to `limit` entries from `page`.
     pub fn read_value(
         &self,
@@ -631,6 +671,127 @@ impl Session {
             }
         })
     }
+}
+
+async fn preview(connection: &mut ConnectionManager, key: String) -> Result<KeyPreview, Error> {
+    let type_name: String = redis::cmd("TYPE").arg(&key).query_async(connection).await?;
+    let kind = KeyKind::parse(&type_name);
+    let ttl: i64 = redis::cmd("PTTL").arg(&key).query_async(connection).await?;
+    let last = SAMPLE_ENTRIES as i64 - 1;
+    let (length, items): (Option<u64>, Vec<String>) = match kind {
+        KeyKind::String => {
+            let length: u64 = redis::cmd("STRLEN")
+                .arg(&key)
+                .query_async(connection)
+                .await?;
+            let start: Vec<u8> = redis::cmd("GETRANGE")
+                .arg(&key)
+                .arg(0)
+                .arg(SAMPLE * 4)
+                .query_async(connection)
+                .await?;
+            (Some(length), vec![display_bytes(&start)])
+        }
+        KeyKind::Hash => {
+            let length: u64 = redis::cmd("HLEN").arg(&key).query_async(connection).await?;
+            let (_, items): (u64, Vec<Vec<u8>>) = redis::cmd("HSCAN")
+                .arg(&key)
+                .arg(0)
+                .arg("COUNT")
+                .arg(SAMPLE_ENTRIES)
+                .query_async(connection)
+                .await?;
+            let pairs = items
+                .chunks(2)
+                .take(SAMPLE_ENTRIES)
+                .map(|pair| {
+                    format!(
+                        "{}={}",
+                        display_bytes(&pair[0]),
+                        pair.get(1).map(|v| display_bytes(v)).unwrap_or_default()
+                    )
+                })
+                .collect();
+            (Some(length), pairs)
+        }
+        KeyKind::List => {
+            let length: u64 = redis::cmd("LLEN").arg(&key).query_async(connection).await?;
+            let items: Vec<Vec<u8>> = redis::cmd("LRANGE")
+                .arg(&key)
+                .arg(0)
+                .arg(last)
+                .query_async(connection)
+                .await?;
+            (
+                Some(length),
+                items.iter().map(|v| display_bytes(v)).collect(),
+            )
+        }
+        KeyKind::Set => {
+            let length: u64 = redis::cmd("SCARD")
+                .arg(&key)
+                .query_async(connection)
+                .await?;
+            let (_, items): (u64, Vec<Vec<u8>>) = redis::cmd("SSCAN")
+                .arg(&key)
+                .arg(0)
+                .arg("COUNT")
+                .arg(SAMPLE_ENTRIES)
+                .query_async(connection)
+                .await?;
+            let members = items
+                .iter()
+                .take(SAMPLE_ENTRIES)
+                .map(|v| display_bytes(v))
+                .collect();
+            (Some(length), members)
+        }
+        KeyKind::ZSet => {
+            let length: u64 = redis::cmd("ZCARD")
+                .arg(&key)
+                .query_async(connection)
+                .await?;
+            let items: Vec<(Vec<u8>, String)> = redis::cmd("ZRANGE")
+                .arg(&key)
+                .arg(0)
+                .arg(last)
+                .arg("WITHSCORES")
+                .query_async(connection)
+                .await?;
+            let members = items
+                .iter()
+                .map(|(member, score)| format!("{} ({score})", display_bytes(member)))
+                .collect();
+            (Some(length), members)
+        }
+        KeyKind::Stream => {
+            let length: u64 = redis::cmd("XLEN").arg(&key).query_async(connection).await?;
+            (Some(length), Vec::new())
+        }
+        KeyKind::Missing | KeyKind::Other => (None, Vec::new()),
+    };
+    let more = length.is_some_and(|length| match kind {
+        KeyKind::String => length as usize > SAMPLE,
+        _ => length as usize > items.len(),
+    });
+    let mut sample: String = items
+        .join(", ")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if sample.chars().count() > SAMPLE {
+        sample = sample.chars().take(SAMPLE).collect();
+        sample.push('…');
+    } else if more && !sample.is_empty() {
+        sample.push_str(", …");
+    }
+    Ok(KeyPreview {
+        key,
+        kind,
+        ttl_ms: (ttl >= 0).then_some(ttl),
+        length,
+        sample,
+    })
 }
 
 /// `INFO keyspace` → one entry per database, empty ones included.
@@ -823,6 +984,58 @@ mod tests {
             }
         }
         assert!(members >= 50);
+    }
+
+    #[test]
+    #[ignore = "needs the dev Redis"]
+    fn writes_and_previews_keys() {
+        let (engine, target) = dev();
+        let session = block(engine.connect(target)).unwrap();
+        // Keys of its own, removed at the end, in database 2 (empty in the seed).
+        let run = |line: &[&str]| {
+            block(session.command(2, line.iter().map(|a| a.to_string()).collect())).unwrap()
+        };
+        let preview = |keys: &[&str]| {
+            block(session.preview_keys(2, keys.iter().map(|k| k.to_string()).collect())).unwrap()
+        };
+        run(&["DEL", "kuery:test:s", "kuery:test:h", "kuery:test:renamed"]);
+        assert_eq!(
+            run(&["SET", "kuery:test:s", "hello", "EX", "100"]),
+            Reply::Status("OK".into())
+        );
+        run(&[
+            "HSET",
+            "kuery:test:h",
+            "a",
+            "1",
+            "b",
+            "2",
+            "c",
+            "3",
+            "d",
+            "4",
+        ]);
+        let previews = preview(&["kuery:test:s", "kuery:test:h", "kuery:test:none"]);
+        assert_eq!(previews[0].kind, KeyKind::String);
+        assert_eq!(previews[0].sample, "hello");
+        assert!(previews[0].ttl_ms.is_some_and(|ttl| ttl > 0));
+        assert_eq!(
+            (previews[1].kind, previews[1].length),
+            (KeyKind::Hash, Some(4))
+        );
+        assert!(previews[1].sample.ends_with('…'), "{}", previews[1].sample);
+        assert!(!previews[2].exists());
+
+        run(&["PERSIST", "kuery:test:s"]);
+        run(&["RENAME", "kuery:test:s", "kuery:test:renamed"]);
+        run(&["HDEL", "kuery:test:h", "a"]);
+        let previews = preview(&["kuery:test:renamed", "kuery:test:h"]);
+        assert_eq!(previews[0].ttl_ms, None);
+        assert_eq!(previews[1].length, Some(3));
+        assert_eq!(
+            run(&["DEL", "kuery:test:renamed", "kuery:test:h"]),
+            Reply::Int(2)
+        );
     }
 
     #[test]

@@ -27,15 +27,17 @@ use gpui_kit::{
 use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
+use kuery_core::driver::Family;
 use kuery_core::sql::quote_qualified;
 use kuery_pg::catalog;
 
 use crate::app;
 use crate::assets::AppIcon;
-use crate::connection::{Db, Reconnect, RedisDb};
+use crate::connection::{Db, RedisDb};
 use crate::context_menus::{copy, item, item_icon, reveal};
+use crate::drivers::{self, Connection};
 use crate::history::{self, HistoryEntry};
-use crate::project::{ConnectionSpec, Driver, ProjectModel, QueryEntry};
+use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
@@ -440,27 +442,24 @@ impl Explorer {
         ) {
             return;
         }
-        node.state = ConnectionState::Connecting;
         let spec = node.spec.clone();
+        let driver = match drivers::for_spec(&spec) {
+            Ok(driver) => driver,
+            Err(error) => {
+                node.state = ConnectionState::Failed(error);
+                cx.notify();
+                return;
+            }
+        };
+        node.state = ConnectionState::Connecting;
         let state = app::state(cx);
-        let (engine, secrets) = (state.engine.clone(), state.secrets.clone());
+        let (engines, secrets) = (state.engines(), state.secrets.clone());
         // The keychain may ask the user for permission: read it off the UI thread.
         let id = spec.id.clone();
         let password = cx.background_spawn(async move { secrets.get(&id) });
-        if spec.driver == Driver::Redis {
-            self.connect_redis(spec, password, cx);
-            return;
-        }
         cx.spawn(async move |this, cx| {
             let result = match password.await {
-                Ok(password) => {
-                    let conninfo = spec.conninfo(password.as_deref());
-                    engine
-                        .connect_with(conninfo.clone(), spec.environment().access())
-                        .await
-                        .map(|session| (session, conninfo))
-                        .map_err(|error| error.to_string())
-                }
+                Ok(password) => driver.connect(&spec, password, &engines).await,
                 Err(error) => Err(error),
             };
             this.update(cx, |this, cx| {
@@ -472,20 +471,21 @@ impl Explorer {
                     return;
                 }
                 match result {
-                    Ok((session, conninfo)) => {
-                        let db = Db::new(
-                            spec.name.clone().into(),
-                            spec.environment(),
-                            session,
-                            spec.target().into(),
-                            Reconnect::new(conninfo),
-                        );
+                    Ok(Connection::Sql(db)) => {
                         node.state = ConnectionState::Ready {
                             db: db.clone(),
                             catalog: CatalogState::Loading,
                         };
                         this.load_catalog(index, cx);
                         cx.emit(ExplorerEvent::Connected(db));
+                    }
+                    Ok(Connection::KeyValue(db)) => {
+                        node.state = ConnectionState::RedisReady {
+                            db: db.clone(),
+                            keyspace: redis_keys::Keyspace::Loading,
+                        };
+                        this.load_keyspace(index, cx);
+                        cx.emit(ExplorerEvent::RedisConnected(db));
                     }
                     Err(error) => node.state = ConnectionState::Failed(error),
                 }
@@ -854,7 +854,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let environment = node.spec.environment();
-        let redis = node.spec.driver == Driver::Redis;
+        let redis = node.spec.family() == Some(Family::KeyValue);
         let ready = matches!(
             node.state,
             ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
@@ -885,11 +885,11 @@ impl Explorer {
         )
         .group(group.clone())
         .child(
-            Icon::new(if redis {
-                Icon::from(IconName::MemoryStick)
-            } else {
-                Icon::from(AppIcon::Database)
-            })
+            Icon::new(
+                node.spec
+                    .family()
+                    .map_or(Icon::from(AppIcon::Database), drivers::family_icon),
+            )
             .size(px(15.))
             .text_color(color(if ready {
                 theme::TEXT_SECONDARY

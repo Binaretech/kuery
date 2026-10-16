@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kuery_core::driver::{self, DriverInfo, Family};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Environment;
@@ -32,46 +33,15 @@ pub struct Project {
     pub connections: Vec<ConnectionSpec>,
 }
 
-/// The kind of server a connection talks to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Driver {
-    #[default]
-    Postgres,
-    Redis,
-}
-
-impl Driver {
-    pub const ALL: [Driver; 2] = [Driver::Postgres, Driver::Redis];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Driver::Postgres => "PostgreSQL",
-            Driver::Redis => "Redis",
-        }
-    }
-
-    pub fn default_port(self) -> u16 {
-        match self {
-            Driver::Postgres => 5432,
-            Driver::Redis => 6379,
-        }
-    }
-
-    fn is_postgres(&self) -> bool {
-        *self == Driver::Postgres
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSpec {
     /// Stable id: the keychain entry and saved queries refer to it.
     pub id: String,
     pub name: String,
-    /// Left out of the file for Postgres, which projects had before there
-    /// was a choice.
-    #[serde(default, skip_serializing_if = "Driver::is_postgres")]
-    pub driver: Driver,
+    /// The driver's id (see [`kuery_core::driver`]). Left out of the file
+    /// for Postgres, which projects had before there was a choice.
+    #[serde(default = "default_driver", skip_serializing_if = "is_default_driver")]
+    pub driver: String,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -96,6 +66,14 @@ fn default_port() -> u16 {
     5432
 }
 
+fn default_driver() -> String {
+    driver::DEFAULT.to_string()
+}
+
+fn is_default_driver(id: &str) -> bool {
+    id == driver::DEFAULT
+}
+
 impl ConnectionSpec {
     pub fn environment(&self) -> Environment {
         Environment::detect(
@@ -104,11 +82,20 @@ impl ConnectionSpec {
         )
     }
 
+    /// The driver's descriptor; `None` for an id this version does not know.
+    pub fn driver_info(&self) -> Option<&'static DriverInfo> {
+        driver::find(&self.driver)
+    }
+
+    pub fn family(&self) -> Option<Family> {
+        self.driver_info().map(|info| info.family)
+    }
+
     /// `host:port/database`, for display.
     pub fn target(&self) -> String {
-        match self.driver {
-            Driver::Postgres => format!("{}:{}/{}", self.host, self.port, self.database),
-            Driver::Redis => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
+        match self.family() {
+            Some(Family::KeyValue) => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
+            _ => format!("{}:{}/{}", self.host, self.port, self.database),
         }
     }
 
@@ -435,7 +422,7 @@ mod tests {
             id: new_id(),
             name: name.into(),
             host: "localhost".into(),
-            driver: Driver::Postgres,
+            driver: "postgres".into(),
             port: 54329,
             database: "kuery".into(),
             user: "kuery".into(),
@@ -452,7 +439,10 @@ mod tests {
             "id = \"r\"\nname = \"cache\"\ndriver = \"redis\"\nhost = \"localhost\"\nport = 63799\n",
         )
         .unwrap();
-        assert_eq!(redis.driver, Driver::Redis);
+        assert_eq!(
+            (redis.driver.as_str(), redis.family()),
+            ("redis", Some(Family::KeyValue))
+        );
         assert_eq!(
             (redis.redis_db(), redis.target()),
             (0, "localhost:63799/0".to_string())

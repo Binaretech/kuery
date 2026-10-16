@@ -93,6 +93,16 @@ pub fn init(
     });
 }
 
+impl AppState {
+    /// The drivers' runtimes, for [`crate::drivers::Driver`].
+    pub fn engines(&self) -> crate::drivers::Engines {
+        crate::drivers::Engines {
+            postgres: self.engine.clone(),
+            redis: self.redis.clone(),
+        }
+    }
+}
+
 pub fn state(cx: &App) -> &AppState {
     cx.global::<AppState>()
 }

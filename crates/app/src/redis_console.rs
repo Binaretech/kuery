@@ -4,11 +4,14 @@
 //! enter` every line, one after another. The last reply fills the results
 //! grid; every reply goes to the Output log the way `redis-cli` prints it.
 //!
-//! For now the console only reads: commands that write, and commands that
-//! would change or hold the connection, are refused with the reason (see
-//! [`kuery_core::redis::classify`]). `KEYS` runs on development connections
-//! only, since it blocks the server while it walks every key.
+//! The console starts in Read-only, where only commands that read run (see
+//! [`kuery_core::redis::classify`]). In Write, commands that write run too,
+//! once the environment's policy is met (see [`redis_write::approve`]), and
+//! each one is logged to the audit log. Commands that would change or hold
+//! the connection never run. `KEYS` runs on development connections only,
+//! since it blocks the server while it walks every key.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +34,7 @@ use crate::completion::RedisCompletions;
 use crate::connection::{Environment, RedisDb};
 use crate::context_menus::item;
 use crate::query_tab::{RunAll, RunQuery};
+use crate::redis_write::{self, Planned};
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::format_duration;
@@ -64,6 +68,10 @@ enum Status {
 pub struct ConsoleTab {
     db: RedisDb,
     database: i64,
+    /// The project folder, for the audit log.
+    project: PathBuf,
+    /// Write mode: commands that write may run.
+    writing: bool,
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
     output: Vec<OutputEntry>,
@@ -74,7 +82,13 @@ pub struct ConsoleTab {
 }
 
 impl ConsoleTab {
-    pub fn new(db: RedisDb, database: i64, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db: RedisDb,
+        database: i64,
+        project: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = EditorState::new(window, cx)
                 .line_number(true)
@@ -86,6 +100,8 @@ impl ConsoleTab {
         Self {
             db,
             database,
+            project,
+            writing: false,
             editor,
             table,
             output: Vec::new(),
@@ -123,23 +139,52 @@ impl ConsoleTab {
         }
     }
 
+    pub fn is_writing(&self) -> bool {
+        self.writing
+    }
+
+    /// Switches to Write (allowing writes for the session first on
+    /// production) or back to Read-only.
+    fn set_writing(&mut self, writing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if writing && !self.db.allows_writes() {
+            let this = cx.entity().downgrade();
+            crate::write_mode::allow_redis_writes(self.db.clone(), window, cx, move |_, cx| {
+                this.update(cx, |this, cx| {
+                    this.writing = true;
+                    cx.notify();
+                })
+                .ok();
+            });
+            return;
+        }
+        self.writing = writing;
+        cx.notify();
+    }
+
+    /// Production: stops allowing writes on the connection, for every tab.
+    pub fn stop_allowing_writes(&mut self, cx: &mut Context<Self>) {
+        self.db.revoke_writes();
+        self.writing = false;
+        cx.notify();
+    }
+
     fn set_database(&mut self, database: i64, cx: &mut Context<Self>) {
         self.database = database;
         cx.notify();
     }
 
-    fn run_query(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+    fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         let lines = self.lines_to_run(cx);
-        self.run(lines, cx);
+        self.run(lines, window, cx);
     }
 
-    fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).text().to_string();
         let lines = command_lines(&text)
             .into_iter()
             .map(|(_, line)| line.to_string())
             .collect();
-        self.run(lines, cx);
+        self.run(lines, window, cx);
     }
 
     /// The selected lines, or the line under the cursor.
@@ -162,37 +207,75 @@ impl ConsoleTab {
             .collect()
     }
 
-    /// Runs the commands one after another; a refused or failed one is
-    /// logged and the rest still run.
-    fn run(&mut self, lines: Vec<String>, cx: &mut Context<Self>) {
+    /// Checks every line first: the ones that cannot run are logged and
+    /// left out. If any of the rest writes, they run once approved (see
+    /// [`redis_write::approve`]); otherwise right away.
+    fn run(&mut self, lines: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if lines.is_empty() || self.task.is_some() {
+            return;
+        }
+        let development = self.db.environment == Environment::Development;
+        let mut planned = Vec::new();
+        let mut refused = None;
+        for line in &lines {
+            match split_command(line) {
+                Ok(args) if args.is_empty() => {}
+                Ok(args) => match refusal(&args, development, self.writing) {
+                    Some(reason) => {
+                        self.push_output(line, reason.clone(), true, None);
+                        refused = Some(reason);
+                    }
+                    None => planned.push(Planned::new(args)),
+                },
+                Err(error) => {
+                    self.push_output(line, error.clone(), true, None);
+                    refused = Some(error);
+                }
+            }
+        }
+        if planned.is_empty() {
+            if let Some(reason) = refused {
+                self.status = Status::Failed(reason);
+                self.panel = Panel::Output;
+            }
+            cx.notify();
+            return;
+        }
+        if planned.iter().any(|command| command.writes) {
+            let this = cx.entity().downgrade();
+            let commands = planned.clone();
+            redis_write::approve(
+                self.db.clone(),
+                self.database,
+                planned,
+                window,
+                cx,
+                move |_, cx| {
+                    let commands = commands.clone();
+                    this.update(cx, |this, cx| this.execute(commands, cx)).ok();
+                },
+            );
+        } else {
+            self.execute(planned, cx);
+        }
+    }
+
+    /// Runs the commands one after another; a failed one is logged and the
+    /// rest still run. Writes go to the audit log.
+    fn execute(&mut self, commands: Vec<Planned>, cx: &mut Context<Self>) {
+        if self.task.is_some() {
             return;
         }
         let session = self.db.session.clone();
         let database = self.database;
-        let development = self.db.environment == Environment::Development;
         self.status = Status::Running;
         self.task = Some(cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let mut last_reply = None;
             let mut failed = None;
-            for line in &lines {
+            for command in &commands {
                 let started = Instant::now();
-                let args = match split_command(line) {
-                    Ok(args) if !args.is_empty() => args,
-                    Ok(_) => continue,
-                    Err(error) => {
-                        failed = Some(error.clone());
-                        log(&this, cx, line, error, true, None);
-                        continue;
-                    }
-                };
-                if let Some(refusal) = refusal(&args, development) {
-                    failed = Some(refusal.clone());
-                    log(&this, cx, line, refusal, true, None);
-                    continue;
-                }
-                match session.command(database, args).await {
+                match session.command(database, command.args.clone()).await {
                     Ok(reply) => {
                         let is_error = matches!(reply, kuery_redis::Reply::Error(_));
                         if is_error {
@@ -201,7 +284,7 @@ impl ConsoleTab {
                         log(
                             &this,
                             cx,
-                            line,
+                            command,
                             reply.format_cli(),
                             is_error,
                             Some(started.elapsed()),
@@ -212,19 +295,20 @@ impl ConsoleTab {
                     }
                     Err(error) => {
                         failed = Some(error.to_string());
-                        log(&this, cx, line, error.to_string(), true, None);
+                        log(&this, cx, command, error.to_string(), true, None);
                     }
                 }
             }
             this.update(cx, |this, cx| {
                 this.task = None;
+                let single = commands.len() == 1;
                 if let Some(reply) = last_reply {
                     let table = reply.table();
                     this.table.update(cx, |state, cx| {
                         state.delegate_mut().show(table.columns, &table.rows);
                         state.refresh(cx);
                     });
-                    this.panel = if failed.is_some() && lines.len() == 1 {
+                    this.panel = if failed.is_some() && single {
                         Panel::Output
                     } else {
                         Panel::Results
@@ -233,9 +317,9 @@ impl ConsoleTab {
                     this.panel = Panel::Output;
                 }
                 this.status = match failed {
-                    Some(error) if lines.len() == 1 => Status::Failed(error),
+                    Some(error) if single => Status::Failed(error),
                     _ => Status::Done {
-                        commands: lines.len(),
+                        commands: commands.len(),
                         elapsed: started.elapsed(),
                     },
                 };
@@ -244,6 +328,21 @@ impl ConsoleTab {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn push_output(
+        &mut self,
+        command: &str,
+        text: String,
+        failed: bool,
+        elapsed: Option<Duration>,
+    ) {
+        self.output.push(OutputEntry {
+            command: command.to_string(),
+            text,
+            failed,
+            elapsed,
+        });
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -324,17 +423,19 @@ impl ConsoleTab {
             )
             .child(div().flex_1())
             .child(
-                chrome::pill()
-                    .pr(px(10.))
-                    .id("console-read-only")
-                    .child(Icon::new(AppIcon::Lock).size(px(12.)))
-                    .child("Read-only")
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(
-                            "The Redis console only runs commands that read, for now",
+                chrome::segmented().children(
+                    [
+                        ("console-read", AppIcon::Lock, "Read-only", false),
+                        ("console-write", AppIcon::Pencil, "Write", true),
+                    ]
+                    .map(|(id, icon, label, writing)| {
+                        chrome::segment(id, icon, label, self.writing == writing).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.set_writing(writing, window, cx)
+                            }),
                         )
-                        .build(window, cx)
                     }),
+                ),
             )
             .child(
                 chrome::pill()
@@ -446,39 +547,48 @@ impl ConsoleTab {
 }
 
 /// Why a command may not run from the console, if it may not.
-fn refusal(args: &[String], development: bool) -> Option<String> {
+fn refusal(args: &[String], development: bool, writing: bool) -> Option<String> {
     let name = args
         .first()
         .map(|a| a.to_ascii_uppercase())
         .unwrap_or_default();
     match classify(args) {
         Class::Read => None,
+        Class::Write if writing => None,
         Class::Heavy if development => None,
         Class::Heavy => Some(format!(
             "{name} walks every key and blocks the server meanwhile; it only runs on development connections. Use SCAN, or the sidebar's filter."
         )),
         Class::Write => Some(format!(
-            "{name} is not run: the Redis console only reads for now."
+            "{name} writes: switch the console to Write to run it."
         )),
         Class::Unsupported(reason) => Some(format!("{name} is not run: {reason}.")),
     }
 }
 
+/// Adds a reply to the Output log, and a write to the audit log.
 fn log(
     this: &gpui_kit::WeakEntity<ConsoleTab>,
     cx: &mut gpui_kit::AsyncApp,
-    command: &str,
+    command: &Planned,
     text: String,
     failed: bool,
     elapsed: Option<Duration>,
 ) {
     this.update(cx, |this, cx| {
-        this.output.push(OutputEntry {
-            command: command.to_string(),
-            text,
-            failed,
-            elapsed,
-        });
+        if command.writes {
+            let outcome = text.lines().next().unwrap_or_default().to_string();
+            redis_write::audit(
+                &this.db,
+                &this.project,
+                this.database,
+                &command.line,
+                outcome,
+                failed,
+                cx,
+            );
+        }
+        this.push_output(&command.line, text, failed, elapsed);
         cx.notify();
     })
     .ok();
@@ -520,16 +630,21 @@ mod tests {
 
     #[test]
     fn refuses_what_the_console_does_not_run() {
-        assert_eq!(refusal(&args("HGETALL user:1"), false), None);
+        assert_eq!(refusal(&args("HGETALL user:1"), false, false), None);
         assert!(
-            refusal(&args("SET a 1"), true)
+            refusal(&args("SET a 1"), true, false)
                 .unwrap()
-                .contains("only reads")
+                .contains("Write")
         );
-        assert_eq!(refusal(&args("KEYS *"), true), None);
-        assert!(refusal(&args("keys *"), false).unwrap().starts_with("KEYS"));
+        assert_eq!(refusal(&args("SET a 1"), false, true), None);
+        assert_eq!(refusal(&args("KEYS *"), true, false), None);
         assert!(
-            refusal(&args("SELECT 1"), true)
+            refusal(&args("keys *"), false, true)
+                .unwrap()
+                .starts_with("KEYS")
+        );
+        assert!(
+            refusal(&args("SELECT 1"), true, true)
                 .unwrap()
                 .contains("toolbar")
         );

@@ -26,7 +26,7 @@ use kuery_core::read_only::Rejection;
 use kuery_pg::StatementImpact;
 
 use crate::assets::AppIcon;
-use crate::connection::{Db, Environment, WriteKind, WritePolicy};
+use crate::connection::{Db, Environment, RedisDb, WriteKind, WritePolicy};
 use crate::theme::{self, color};
 use crate::ui::thousands;
 
@@ -215,7 +215,39 @@ pub fn allow_writes(
     cx: &mut App,
     allowed: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    let dialog = cx.new(|cx| AllowWrites::new(db, kind, Rc::new(allowed), window, cx));
+    let subject = Subject {
+        name: db.name.clone(),
+        target: db.target.clone(),
+        scope: Scope::Postgres(kind),
+        allow: Rc::new(move || db.allow(kind)),
+    };
+    open_allow(subject, window, cx, allowed);
+}
+
+/// The same for a Redis connection: its console and key tabs may write
+/// until it disconnects or the app quits.
+pub fn allow_redis_writes(
+    db: RedisDb,
+    window: &mut Window,
+    cx: &mut App,
+    allowed: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let subject = Subject {
+        name: db.name.clone(),
+        target: db.target.clone(),
+        scope: Scope::Redis,
+        allow: Rc::new(move || db.allow_writes()),
+    };
+    open_allow(subject, window, cx, allowed);
+}
+
+fn open_allow(
+    subject: Subject,
+    window: &mut Window,
+    cx: &mut App,
+    allowed: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let dialog = cx.new(|cx| AllowWrites::new(subject, Rc::new(allowed), window, cx));
     let first_build = std::cell::Cell::new(true);
     window.open_dialog(cx, move |modal, window, cx| {
         if first_build.replace(false) {
@@ -232,9 +264,22 @@ pub fn allow_writes(
 /// Runs once writes are allowed.
 type OnAllowed = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// What a production connection is being allowed to do.
+enum Scope {
+    Postgres(WriteKind),
+    Redis,
+}
+
+/// The connection writes are allowed on, and how to allow them.
+struct Subject {
+    name: SharedString,
+    target: SharedString,
+    scope: Scope,
+    allow: Rc<dyn Fn()>,
+}
+
 struct AllowWrites {
-    db: Db,
-    kind: WriteKind,
+    subject: Subject,
     input: Entity<InputState>,
     allowed: OnAllowed,
     error: Option<String>,
@@ -242,13 +287,12 @@ struct AllowWrites {
 
 impl AllowWrites {
     fn new(
-        db: Db,
-        kind: WriteKind,
+        subject: Subject,
         allowed: OnAllowed,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(db.name.clone()));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(subject.name.clone()));
         cx.subscribe_in(
             &input,
             window,
@@ -261,8 +305,7 @@ impl AllowWrites {
         )
         .detach();
         Self {
-            db,
-            kind,
+            subject,
             input,
             allowed,
             error: None,
@@ -270,12 +313,15 @@ impl AllowWrites {
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.input.read(cx).value().trim() != self.db.name.as_ref() {
-            self.error = Some(format!("Type \u{201c}{}\u{201d} exactly", self.db.name));
+        if self.input.read(cx).value().trim() != self.subject.name.as_ref() {
+            self.error = Some(format!(
+                "Type \u{201c}{}\u{201d} exactly",
+                self.subject.name
+            ));
             cx.notify();
             return;
         }
-        self.db.allow(self.kind);
+        (self.subject.allow)();
         window.close_dialog(cx);
         (self.allowed)(window, cx);
     }
@@ -284,7 +330,8 @@ impl AllowWrites {
 impl Render for AllowWrites {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
-        let matches = self.input.read(cx).value().trim() == self.db.name.as_ref();
+        let subject = &self.subject;
+        let matches = self.input.read(cx).value().trim() == subject.name.as_ref();
         let point = |icon: AppIcon, text: &'static str| {
             h_flex()
                 .gap(px(9.))
@@ -295,6 +342,40 @@ impl Render for AllowWrites {
                 )
                 .child(text)
         };
+        let (icon, title, description, confirmed, button) = match subject.scope {
+            Scope::Postgres(WriteKind::Transactional) => (
+                AppIcon::Pencil,
+                "Allow writes on production?",
+                format!(
+                    "Query tabs on {} ({}) will be able to change data.",
+                    subject.name, subject.target
+                ),
+                "Every change is confirmed and stays in a transaction until you commit",
+                "Allow Writes",
+            ),
+            Scope::Postgres(WriteKind::Full) => (
+                AppIcon::FullWrite,
+                "Allow full writes on production?",
+                format!(
+                    "Each script runs against {} and is applied as soon as it finishes. There \
+                     is no Roll Back.",
+                    subject.name
+                ),
+                "Every change is still confirmed before it runs",
+                "Allow Full Writes",
+            ),
+            Scope::Redis => (
+                AppIcon::Pencil,
+                "Allow writes on production?",
+                format!(
+                    "The console and key tabs on {} ({}) will be able to change data. Redis \
+                     has no transactions: each command applies as soon as it runs.",
+                    subject.name, subject.target
+                ),
+                "Every change is confirmed before it runs",
+                "Allow Writes",
+            ),
+        };
         v_flex()
             .gap_4()
             .text_size(px(13.))
@@ -302,13 +383,7 @@ impl Render for AllowWrites {
                 h_flex()
                     .gap(px(14.))
                     .items_start()
-                    .child(icon_box(
-                        match self.kind {
-                            WriteKind::Transactional => AppIcon::Pencil,
-                            WriteKind::Full => AppIcon::FullWrite,
-                        },
-                        theme::AMBER,
-                    ))
+                    .child(icon_box(icon, theme::AMBER))
                     .child(
                         v_flex()
                             .flex_1()
@@ -317,22 +392,9 @@ impl Render for AllowWrites {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(match self.kind {
-                                        WriteKind::Transactional => "Allow writes on production?",
-                                        WriteKind::Full => "Allow full writes on production?",
-                                    }),
+                                    .child(title),
                             )
-                            .child(div().text_color(color(0xc7c7cc)).child(match self.kind {
-                                WriteKind::Transactional => format!(
-                                    "Query tabs on {} ({}) will be able to change data.",
-                                    self.db.name, self.db.target
-                                ),
-                                WriteKind::Full => format!(
-                                    "Each script runs against {} and is applied as soon as \
-                                     it finishes. There is no Roll Back.",
-                                    self.db.name
-                                ),
-                            })),
+                            .child(div().text_color(color(0xc7c7cc)).child(description)),
                     ),
             )
             .child(
@@ -349,16 +411,7 @@ impl Render for AllowWrites {
                         AppIcon::History,
                         "Lasts until the connection closes or you quit Kuery",
                     ))
-                    .child(point(
-                        AppIcon::Pencil,
-                        match self.kind {
-                            WriteKind::Transactional => {
-                                "Every change is confirmed and stays in a transaction until you \
-                                 commit"
-                            }
-                            WriteKind::Full => "Every change is still confirmed before it runs",
-                        },
-                    ))
+                    .child(point(AppIcon::Pencil, confirmed))
                     .child(point(
                         AppIcon::Audit,
                         "Logged in the audit log, never saved in the project",
@@ -377,7 +430,7 @@ impl Render for AllowWrites {
                                 div()
                                     .font_family(mono)
                                     .text_color(color(theme::TEXT))
-                                    .child(self.db.name.clone()),
+                                    .child(subject.name.clone()),
                             )
                             .child("to confirm"),
                     )
@@ -402,10 +455,7 @@ impl Render for AllowWrites {
                     .child(
                         Button::new("allow-writes")
                             .danger()
-                            .label(match self.kind {
-                                WriteKind::Transactional => "Allow Writes",
-                                WriteKind::Full => "Allow Full Writes",
-                            })
+                            .label(button)
                             .disabled(!matches)
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
@@ -414,7 +464,7 @@ impl Render for AllowWrites {
 }
 
 /// A 36 px rounded square with an icon, for dialog headers.
-fn icon_box(icon: AppIcon, tone: u32) -> impl IntoElement {
+pub fn icon_box(icon: AppIcon, tone: u32) -> impl IntoElement {
     div()
         .size(px(36.))
         .flex_shrink_0()

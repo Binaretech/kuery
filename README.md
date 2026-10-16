@@ -8,8 +8,8 @@ query tabs that run read-only with streamed results (or, in write mode,
 inside a transaction you commit), and table tabs
 with server-side filtering, sorting and paging, the table definition, and
 row editing through staged changes (never on production connections).
-Redis connections get a key browser, key tabs and a read-only console (see
-[Redis](#redis)).
+Redis connections get a key browser, key tabs with staged edits and a console
+(see [Redis](#redis)).
 
 ## Layout
 
@@ -80,14 +80,38 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
 
+## Drivers
+
+The connection dialog picks the driver from a searchable list, grouped by
+family (type to find it by name, alias such as `pg`, or family). A
+connection stores the driver's id (`driver = "redis"` in `project.toml`;
+connections without one are Postgres), and the rest of the form follows the
+driver: its default port, what its database and user fields mean and whether
+they are required, and how it asks about TLS.
+
+Drivers follow one contract in two parts:
+
+- **The descriptor** (`kuery_core::driver::DriverInfo`), plain data: id,
+  name and aliases, family, default port, the database and user fields, the
+  TLS choices and what production means for it. `driver::ALL` lists them.
+- **The implementation** (`Driver` in `crates/app/src/drivers.rs`): `test`
+  connects read-only and says what it reached, `connect` opens the
+  connection the sidebar keeps. What it opens is a `Connection` of its
+  family, and the family decides the rest: SQL drivers get schemas, query
+  tabs and table tabs; key-value drivers get databases and keys, key tabs and
+  a console. `drivers::all()` registers them, in the descriptors' order (a
+  test checks the two lists match).
+
+Adding a driver means a crate for its protocol, a descriptor in
+`driver::ALL`, and a `Driver` implementation in `drivers::all()`. A driver of
+an existing family reuses that family's sidebar and tabs; a new family needs
+its own.
+
 ## Redis
 
-A connection's driver is PostgreSQL or Redis, picked at the top of the
-connection dialog (`driver = "redis"` in `project.toml`; connections without
-it are Postgres). For Redis the database is the index the console starts on,
-the user an optional ACL user, and TLS is on or off (with the server's
-certificate checked against the system's roots). Standalone servers only, for
-now.
+For Redis the database is the index the console starts on, the user an
+optional ACL user, and TLS is on or off (with the server's certificate
+checked against the system's roots). Standalone servers only, for now.
 
 In the sidebar a Redis connection lists its databases with their key
 counts (empty ones are left out, except the default). Expanding one reads its
@@ -105,15 +129,47 @@ The console (from a database's hover icon or menu, or a connection's menu)
 runs commands one per line, as `redis-cli` reads them, with command-name
 completion: `secondary-enter` runs the line under the cursor or the selected
 lines, `secondary-alt-enter` every line. The last reply fills the grid; the
-Output tab logs each reply the way `redis-cli` prints it. For now the console
-only reads: commands that write are refused, as are those that would change
-or hold the connection (`SELECT`, `SUBSCRIBE`, `MONITOR`, blocking pops,
-`MULTI`); pick the database in its toolbar instead. `KEYS` runs on
-development connections only.
+Output tab logs each reply the way `redis-cli` prints it. Commands that would
+change or hold the connection never run (`SELECT`, `SUBSCRIBE`, `MONITOR`,
+blocking pops, `MULTI`; pick the database in the toolbar instead), and `KEYS`
+runs on development connections only.
+
+### Writing to Redis
+
+The console starts in Read-only, where commands that write are refused; its
+Read-only / Write control switches. Redis has no transactions, so there is
+no transactional mode: each command applies as soon as it runs and cannot be
+rolled back. Writes follow the environment, as in Postgres write mode:
+
+- development asks only before risky commands: `FLUSHDB`, `FLUSHALL`, `DEL`
+  or `UNLINK` of ten keys or more, `CONFIG SET`, `SHUTDOWN`, `DEBUG`,
+  `SWAPDB`, `CLIENT KILL`, ACL and module changes, and a `RENAME` (or `COPY …
+  REPLACE`) onto a key that exists;
+- staging asks before every write;
+- production needs writes allowed for the connection session first (typing
+  its name; never saved, gone when it disconnects; "Stop allowing writes" in
+  the status bar takes it back), then asks before every write.
+
+The confirmation lists the commands in order, flags the risky ones, and shows
+what each key they change holds now (type, size, time to live and the start
+of the value, or "new key"). Every write that runs is logged to the audit
+log, with its connection, database and outcome.
+
+A key tab stages changes and applies them the same way: a new string value
+(edited as text, keeping the time to live), the time to live, a new name,
+deleting the key, and adding entries (+) or changing and removing them from a
+row's menu (hash fields, list items at the head or tail, set and sorted-set
+members and scores, stream entries). The staged list shows each change with
+its command; Apply runs them in order, stops at the first that fails and
+keeps the rest, then reloads the key. Removed list items are first set to a
+marker and removed together, so indexes do not move under the other changes.
+On production nothing can be staged until writes are allowed ("Allow
+writes…" in the tab).
 
 The dev compose starts a Redis on port 63799 with every key type, keys that
 expire, 1,500 products to page through and a second database; the repo's
-project has a `local-cache` connection to it.
+project has a `local-cache` connection to it, and `prod-cache`, the same
+server marked as production, to try the production rules.
 
 ## Write mode
 

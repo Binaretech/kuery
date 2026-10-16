@@ -1,6 +1,7 @@
 //! Redis without a connection: splitting command lines the way `redis-cli`
-//! does, telling which commands only read, and grouping key names into a
-//! tree by a delimiter (`user:1:name` → `user ▸ 1 ▸ name`).
+//! does (and quoting them back), telling which commands only read, which
+//! writes deserve a second look and which keys they change, and grouping key
+//! names into a tree by a delimiter (`user:1:name` → `user ▸ 1 ▸ name`).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -286,6 +287,161 @@ pub fn classify(args: &[String]) -> Class {
     }
 }
 
+/// `DEL`/`UNLINK` with this many keys or more counts as dangerous.
+pub const MANY_KEYS: usize = 10;
+
+/// Why a command that writes deserves a second look, if it does: it loses
+/// a lot of data at once, or changes the server rather than its data.
+/// (`RENAME` over an existing key is caught by looking at the target, see
+/// [`overwritten_key`].)
+pub fn danger(args: &[String]) -> Option<String> {
+    let command = args.first()?.to_ascii_uppercase();
+    let sub = args
+        .get(1)
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_default();
+    let reason = match command.as_str() {
+        "FLUSHDB" => "deletes every key in the database".to_string(),
+        "FLUSHALL" => "deletes every key in every database".to_string(),
+        "DEL" | "UNLINK" if args.len() > MANY_KEYS => {
+            format!("deletes {} keys at once", args.len() - 1)
+        }
+        "CONFIG" if sub != "GET" && sub != "HELP" => "changes the server's configuration".into(),
+        "SHUTDOWN" => "stops the server".into(),
+        "DEBUG" => "is a debugging command that can crash or stall the server".into(),
+        "SWAPDB" => "swaps two whole databases".into(),
+        "MIGRATE" => "moves keys to another server".into(),
+        "REPLICAOF" | "SLAVEOF" => "changes replication".into(),
+        "CLIENT" if sub == "KILL" || sub == "PAUSE" => "disconnects or pauses clients".into(),
+        "SCRIPT" if sub == "FLUSH" || sub == "KILL" => "removes or stops server scripts".into(),
+        "FUNCTION" if matches!(sub.as_str(), "FLUSH" | "DELETE" | "KILL" | "RESTORE") => {
+            "changes the server's functions".into()
+        }
+        "ACL" if matches!(sub.as_str(), "SETUSER" | "DELUSER" | "LOAD" | "SAVE") => {
+            "changes users and permissions".into()
+        }
+        "MODULE" if sub != "LIST" && sub != "HELP" => "loads or unloads server modules".into(),
+        _ => return None,
+    };
+    Some(reason)
+}
+
+/// Commands whose first argument is the one key they change.
+const ONE_KEY: &[&str] = &[
+    "APPEND",
+    "DECR",
+    "DECRBY",
+    "EXPIRE",
+    "EXPIREAT",
+    "GETDEL",
+    "GETEX",
+    "GETSET",
+    "HDEL",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HMSET",
+    "HSET",
+    "HSETNX",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "LINSERT",
+    "LPOP",
+    "LPUSH",
+    "LPUSHX",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "PERSIST",
+    "PEXPIRE",
+    "PEXPIREAT",
+    "PFADD",
+    "PSETEX",
+    "RPOP",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SET",
+    "SETBIT",
+    "SETEX",
+    "SETNX",
+    "SETRANGE",
+    "SPOP",
+    "SREM",
+    "XADD",
+    "XDEL",
+    "XTRIM",
+    "ZADD",
+    "ZINCRBY",
+    "ZPOPMAX",
+    "ZPOPMIN",
+    "ZREM",
+    "ZREMRANGEBYLEX",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+];
+
+/// The keys a command that writes would change, to show them before it
+/// runs. Commands Kuery does not know list none.
+pub fn written_keys(args: &[String]) -> Vec<String> {
+    let Some(command) = args.first().map(|c| c.to_ascii_uppercase()) else {
+        return Vec::new();
+    };
+    match command.as_str() {
+        "DEL" | "UNLINK" => args[1..].to_vec(),
+        "MSET" | "MSETNX" => args[1..].iter().step_by(2).cloned().collect(),
+        "RENAME" | "RENAMENX" | "SMOVE" | "LMOVE" | "RPOPLPUSH" | "COPY" => {
+            args.iter().skip(1).take(2).cloned().collect()
+        }
+        name if ONE_KEY.contains(&name) => args.get(1).cloned().into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The existing key a command would replace, if it names one: the target of
+/// `RENAME`, or of `COPY … REPLACE`.
+pub fn overwritten_key(args: &[String]) -> Option<&str> {
+    let command = args.first()?.to_ascii_uppercase();
+    match command.as_str() {
+        "RENAME" => args.get(2).map(String::as_str),
+        "COPY" if args.iter().any(|a| a.eq_ignore_ascii_case("REPLACE")) => {
+            args.get(2).map(String::as_str)
+        }
+        _ => None,
+    }
+}
+
+/// Arguments back into one command line that [`split_command`] reads the
+/// same way: plain when they can be, double-quoted with escapes otherwise.
+pub fn join_command(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            let plain = !arg.is_empty()
+                && arg.chars().all(|c| {
+                    !c.is_whitespace() && !c.is_control() && c != '"' && c != '\'' && c != '\\'
+                });
+            if plain {
+                return arg.clone();
+            }
+            let mut quoted = String::from("\"");
+            for c in arg.chars() {
+                match c {
+                    '"' => quoted.push_str("\\\""),
+                    '\\' => quoted.push_str("\\\\"),
+                    '\n' => quoted.push_str("\\n"),
+                    '\r' => quoted.push_str("\\r"),
+                    '\t' => quoted.push_str("\\t"),
+                    c if c.is_control() => quoted.push_str(&format!("\\x{:02x}", c as u32)),
+                    c => quoted.push(c),
+                }
+            }
+            quoted.push('"');
+            quoted
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Every command name Kuery knows, for completion in the console.
 pub fn known_commands() -> Vec<&'static str> {
     let mut names: Vec<&str> = READS
@@ -503,6 +659,52 @@ mod tests {
         assert!(matches!(class("SELECT 2"), Class::Unsupported(_)));
         assert!(matches!(class("SUBSCRIBE news"), Class::Unsupported(_)));
         assert!(known_commands().contains(&"HGETALL"));
+    }
+
+    #[test]
+    fn flags_dangerous_writes() {
+        let danger = |line: &str| danger(&args(line));
+        assert!(danger("FLUSHDB").unwrap().contains("every key"));
+        assert!(danger("flushall async").is_some());
+        assert_eq!(danger("DEL a b c"), None);
+        assert!(
+            danger("DEL a b c d e f g h i j")
+                .unwrap()
+                .contains("10 keys")
+        );
+        assert!(danger("CONFIG SET maxmemory 1").is_some());
+        assert_eq!(danger("CONFIG GET maxmemory"), None);
+        assert_eq!(danger("SET a 1"), None);
+        assert!(danger("SHUTDOWN NOSAVE").is_some());
+    }
+
+    #[test]
+    fn finds_the_keys_a_write_changes() {
+        let keys = |line: &str| written_keys(&args(line));
+        assert_eq!(keys("SET a 1 EX 10"), ["a"]);
+        assert_eq!(keys("del a b"), ["a", "b"]);
+        assert_eq!(keys("MSET a 1 b 2"), ["a", "b"]);
+        assert_eq!(keys("RENAME a b"), ["a", "b"]);
+        assert_eq!(keys("HSET user:1 plan pro"), ["user:1"]);
+        assert!(keys("FLUSHDB").is_empty());
+        assert_eq!(overwritten_key(&args("RENAME a b")), Some("b"));
+        assert_eq!(overwritten_key(&args("RENAMENX a b")), None);
+        assert_eq!(overwritten_key(&args("COPY a b REPLACE")), Some("b"));
+        assert_eq!(overwritten_key(&args("COPY a b")), None);
+    }
+
+    #[test]
+    fn quotes_commands_back_into_lines() {
+        let line = vec![
+            "SET".to_string(),
+            "key one".into(),
+            "say \"hi\"\n".into(),
+            "".into(),
+            "plain".into(),
+        ];
+        let joined = join_command(&line);
+        assert_eq!(joined, r#"SET "key one" "say \"hi\"\n" "" plain"#);
+        assert_eq!(split_command(&joined).unwrap(), line);
     }
 
     #[test]

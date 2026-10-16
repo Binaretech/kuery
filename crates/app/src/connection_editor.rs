@@ -1,41 +1,90 @@
 //! Connection editor, shown in a dialog: add, edit, test and delete one of the
-//! project's connections, to PostgreSQL or Redis. The password goes to the
-//! system keychain; the rest to `.kuery/project.toml`.
+//! project's connections. The driver is picked from a searchable list of
+//! every driver Kuery has, grouped by family; the rest of the form follows
+//! the driver's descriptor (see [`kuery_core::driver`]): its default port,
+//! what its database and user fields mean, and how it asks about TLS. The
+//! password goes to the system keychain; the rest to `.kuery/project.toml`.
 
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::searchable_list::{SearchableGroup, SearchableListItem, SearchableVec};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{Disableable as _, IndexPath, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Window, div, px,
 };
+use kuery_core::driver::{self, DriverInfo, Family};
 
 use crate::app;
-use crate::assets::AppIcon;
-use crate::chrome;
-use crate::project::{ConnectionSpec, Driver, ProjectModel, new_id};
+use crate::drivers::{self, family_icon};
+use crate::project::{ConnectionSpec, ProjectModel, new_id};
 use crate::secrets::SecretStore;
 use crate::theme::{self, color};
 use crate::ui::muted;
 
 type TextSelect = SelectState<SearchableVec<SharedString>>;
+type DriverSelect = SelectState<SearchableVec<SearchableGroup<DriverItem>>>;
 
-const SSL_MODES: [&str; 6] = [
-    "default",
-    "disable",
-    "prefer",
-    "require",
-    "verify-ca",
-    "verify-full",
-];
-/// Redis: off, or on with the server's certificate verified.
-const TLS_MODES: [&str; 2] = ["disabled", "enabled"];
 const ENVIRONMENTS: [&str; 4] = ["detect from host", "development", "staging", "production"];
+
+/// A driver in the searchable list: its icon and name; found by name,
+/// alias or family.
+#[derive(Debug, Clone)]
+struct DriverItem(&'static DriverInfo);
+
+impl SearchableListItem for DriverItem {
+    type Value = &'static str;
+
+    fn title(&self) -> SharedString {
+        self.0.name.into()
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        h_flex()
+            .gap_2()
+            .child(
+                family_icon(self.0.family)
+                    .size(px(14.))
+                    .text_color(color(theme::TEXT_SECONDARY)),
+            )
+            .child(self.0.name)
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0.id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.0.matches(query)
+    }
+}
+
+/// Every driver, grouped by family in the order families first appear.
+fn driver_groups() -> SearchableVec<SearchableGroup<DriverItem>> {
+    let mut families: Vec<Family> = Vec::new();
+    for info in driver::ALL {
+        if !families.contains(&info.family) {
+            families.push(info.family);
+        }
+    }
+    SearchableVec::new(
+        families
+            .into_iter()
+            .map(|family| {
+                SearchableGroup::new(family.label()).items(
+                    driver::ALL
+                        .iter()
+                        .filter(|info| info.family == family)
+                        .map(|info| DriverItem(info)),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
 
 enum TestState {
     Idle,
@@ -48,7 +97,8 @@ pub struct ConnectionEditor {
     model: Entity<ProjectModel>,
     /// `None` for a new connection.
     id: Option<String>,
-    driver: Driver,
+    driver: &'static DriverInfo,
+    driver_select: Entity<DriverSelect>,
     name: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
@@ -56,7 +106,7 @@ pub struct ConnectionEditor {
     user: Entity<InputState>,
     password: Entity<InputState>,
     has_saved_password: bool,
-    sslmode: Entity<TextSelect>,
+    /// The driver's TLS choices (see [`driver::Tls::options`]).
     tls: Entity<TextSelect>,
     environment: Entity<TextSelect>,
     test: TestState,
@@ -74,8 +124,14 @@ impl ConnectionEditor {
         let spec = id
             .as_deref()
             .and_then(|id| model.read(cx).project.connection(id).cloned());
-        let driver = spec.as_ref().map_or(Driver::Postgres, |s| s.driver);
-        let (database_hint, user_hint) = placeholders(driver);
+        let unknown_driver = spec
+            .as_ref()
+            .filter(|spec| spec.driver_info().is_none())
+            .map(|spec| spec.driver.clone());
+        let info = spec
+            .as_ref()
+            .and_then(ConnectionSpec::driver_info)
+            .unwrap_or(&driver::POSTGRES);
         let text = |value: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>| {
             let (value, placeholder) = (value.to_string(), placeholder.to_string());
             cx.new(|cx| {
@@ -96,7 +152,7 @@ impl ConnectionEditor {
             window,
             cx,
         );
-        let default_port = driver.default_port().to_string();
+        let default_port = info.default_port.to_string();
         let port = text(
             &spec
                 .as_ref()
@@ -107,17 +163,21 @@ impl ConnectionEditor {
         );
         let database = text(
             spec.as_ref().map_or("", |s| &s.database),
-            database_hint,
+            info.database.placeholder,
             window,
             cx,
         );
-        let user = text(spec.as_ref().map_or("", |s| &s.user), user_hint, window, cx);
+        let user = text(
+            spec.as_ref().map_or("", |s| &s.user),
+            info.user.placeholder,
+            window,
+            cx,
+        );
         let password = cx.new(|cx| InputState::new(window, cx).masked(true));
 
         let select =
-            |items: &[&str], selected: usize, window: &mut Window, cx: &mut Context<Self>| {
-                let items: Vec<SharedString> =
-                    items.iter().map(|i| SharedString::from(*i)).collect();
+            |items: Vec<&str>, selected: usize, window: &mut Window, cx: &mut Context<Self>| {
+                let items: Vec<SharedString> = items.into_iter().map(SharedString::from).collect();
                 cx.new(|cx| {
                     SelectState::new(
                         SearchableVec::new(items),
@@ -127,28 +187,45 @@ impl ConnectionEditor {
                     )
                 })
             };
-        let ssl_index = spec
-            .as_ref()
-            .and_then(|s| s.sslmode.as_deref())
-            .and_then(|mode| SSL_MODES.iter().position(|m| *m == mode))
-            .unwrap_or(0);
+        let tls_index = info
+            .tls
+            .index(spec.as_ref().and_then(|s| s.sslmode.as_deref()));
+        let tls = select(info.tls.options(), tls_index, window, cx);
         let environment_index = spec
             .as_ref()
             .and_then(|s| s.environment.as_deref())
             .and_then(|e| ENVIRONMENTS.iter().position(|m| *m == e))
             .unwrap_or(0);
-        let tls_index = usize::from(
-            spec.as_ref()
-                .is_some_and(|s| s.driver == Driver::Redis && s.redis_target(None).tls),
-        );
-        let sslmode = select(&SSL_MODES, ssl_index, window, cx);
-        let tls = select(&TLS_MODES, tls_index, window, cx);
-        let environment = select(&ENVIRONMENTS, environment_index, window, cx);
+        let environment = select(ENVIRONMENTS.to_vec(), environment_index, window, cx);
+
+        let driver_select = cx.new(|cx| {
+            let mut state = SelectState::new(driver_groups(), None, window, cx).searchable(true);
+            state.set_selected_value(&info.id, window, cx);
+            state
+        });
+        cx.subscribe_in(
+            &driver_select,
+            window,
+            |this,
+             _,
+             event: &SelectEvent<SearchableVec<SearchableGroup<DriverItem>>>,
+             window,
+             cx| {
+                let SelectEvent::Confirm(Some(id)) = event else {
+                    return;
+                };
+                if let Some(info) = driver::find(id) {
+                    this.set_driver(info, window, cx);
+                }
+            },
+        )
+        .detach();
 
         let mut editor = Self {
             model,
             id,
-            driver,
+            driver: info,
+            driver_select,
             name,
             host,
             port,
@@ -156,11 +233,16 @@ impl ConnectionEditor {
             user,
             password,
             has_saved_password: false,
-            sslmode,
             tls,
             environment,
             test: TestState::Idle,
-            error: None,
+            error: unknown_driver.map(|id| {
+                format!(
+                    "This version of Kuery has no \u{201c}{id}\u{201d} driver; saving switches \
+                     the connection to {}",
+                    info.name
+                )
+            }),
             confirm_delete: false,
         };
         editor.load_password_state(cx);
@@ -174,7 +256,7 @@ impl ConnectionEditor {
         model: Entity<ProjectModel>,
         id: Option<String>,
         window: &mut Window,
-        cx: &mut gpui_kit::App,
+        cx: &mut App,
     ) {
         let title = if id.is_some() {
             "Edit Connection"
@@ -197,26 +279,44 @@ impl ConnectionEditor {
     }
 
     /// Switches the form to another driver: the port follows if it was the
-    /// old driver's default, and the hints change.
-    fn set_driver(&mut self, driver: Driver, window: &mut Window, cx: &mut Context<Self>) {
-        if driver == self.driver {
+    /// old driver's default, the hints and TLS choices change.
+    fn set_driver(
+        &mut self,
+        info: &'static DriverInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if info.id == self.driver.id {
             return;
         }
-        let old_default = self.driver.default_port().to_string();
-        let new_default = driver.default_port().to_string();
+        let old_default = self.driver.default_port.to_string();
+        let new_default = info.default_port.to_string();
         self.port.update(cx, |port, cx| {
-            if port.value().trim().is_empty() || port.value().trim() == old_default {
+            let current = port.value().trim().to_string();
+            if current.is_empty() || current == old_default {
                 port.set_value(new_default.clone(), window, cx);
             }
             port.set_placeholder(new_default.clone(), window, cx);
         });
-        let (database_hint, user_hint) = placeholders(driver);
         self.database.update(cx, |input, cx| {
-            input.set_placeholder(database_hint, window, cx)
+            input.set_placeholder(info.database.placeholder, window, cx)
         });
-        self.user
-            .update(cx, |input, cx| input.set_placeholder(user_hint, window, cx));
-        self.driver = driver;
+        self.user.update(cx, |input, cx| {
+            input.set_placeholder(info.user.placeholder, window, cx)
+        });
+        if info.tls != self.driver.tls {
+            let options: Vec<SharedString> = info
+                .tls
+                .options()
+                .into_iter()
+                .map(SharedString::from)
+                .collect();
+            self.tls.update(cx, |select, cx| {
+                select.set_items(SearchableVec::new(options), window, cx);
+                select.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            });
+        }
+        self.driver = info;
         self.test = TestState::Idle;
         self.error = None;
         cx.notify();
@@ -239,21 +339,16 @@ impl ConnectionEditor {
         .detach();
     }
 
-    fn selected(
-        select: &Entity<TextSelect>,
-        options: &[&str],
-        cx: &gpui_kit::App,
-    ) -> Option<String> {
-        let index = select
+    fn selected_index(select: &Entity<TextSelect>, cx: &App) -> usize {
+        select
             .read(cx)
             .selected_index(cx)
             .map(|i| i.row)
-            .unwrap_or(0);
-        (index > 0).then(|| options[index.min(options.len() - 1)].to_string())
+            .unwrap_or(0)
     }
 
     /// The form as a connection, or why it is not valid.
-    fn spec(&self, cx: &gpui_kit::App) -> Result<ConnectionSpec, String> {
+    fn spec(&self, cx: &App) -> Result<ConnectionSpec, String> {
         let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
         let name = value(&self.name);
         let host = value(&self.host);
@@ -262,38 +357,27 @@ impl ConnectionEditor {
         if name.is_empty() {
             return Err("Give the connection a name".into());
         }
-        match self.driver {
-            Driver::Postgres if host.is_empty() || database.is_empty() || user.is_empty() => {
-                return Err("Host, database and user are required".into());
-            }
-            Driver::Redis if host.is_empty() => return Err("The host is required".into()),
-            Driver::Redis if !database.is_empty() && database.parse::<u32>().is_err() => {
-                return Err("The database is a number, such as 0".into());
-            }
-            _ => {}
-        }
+        self.driver.validate(&host, &database, &user)?;
         let port = value(&self.port)
             .parse::<u16>()
             .map_err(|_| "The port must be a number between 1 and 65535".to_string())?;
-        let sslmode = match self.driver {
-            Driver::Postgres => Self::selected(&self.sslmode, &SSL_MODES, cx),
-            Driver::Redis => Self::selected(&self.tls, &TLS_MODES, cx).map(|_| "require".into()),
-        };
+        let environment = Self::selected_index(&self.environment, cx);
         Ok(ConnectionSpec {
             id: self.id.clone().unwrap_or_else(new_id),
             name,
-            driver: self.driver,
+            driver: self.driver.id.to_string(),
             host,
             port,
             database,
             user,
-            sslmode,
-            environment: Self::selected(&self.environment, &ENVIRONMENTS, cx),
+            sslmode: self.driver.tls.stored(Self::selected_index(&self.tls, cx)),
+            environment: (environment > 0)
+                .then(|| ENVIRONMENTS[environment.min(ENVIRONMENTS.len() - 1)].to_string()),
         })
     }
 
     /// The password typed in the form, or the saved one if the field is empty.
-    fn password(&self, cx: &gpui_kit::App) -> Option<String> {
+    fn password(&self, cx: &App) -> Option<String> {
         let typed = self.password.read(cx).value().to_string();
         (!typed.is_empty()).then_some(typed)
     }
@@ -307,13 +391,17 @@ impl ConnectionEditor {
                 return;
             }
         };
+        let driver = match drivers::for_spec(&spec) {
+            Ok(driver) => driver,
+            Err(error) => {
+                self.test = TestState::Failed(error);
+                cx.notify();
+                return;
+            }
+        };
         let typed = self.password(cx);
         let state = app::state(cx);
-        let (engine, redis, secrets) = (
-            state.engine.clone(),
-            state.redis.clone(),
-            state.secrets.clone(),
-        );
+        let (engines, secrets) = (state.engines(), state.secrets.clone());
         let saved_id = self.id.clone();
         self.error = None;
         self.test = TestState::Testing;
@@ -330,24 +418,7 @@ impl ConnectionEditor {
                     None => None,
                 },
             };
-            let result = match spec.driver {
-                Driver::Postgres => engine
-                    .connect_with(
-                        spec.conninfo(password.as_deref()),
-                        kuery_pg::Access::ReadOnly,
-                    )
-                    .await
-                    .map(|session| format!("Connected · PostgreSQL {}", session.server_version()))
-                    .map_err(|error| error.to_string()),
-                Driver::Redis => redis
-                    .connect(spec.redis_target(password.as_deref()))
-                    .await
-                    .map(|session| {
-                        let server = session.server();
-                        format!("Connected · Redis {} · {}", server.version, server.mode)
-                    })
-                    .map_err(|error| error.to_string()),
-            };
+            let result = driver.test(&spec, password, &engines).await;
             this.update(cx, |this, cx| {
                 this.test = match result {
                     Ok(message) => TestState::Passed(message),
@@ -423,14 +494,6 @@ impl ConnectionEditor {
     }
 }
 
-/// Hints for the database and user fields.
-fn placeholders(driver: Driver) -> (&'static str, &'static str) {
-    match driver {
-        Driver::Postgres => ("postgres", "postgres"),
-        Driver::Redis => ("0", "default"),
-    }
-}
-
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     h_flex()
         .gap_3()
@@ -448,6 +511,7 @@ const LABEL_WIDTH: gpui_kit::Pixels = px(104.);
 
 impl Render for ConnectionEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let info = self.driver;
         let password_hint = if self.has_saved_password {
             "Saved in the system keychain · leave empty to keep it"
         } else {
@@ -461,60 +525,36 @@ impl Render for ConnectionEditor {
             (None, TestState::Failed(message)) => Some((message.clone(), theme::RED)),
         };
         let indent = LABEL_WIDTH + px(12.);
-
-        let redis = self.driver == Driver::Redis;
-        let drivers = chrome::segmented().children(Driver::ALL.into_iter().map(|driver| {
-            chrome::segment(
-                SharedString::from(format!("driver-{}", driver.label())),
-                match driver {
-                    Driver::Postgres => AppIcon::Database,
-                    Driver::Redis => AppIcon::Key,
-                },
-                driver.label(),
-                self.driver == driver,
-            )
-            .on_click(cx.listener(move |this, _, window, cx| this.set_driver(driver, window, cx)))
-        }));
+        let tls_label = match info.tls {
+            driver::Tls::Modes(_) => "SSL mode",
+            driver::Tls::Toggle => "TLS",
+        };
 
         v_flex()
             .gap_4()
             .text_size(px(13.))
-            .child(field("Driver", h_flex().child(drivers)))
+            .child(field(
+                "Driver",
+                Select::new(&self.driver_select)
+                    .search_placeholder("Search drivers")
+                    .icon(family_icon(info.family))
+                    .menu_max_h(px(320.)),
+            ))
             .child(
                 v_flex()
                     .gap_3()
                     .child(field("Name", Input::new(&self.name)))
                     .child(field("Host", Input::new(&self.host)))
                     .child(field("Port", Input::new(&self.port)))
-                    .child(field("Database", Input::new(&self.database)))
-                    .when(redis, |form| {
-                        form.child(field(
-                            "",
-                            muted("The database index the console starts on; the sidebar lists them all."),
-                        ))
-                    })
-                    .child(field("User", Input::new(&self.user)))
-                    .when(redis, |form| {
-                        form.child(field("", muted("An ACL user; leave empty for the default user.")))
-                    })
+                    .child(field(info.database.label, Input::new(&self.database)))
+                    .children(info.database.help.map(|help| field("", muted(help))))
+                    .child(field(info.user.label, Input::new(&self.user)))
+                    .children(info.user.help.map(|help| field("", muted(help))))
                     .child(field("Password", Input::new(&self.password).mask_toggle()))
                     .child(field("", muted(password_hint)))
-                    .map(|form| {
-                        if redis {
-                            form.child(field("TLS", Select::new(&self.tls)))
-                        } else {
-                            form.child(field("SSL mode", Select::new(&self.sslmode)))
-                        }
-                    })
+                    .child(field(tls_label, Select::new(&self.tls)))
                     .child(field("Environment", Select::new(&self.environment)))
-                    .child(field(
-                        "",
-                        muted(if redis {
-                            "Production connections always open read-only."
-                        } else {
-                            "Production connections always open read-only and cannot edit rows."
-                        }),
-                    )),
+                    .child(field("", muted(info.production_note))),
             )
             .child(field("", muted("Saved in .kuery/project.toml")))
             .children(status.map(|(message, tone)| {

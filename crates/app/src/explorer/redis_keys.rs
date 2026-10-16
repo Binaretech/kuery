@@ -73,54 +73,6 @@ fn selected_key(index: usize, database: i64, key: &str) -> String {
 }
 
 impl Explorer {
-    pub(super) fn connect_redis(
-        &mut self,
-        spec: ConnectionSpec,
-        password: Task<Result<Option<String>, String>>,
-        cx: &mut Context<Self>,
-    ) {
-        let engine = app::state(cx).redis.clone();
-        cx.spawn(async move |this, cx| {
-            let result = match password.await {
-                Ok(password) => engine
-                    .connect(spec.redis_target(password.as_deref()))
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            this.update(cx, |this, cx| {
-                let Some(index) = this.index_of(&spec.id) else {
-                    return;
-                };
-                let node = &mut this.connections[index];
-                if node.spec != spec {
-                    return;
-                }
-                match result {
-                    Ok(session) => {
-                        let db = RedisDb {
-                            name: spec.name.clone().into(),
-                            environment: spec.environment(),
-                            session,
-                            target: spec.target().into(),
-                        };
-                        node.state = ConnectionState::RedisReady {
-                            db: db.clone(),
-                            keyspace: Keyspace::Loading,
-                        };
-                        this.load_keyspace(index, cx);
-                        cx.emit(ExplorerEvent::RedisConnected(db));
-                    }
-                    Err(error) => node.state = ConnectionState::Failed(error),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
     fn redis_db(&self, index: usize) -> Option<RedisDb> {
         match &self.connections.get(index)?.state {
             ConnectionState::RedisReady { db, .. } => Some(db.clone()),
