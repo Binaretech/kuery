@@ -222,12 +222,20 @@ Foreign keys are lines in crow's foot notation, from the referencing column
 (three prongs: many) to the key it refers to (two bars: one); a dashed line
 with a ring is an optional relation (the column may be NULL). The layout
 reads one way: tables others refer to sit on the left and the tables that
-depend on them to their right, each layer ordered to keep lines from
-crossing; tables without relations are set apart on the right.
+depend on them to their right, each layer ordered to cross as few lines as
+it can (down to the row each line leaves from) and each card level with the
+tables it relates to; tables without relations are set apart on the right.
+A relation that skips columns passes through the gaps between their cards
+instead of over them.
 
-Cards can be dragged; where they were left is saved in
-`.kuery/diagrams/<connection>-<schema>.toml` (only positions, fine to commit)
-and "Reset layout" forgets it and goes back to the automatic layout.
+Cards can be dragged; they snap to a 20 pt grid, and a card dropped on
+others pushes them out of its way. Where cards were left is saved in
+`.kuery/diagrams/<connection>-<schema>.toml` (only positions, fine to commit).
+"Untangle" tidies an arrangement up keeping its columns and about where
+each card is: it reorders each column to cross fewer lines, lines cards up
+with the tables they relate to and pulls apart the ones that overlap.
+"Reset layout" forgets the saved places and goes back to the automatic
+layout.
 
 Clicking a table highlights it, its relations and its neighbors, and the
 footer says what it refers to (with its delete rule when it cascades or sets

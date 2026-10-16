@@ -350,12 +350,13 @@ impl DiagramTab {
         drag.moved = true;
         let (table, (x, y)) = (drag.table, drag.origin);
         if let Some(layout) = self.shown_layout_mut() {
-            layout.place(table, x + dx, y + dy);
+            layout.place(table, diagram::snap(x + dx), diagram::snap(y + dy));
         }
         cx.notify();
     }
 
-    /// Ends a drag; a card moved in the whole-schema view keeps its place.
+    /// Ends a drag: the card pushes the cards it landed on out of its way,
+    /// and in the whole-schema view they all keep their places.
     fn end_drag(&mut self, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else {
             return;
@@ -364,19 +365,46 @@ impl DiagramTab {
             return;
         }
         self.dragged = true;
+        let mut moved = vec![drag.table];
+        if let Some(layout) = self.shown_layout_mut() {
+            moved.extend(layout.push_apart(drag.table));
+        }
+        self.keep_places(&moved);
+        cx.notify();
+    }
+
+    /// Saves where these cards are, in the whole-schema view.
+    fn keep_places(&mut self, cards: &[usize]) {
         if self.view.is_some() {
             return;
         }
-        if let State::Ready { diagram, layout } = &self.state {
-            let card = layout.cards[drag.table];
-            self.saved.insert(
-                diagram.tables[drag.table].table.name.clone(),
-                (card.x, card.y),
-            );
-            if let Err(error) = save_layout(&self.file(), &self.saved) {
-                eprintln!("kuery: could not save the diagram layout: {error}");
-            }
+        let State::Ready { diagram, layout } = &self.state else {
+            return;
+        };
+        for &index in cards {
+            let card = layout.cards[index];
+            self.saved
+                .insert(diagram.tables[index].table.name.clone(), (card.x, card.y));
         }
+        if let Err(error) = save_layout(&self.file(), &self.saved) {
+            eprintln!("kuery: could not save the diagram layout: {error}");
+        }
+    }
+
+    /// Reorders what is shown to cross fewer lines, keeping its columns;
+    /// in the whole-schema view every card keeps its new place.
+    fn untangle(&mut self, cx: &mut Context<Self>) {
+        let keys_only = self.keys_only;
+        let count = if let Some((diagram, layout)) = &mut self.view {
+            *layout = diagram::untangle(diagram, layout, keys_only);
+            0
+        } else if let State::Ready { diagram, layout } = &mut self.state {
+            *layout = diagram::untangle(diagram, layout, keys_only);
+            layout.cards.len()
+        } else {
+            0
+        };
+        self.keep_places(&(0..count).collect::<Vec<_>>());
         cx.notify();
     }
 
@@ -555,6 +583,17 @@ impl DiagramTab {
                     }),
             )
             .child(chrome::toolbar_divider())
+            .child(
+                chrome::icon_button(
+                    "diagram-untangle",
+                    AppIcon::Format,
+                    "Untangle: reorder the columns to cross fewer lines",
+                    ready,
+                )
+                .when(ready, |b| {
+                    b.on_click(cx.listener(|this, _, _, cx| this.untangle(cx)))
+                }),
+            )
             .when(!self.saved.is_empty(), |bar| {
                 bar.child(
                     chrome::icon_button(
@@ -643,13 +682,15 @@ impl DiagramTab {
                         None => color(0x5a5a61),
                     };
                     let width = if *touches == Some(true) { 2.0 } else { 1.4 };
-                    let (c1, c2) = wire.controls();
+
                     let mut path = PathBuilder::stroke(px(width));
                     if *optional {
                         path = path.dash_array(&[px(5. * zoom), px(4. * zoom)]);
                     }
                     path.move_to(at(wire.from));
-                    path.cubic_bezier_to(at(wire.to), at(c1), at(c2));
+                    for [_, c1, c2, end] in wire.curves() {
+                        path.cubic_bezier_to(at(end), at(c1), at(c2));
+                    }
                     if let Ok(path) = path.build() {
                         window.paint_path(path, tone);
                     }
@@ -900,7 +941,7 @@ impl DiagramTab {
                 }
             }
             None => "Three prongs: many · two bars: one · dashed: optional · drag cards to \
-                     arrange them · click a table to follow its relations"
+                     arrange them (Untangle tidies up) · click a table to follow its relations"
                 .to_string(),
         };
         div()

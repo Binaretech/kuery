@@ -9,7 +9,17 @@
 //! database and shared by the diagram tab and its exports (SVG, Mermaid and
 //! DBML). A diagram can also be narrowed to one table's neighborhood
 //! ([`Diagram::around`]), and cards can be moved and placed back
-//! ([`Layout::place`]).
+//! ([`Layout::place`]), pushing the cards they land on out of the way
+//! ([`Layout::push_apart`]), and tidied up again keeping their columns
+//! ([`untangle`]).
+//!
+//! The layers are ordered to cross few lines: relations that skip layers
+//! get a waypoint in each layer they pass, so they count when ordering and
+//! get room between cards; layers are swept by where their links lead
+//! (down to the row each line leaves from) and neighbors swapped while that
+//! crosses less, keeping the order with the fewest crossings. Cards then sit
+//! level with the tables they relate to, and every wire passes the columns
+//! between its ends through their gaps.
 
 use crate::catalog::TableRef;
 
@@ -22,9 +32,22 @@ const PADDING: f32 = 6.;
 /// Between layers, and between cards of a layer.
 const LAYER_GAP: f32 = 150.;
 const CARD_GAP: f32 = 36.;
+/// The least space between columns [`untangle`] keeps.
+const MIN_LAYER_GAP: f32 = 80.;
 const MARGIN: f32 = 40.;
-/// Barycenter sweeps when ordering each layer.
-const SWEEPS: usize = 6;
+/// The room a relation passing through a layer takes, and its space from
+/// the cards around it.
+const WAYPOINT: f32 = 8.;
+const WAYPOINT_GAP: f32 = 14.;
+/// How far a wire keeps from the cards it passes.
+const CLEARANCE: f32 = 12.;
+/// The grid cards snap to, and the least space a dropped card leaves.
+pub const GRID: f32 = 20.;
+const PUSH_SPACE: f32 = 20.;
+/// Ordering sweeps, rounds of swapping neighbors, and alignment passes.
+const SWEEPS: usize = 8;
+const TRANSPOSES: usize = 12;
+const ALIGN_PASSES: usize = 9;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagram {
@@ -369,12 +392,27 @@ pub struct Card {
     pub height: f32,
 }
 
+impl Card {
+    /// The card overlaps `other`, or comes closer than `space` to it.
+    fn crowds(&self, other: &Card, space: f32) -> bool {
+        self.x < other.x + other.width + space
+            && other.x < self.x + self.width + space
+            && self.y < other.y + other.height + space
+            && other.y < self.y + self.height + space
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     /// One per table, in the diagram's order.
     pub cards: Vec<Card>,
     pub width: f32,
     pub height: f32,
+}
+
+/// `value` on the grid cards snap to while dragged.
+pub fn snap(value: f32) -> f32 {
+    (value / GRID).round() * GRID
 }
 
 impl Layout {
@@ -387,6 +425,92 @@ impl Layout {
         card.x = x.max(MARGIN / 2.);
         card.y = y.max(MARGIN / 2.);
         self.fit();
+    }
+
+    /// Pushes the cards that card `moved` lands on (or comes too close to)
+    /// out of its way, the shortest way out and away from it, and the
+    /// cards those land on out of theirs. Returns the cards pushed.
+    pub fn push_apart(&mut self, moved: usize) -> Vec<usize> {
+        let count = self.cards.len();
+        if moved >= count {
+            return Vec::new();
+        }
+        let mut settled = vec![false; count];
+        settled[moved] = true;
+        let mut queue = vec![moved];
+        let mut pushed = Vec::new();
+        while let Some(pusher) = queue.pop() {
+            for other in 0..count {
+                let blocker = self.cards[pusher];
+                if settled[other] || !self.cards[other].crowds(&blocker, PUSH_SPACE) {
+                    continue;
+                }
+                let direction = self.way_out(other, &blocker);
+                // Further along the same way while it lands on a card that
+                // already stays put.
+                for _ in 0..count {
+                    let card = self.cards[other];
+                    let Some(block) = (0..count)
+                        .filter(|i| settled[*i])
+                        .map(|i| self.cards[i])
+                        .find(|c| card.crowds(c, PUSH_SPACE))
+                    else {
+                        break;
+                    };
+                    let card = &mut self.cards[other];
+                    match direction {
+                        (dx, _) if dx > 0. => card.x = block.x + block.width + PUSH_SPACE,
+                        (dx, _) if dx < 0. => card.x = block.x - PUSH_SPACE - card.width,
+                        (_, dy) if dy > 0. => card.y = block.y + block.height + PUSH_SPACE,
+                        _ => card.y = block.y - PUSH_SPACE - card.height,
+                    }
+                }
+                settled[other] = true;
+                queue.push(other);
+                pushed.push(other);
+            }
+        }
+        self.fit();
+        pushed
+    }
+
+    /// The shortest way to move card `index` off `blocker`, preferring to
+    /// move away from it and never past the margin: a unit step on one
+    /// axis.
+    fn way_out(&self, index: usize, blocker: &Card) -> (f32, f32) {
+        let card = self.cards[index];
+        let center = |c: &Card| (c.x + c.width / 2., c.y + c.height / 2.);
+        let (cx, cy) = center(&card);
+        let (bx, by) = center(blocker);
+        let ways = [
+            (
+                (1., 0.),
+                blocker.x + blocker.width + PUSH_SPACE - card.x,
+                cx >= bx,
+            ),
+            (
+                (-1., 0.),
+                card.x + card.width + PUSH_SPACE - blocker.x,
+                cx < bx,
+            ),
+            (
+                (0., 1.),
+                blocker.y + blocker.height + PUSH_SPACE - card.y,
+                cy >= by,
+            ),
+            (
+                (0., -1.),
+                card.y + card.height + PUSH_SPACE - blocker.y,
+                cy < by,
+            ),
+        ];
+        ways.into_iter()
+            .filter(|((dx, dy), distance, _)| {
+                card.x + dx * distance >= MARGIN / 2. && card.y + dy * distance >= MARGIN / 2.
+            })
+            .map(|(way, distance, away)| (way, if away { distance } else { distance * 3. }))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or((0., 1.), |(way, _)| way)
     }
 
     /// The size that holds every card, with a margin.
@@ -442,66 +566,156 @@ pub fn layout(diagram: &Diagram, keys_only: bool) -> Layout {
             columns[layers[table]].push(table);
         }
     }
-    order_layers(&mut columns, &parents, &children);
+    let column_x = |index: usize| MARGIN + index as f32 * (CARD_WIDTH + LAYER_GAP);
+    let xs: Vec<f32> = (0..columns.len()).map(column_x).collect();
+    let mut cards: Vec<Card> = diagram
+        .tables
+        .iter()
+        .map(|table| Card {
+            x: 0.,
+            y: 0.,
+            width: CARD_WIDTH,
+            height: table.card_height(keys_only),
+        })
+        .collect();
+    let first_alone = columns.len();
+    arrange(diagram, keys_only, columns, &xs, None, &mut cards);
 
-    // Tables without relations, in columns as tall as the tallest layer
-    // (or of a few cards when nothing is related).
+    // Tables without relations, in columns as tall as the related ones (or
+    // of a few cards when nothing is related), right of them.
     let alone: Vec<usize> = by_name.iter().copied().filter(|t| !related[*t]).collect();
-    let height_of = |table: usize| diagram.tables[table].card_height(keys_only);
-    let stack = |tables: &[usize]| -> f32 {
-        tables.iter().map(|t| height_of(*t)).sum::<f32>()
-            + CARD_GAP * tables.len().saturating_sub(1) as f32
-    };
-    let tallest = columns.iter().map(|c| stack(c)).fold(0.0, f32::max);
+    let tallest = (0..count)
+        .filter(|t| related[*t])
+        .map(|t| cards[t].y + cards[t].height - MARGIN)
+        .fold(0.0, f32::max);
     let limit = if tallest > 0.0 {
         tallest
     } else {
         // About a square block.
         let side = (alone.len() as f32).sqrt().ceil().max(1.0) as usize;
-        alone.iter().take(side).map(|t| height_of(*t)).sum::<f32>() + CARD_GAP * side as f32
+        alone
+            .iter()
+            .take(side)
+            .map(|t| cards[*t].height)
+            .sum::<f32>()
+            + CARD_GAP * side as f32
     };
-    let mut current: Vec<usize> = Vec::new();
+    let (mut column, mut y) = (first_alone, MARGIN);
     for &table in &alone {
-        let next = stack(&current) + CARD_GAP + height_of(table);
-        if !current.is_empty() && next > limit {
-            columns.push(std::mem::take(&mut current));
+        let height = cards[table].height;
+        if y > MARGIN && y + height - MARGIN > limit {
+            column += 1;
+            y = MARGIN;
         }
-        current.push(table);
+        cards[table].x = column_x(column);
+        cards[table].y = y;
+        y += height + CARD_GAP;
     }
-    if !current.is_empty() {
-        columns.push(current);
-    }
-
-    let tallest = columns.iter().map(|c| stack(c)).fold(0.0, f32::max);
-    let mut cards = vec![
-        Card {
-            x: 0.,
-            y: 0.,
-            width: CARD_WIDTH,
-            height: 0.,
-        };
-        count
-    ];
-    for (index, column) in columns.iter().enumerate() {
-        let x = MARGIN + index as f32 * (CARD_WIDTH + LAYER_GAP);
-        let mut y = MARGIN + (tallest - stack(column)) / 2.;
-        for &table in column {
-            let height = height_of(table);
-            cards[table] = Card {
-                x,
-                y,
-                width: CARD_WIDTH,
-                height,
-            };
-            y += height + CARD_GAP;
-        }
-    }
-    Layout {
+    let mut layout = Layout {
         cards,
-        width: MARGIN * 2.
-            + columns.len() as f32 * CARD_WIDTH
-            + columns.len().saturating_sub(1) as f32 * LAYER_GAP,
-        height: MARGIN * 2. + tallest,
+        width: 0.,
+        height: 0.,
+    };
+    layout.fit();
+    layout
+}
+
+/// Arranges a layout someone changed by hand: keeps its columns (cards
+/// whose left edges are close) and about where each card is, but orders
+/// each column to cross fewer lines, lines cards up with the tables they
+/// relate to, makes room for relations that pass through a column and
+/// pulls apart cards that overlap.
+pub fn untangle(diagram: &Diagram, layout: &Layout, keys_only: bool) -> Layout {
+    let count = diagram.tables.len().min(layout.cards.len());
+    let mut by_x: Vec<usize> = (0..count).collect();
+    by_x.sort_by(|a, b| layout.cards[*a].x.total_cmp(&layout.cards[*b].x));
+    let mut columns: Vec<Vec<usize>> = Vec::new();
+    let mut start = f32::NEG_INFINITY;
+    for table in by_x {
+        let x = layout.cards[table].x;
+        if columns.is_empty() || x - start > CARD_WIDTH / 2. {
+            columns.push(Vec::new());
+            start = x;
+        }
+        if let Some(column) = columns.last_mut() {
+            column.push(table);
+        }
+    }
+    let mut xs: Vec<f32> = Vec::with_capacity(columns.len());
+    for column in &mut columns {
+        column.sort_by(|a, b| layout.cards[*a].y.total_cmp(&layout.cards[*b].y));
+        let mean = column.iter().map(|t| layout.cards[*t].x).sum::<f32>() / column.len() as f32;
+        let x = match xs.last() {
+            Some(previous) => snap(mean).max(previous + CARD_WIDTH + MIN_LAYER_GAP),
+            None => snap(mean).max(MARGIN / 2.),
+        };
+        xs.push(x);
+    }
+    let preferred: Vec<f32> = layout.cards.iter().map(|card| card.y).collect();
+    let mut cards = layout.cards.clone();
+    for (card, table) in cards.iter_mut().zip(&diagram.tables) {
+        card.height = table.card_height(keys_only);
+    }
+    arrange(
+        diagram,
+        keys_only,
+        columns,
+        &xs,
+        Some(&preferred),
+        &mut cards,
+    );
+    let mut untangled = Layout {
+        cards,
+        width: 0.,
+        height: 0.,
+    };
+    untangled.fit();
+    untangled
+}
+
+/// Orders the tables of each column (left to right, each listed top to
+/// bottom) to cross fewer lines and sets the tops of their cards so lines
+/// run as straight as they can, near the `preferred` tops when given;
+/// column `i` at `xs[i]`.
+fn arrange(
+    diagram: &Diagram,
+    keys_only: bool,
+    columns: Vec<Vec<usize>>,
+    xs: &[f32],
+    preferred: Option<&[f32]>,
+    cards: &mut [Card],
+) {
+    let mut graph = Layered::new(diagram, keys_only, columns);
+    graph.order();
+    let tops = graph.align(preferred);
+    let highest = graph
+        .layers
+        .iter()
+        .flatten()
+        .map(|node| tops[*node])
+        .fold(f32::INFINITY, f32::min);
+    if !highest.is_finite() {
+        return;
+    }
+    // From the margin down, or where the cards were.
+    let first = match preferred {
+        Some(preferred) => graph
+            .layers
+            .iter()
+            .flatten()
+            .filter(|node| **node < graph.tables)
+            .map(|node| preferred[*node])
+            .fold(f32::INFINITY, f32::min)
+            .max(MARGIN / 2.),
+        None => MARGIN,
+    };
+    for (layer, nodes) in graph.layers.iter().enumerate() {
+        for &node in nodes {
+            if node < graph.tables {
+                cards[node].x = xs[layer];
+                cards[node].y = tops[node] - highest + first;
+            }
+        }
     }
 }
 
@@ -530,58 +744,356 @@ fn assign_layer(
     layer
 }
 
-/// Orders each layer by the average position of its neighbors in the
-/// layers already ordered, sweeping right and then left, so lines cross
-/// less.
-fn order_layers(columns: &mut [Vec<usize>], parents: &[Vec<usize>], children: &[Vec<usize>]) {
-    let count = parents.len();
-    let mut position = vec![0.0f32; count];
-    let mut layer_of = vec![usize::MAX; count];
-    let place = |columns: &[Vec<usize>], position: &mut [f32], layer_of: &mut [usize]| {
-        for (layer, column) in columns.iter().enumerate() {
-            let size = column.len().max(1) as f32;
-            for (index, &table) in column.iter().enumerate() {
-                position[table] = (index as f32 + 0.5) / size;
+/// A link between nodes of neighboring layers: the other node, where the
+/// link meets this node (from its top) and where it meets the other.
+type Link = (usize, f32, f32);
+
+/// The layered graph the layout orders: tables (nodes `0..tables`) and a
+/// waypoint in every layer a relation passes through, so long relations
+/// count when ordering and get room between cards.
+struct Layered {
+    tables: usize,
+    heights: Vec<f32>,
+    layers: Vec<Vec<usize>>,
+    /// Each node's links to the layer on its left and on its right.
+    left: Vec<Vec<Link>>,
+    right: Vec<Vec<Link>>,
+}
+
+impl Layered {
+    fn new(diagram: &Diagram, keys_only: bool, layers: Vec<Vec<usize>>) -> Self {
+        let tables = diagram.tables.len();
+        let mut layer_of = vec![usize::MAX; tables];
+        for (layer, nodes) in layers.iter().enumerate() {
+            for &table in nodes {
                 layer_of[table] = layer;
             }
         }
-    };
-    place(columns, &mut position, &mut layer_of);
-    for sweep in 0..SWEEPS {
-        let rightward = sweep % 2 == 0;
-        let layers: Vec<usize> = if rightward {
-            (1..columns.len()).collect()
-        } else {
-            (0..columns.len().saturating_sub(1)).rev().collect()
+        let mut graph = Layered {
+            tables,
+            heights: diagram
+                .tables
+                .iter()
+                .map(|t| t.card_height(keys_only))
+                .collect(),
+            layers,
+            left: vec![Vec::new(); tables],
+            right: vec![Vec::new(); tables],
         };
+        for (_, relation) in diagram.drawn_relations() {
+            let (Some(from), Some(to)) = (
+                diagram.index_of(&relation.from),
+                diagram.index_of(&relation.to),
+            ) else {
+                continue;
+            };
+            let (from_layer, to_layer) = (layer_of[from], layer_of[to]);
+            if from == to
+                || from_layer == usize::MAX
+                || to_layer == usize::MAX
+                || from_layer == to_layer
+            {
+                continue;
+            }
+            let port = |table: usize, columns: &[String]| {
+                diagram.tables[table]
+                    .column_y(columns.first().map_or("", String::as_str), keys_only)
+            };
+            let from_end = (from, port(from, &relation.from_columns), from_layer);
+            let to_end = (to, port(to, &relation.to_columns), to_layer);
+            let (start, end) = if from_layer < to_layer {
+                (from_end, to_end)
+            } else {
+                (to_end, from_end)
+            };
+            let (mut node, mut port) = (start.0, start.1);
+            for layer in start.2 + 1..end.2 {
+                let waypoint = graph.heights.len();
+                graph.heights.push(WAYPOINT);
+                graph.left.push(Vec::new());
+                graph.right.push(Vec::new());
+                graph.layers[layer].push(waypoint);
+                graph.link(node, port, waypoint, WAYPOINT / 2.);
+                (node, port) = (waypoint, WAYPOINT / 2.);
+            }
+            graph.link(node, port, end.0, end.1);
+        }
+        graph
+    }
+
+    fn link(&mut self, left: usize, left_port: f32, right: usize, right_port: f32) {
+        self.right[left].push((right, left_port, right_port));
+        self.left[right].push((left, right_port, left_port));
+    }
+
+    /// Each node's place in its layer.
+    fn places(&self) -> Vec<usize> {
+        let mut at = vec![0; self.heights.len()];
+        for nodes in &self.layers {
+            for (index, &node) in nodes.iter().enumerate() {
+                at[node] = index;
+            }
+        }
+        at
+    }
+
+    /// Where a link meets a node, in order down its layer: its place, plus
+    /// how far down the node the link meets it.
+    fn slot(&self, at: &[usize], node: usize, port: f32) -> f32 {
+        at[node] as f32 + (port / self.heights[node]).clamp(0., 0.99)
+    }
+
+    /// How many pairs of links cross.
+    fn crossings(&self) -> usize {
+        let places = self.places();
+        let at = places.as_slice();
+        let mut total = 0;
+        for nodes in &self.layers {
+            let links: Vec<(f32, f32)> = nodes
+                .iter()
+                .flat_map(|&node| {
+                    self.right[node].iter().map(move |&(other, own, theirs)| {
+                        (self.slot(at, node, own), self.slot(at, other, theirs))
+                    })
+                })
+                .collect();
+            for (index, a) in links.iter().enumerate() {
+                for b in &links[index + 1..] {
+                    if (a.0 - b.0) * (a.1 - b.1) < 0. {
+                        total += 1;
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Orders every layer: sweeps that sort each layer by where its links
+    /// lead in the layer before, then swaps of neighbors that cross fewer
+    /// links, keeping the order that crosses least.
+    fn order(&mut self) {
+        let mut best = self.layers.clone();
+        let mut fewest = self.crossings();
+        for sweep in 0..SWEEPS {
+            if fewest == 0 {
+                break;
+            }
+            self.sweep(sweep % 2 == 0);
+            self.transpose();
+            let crossings = self.crossings();
+            if crossings < fewest {
+                fewest = crossings;
+                best = self.layers.clone();
+            }
+        }
+        self.layers = best;
+    }
+
+    fn sweep(&mut self, rightward: bool) {
+        let count = self.layers.len();
+        let layers: Vec<usize> = if rightward {
+            (1..count).collect()
+        } else {
+            (0..count.saturating_sub(1)).rev().collect()
+        };
+        let mut sizes: Vec<f32> = self
+            .layers
+            .iter()
+            .map(|nodes| nodes.len().max(1) as f32)
+            .collect();
+        let mut layer_of = vec![0; self.heights.len()];
+        for (layer, nodes) in self.layers.iter().enumerate() {
+            for &node in nodes {
+                layer_of[node] = layer;
+            }
+        }
         for layer in layers {
-            let key = |table: usize| {
-                let neighbors: Vec<f32> = parents[table]
+            let at = self.places();
+            let mut keyed: Vec<(f32, usize)> = self.layers[layer]
+                .iter()
+                .map(|&node| {
+                    let links = if rightward {
+                        &self.left[node]
+                    } else {
+                        &self.right[node]
+                    };
+                    let key = if links.is_empty() {
+                        (at[node] as f32 + 0.5) / sizes[layer]
+                    } else {
+                        links
+                            .iter()
+                            .map(|&(other, _, theirs)| {
+                                self.slot(&at, other, theirs) / sizes[layer_of[other]]
+                            })
+                            .sum::<f32>()
+                            / links.len() as f32
+                    };
+                    (key, node)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
+            self.layers[layer] = keyed.into_iter().map(|(_, node)| node).collect();
+            sizes[layer] = self.layers[layer].len().max(1) as f32;
+        }
+    }
+
+    /// Swaps neighbors in a layer while that crosses fewer links.
+    fn transpose(&mut self) {
+        let mut at = self.places();
+        for _ in 0..TRANSPOSES {
+            let mut improved = false;
+            for layer in 0..self.layers.len() {
+                for index in 0..self.layers[layer].len().saturating_sub(1) {
+                    let (upper, lower) = (self.layers[layer][index], self.layers[layer][index + 1]);
+                    if self.pair_crossings(&at, lower, upper)
+                        < self.pair_crossings(&at, upper, lower)
+                    {
+                        self.layers[layer].swap(index, index + 1);
+                        at[upper] = index + 1;
+                        at[lower] = index;
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
+    /// Crossings between the links of two neighbors of a layer with
+    /// `upper` right above `lower`.
+    fn pair_crossings(&self, at: &[usize], upper: usize, lower: usize) -> usize {
+        let mut count = 0;
+        for side in [&self.left, &self.right] {
+            for &(a, _, a_port) in &side[upper] {
+                for &(b, _, b_port) in &side[lower] {
+                    if self.slot(at, a, a_port) > self.slot(at, b, b_port) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn gap(&self, a: usize, b: usize) -> f32 {
+        if a < self.tables && b < self.tables {
+            CARD_GAP
+        } else {
+            WAYPOINT_GAP
+        }
+    }
+
+    /// The top of every node: each layer stacked in its order, then moved
+    /// in passes so each node sits level with the nodes it links to (and
+    /// near its `preferred` top), never closer to its neighbors than a gap.
+    fn align(&self, preferred: Option<&[f32]>) -> Vec<f32> {
+        let mut tops = vec![0.0f32; self.heights.len()];
+        for nodes in &self.layers {
+            let mut top = 0.;
+            for (index, &node) in nodes.iter().enumerate() {
+                if index > 0 {
+                    top += self.gap(nodes[index - 1], node);
+                }
+                tops[node] = top;
+                top += self.heights[node];
+            }
+        }
+        if let Some(preferred) = preferred {
+            for (layer, nodes) in self.layers.iter().enumerate() {
+                let wanted: Vec<(f32, f32)> = nodes
                     .iter()
-                    .chain(&children[table])
-                    .filter(|n| {
-                        let other = layer_of[**n];
-                        if rightward {
-                            other < layer
+                    .map(|&node| match preferred.get(node) {
+                        Some(top) if node < self.tables => (*top, 1.),
+                        _ => (tops[node], 0.25),
+                    })
+                    .collect();
+                self.settle(layer, &wanted, &mut tops);
+            }
+        }
+        let count = self.layers.len();
+        for pass in 0..ALIGN_PASSES {
+            // Level with the left, then the right, then both.
+            let (left, right, rightward) = match pass % 3 {
+                0 => (true, false, true),
+                1 => (false, true, false),
+                _ => (true, true, true),
+            };
+            let layers: Vec<usize> = if rightward {
+                (0..count).collect()
+            } else {
+                (0..count).rev().collect()
+            };
+            for layer in layers {
+                let wanted: Vec<(f32, f32)> = self.layers[layer]
+                    .iter()
+                    .map(|&node| {
+                        let (mut sum, mut weight) = (0., 0.);
+                        let sides = [(left, &self.left[node]), (right, &self.right[node])];
+                        for (used, links) in sides {
+                            if used {
+                                for &(other, own, theirs) in links {
+                                    sum += tops[other] + theirs - own;
+                                    weight += 1.;
+                                }
+                            }
+                        }
+                        if let Some(top) = preferred.and_then(|p| p.get(node))
+                            && node < self.tables
+                        {
+                            sum += top;
+                            weight += 1.;
+                        }
+                        if weight == 0. {
+                            (tops[node], 0.25)
                         } else {
-                            other > layer && other != usize::MAX
+                            (sum / weight, weight)
                         }
                     })
-                    .map(|n| position[*n])
                     .collect();
-                if neighbors.is_empty() {
-                    position[table]
-                } else {
-                    neighbors.iter().sum::<f32>() / neighbors.len() as f32
+                self.settle(layer, &wanted, &mut tops);
+            }
+        }
+        tops
+    }
+
+    /// Sets the tops of a layer's nodes as close to the `wanted` ones
+    /// (each with a weight) as they get keeping their order and gaps: the
+    /// least squares fit, by pooling neighbors that would overlap.
+    fn settle(&self, layer: usize, wanted: &[(f32, f32)], tops: &mut [f32]) {
+        let nodes = &self.layers[layer];
+        // Each node's distance from the first when packed tight.
+        let mut offsets = Vec::with_capacity(nodes.len());
+        let mut offset = 0.;
+        for (index, &node) in nodes.iter().enumerate() {
+            if index > 0 {
+                let above = nodes[index - 1];
+                offset += self.heights[above] + self.gap(above, node);
+            }
+            offsets.push(offset);
+        }
+        // Blocks of nodes packed tight: (weight, weighted sum of wanted
+        // starts, nodes).
+        let mut blocks: Vec<(f32, f32, usize)> = Vec::new();
+        for (index, &(top, weight)) in wanted.iter().enumerate() {
+            blocks.push((weight, weight * (top - offsets[index]), 1));
+            while let [.., (w1, s1, n1), (w2, s2, n2)] = blocks[..] {
+                if s1 / w1 <= s2 / w2 {
+                    break;
                 }
-            };
-            let mut keyed: Vec<(f32, usize)> =
-                columns[layer].iter().map(|t| (key(*t), *t)).collect();
-            keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
-            columns[layer] = keyed.into_iter().map(|(_, t)| t).collect();
-            let size = columns[layer].len().max(1) as f32;
-            for (index, &table) in columns[layer].iter().enumerate() {
-                position[table] = (index as f32 + 0.5) / size;
+                blocks.pop();
+                if let Some(last) = blocks.last_mut() {
+                    *last = (w1 + w2, s1 + s2, n1 + n2);
+                }
+            }
+        }
+        let mut index = 0;
+        for (weight, sum, nodes_in_block) in blocks {
+            let start = sum / weight;
+            for _ in 0..nodes_in_block {
+                tops[nodes[index]] = start + offsets[index];
+                index += 1;
             }
         }
     }
@@ -604,9 +1116,13 @@ impl Side {
     }
 }
 
+/// A cubic Bézier: start, two control points, end.
+pub type Curve = [(f32, f32); 4];
+
 /// A relation's line: from the referencing column (the "many" end) to the
-/// referenced one (the "one" end).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// referenced one (the "one" end), through the gaps of the columns of cards
+/// it crosses.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Wire {
     /// Index into the diagram's relations.
     pub relation: usize,
@@ -614,17 +1130,34 @@ pub struct Wire {
     pub from_side: Side,
     pub to: (f32, f32),
     pub to_side: Side,
+    /// Where it enters and leaves each column it passes, from `from`.
+    pub via: Vec<(f32, f32)>,
 }
 
 impl Wire {
-    /// The cubic Bézier control points for the line, leaving each end
-    /// straight out of its card.
-    pub fn controls(&self) -> ((f32, f32), (f32, f32)) {
-        let reach = ((self.to.0 - self.from.0).abs() / 2.).clamp(40., 160.);
-        (
-            (self.from.0 + self.from_side.sign() * reach, self.from.1),
-            (self.to.0 + self.to_side.sign() * reach, self.to.1),
-        )
+    /// The curves that draw it, each leaving and reaching its ends level,
+    /// straight out of the cards.
+    pub fn curves(&self) -> Vec<Curve> {
+        if self.via.is_empty() {
+            let reach = ((self.to.0 - self.from.0).abs() / 2.).clamp(40., 160.);
+            return vec![[
+                self.from,
+                (self.from.0 + self.from_side.sign() * reach, self.from.1),
+                (self.to.0 + self.to_side.sign() * reach, self.to.1),
+                self.to,
+            ]];
+        }
+        let mut points = vec![self.from];
+        points.extend(&self.via);
+        points.push(self.to);
+        points
+            .windows(2)
+            .map(|pair| {
+                let (a, b) = (pair[0], pair[1]);
+                let reach = (b.0 - a.0) / 2.;
+                [a, (a.0 + reach, a.1), (b.0 - reach, b.1), b]
+            })
+            .collect()
     }
 }
 
@@ -660,15 +1193,96 @@ pub fn wires(diagram: &Diagram, layout: &Layout, keys_only: bool) -> Vec<Wire> {
                 Side::Left => card.x,
                 Side::Right => card.x + card.width,
             };
+            let from = (edge(from_card, from_side), from_y);
+            let to = (edge(to_card, to_side), to_y);
+            let via = if from_side == to_side {
+                Vec::new()
+            } else {
+                route(layout, [from_index, to_index], from, to)
+            };
             Some(Wire {
                 relation: index,
-                from: (edge(from_card, from_side), from_y),
+                from,
                 from_side,
-                to: (edge(to_card, to_side), to_y),
+                to,
                 to_side,
+                via,
             })
         })
         .collect()
+}
+
+/// Where a wire from `from` to `to` enters and leaves each column of cards
+/// between them (other than its own cards): at the free height nearest the
+/// straight line from where it is to its end.
+fn route(layout: &Layout, ends: [usize; 2], from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
+    let (low, high) = (from.0.min(to.0), from.0.max(to.0));
+    let mut between: Vec<Card> = layout
+        .cards
+        .iter()
+        .enumerate()
+        .filter(|(index, card)| !ends.contains(index) && card.x < high && card.x + card.width > low)
+        .map(|(_, card)| *card)
+        .collect();
+    between.sort_by(|a, b| a.x.total_cmp(&b.x));
+    // Columns: cards that overlap across.
+    let mut columns: Vec<(f32, f32, Vec<Card>)> = Vec::new();
+    for card in between {
+        match columns.last_mut() {
+            Some((_, right, cards)) if card.x < *right => {
+                *right = right.max(card.x + card.width);
+                cards.push(card);
+            }
+            _ => columns.push((card.x, card.x + card.width, vec![card])),
+        }
+    }
+    let rightward = to.0 > from.0;
+    if !rightward {
+        columns.reverse();
+    }
+    let mut via = Vec::new();
+    let mut at = from;
+    for (left, right, cards) in columns {
+        let (left, right) = (left.max(low), right.min(high));
+        let (enter, leave) = if rightward {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let span = to.0 - at.0;
+        let line = if span.abs() < 1. {
+            to.1
+        } else {
+            at.1 + (enter - at.0) / span * (to.1 - at.1)
+        };
+        let y = free_height(&cards, line);
+        via.push((enter, y));
+        via.push((leave, y));
+        at = (leave, y);
+    }
+    via
+}
+
+/// The height nearest `y` that runs clear of every card of a column.
+fn free_height(cards: &[Card], y: f32) -> f32 {
+    let mut blocked: Vec<(f32, f32)> = cards
+        .iter()
+        .map(|card| (card.y - CLEARANCE, card.y + card.height + CLEARANCE))
+        .collect();
+    blocked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (top, bottom) in blocked {
+        match merged.last_mut() {
+            Some(last) if top <= last.1 => last.1 = last.1.max(bottom),
+            _ => merged.push((top, bottom)),
+        }
+    }
+    for (top, bottom) in merged {
+        if y > top && y < bottom {
+            return if y - top <= bottom - y { top } else { bottom };
+        }
+    }
+    y
 }
 
 /// A straight line from one point to another.
@@ -716,18 +1330,20 @@ pub fn to_svg(diagram: &Diagram, layout: &Layout, keys_only: bool) -> String {
     );
     for wire in wires(diagram, layout, keys_only) {
         let relation = &diagram.relations[wire.relation];
-        let (c1, c2) = wire.controls();
+        let mut path = format!("M{} {}", wire.from.0, wire.from.1);
+        for [_, c1, c2, end] in wire.curves() {
+            path.push_str(&format!(
+                " C{} {} {} {} {} {}",
+                c1.0, c1.1, c2.0, c2.1, end.0, end.1
+            ));
+        }
         svg.push_str(&format!(
-            "<path d=\"M{} {} C{} {} {} {} {} {}\" fill=\"none\" stroke=\"#6e6e73\" stroke-width=\"1.4\"{}/>\n",
-            wire.from.0,
-            wire.from.1,
-            c1.0,
-            c1.1,
-            c2.0,
-            c2.1,
-            wire.to.0,
-            wire.to.1,
-            if relation.optional { " stroke-dasharray=\"5 4\"" } else { "" }
+            "<path d=\"{path}\" fill=\"none\" stroke=\"#6e6e73\" stroke-width=\"1.4\"{}/>\n",
+            if relation.optional {
+                " stroke-dasharray=\"5 4\""
+            } else {
+                ""
+            }
         ));
         let (lines, ring) = end_marks(&wire, relation.optional);
         for ((x0, y0), (x1, y1)) in lines {
@@ -1027,6 +1643,319 @@ mod tests {
         let mut cascade = diagram.clone();
         cascade.relations[0].on_delete = OnDelete::Cascade;
         assert!(cascade.to_dbml().contains("customers.id [delete: cascade]"));
+    }
+
+    /// Points along a wire, close enough to test what it passes through.
+    fn sample(wire: &Wire) -> Vec<(f32, f32)> {
+        let mut points = Vec::new();
+        for [a, b, c, d] in wire.curves() {
+            for step in 0..=24 {
+                let t = step as f32 / 24.;
+                let u = 1. - t;
+                let mix = |p: [f32; 4]| {
+                    u * u * u * p[0]
+                        + 3. * u * u * t * p[1]
+                        + 3. * u * t * t * p[2]
+                        + t * t * t * p[3]
+                };
+                points.push((mix([a.0, b.0, c.0, d.0]), mix([a.1, b.1, c.1, d.1])));
+            }
+        }
+        points
+    }
+
+    /// How many times two wires cross, leaving out where they meet at a
+    /// card they share.
+    fn crossings(diagram: &Diagram, layout: &Layout) -> usize {
+        let wires = wires(diagram, layout, false);
+        let cross = |p: (f32, f32), q: (f32, f32), r: (f32, f32), s: (f32, f32)| {
+            let side = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+                (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+            };
+            side(p, q, r) * side(p, q, s) <= 0. && side(r, s, p) * side(r, s, q) <= 0.
+        };
+        let mut count = 0;
+        for (i, a) in wires.iter().enumerate() {
+            for b in &wires[i + 1..] {
+                let (pa, pb) = (sample(a), sample(b));
+                let ends = [a.from, a.to, b.from, b.to];
+                let near_end = |p: (f32, f32)| {
+                    ends.iter()
+                        .any(|e| (p.0 - e.0).abs() < 3. && (p.1 - e.1).abs() < 3.)
+                };
+                let crossed = pa.windows(2).any(|x| {
+                    pb.windows(2).any(|y| {
+                        ![x[0], x[1], y[0], y[1]].into_iter().any(near_end)
+                            && cross(x[0], x[1], y[0], y[1])
+                    })
+                });
+                count += usize::from(crossed);
+            }
+        }
+        count
+    }
+
+    fn overlapping(layout: &Layout) -> Option<(usize, usize)> {
+        for (i, a) in layout.cards.iter().enumerate() {
+            for (j, b) in layout.cards.iter().enumerate().skip(i + 1) {
+                if a.crowds(b, 0.) {
+                    return Some((i, j));
+                }
+            }
+        }
+        None
+    }
+
+    fn at(diagram: &Diagram, layout: &Layout, name: &str) -> Card {
+        layout.cards[diagram.index_of(&TableRef::new("public", name)).unwrap()]
+    }
+
+    #[test]
+    fn orders_layers_so_lines_do_not_cross() {
+        // By name, a and b sit above c and d, and c → b, d → a cross.
+        let diagram = Diagram {
+            schema: "public".into(),
+            tables: vec![
+                table("a", vec![column("id", true, false, false)]),
+                table("b", vec![column("id", true, false, false)]),
+                table(
+                    "c",
+                    vec![
+                        column("id", true, false, false),
+                        column("b_id", false, true, false),
+                    ],
+                ),
+                table(
+                    "d",
+                    vec![
+                        column("id", true, false, false),
+                        column("a_id", false, true, false),
+                    ],
+                ),
+            ],
+            relations: vec![
+                relation("c", "b_id", "b", false),
+                relation("d", "a_id", "a", false),
+            ],
+        };
+        let mut layout = layout(&diagram, false);
+        assert_eq!(crossings(&diagram, &layout), 0);
+        // And each table level with the one it refers to.
+        let wires = wires(&diagram, &layout, false);
+        assert!(
+            wires.iter().all(|w| (w.from.1 - w.to.1).abs() < 1.),
+            "{wires:?}"
+        );
+        // Swapped by hand, they cross.
+        let (a, b) = (layout.cards[0], layout.cards[1]);
+        layout.place(0, b.x, b.y);
+        layout.place(1, a.x, a.y);
+        assert_eq!(crossings(&diagram, &layout), 1);
+    }
+
+    /// A schema of `count` tables where each refers to one to three
+    /// earlier ones, picked by a fixed pseudo-random sequence.
+    fn tangled(count: usize) -> Diagram {
+        let mut seed = 7u64;
+        let mut next = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below.max(1)
+        };
+        let mut tables = Vec::new();
+        let mut relations = Vec::new();
+        for index in 0..count {
+            let name = format!("t{index:02}");
+            let mut columns = vec![column("id", true, false, false)];
+            if index > 0 {
+                for _ in 0..1 + next(3) {
+                    let parent = next(index);
+                    let key = format!("t{parent:02}_id");
+                    if columns.iter().any(|c| c.name == key) {
+                        continue;
+                    }
+                    columns.push(column(&key, false, true, false));
+                    relations.push(relation(&name, &key, &format!("t{parent:02}"), false));
+                }
+            }
+            columns.push(column("note", false, false, true));
+            tables.push(table(&name, columns));
+        }
+        Diagram {
+            schema: "public".into(),
+            tables,
+            relations,
+        }
+    }
+
+    #[test]
+    fn lays_out_a_tangled_schema_cleanly() {
+        let diagram = tangled(40);
+        let layout = layout(&diagram, false);
+        assert_eq!(overlapping(&layout), None);
+        assert!(
+            layout
+                .cards
+                .iter()
+                .all(|c| c.x.is_finite() && c.y.is_finite())
+        );
+        for wire in wires(&diagram, &layout, false) {
+            let relation = &diagram.relations[wire.relation];
+            let ends = [
+                diagram.index_of(&relation.from).unwrap(),
+                diagram.index_of(&relation.to).unwrap(),
+            ];
+            for (index, card) in layout.cards.iter().enumerate() {
+                if ends.contains(&index) {
+                    continue;
+                }
+                let through = sample(&wire).iter().any(|(x, y)| {
+                    *x > card.x + 1.
+                        && *x < card.x + card.width - 1.
+                        && *y > card.y + 1.
+                        && *y < card.y + card.height - 1.
+                });
+                assert!(!through, "{} runs through card {index}", relation.name);
+            }
+        }
+        let untangled = untangle(&diagram, &layout, false);
+        assert_eq!(overlapping(&untangled), None);
+    }
+
+    #[test]
+    fn orders_by_the_row_a_line_leaves_from() {
+        // line's z_id is above its a_id: z goes above a.
+        let diagram = Diagram {
+            schema: "public".into(),
+            tables: vec![
+                table("a", vec![column("id", true, false, false)]),
+                table("z", vec![column("id", true, false, false)]),
+                table(
+                    "line",
+                    vec![
+                        column("id", true, false, false),
+                        column("z_id", false, true, false),
+                        column("a_id", false, true, false),
+                    ],
+                ),
+            ],
+            relations: vec![
+                relation("line", "z_id", "z", false),
+                relation("line", "a_id", "a", false),
+            ],
+        };
+        let layout = layout(&diagram, false);
+        assert!(at(&diagram, &layout, "z").y < at(&diagram, &layout, "a").y);
+        assert_eq!(crossings(&diagram, &layout), 0);
+    }
+
+    #[test]
+    fn long_relations_pass_between_cards() {
+        let diagram = shop();
+        let layout = layout(&diagram, false);
+        let wires = wires(&diagram, &layout, false);
+        // order_items → products skips the orders column.
+        let long = wires.iter().find(|w| w.relation == 2).unwrap();
+        assert_eq!(long.via.len(), 2);
+        for wire in &wires {
+            let relation = &diagram.relations[wire.relation];
+            let ends = [
+                diagram.index_of(&relation.from).unwrap(),
+                diagram.index_of(&relation.to).unwrap(),
+            ];
+            for (index, card) in layout.cards.iter().enumerate() {
+                if ends.contains(&index) {
+                    continue;
+                }
+                for (x, y) in sample(wire) {
+                    let inside = x > card.x
+                        && x < card.x + card.width
+                        && y > card.y
+                        && y < card.y + card.height;
+                    assert!(!inside, "{} runs through card {index}", relation.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routes_around_cards_moved_into_the_way() {
+        let diagram = shop();
+        let mut layout = layout(&diagram, false);
+        let items = at(&diagram, &layout, "order_items");
+        let products = diagram
+            .index_of(&TableRef::new("public", "products"))
+            .unwrap();
+        let audit = diagram
+            .index_of(&TableRef::new("public", "audit_log"))
+            .unwrap();
+        // products far left, level with order_items, and audit_log between.
+        layout.place(products, 20., items.y + 40.);
+        layout.place(audit, (20. + items.x) / 2., items.y + 20.);
+        let wire = wires(&diagram, &layout, false)
+            .into_iter()
+            .find(|w| w.relation == 2)
+            .unwrap();
+        let card = layout.cards[audit];
+        assert!(!sample(&wire).iter().any(|(x, y)| {
+            *x > card.x && *x < card.x + card.width && *y > card.y && *y < card.y + card.height
+        }));
+    }
+
+    #[test]
+    fn untangles_a_layout_moved_by_hand() {
+        let diagram = shop();
+        let mut layout = layout(&diagram, false);
+        let orders = at(&diagram, &layout, "orders");
+        // customers dropped onto orders, products below everything.
+        let customers = diagram
+            .index_of(&TableRef::new("public", "customers"))
+            .unwrap();
+        let products = diagram
+            .index_of(&TableRef::new("public", "products"))
+            .unwrap();
+        layout.place(customers, orders.x + 30., orders.y + 10.);
+        layout.place(products, 40., layout.height + 300.);
+        assert!(overlapping(&layout).is_some());
+        let untangled = untangle(&diagram, &layout, false);
+        assert_eq!(overlapping(&untangled), None);
+        assert_eq!(crossings(&diagram, &untangled), 0);
+        // Columns stay: products left of order_items, customers with orders.
+        assert!(at(&diagram, &untangled, "products").x < at(&diagram, &untangled, "order_items").x);
+        assert_eq!(
+            at(&diagram, &untangled, "customers").x,
+            at(&diagram, &untangled, "orders").x
+        );
+    }
+
+    #[test]
+    fn a_dropped_card_pushes_the_cards_under_it() {
+        let diagram = shop();
+        let mut layout = layout(&diagram, false);
+        let orders = diagram
+            .index_of(&TableRef::new("public", "orders"))
+            .unwrap();
+        let target = layout.cards[orders];
+        layout.place(1, target.x + 10., target.y + 5.);
+        let dropped = layout.cards[1];
+        let pushed = layout.push_apart(1);
+        assert!(pushed.contains(&orders));
+        assert_eq!(layout.cards[1], dropped);
+        assert_eq!(overlapping(&layout), None);
+        assert!(
+            layout
+                .cards
+                .iter()
+                .all(|c| c.x >= MARGIN / 2. && c.y >= MARGIN / 2.)
+        );
+    }
+
+    #[test]
+    fn snaps_to_the_grid() {
+        assert_eq!(snap(29.), 20.);
+        assert_eq!(snap(31.), 40.);
+        assert_eq!(snap(-4.), 0.);
     }
 
     #[test]
