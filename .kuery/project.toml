@@ -1,7 +1,8 @@
 # Kuery project.
 # Connection passwords are kept in the system keychain, not in this file.
 # These point at the dev Postgres and Redis in dev/compose.yaml, which need
-# no password.
+# no password; local-dev-ssh reaches the same Postgres through the compose
+# file's SSH bastion.
 
 [project]
 name = "Checkout v2"
@@ -15,6 +16,20 @@ port = 54329
 database = "kuery"
 user = "kuery"
 environment = "development"
+
+[[connections]]
+id = "local-dev-ssh"
+name = "local-dev-ssh"
+host = "postgres"
+port = 5432
+database = "kuery"
+user = "kuery"
+environment = "development"
+
+[connections.ssh]
+host = "localhost"
+port = 22229
+user = "kuery"
 
 [[connections]]
 id = "local-analytics"

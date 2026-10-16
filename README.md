@@ -76,11 +76,12 @@ change when you click Preview Impact.
 ## Development
 
 ```bash
-docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, and a seeded Redis
+docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, a seeded Redis and an SSH bastion
 cargo run -p kuery -- .                                 # the app, on this repo's project
 cargo test --workspace                                    # tests without a database
 cargo test -p kuery-pg -- --ignored                     # tests against the dev Postgres
 cargo test -p kuery-redis -- --ignored                  # tests against the dev Redis
+cargo test -p kuery -- --ignored                        # SSH tunnels through the dev bastion
 cargo run --release -p kuery-pg --example stream_bench  # streaming without a UI
 ```
 
@@ -117,6 +118,35 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 `environment` (development, staging or production) is detected from the host
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
+
+### SSH tunnels
+
+Any connection can go through an SSH host ("Connect through an SSH host" in
+the dialog): Host and Port are then the server as the SSH host sees it, and
+the SSH host, port, user and identity file go under `[connections.ssh]`:
+
+```toml
+[connections.ssh]
+host = "bastion.example.com"   # or a ~/.ssh/config alias
+port = 22                      # optional
+user = "deploy"                # optional
+identity_file = "~/.ssh/id_ed25519"  # optional
+```
+
+The tunnel is the system's `ssh` (OpenSSH) forwarding a local port, so it
+follows `~/.ssh/config` (aliases, `ProxyJump`, keys), the SSH agent and
+`known_hosts`; empty fields are left to them. It never asks anything: it
+signs in by key or agent, never with an SSH password; a host seen for the
+first time is added to `known_hosts`, and one whose key changed is refused.
+It opens with the connection and closes with it. Through SSH the
+environment is detected from the SSH host (the server's `localhost` is the
+SSH host's), and Postgres still checks TLS certificates against the
+server's name. Redis over TLS through a tunnel checks them against
+`127.0.0.1`, so it needs certificates that allow it.
+
+The dev compose file has an SSH bastion (`localhost:22229`, user `kuery`,
+no password) and the repo's project a `local-dev-ssh` connection that reaches
+the dev Postgres through it.
 
 ## Drivers
 

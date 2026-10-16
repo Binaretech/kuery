@@ -21,6 +21,7 @@ use kuery_core::driver::{self, DriverInfo, Family};
 use crate::assets::AppIcon;
 use crate::connection::{Db, Reconnect, RedisDb};
 use crate::project::ConnectionSpec;
+use crate::tunnel;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -98,14 +99,21 @@ impl Driver for Postgres {
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<String, String>> {
-        let connect = engines.postgres.connect_with(
-            spec.conninfo(password.as_deref()),
-            kuery_pg::Access::ReadOnly,
-        );
+        let (spec, engine) = (spec.clone(), engines.postgres.clone());
         Box::pin(async move {
-            connect
+            let tunnel = tunnel::open_for(&spec).await?;
+            let conninfo =
+                spec.conninfo(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+            engine
+                .connect_with(conninfo, kuery_pg::Access::ReadOnly)
                 .await
-                .map(|session| format!("Connected · PostgreSQL {}", session.server_version()))
+                .map(|session| {
+                    format!(
+                        "Connected{} · PostgreSQL {}",
+                        through(&spec),
+                        session.server_version()
+                    )
+                })
                 .map_err(|error| error.to_string())
         })
     }
@@ -116,19 +124,22 @@ impl Driver for Postgres {
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<Connection, String>> {
-        let conninfo = spec.conninfo(password.as_deref());
-        let connect = engines
-            .postgres
-            .connect_with(conninfo.clone(), spec.environment().access());
-        let spec = spec.clone();
+        let (spec, engine) = (spec.clone(), engines.postgres.clone());
         Box::pin(async move {
-            let session = connect.await.map_err(|error| error.to_string())?;
+            let tunnel = tunnel::open_for(&spec).await?;
+            let conninfo =
+                spec.conninfo(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+            let session = engine
+                .connect_with(conninfo.clone(), spec.environment().access())
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(Connection::Sql(Db::new(
                 spec.name.clone().into(),
                 spec.environment(),
                 session,
                 spec.target().into(),
                 Reconnect::new(conninfo),
+                tunnel,
             )))
         })
     }
@@ -147,15 +158,22 @@ impl Driver for Redis {
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<String, String>> {
-        let connect = engines
-            .redis
-            .connect(spec.redis_target(password.as_deref()));
+        let (spec, engine) = (spec.clone(), engines.redis.clone());
         Box::pin(async move {
-            connect
+            let tunnel = tunnel::open_for(&spec).await?;
+            let target =
+                spec.redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+            engine
+                .connect(target)
                 .await
                 .map(|session| {
                     let server = session.server();
-                    format!("Connected · Redis {} · {}", server.version, server.mode)
+                    format!(
+                        "Connected{} · Redis {} · {}",
+                        through(&spec),
+                        server.version,
+                        server.mode
+                    )
                 })
                 .map_err(|error| error.to_string())
         })
@@ -167,20 +185,32 @@ impl Driver for Redis {
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<Connection, String>> {
-        let connect = engines
-            .redis
-            .connect(spec.redis_target(password.as_deref()));
-        let spec = spec.clone();
+        let (spec, engine) = (spec.clone(), engines.redis.clone());
         Box::pin(async move {
-            let session = connect.await.map_err(|error| error.to_string())?;
+            let tunnel = tunnel::open_for(&spec).await?;
+            let target =
+                spec.redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+            let session = engine
+                .connect(target)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(Connection::KeyValue(RedisDb::new(
                 spec.name.clone().into(),
                 spec.environment(),
                 session,
                 spec.target().into(),
+                tunnel,
             )))
         })
     }
+}
+
+/// ` through bastion` when the connection goes through SSH.
+fn through(spec: &ConnectionSpec) -> String {
+    spec.ssh
+        .as_ref()
+        .map(|ssh| format!(" through {}", ssh.host))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -194,5 +224,54 @@ mod tests {
         assert_eq!(ids, described);
         assert!(find("redis").is_some());
         assert!(find("oracle").is_none());
+    }
+
+    /// Needs the dev Postgres, Redis and bastion
+    /// (`docker compose -f dev/compose.yaml up -d`).
+    #[test]
+    #[ignore]
+    fn connects_through_the_dev_bastion() {
+        use crate::project::SshSpec;
+        let engines = Engines {
+            postgres: Arc::new(kuery_pg::Engine::new().unwrap()),
+            redis: Arc::new(kuery_redis::Engine::new().unwrap()),
+        };
+        let ssh = Some(SshSpec {
+            host: "localhost".into(),
+            port: Some(22229),
+            user: "kuery".into(),
+            identity_file: String::new(),
+        });
+        let postgres = ConnectionSpec {
+            id: "t".into(),
+            name: "t".into(),
+            driver: "postgres".into(),
+            host: "postgres".into(),
+            port: 5432,
+            database: "kuery".into(),
+            user: "kuery".into(),
+            sslmode: None,
+            environment: None,
+            ssh: ssh.clone(),
+        };
+        let reached =
+            futures::executor::block_on(Postgres.test(&postgres, None, &engines)).unwrap();
+        assert!(
+            reached.starts_with("Connected through localhost · PostgreSQL 16"),
+            "{reached}"
+        );
+        let redis = ConnectionSpec {
+            driver: "redis".into(),
+            host: "redis".into(),
+            port: 6379,
+            database: "0".into(),
+            user: String::new(),
+            ..postgres
+        };
+        let reached = futures::executor::block_on(Redis.test(&redis, None, &engines)).unwrap();
+        assert!(
+            reached.starts_with("Connected through localhost · Redis 7"),
+            "{reached}"
+        );
     }
 }

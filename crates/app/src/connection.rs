@@ -13,6 +13,7 @@ use gpui_kit::SharedString;
 use kuery_pg::{Access, ConnectError, Engine, Session};
 
 use crate::theme;
+use crate::tunnel::Tunnel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -171,6 +172,8 @@ pub struct Db {
     /// by every tab on it, gone when it disconnects or the app quits.
     writes_allowed: Arc<AtomicBool>,
     full_writes_allowed: Arc<AtomicBool>,
+    /// The SSH tunnel the connection goes through, open while any clone is.
+    _tunnel: Option<Arc<Tunnel>>,
 }
 
 impl Db {
@@ -180,6 +183,7 @@ impl Db {
         session: Session,
         target: SharedString,
         reconnect: Reconnect,
+        tunnel: Option<Arc<Tunnel>>,
     ) -> Self {
         Self {
             name,
@@ -189,6 +193,7 @@ impl Db {
             reconnect,
             writes_allowed: Arc::new(AtomicBool::new(false)),
             full_writes_allowed: Arc::new(AtomicBool::new(false)),
+            _tunnel: tunnel,
         }
     }
 
@@ -236,6 +241,8 @@ pub struct RedisDb {
     /// Production only: whether writes were allowed for this connection
     /// session. Shared by every tab on it, gone when it disconnects.
     writes_allowed: Arc<AtomicBool>,
+    /// The SSH tunnel the connection goes through, open while any clone is.
+    _tunnel: Option<Arc<Tunnel>>,
 }
 
 impl RedisDb {
@@ -244,6 +251,7 @@ impl RedisDb {
         environment: Environment,
         session: kuery_redis::Session,
         target: SharedString,
+        tunnel: Option<Arc<Tunnel>>,
     ) -> Self {
         Self {
             name,
@@ -251,6 +259,7 @@ impl RedisDb {
             session,
             target,
             writes_allowed: Arc::new(AtomicBool::new(false)),
+            _tunnel: tunnel,
         }
     }
 

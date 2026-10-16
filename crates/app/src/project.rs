@@ -60,6 +60,24 @@ pub struct ConnectionSpec {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Reach the server through this SSH host; `host` and `port` are then
+    /// the server's as the SSH host sees them (see [`crate::tunnel`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshSpec>,
+}
+
+/// An SSH host to tunnel through: a host name or a `~/.ssh/config` alias.
+/// Empty fields leave it to `~/.ssh/config` and the SSH agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshSpec {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    /// A private key file, `~/` allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity_file: String,
 }
 
 fn default_port() -> u16 {
@@ -75,11 +93,14 @@ fn is_default_driver(id: &str) -> bool {
 }
 
 impl ConnectionSpec {
+    /// Through SSH the SSH host decides: the server's `localhost` is the
+    /// SSH host's, not this machine's.
     pub fn environment(&self) -> Environment {
-        Environment::detect(
-            &format!("postgres://{}/", self.host),
-            self.environment.as_deref(),
-        )
+        let host = match &self.ssh {
+            Some(ssh) => &ssh.host,
+            None => &self.host,
+        };
+        Environment::detect(&format!("postgres://{host}/"), self.environment.as_deref())
     }
 
     /// The driver's descriptor; `None` for an id this version does not know.
@@ -91,11 +112,15 @@ impl ConnectionSpec {
         self.driver_info().map(|info| info.family)
     }
 
-    /// `host:port/database`, for display.
+    /// `host:port/database`, and the SSH host it goes through, for display.
     pub fn target(&self) -> String {
-        match self.family() {
+        let target = match self.family() {
             Some(Family::KeyValue) => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
             _ => format!("{}:{}/{}", self.host, self.port, self.database),
+        };
+        match &self.ssh {
+            Some(ssh) => format!("{target} via {}", ssh.host),
+            None => target,
         }
     }
 
@@ -104,12 +129,16 @@ impl ConnectionSpec {
         self.database.trim().parse().unwrap_or(0)
     }
 
-    /// Where and how to connect to Redis. The password is only ever added
-    /// here, in memory.
-    pub fn redis_target(&self, password: Option<&str>) -> kuery_redis::Target {
+    /// Where and how to connect to Redis, through the local end of a tunnel
+    /// when `tunnel` gives its port. The password is only ever added here, in
+    /// memory.
+    pub fn redis_target(&self, password: Option<&str>, tunnel: Option<u16>) -> kuery_redis::Target {
         kuery_redis::Target {
-            host: self.host.clone(),
-            port: self.port,
+            host: match tunnel {
+                Some(_) => "127.0.0.1".into(),
+                None => self.host.clone(),
+            },
+            port: tunnel.unwrap_or(self.port),
             db: self.redis_db(),
             username: Some(self.user.trim().to_string()).filter(|user| !user.is_empty()),
             password: password.filter(|p| !p.is_empty()).map(str::to_string),
@@ -120,16 +149,20 @@ impl ConnectionSpec {
         }
     }
 
-    /// libpq `key=value` connection string. The password is only ever added
-    /// here, in memory.
-    pub fn conninfo(&self, password: Option<&str>) -> String {
-        let mut parts = vec![
-            format!("host={}", quote(&self.host)),
-            format!("port={}", self.port),
+    /// libpq `key=value` connection string, through the local end of a
+    /// tunnel when `tunnel` gives its port (the host still names the server,
+    /// for TLS). The password is only ever added here, in memory.
+    pub fn conninfo(&self, password: Option<&str>, tunnel: Option<u16>) -> String {
+        let mut parts = vec![format!("host={}", quote(&self.host))];
+        if tunnel.is_some() {
+            parts.push("hostaddr=127.0.0.1".into());
+        }
+        parts.extend([
+            format!("port={}", tunnel.unwrap_or(self.port)),
             format!("dbname={}", quote(&self.database)),
             format!("user={}", quote(&self.user)),
             "application_name=Kuery".to_string(),
-        ];
+        ]);
         if let Some(password) = password.filter(|p| !p.is_empty()) {
             parts.push(format!("password={}", quote(password)));
         }
@@ -428,6 +461,7 @@ mod tests {
             user: "kuery".into(),
             sslmode: None,
             environment: None,
+            ssh: None,
         }
     }
 
@@ -447,7 +481,7 @@ mod tests {
             (redis.redis_db(), redis.target()),
             (0, "localhost:63799/0".to_string())
         );
-        let target = redis.redis_target(Some(""));
+        let target = redis.redis_target(Some(""), None);
         assert_eq!(
             (target.username, target.password, target.tls),
             (None, None, false)
@@ -458,7 +492,7 @@ mod tests {
             user: "reader".into(),
             ..redis
         };
-        let target = tls.redis_target(Some("pw"));
+        let target = tls.redis_target(Some("pw"), None);
         assert_eq!((target.db, target.tls), (2, true));
         assert_eq!(target.username.as_deref(), Some("reader"));
         assert!(
@@ -515,12 +549,45 @@ mod tests {
         spec.user = "o'brien".into();
         spec.sslmode = Some("require".into());
         assert_eq!(
-            spec.conninfo(Some(r"p\ss")),
+            spec.conninfo(Some(r"p\ss"), None),
             r"host='localhost' port=54329 dbname='kuery' user='o\'brien' application_name=Kuery password='p\\ss' sslmode='require'"
         );
-        assert!(!spec.conninfo(None).contains("password"));
+        assert!(!spec.conninfo(None, None).contains("password"));
         assert_eq!(spec.target(), "localhost:54329/kuery");
         assert_eq!(spec.environment(), Environment::Development);
+    }
+
+    #[test]
+    fn connects_through_ssh_and_lets_the_ssh_host_decide_the_environment() {
+        let through = ConnectionSpec {
+            ssh: Some(SshSpec {
+                host: "bastion.example.com".into(),
+                port: Some(2222),
+                user: "deploy".into(),
+                identity_file: String::new(),
+            }),
+            ..spec("prod")
+        };
+        // The server's localhost is the bastion's: production, not this machine.
+        assert_eq!(through.environment(), Environment::Production);
+        assert_eq!(
+            through.target(),
+            "localhost:54329/kuery via bastion.example.com"
+        );
+        let conninfo = through.conninfo(None, Some(40001));
+        assert!(conninfo.starts_with("host='localhost' hostaddr=127.0.0.1 port=40001 "));
+        let redis = through.redis_target(None, Some(40001));
+        assert_eq!((redis.host.as_str(), redis.port), ("127.0.0.1", 40001));
+
+        let text = toml::to_string(&through).unwrap();
+        assert!(
+            text.contains("[ssh]\nhost = \"bastion.example.com\"\nport = 2222\nuser = \"deploy\""),
+            "{text}"
+        );
+        assert!(!text.contains("identity_file"));
+        let read: ConnectionSpec = toml::from_str(&text).unwrap();
+        assert_eq!(read, through);
+        assert!(!toml::to_string(&spec("x")).unwrap().contains("ssh"));
     }
 
     #[test]

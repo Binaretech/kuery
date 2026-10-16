@@ -39,6 +39,7 @@ mod results;
 mod secrets;
 mod table_tab;
 mod theme;
+mod tunnel;
 mod ui;
 mod welcome;
 mod workspace;

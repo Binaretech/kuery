@@ -4,10 +4,12 @@
 //! the driver's descriptor (see [`kuery_core::driver`]): its default port,
 //! what its database and user fields mean, and how it asks about TLS. The
 //! password goes to the system keychain; the rest to `.kuery/project.toml`.
+//! Any connection can go through an SSH host (see [`crate::tunnel`]).
 
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableGroup, SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -21,7 +23,7 @@ use kuery_core::driver::{self, DriverInfo, Family};
 
 use crate::app;
 use crate::drivers::{self, family_icon};
-use crate::project::{ConnectionSpec, ProjectModel, new_id};
+use crate::project::{ConnectionSpec, ProjectModel, SshSpec, new_id};
 use crate::secrets::SecretStore;
 use crate::theme::{self, color};
 use crate::ui::muted;
@@ -109,6 +111,12 @@ pub struct ConnectionEditor {
     /// The driver's TLS choices (see [`driver::Tls::options`]).
     tls: Entity<TextSelect>,
     environment: Entity<TextSelect>,
+    /// Through an SSH host, and its fields.
+    ssh: bool,
+    ssh_host: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    ssh_user: Entity<InputState>,
+    ssh_identity: Entity<InputState>,
     test: TestState,
     error: Option<String>,
     confirm_delete: bool,
@@ -174,6 +182,34 @@ impl ConnectionEditor {
             cx,
         );
         let password = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let ssh = spec.as_ref().and_then(|s| s.ssh.clone());
+        let ssh_host = text(
+            ssh.as_ref().map_or("", |s| &s.host),
+            "bastion.example.com or a ~/.ssh/config alias",
+            window,
+            cx,
+        );
+        let ssh_port = text(
+            &ssh.as_ref()
+                .and_then(|s| s.port)
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            "22",
+            window,
+            cx,
+        );
+        let ssh_user = text(
+            ssh.as_ref().map_or("", |s| &s.user),
+            "from ~/.ssh/config",
+            window,
+            cx,
+        );
+        let ssh_identity = text(
+            ssh.as_ref().map_or("", |s| &s.identity_file),
+            "~/.ssh/id_ed25519, or the SSH agent",
+            window,
+            cx,
+        );
 
         let select =
             |items: Vec<&str>, selected: usize, window: &mut Window, cx: &mut Context<Self>| {
@@ -235,6 +271,11 @@ impl ConnectionEditor {
             has_saved_password: false,
             tls,
             environment,
+            ssh: ssh.is_some(),
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_identity,
             test: TestState::Idle,
             error: unknown_driver.map(|id| {
                 format!(
@@ -362,6 +403,29 @@ impl ConnectionEditor {
             .parse::<u16>()
             .map_err(|_| "The port must be a number between 1 and 65535".to_string())?;
         let environment = Self::selected_index(&self.environment, cx);
+        let ssh = if self.ssh {
+            let host = value(&self.ssh_host);
+            if host.is_empty() {
+                return Err("Name the SSH host to connect through".into());
+            }
+            let port = value(&self.ssh_port);
+            let port =
+                if port.is_empty() {
+                    None
+                } else {
+                    Some(port.parse::<u16>().map_err(|_| {
+                        "The SSH port must be a number between 1 and 65535".to_string()
+                    })?)
+                };
+            Some(SshSpec {
+                host,
+                port,
+                user: value(&self.ssh_user),
+                identity_file: value(&self.ssh_identity),
+            })
+        } else {
+            None
+        };
         Ok(ConnectionSpec {
             id: self.id.clone().unwrap_or_else(new_id),
             name,
@@ -373,6 +437,7 @@ impl ConnectionEditor {
             sslmode: self.driver.tls.stored(Self::selected_index(&self.tls, cx)),
             environment: (environment > 0)
                 .then(|| ENVIRONMENTS[environment.min(ENVIRONMENTS.len() - 1)].to_string()),
+            ssh,
         })
     }
 
@@ -525,6 +590,7 @@ impl Render for ConnectionEditor {
             (None, TestState::Failed(message)) => Some((message.clone(), theme::RED)),
         };
         let indent = LABEL_WIDTH + px(12.);
+        let weak = cx.entity().downgrade();
         let tls_label = match info.tls {
             driver::Tls::Modes(_) => "SSL mode",
             driver::Tls::Toggle => "TLS",
@@ -553,6 +619,34 @@ impl Render for ConnectionEditor {
                     .child(field("Password", Input::new(&self.password).mask_toggle()))
                     .child(field("", muted(password_hint)))
                     .child(field(tls_label, Select::new(&self.tls)))
+                    .child(field(
+                        "SSH tunnel",
+                        Checkbox::new("connection-ssh")
+                            .label("Connect through an SSH host")
+                            .checked(self.ssh)
+                            .on_click(move |checked, _, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.ssh = *checked;
+                                    this.test = TestState::Idle;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                    ))
+                    .when(self.ssh, |form| {
+                        form.child(field("SSH host", Input::new(&self.ssh_host)))
+                            .child(field("SSH port", Input::new(&self.ssh_port)))
+                            .child(field("SSH user", Input::new(&self.ssh_user)))
+                            .child(field("Identity file", Input::new(&self.ssh_identity)))
+                            .child(field(
+                                "",
+                                muted(
+                                    "Uses your ssh: ~/.ssh/config, the SSH agent and known_hosts, \
+                                     never an SSH password. Host and Port above are the server \
+                                     as the SSH host sees it.",
+                                ),
+                            ))
+                    })
                     .child(field("Environment", Select::new(&self.environment)))
                     .child(field("", muted(info.production_note))),
             )

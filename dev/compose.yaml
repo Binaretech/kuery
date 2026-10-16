@@ -31,3 +31,22 @@ services:
       - "63799:6379"
     volumes:
       - ./seed-redis.sh:/seed/seed-redis.sh:ro
+
+  # An SSH host to try SSH tunnels with: from it, Postgres is postgres:5432
+  # and Redis redis:6379. Development only: user kuery, no password.
+  bastion:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - >-
+        apk add --no-cache openssh > /dev/null &&
+        ssh-keygen -A > /dev/null &&
+        (id kuery > /dev/null 2>&1 || adduser -D kuery) &&
+        passwd -d kuery > /dev/null &&
+        exec /usr/sbin/sshd -D -e
+        -o PasswordAuthentication=yes
+        -o PermitEmptyPasswords=yes
+        -o AllowTcpForwarding=yes
+    ports:
+      - "22229:22"
