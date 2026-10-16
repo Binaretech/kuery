@@ -23,7 +23,8 @@ use gpui_kit::{
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::read_only::Rejection;
 
-use kuery_pg::StatementImpact;
+use kuery_core::session::StatementImpact;
+use kuery_core::sql::Dialect;
 
 use crate::assets::AppIcon;
 use crate::connection::{Db, Environment, RedisDb, WriteKind, WritePolicy};
@@ -83,9 +84,9 @@ fn note(kind: WriteKind) -> String {
     }
 }
 
-pub fn review(sql: &str, environment: Environment, kind: WriteKind) -> Review {
+pub fn review(dialect: Dialect, sql: &str, environment: Environment, kind: WriteKind) -> Review {
     let policy = environment.write_policy();
-    let analysis = match analysis::analyze(sql) {
+    let analysis = match analysis::analyze_in(dialect, sql) {
         Ok(analysis) => analysis,
         Err(Rejection::Empty) => return Review::Refuse("There is no statement to run".into()),
         Err(error) if policy.allows_unanalysed() => {
@@ -172,8 +173,8 @@ fn plural(count: usize, noun: &str) -> String {
 /// One line per statement of a previewed script, e.g. `UPDATE orders: 1,204
 /// rows would change`. Statements are named from the analysis when it lines
 /// up with what the server ran, and numbered otherwise.
-pub fn describe_impact(sql: &str, impacts: &[StatementImpact]) -> Vec<String> {
-    let summaries: Option<Vec<String>> = analysis::analyze(sql)
+pub fn describe_impact(dialect: Dialect, sql: &str, impacts: &[StatementImpact]) -> Vec<String> {
+    let summaries: Option<Vec<String>> = analysis::analyze_in(dialect, sql)
         .ok()
         .map(|a| a.statements.into_iter().map(|s| s.summary).collect())
         .filter(|summaries: &Vec<String>| summaries.len() == impacts.len());
@@ -830,7 +831,12 @@ mod tests {
     use super::*;
 
     fn review_in(environment: Environment, sql: &str) -> Review {
-        review(sql, environment, WriteKind::Transactional)
+        review(
+            Dialect::Postgres,
+            sql,
+            environment,
+            WriteKind::Transactional,
+        )
     }
 
     fn confirmation(review: Review) -> Confirmation {
@@ -920,6 +926,7 @@ mod tests {
     #[test]
     fn full_write_says_changes_apply_right_away() {
         let confirmation = confirmation(review(
+            Dialect::Postgres,
             "insert into t values (1)",
             Environment::Staging,
             WriteKind::Full,
@@ -928,7 +935,7 @@ mod tests {
         assert_eq!(confirmation.run_label, "Apply 1 change");
         assert!(confirmation.note.contains("There is no Roll Back"));
         assert!(matches!(
-            review("begin", Environment::Development, WriteKind::Full),
+            review(Dialect::Postgres, "begin", Environment::Development, WriteKind::Full),
             Review::Refuse(message) if message.contains("switch to Write")
         ));
     }
@@ -946,7 +953,11 @@ mod tests {
             },
         ];
         assert_eq!(
-            describe_impact("update orders set a = 1; select 1", &impacts),
+            describe_impact(
+                Dialect::Postgres,
+                "update orders set a = 1; select 1",
+                &impacts
+            ),
             [
                 "UPDATE orders: 1,204 rows would change",
                 "SELECT: 1 row returned"
@@ -954,7 +965,7 @@ mod tests {
         );
         // When the analysis does not line up, statements are numbered.
         assert_eq!(
-            describe_impact("updat t", &impacts[..1]),
+            describe_impact(Dialect::Postgres, "updat t", &impacts[..1]),
             ["Statement 1: 1,204 rows would change"]
         );
     }

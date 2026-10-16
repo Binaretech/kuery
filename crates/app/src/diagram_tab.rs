@@ -188,7 +188,7 @@ impl DiagramTab {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let load = kuery_pg::catalog::diagram(self.db.session.clone(), self.schema.clone());
+        let load = self.db.session.diagram(self.schema.clone());
         self.state = State::Loading;
         self.view = None;
         self.task = Some(cx.spawn(async move |this, cx| {

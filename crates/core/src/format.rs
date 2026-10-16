@@ -1,22 +1,27 @@
 //! SQL formatting for the editor ("Format SQL").
 
-use sqlformat::{Dialect, FormatOptions, Indent, QueryParams};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlformat::{FormatOptions, Indent, QueryParams};
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::script::Offsets;
+use crate::sql::Dialect;
 
 /// Reindents `sql`: one clause per line, two-space indentation, a blank line
 /// between statements. Keyword case is left as written, and so are comments,
 /// strings and dollar-quoted bodies. SQL that cannot be tokenized comes back
 /// unchanged.
 pub fn format_sql(sql: &str) -> String {
+    format_sql_in(Dialect::Postgres, sql)
+}
+
+/// The same, for a database speaking `dialect`.
+pub fn format_sql_in(dialect: Dialect, sql: &str) -> String {
     // The formatter would reformat function bodies as if they were plain
     // SQL: swap them for placeholders and put them back afterwards.
-    let Some((protected, bodies)) = protect_dollar_quotes(sql) else {
+    let Some((protected, bodies)) = protect_dollar_quotes(dialect, sql) else {
         return sql.to_string();
     };
-    let mut formatted = format_plain(&protected);
+    let mut formatted = format_plain(dialect, &protected);
     for (index, body) in bodies.iter().enumerate() {
         formatted = formatted.replacen(&placeholder(index), body, 1);
     }
@@ -32,8 +37,8 @@ fn placeholder(index: usize) -> String {
 
 /// `sql` with each dollar-quoted string replaced by a placeholder, and the
 /// strings in order.
-fn protect_dollar_quotes(sql: &str) -> Option<(String, Vec<String>)> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+fn protect_dollar_quotes(dialect: Dialect, sql: &str) -> Option<(String, Vec<String>)> {
+    let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
     let offsets = Offsets::new(sql);
@@ -51,12 +56,15 @@ fn protect_dollar_quotes(sql: &str) -> Option<(String, Vec<String>)> {
     Some((out, bodies))
 }
 
-fn format_plain(sql: &str) -> String {
+fn format_plain(dialect: Dialect, sql: &str) -> String {
     let options = FormatOptions {
         indent: Indent::Spaces(2),
         uppercase: None,
         lines_between_queries: 2,
-        dialect: Dialect::PostgreSql,
+        dialect: match dialect {
+            Dialect::Postgres => sqlformat::Dialect::PostgreSql,
+            Dialect::Sqlite | Dialect::Mysql => sqlformat::Dialect::Generic,
+        },
         ..FormatOptions::default()
     };
     sqlformat::format(sql, &QueryParams::None, &options)

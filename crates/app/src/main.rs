@@ -38,6 +38,7 @@ mod redis_key_tab;
 mod redis_write;
 mod results;
 mod secrets;
+mod sql_session;
 mod table_tab;
 mod theme;
 mod tunnel;
@@ -55,6 +56,7 @@ fn main() {
     paths::migrate_legacy_config_dir();
     let engine = Arc::new(Engine::new().expect("start the Postgres runtime"));
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
+    let mysql = Arc::new(kuery_mysql::Engine::new().expect("start the MySQL runtime"));
     let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
@@ -67,6 +69,7 @@ fn main() {
             app::init(
                 engine.clone(),
                 redis.clone(),
+                mysql.clone(),
                 Arc::new(secrets::Keyring),
                 cx,
             );

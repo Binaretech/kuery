@@ -28,7 +28,7 @@ use gpui_kit::{
 use kuery_core::browse::{Browse, Direction, Filter, FilterOp, Sort};
 use kuery_core::catalog::{ColumnInfo, TableDefinition, TableInfo};
 use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange, WriteStatement};
-use kuery_pg::{RunOptions, catalog};
+use kuery_core::session::RunOptions;
 
 actions!(kuery, [ReloadTable, SaveTableChanges]);
 
@@ -192,7 +192,7 @@ impl TableTab {
         )
         .detach();
 
-        let load = catalog::definition(db.session.clone(), info.table.clone());
+        let load = db.session.definition(info.table.clone());
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -265,7 +265,10 @@ impl TableTab {
         match result {
             Ok(definition) => {
                 let names = definition.columns.iter().map(|c| c.name.clone()).collect();
-                self.browse = Some(Browse::new(self.info.table.clone(), names));
+                self.browse = Some(
+                    Browse::new(self.info.table.clone(), names)
+                        .in_dialect(self.db.session.dialect()),
+                );
                 let columns = definition.columns.clone();
                 self.grid.update(cx, |grid, cx| {
                     grid.delegate_mut().set_columns(columns, None);
@@ -301,6 +304,7 @@ impl TableTab {
             table: self.info.table.clone(),
             columns: definition.columns.iter().map(|c| c.name.clone()).collect(),
             primary_key: definition.primary_key(),
+            dialect: self.db.session.dialect(),
         })
     }
 

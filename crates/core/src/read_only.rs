@@ -8,11 +8,21 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, Visit, Visitor};
-use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+
+use crate::sql::Dialect;
 
 /// Functions that have side effects even when called from a `SELECT`.
 const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    // MySQL: named locks, and reading files on the server.
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "load_file",
+    // SQLite: loading native code, writing files, editing in an editor.
+    "load_extension",
+    "writefile",
+    "edit",
     "dblink",
     "dblink_exec",
     "lo_export",
@@ -82,9 +92,15 @@ impl fmt::Display for Rejection {
 
 impl std::error::Error for Rejection {}
 
-/// Checks that `sql` is exactly one statement that only reads data.
+/// Checks that `sql` is exactly one PostgreSQL statement that only reads
+/// data.
 pub fn check(sql: &str) -> Result<(), Rejection> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+    check_in(Dialect::Postgres, sql)
+}
+
+/// The same, for a database speaking `dialect`.
+pub fn check_in(dialect: Dialect, sql: &str) -> Result<(), Rejection> {
+    let statements = Parser::parse_sql(&*dialect.parser(), sql)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
 
     match statements.as_slice() {
@@ -119,6 +135,13 @@ impl Visitor for ReadOnlyVisitor {
                 | Statement::ShowVariables { .. }
                 | Statement::ShowColumns { .. }
                 | Statement::ShowTables { .. }
+                | Statement::ShowCreate { .. }
+                | Statement::ShowDatabases { .. }
+                | Statement::ShowSchemas { .. }
+                | Statement::ShowStatus { .. }
+                | Statement::ShowFunctions { .. }
+                | Statement::ShowCollation { .. }
+                | Statement::ShowViews { .. }
         );
         if allowed {
             ControlFlow::Continue(())
@@ -193,6 +216,31 @@ mod tests {
 
     fn rejected(sql: &str) -> Rejection {
         check(sql).expect_err(&format!("should be rejected: {sql}"))
+    }
+
+    #[test]
+    fn reads_other_dialects() {
+        assert_eq!(
+            check_in(Dialect::Mysql, "select `id` from `shop`.`orders` # note"),
+            Ok(())
+        );
+        assert_eq!(check_in(Dialect::Mysql, "show create table orders"), Ok(()));
+        assert_eq!(check_in(Dialect::Mysql, "show databases"), Ok(()));
+        assert!(matches!(
+            check_in(Dialect::Mysql, "select get_lock('x', 10)"),
+            Err(Rejection::Function(name)) if name == "get_lock"
+        ));
+        assert!(check_in(Dialect::Mysql, "delete from orders").is_err());
+        assert_eq!(
+            check_in(Dialect::Sqlite, "select * from \"main\".\"orders\" limit 3"),
+            Ok(())
+        );
+        assert!(matches!(
+            check_in(Dialect::Sqlite, "select load_extension('x')"),
+            Err(Rejection::Function(_))
+        ));
+        assert!(check_in(Dialect::Sqlite, "pragma journal_mode = delete").is_err());
+        assert!(check_in(Dialect::Sqlite, "attach database 'x.db' as x").is_err());
     }
 
     #[test]

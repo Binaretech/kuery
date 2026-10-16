@@ -1,0 +1,10 @@
+[package]
+name = "kuery-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kuery-core.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+rusqlite.workspace = true

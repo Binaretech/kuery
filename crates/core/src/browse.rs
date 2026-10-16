@@ -6,7 +6,7 @@
 use std::fmt;
 
 use crate::catalog::TableRef;
-use crate::sql::{SqlError, escape_like, quote_ident, quote_literal, quote_qualified};
+use crate::sql::{Dialect, SqlError, escape_like};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
@@ -88,6 +88,7 @@ pub struct Browse {
     pub sort: Vec<Sort>,
     pub page_size: u64,
     pub page: u64,
+    pub dialect: Dialect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +127,14 @@ impl Browse {
             sort: Vec::new(),
             page_size: 100,
             page: 0,
+            dialect: Dialect::Postgres,
         }
+    }
+
+    /// The same, in another database's SQL.
+    pub fn in_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// `SELECT` for the current page.
@@ -136,7 +144,8 @@ impl Browse {
     pub fn page_sql(&self, default_order: &[String]) -> Result<String, BrowseError> {
         let mut sql = format!(
             "select * from {}{}",
-            quote_qualified(&self.table.schema, &self.table.name),
+            self.dialect
+                .quote_qualified(&self.table.schema, &self.table.name),
             self.where_clause()?
         );
 
@@ -150,10 +159,9 @@ impl Browse {
                 .iter()
                 .map(|sort| {
                     let column = self.column(&sort.column)?;
-                    Ok(match sort.direction {
-                        Direction::Ascending => format!("{column} asc nulls last"),
-                        Direction::Descending => format!("{column} desc nulls last"),
-                    })
+                    Ok(self
+                        .dialect
+                        .order_nulls_last(&column, sort.direction == Direction::Descending))
                 })
                 .collect::<Result<_, BrowseError>>()?
         };
@@ -174,7 +182,8 @@ impl Browse {
     pub fn count_sql(&self) -> Result<String, BrowseError> {
         Ok(format!(
             "select count(*) from {}{}",
-            quote_qualified(&self.table.schema, &self.table.name),
+            self.dialect
+                .quote_qualified(&self.table.schema, &self.table.name),
             self.where_clause()?
         ))
     }
@@ -199,14 +208,17 @@ impl Browse {
         }
         // Untyped literals are cast to the column's type, so `status = 'paid'`
         // works with enums, dates or uuids.
+        let dialect = self.dialect;
         let comparison = |op: &str| -> Result<String, BrowseError> {
-            Ok(format!("{column} {op} {}", quote_literal(value)?))
+            Ok(format!("{column} {op} {}", dialect.quote_literal(value)?))
         };
         let pattern = |pattern: String| -> Result<String, BrowseError> {
             Ok(format!(
-                "{column}::text ilike {} escape {}",
-                quote_literal(&pattern)?,
-                quote_literal("\\")?
+                "{} {} {} escape {}",
+                dialect.as_text(&column),
+                dialect.like_ignoring_case(),
+                dialect.quote_literal(&pattern)?,
+                dialect.quote_literal("\\")?
             ))
         };
         match filter.op {
@@ -223,7 +235,7 @@ impl Browse {
                     .split(',')
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
-                    .map(quote_literal)
+                    .map(|value| dialect.quote_literal(value))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(format!("{column} in ({})", values.join(", ")))
             }
@@ -234,7 +246,7 @@ impl Browse {
 
     fn column(&self, name: &str) -> Result<String, BrowseError> {
         if self.columns.iter().any(|c| c == name) {
-            Ok(quote_ident(name))
+            Ok(self.dialect.quote_ident(name))
         } else {
             Err(BrowseError::UnknownColumn(name.to_string()))
         }
@@ -273,6 +285,30 @@ mod tests {
         assert_eq!(
             browse.page_sql(&[]).unwrap(),
             r#"select * from "public"."orders" limit 50 offset 150"#
+        );
+    }
+
+    #[test]
+    fn browses_in_each_dialect() {
+        let mut browse = Browse::new(
+            TableRef::new("shop", "orders"),
+            vec!["id".into(), "status".into()],
+        )
+        .in_dialect(Dialect::Mysql);
+        browse.filters = vec![filter("status", FilterOp::Contains, "pa")];
+        browse.sort = vec![Sort {
+            column: "id".into(),
+            direction: Direction::Descending,
+        }];
+        assert_eq!(
+            browse.page_sql(&[]).unwrap(),
+            "select * from `shop`.`orders` where cast(`status` as char) like '%pa%' escape _utf8mb4 x'5c' \
+             order by `id` is null, `id` desc limit 100 offset 0"
+        );
+        browse.dialect = Dialect::Sqlite;
+        assert_eq!(
+            browse.count_sql().unwrap(),
+            "select count(*) from \"shop\".\"orders\" where cast(\"status\" as text) like '%pa%' escape '\\'"
         );
     }
 

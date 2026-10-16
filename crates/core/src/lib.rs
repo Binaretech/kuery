@@ -21,5 +21,6 @@ pub mod read_only;
 pub mod redis;
 pub mod result_set;
 pub mod script;
+pub mod session;
 pub mod sql;
 pub mod stats;

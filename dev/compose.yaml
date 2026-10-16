@@ -32,6 +32,18 @@ services:
     volumes:
       - ./seed-redis.sh:/seed/seed-redis.sh:ro
 
+  # MySQL with the sample shop in the `shop` database; user kuery, no
+  # password (development only).
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: shop
+    ports:
+      - "33069:3306"
+    volumes:
+      - ./seed-mysql.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+
   # An SSH host to try SSH tunnels with: from it, Postgres is postgres:5432
   # and Redis redis:6379. Development only: user kuery, no password.
   bastion:

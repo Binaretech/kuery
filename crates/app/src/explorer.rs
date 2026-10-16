@@ -28,8 +28,7 @@ use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
 use kuery_core::driver::Family;
-use kuery_core::sql::quote_qualified;
-use kuery_pg::catalog;
+use kuery_core::sql::{Dialect, quote_qualified};
 
 use crate::app;
 use crate::assets::AppIcon;
@@ -459,6 +458,8 @@ impl Explorer {
             }
         };
         node.state = ConnectionState::Connecting;
+        // A database file's relative path starts at the project folder.
+        let resolved = spec.resolved(&self.model.read(cx).project.root);
         let state = app::state(cx);
         let (engines, secrets) = (state.engines(), state.secrets.clone());
         // The keychain may ask the user for permission: read it off the UI thread.
@@ -466,7 +467,7 @@ impl Explorer {
         let password = cx.background_spawn(async move { secrets.get(&id) });
         cx.spawn(async move |this, cx| {
             let result = match password.await {
-                Ok(password) => driver.connect(&spec, password, &engines).await,
+                Ok(password) => driver.connect(&resolved, password, &engines).await,
                 Err(error) => Err(error),
             };
             this.update(cx, |this, cx| {
@@ -577,7 +578,7 @@ impl Explorer {
         {
             *catalog = CatalogState::Loading;
         }
-        let load = catalog::overview(db.session.clone());
+        let load = db.session.overview();
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -641,7 +642,7 @@ impl Explorer {
             function.schema, function.name, function.oid
         ));
         let title: SharedString = format!("{}()", function.name).into();
-        let load = catalog::function_definition(db.session.clone(), function);
+        let load = db.session.function_definition(function);
         cx.spawn(async move |this, cx| {
             let sql = match load.await {
                 Ok(definition) => definition,
@@ -728,10 +729,11 @@ impl Explorer {
 
     fn query_table(&mut self, index: usize, table: &TableRef, cx: &mut Context<Self>) {
         let Some(db) = self.db(index) else { return };
+        let sql = select_sql(db.session.dialect(), table);
         cx.emit(ExplorerEvent::OpenQuery {
             db,
             title: table.name.clone().into(),
-            sql: select_sql(table),
+            sql,
         });
     }
 
@@ -878,6 +880,10 @@ impl Explorer {
             node.state,
             ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
         );
+        let activity = matches!(
+            &node.state,
+            ConnectionState::Ready { db, .. } if db.session.has_activity()
+        );
         // The environment's color: filled once connected, an outline before;
         // amber while connecting, red when it failed.
         let dot = match &node.state {
@@ -1004,12 +1010,14 @@ impl Explorer {
                         &this,
                         move |this, _, cx| this.new_query(index, cx),
                     ))
-                    .item(item_icon(
-                        "Server Activity",
-                        AppIcon::Activity,
-                        &this,
-                        move |this, _, cx| this.open_activity(index, cx),
-                    ))
+                    .when(activity, |menu| {
+                        menu.item(item_icon(
+                            "Server Activity",
+                            AppIcon::Activity,
+                            &this,
+                            move |this, _, cx| this.open_activity(index, cx),
+                        ))
+                    })
                     .item(item_icon(
                         "Refresh Catalog",
                         AppIcon::Reload,
@@ -1293,6 +1301,11 @@ impl Explorer {
     }
 
     fn table_row(&self, index: usize, info: &TableInfo, cx: &mut Context<Self>) -> AnyElement {
+        let dialect = self
+            .connections
+            .get(index)
+            .map(|node| node.spec.dialect())
+            .unwrap_or_default();
         let key = format!("{index}/{}/table/{}", info.table.schema, info.table.name);
         let selected = self.selected.as_deref() == Some(key.as_str());
         let editable = info.kind.is_editable();
@@ -1320,7 +1333,7 @@ impl Explorer {
                 let this = cx.entity().downgrade();
                 move |menu, _, _| {
                     let (data, definition, query) = (info.clone(), info.clone(), info.clone());
-                    let name = quote_qualified(&info.table.schema, &info.table.name);
+                    let name = dialect.quote_qualified(&info.table.schema, &info.table.name);
                     menu.item(item_icon(
                         "Open Data",
                         AppIcon::Table,
@@ -1345,7 +1358,10 @@ impl Explorer {
                     ))
                     .separator()
                     .item(copy("Copy Name", name))
-                    .item(copy("Copy SELECT Statement", select_sql(&info.table)))
+                    .item(copy(
+                        "Copy SELECT Statement",
+                        select_sql(dialect, &info.table),
+                    ))
                     .separator()
                     .item(item(
                         "Refresh Catalog",
@@ -1560,10 +1576,10 @@ impl Explorer {
 }
 
 /// `select * from "schema"."table" limit 100;`, for a new query tab.
-fn select_sql(table: &TableRef) -> String {
+fn select_sql(dialect: Dialect, table: &TableRef) -> String {
     format!(
         "select *\nfrom {}\nlimit 100;\n",
-        quote_qualified(&table.schema, &table.name)
+        dialect.quote_qualified(&table.schema, &table.name)
     )
 }
 

@@ -28,8 +28,10 @@ use gpui_kit::{
 };
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::export::{self, Format};
+use kuery_core::session::{Access, Event, QueryError, RunOptions, StatementImpact};
 use kuery_core::{format, plan, script};
-use kuery_pg::{Access, Event, QueryError, RunOptions, Session, StatementImpact, catalog};
+
+use crate::sql_session::SqlSession;
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
@@ -83,7 +85,7 @@ enum WriteState {
 
 /// The tab's own read-write connection and its open transaction, if any.
 struct WriteSession {
-    session: Session,
+    session: SqlSession,
     kind: WriteKind,
     /// Statements and rows changed since the transaction opened.
     statements: usize,
@@ -93,7 +95,7 @@ struct WriteSession {
 }
 
 impl WriteSession {
-    fn new(session: Session, kind: WriteKind) -> Self {
+    fn new(session: SqlSession, kind: WriteKind) -> Self {
         Self {
             session,
             kind,
@@ -302,7 +304,7 @@ impl QueryTab {
     /// Loads what the editor completes. On failure the previous catalog
     /// stays, and completion offers keywords only until a later load works.
     fn load_completion_catalog(&mut self, cx: &mut Context<Self>) {
-        let load = catalog::completion_catalog(self.db.session.clone());
+        let load = self.db.session.completion_catalog();
         let shared = self.completion_catalog.clone();
         self.catalog_task = Some(cx.spawn(async move |_, _| {
             if let Ok(loaded) = load.await {
@@ -402,26 +404,30 @@ impl QueryTab {
             return selected;
         }
         let text = editor.text().to_string();
-        match script::statements(&text) {
-            Some(ranges) if ranges.len() > 1 => script::statement_at(&text, editor.cursor())
-                .map(|range| text[range].to_string())
-                .unwrap_or(text),
+        let dialect = self.db.session.dialect();
+        match script::statements_in(dialect, &text) {
+            Some(ranges) if ranges.len() > 1 => {
+                script::statement_at_in(dialect, &text, editor.cursor())
+                    .map(|range| text[range].to_string())
+                    .unwrap_or(text)
+            }
             _ => text,
         }
     }
 
     /// Formats the selection, or the whole text; undo brings it back.
     fn format_sql(&mut self, _: &FormatSql, window: &mut Window, cx: &mut Context<Self>) {
+        let dialect = self.db.session.dialect();
         self.editor.update(cx, |editor, cx| {
             let selected = editor.selected_text().to_string();
             if !selected.trim().is_empty() {
-                let formatted = format::format_sql(&selected);
+                let formatted = format::format_sql_in(dialect, &selected);
                 if formatted != selected {
                     editor.replace(formatted, window, cx);
                 }
             } else {
                 let text = editor.text().to_string();
-                let formatted = format::format_sql(&text);
+                let formatted = format::format_sql_in(dialect, &text);
                 if formatted != text {
                     editor.replace_all(formatted, window, cx);
                 }
@@ -443,7 +449,8 @@ impl QueryTab {
             }
             WriteState::On(write) => {
                 let kind = write.kind;
-                match write_mode::review(&sql, self.db.environment, kind) {
+                match write_mode::review(self.db.session.dialect(), &sql, self.db.environment, kind)
+                {
                     Review::Run { writes } => self.execute(sql, writes, cx),
                     Review::Refuse(reason) => self.refuse(sql, reason, cx),
                     Review::Confirm(confirmation) => {
@@ -486,7 +493,12 @@ impl QueryTab {
             );
             return;
         };
-        match write_mode::review(&sql, self.db.environment, write.kind) {
+        match write_mode::review(
+            self.db.session.dialect(),
+            &sql,
+            self.db.environment,
+            write.kind,
+        ) {
             Review::Refuse(reason) => self.refuse(sql, reason, cx),
             Review::Run { .. } | Review::Confirm(_) => {
                 if let Some(preview) = self.run_preview(sql, cx) {
@@ -534,6 +546,7 @@ impl QueryTab {
         let WriteState::On(write) = &self.write else {
             return None;
         };
+        let dialect = write.session.dialect();
         let preview = write.session.preview(
             sql.clone(),
             RunOptions {
@@ -548,7 +561,7 @@ impl QueryTab {
                     Ok(impacts) => (
                         format!(
                             "Preview (undone): {}",
-                            write_mode::describe_impact(&sql, impacts).join(" · ")
+                            write_mode::describe_impact(dialect, &sql, impacts).join(" · ")
                         ),
                         false,
                     ),
@@ -666,7 +679,7 @@ impl QueryTab {
                     self.audit(AuditAction::Run, &sql, &outcome, changed, false, cx);
                 }
                 self.record(outcome, false, cx);
-                if changes_schema(&self.last_sql) {
+                if changes_schema(self.db.session.dialect(), &self.last_sql) {
                     self.load_completion_catalog(cx);
                 }
                 self.run = RunState::Done {
@@ -726,11 +739,21 @@ impl QueryTab {
         }
         let statement = self.sql_to_run(cx);
         self.select_panel_tab(PanelTab::Plan, cx);
+        if !self.db.session.has_plans() {
+            let message = format!(
+                "Plans are drawn for PostgreSQL only. On {} run EXPLAIN as a query to see its own.",
+                self.db.session.server_label()
+            );
+            self.plan.update(cx, |plan, cx| plan.fail(message, cx));
+            return;
+        }
         if let Err(error) = plan::explain_sql(&statement, analyze) {
             self.plan.update(cx, |plan, cx| plan.fail(error, cx));
             return;
         }
-        let writes = analyze && analysis::analyze(&statement).map_or(true, |a| a.writes());
+        let writes = analyze
+            && analysis::analyze_in(self.db.session.dialect(), &statement)
+                .map_or(true, |a| a.writes());
         let options = RunOptions {
             statement_timeout: Duration::from_secs(60),
             ..RunOptions::default()
@@ -994,8 +1017,8 @@ impl QueryTab {
     fn enter_write_mode(&mut self, kind: WriteKind, cx: &mut Context<Self>) {
         self.write = WriteState::Connecting;
         cx.notify();
-        let engine = crate::app::state(cx).engine.clone();
-        let connecting = self.db.reconnect.open(&engine, Access::ReadWrite);
+        let engines = crate::app::state(cx).engines();
+        let connecting = self.db.reconnect.open(&engines, Access::ReadWrite);
         cx.spawn(async move |this, cx| {
             let result = connecting.await;
             this.update(cx, |this, cx| {
@@ -1944,6 +1967,7 @@ impl QueryTab {
 
 pub fn describe_error(error: QueryError) -> String {
     match error {
+        QueryError::Database { code, message } if code.is_empty() => message,
         QueryError::Database { code, message } => format!("{message} [{code}]"),
         other => other.to_string(),
     }
@@ -2049,8 +2073,8 @@ impl Render for QueryTab {
 }
 
 /// Whether `sql` creates, alters or drops something completion lists.
-fn changes_schema(sql: &str) -> bool {
-    analysis::analyze(sql).is_ok_and(|analysis| {
+fn changes_schema(dialect: kuery_core::sql::Dialect, sql: &str) -> bool {
+    analysis::analyze_in(dialect, sql).is_ok_and(|analysis| {
         analysis
             .statements
             .iter()

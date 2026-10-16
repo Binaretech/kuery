@@ -399,11 +399,22 @@ impl ConnectionEditor {
             return Err("Give the connection a name".into());
         }
         self.driver.validate(&host, &database, &user)?;
-        let port = value(&self.port)
-            .parse::<u16>()
-            .map_err(|_| "The port must be a number between 1 and 65535".to_string())?;
+        // A database file has no server: no host, port, user or TLS.
+        let file = self.driver.file;
+        let (host, user) = if file {
+            (String::new(), String::new())
+        } else {
+            (host, user)
+        };
+        let port = if file {
+            0
+        } else {
+            value(&self.port)
+                .parse::<u16>()
+                .map_err(|_| "The port must be a number between 1 and 65535".to_string())?
+        };
         let environment = Self::selected_index(&self.environment, cx);
-        let ssh = if self.ssh {
+        let ssh = if self.ssh && !file {
             let host = value(&self.ssh_host);
             if host.is_empty() {
                 return Err("Name the SSH host to connect through".into());
@@ -434,7 +445,9 @@ impl ConnectionEditor {
             port,
             database,
             user,
-            sslmode: self.driver.tls.stored(Self::selected_index(&self.tls, cx)),
+            sslmode: (!file)
+                .then(|| self.driver.tls.stored(Self::selected_index(&self.tls, cx)))
+                .flatten(),
             environment: (environment > 0)
                 .then(|| ENVIRONMENTS[environment.min(ENVIRONMENTS.len() - 1)].to_string()),
             ssh,
@@ -464,6 +477,7 @@ impl ConnectionEditor {
                 return;
             }
         };
+        let spec = spec.resolved(&self.model.read(cx).project.root);
         let typed = self.password(cx);
         let state = app::state(cx);
         let (engines, secrets) = (state.engines(), state.secrets.clone());
@@ -610,30 +624,36 @@ impl Render for ConnectionEditor {
                 v_flex()
                     .gap_3()
                     .child(field("Name", Input::new(&self.name)))
-                    .child(field("Host", Input::new(&self.host)))
-                    .child(field("Port", Input::new(&self.port)))
+                    .when(!info.file, |form| {
+                        form.child(field("Host", Input::new(&self.host)))
+                            .child(field("Port", Input::new(&self.port)))
+                    })
                     .child(field(info.database.label, Input::new(&self.database)))
                     .children(info.database.help.map(|help| field("", muted(help))))
-                    .child(field(info.user.label, Input::new(&self.user)))
-                    .children(info.user.help.map(|help| field("", muted(help))))
-                    .child(field("Password", Input::new(&self.password).mask_toggle()))
-                    .child(field("", muted(password_hint)))
-                    .child(field(tls_label, Select::new(&self.tls)))
-                    .child(field(
-                        "SSH tunnel",
-                        Checkbox::new("connection-ssh")
-                            .label("Connect through an SSH host")
-                            .checked(self.ssh)
-                            .on_click(move |checked, _, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.ssh = *checked;
-                                    this.test = TestState::Idle;
-                                    cx.notify();
-                                })
-                                .ok();
-                            }),
-                    ))
-                    .when(self.ssh, |form| {
+                    .when(!info.file, |form| {
+                        form.child(field(info.user.label, Input::new(&self.user)))
+                            .children(info.user.help.map(|help| field("", muted(help))))
+                            .child(field("Password", Input::new(&self.password).mask_toggle()))
+                            .child(field("", muted(password_hint)))
+                            .child(field(tls_label, Select::new(&self.tls)))
+                    })
+                    .when(!info.file, |form| {
+                        form.child(field(
+                            "SSH tunnel",
+                            Checkbox::new("connection-ssh")
+                                .label("Connect through an SSH host")
+                                .checked(self.ssh)
+                                .on_click(move |checked, _, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.ssh = *checked;
+                                        this.test = TestState::Idle;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }),
+                        ))
+                    })
+                    .when(self.ssh && !info.file, |form| {
                         form.child(field("SSH host", Input::new(&self.ssh_host)))
                             .child(field("SSH port", Input::new(&self.ssh_port)))
                             .child(field("SSH user", Input::new(&self.ssh_user)))

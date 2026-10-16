@@ -19,8 +19,9 @@ use gpui_kit::component::{Icon, IconName};
 use kuery_core::driver::{self, DriverInfo, Family};
 
 use crate::assets::AppIcon;
-use crate::connection::{Db, Reconnect, RedisDb};
+use crate::connection::{Db, RedisDb};
 use crate::project::ConnectionSpec;
+use crate::sql_session::{Reconnect, SqlSession};
 use crate::tunnel;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -30,6 +31,7 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub struct Engines {
     pub postgres: Arc<kuery_pg::Engine>,
     pub redis: Arc<kuery_redis::Engine>,
+    pub mysql: Arc<kuery_mysql::Engine>,
 }
 
 /// An open connection, by family.
@@ -61,7 +63,7 @@ pub trait Driver: Send + Sync + 'static {
 
 /// Every driver, in the order of [`kuery_core::driver::ALL`].
 pub fn all() -> &'static [&'static dyn Driver] {
-    &[&Postgres, &Redis]
+    &[&Postgres, &Mysql, &Sqlite, &Redis]
 }
 
 /// The icon of a driver's family, in the sidebar and the driver list.
@@ -136,10 +138,117 @@ impl Driver for Postgres {
             Ok(Connection::Sql(Db::new(
                 spec.name.clone().into(),
                 spec.environment(),
-                session,
+                SqlSession::Postgres(session),
                 spec.target().into(),
-                Reconnect::new(conninfo),
+                Reconnect::Postgres {
+                    conninfo: conninfo.into(),
+                },
                 tunnel,
+            )))
+        })
+    }
+}
+
+/// MySQL and MariaDB.
+struct Mysql;
+
+impl Driver for Mysql {
+    fn info(&self) -> &'static DriverInfo {
+        &driver::MYSQL
+    }
+
+    fn test(
+        &self,
+        spec: &ConnectionSpec,
+        password: Option<String>,
+        engines: &Engines,
+    ) -> BoxFuture<Result<String, String>> {
+        let (spec, engine) = (spec.clone(), engines.mysql.clone());
+        Box::pin(async move {
+            let tunnel = tunnel::open_for(&spec).await?;
+            let target = spec.mysql_target(password, tunnel.as_ref().map(|t| t.local_port()));
+            let session = engine.connect(target, kuery_pg::Access::ReadOnly).await?;
+            Ok(format!(
+                "Connected{} · {} {}",
+                through(&spec),
+                if session.is_mariadb() {
+                    "MariaDB"
+                } else {
+                    "MySQL"
+                },
+                session.server_version()
+            ))
+        })
+    }
+
+    fn connect(
+        &self,
+        spec: &ConnectionSpec,
+        password: Option<String>,
+        engines: &Engines,
+    ) -> BoxFuture<Result<Connection, String>> {
+        let (spec, engine) = (spec.clone(), engines.mysql.clone());
+        Box::pin(async move {
+            let tunnel = tunnel::open_for(&spec).await?;
+            let target = spec.mysql_target(password, tunnel.as_ref().map(|t| t.local_port()));
+            let session = engine
+                .connect(target.clone(), spec.environment().access())
+                .await?;
+            Ok(Connection::Sql(Db::new(
+                spec.name.clone().into(),
+                spec.environment(),
+                SqlSession::Mysql(session),
+                spec.target().into(),
+                Reconnect::Mysql {
+                    target: Arc::new(target),
+                },
+                tunnel,
+            )))
+        })
+    }
+}
+
+/// A database file. `database` is its path, already made absolute (see
+/// [`ConnectionSpec::resolved`]); production opens it read-only.
+struct Sqlite;
+
+impl Driver for Sqlite {
+    fn info(&self) -> &'static DriverInfo {
+        &driver::SQLITE
+    }
+
+    fn test(
+        &self,
+        spec: &ConnectionSpec,
+        _: Option<String>,
+        _: &Engines,
+    ) -> BoxFuture<Result<String, String>> {
+        let open =
+            kuery_sqlite::Session::open(spec.database.clone().into(), kuery_pg::Access::ReadOnly);
+        Box::pin(async move {
+            let session = open.await?;
+            Ok(format!("Opened · SQLite {}", session.server_version()))
+        })
+    }
+
+    fn connect(
+        &self,
+        spec: &ConnectionSpec,
+        _: Option<String>,
+        _: &Engines,
+    ) -> BoxFuture<Result<Connection, String>> {
+        let path: std::path::PathBuf = spec.database.clone().into();
+        let open = kuery_sqlite::Session::open(path.clone(), spec.environment().access());
+        let spec = spec.clone();
+        Box::pin(async move {
+            let session = open.await?;
+            Ok(Connection::Sql(Db::new(
+                spec.name.clone().into(),
+                spec.environment(),
+                SqlSession::Sqlite(session),
+                spec.target().into(),
+                Reconnect::Sqlite { path },
+                None,
             )))
         })
     }
@@ -235,6 +344,7 @@ mod tests {
         let engines = Engines {
             postgres: Arc::new(kuery_pg::Engine::new().unwrap()),
             redis: Arc::new(kuery_redis::Engine::new().unwrap()),
+            mysql: Arc::new(kuery_mysql::Engine::new().unwrap()),
         };
         let ssh = Some(SshSpec {
             host: "localhost".into(),
@@ -271,6 +381,19 @@ mod tests {
         let reached = futures::executor::block_on(Redis.test(&redis, None, &engines)).unwrap();
         assert!(
             reached.starts_with("Connected through localhost · Redis 7"),
+            "{reached}"
+        );
+        let mysql = ConnectionSpec {
+            driver: "mysql".into(),
+            host: "mysql".into(),
+            port: 3306,
+            database: "shop".into(),
+            user: "kuery".into(),
+            ..redis
+        };
+        let reached = futures::executor::block_on(Mysql.test(&mysql, None, &engines)).unwrap();
+        assert!(
+            reached.starts_with("Connected through localhost · MySQL 8"),
             "{reached}"
         );
     }

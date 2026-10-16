@@ -2,7 +2,9 @@
 # Connection passwords are kept in the system keychain, not in this file.
 # These point at the dev Postgres and Redis in dev/compose.yaml, which need
 # no password; local-dev-ssh reaches the same Postgres through the compose
-# file's SSH bastion.
+# file's SSH bastion. local-mysql is the compose file's MySQL, and
+# local-sqlite is dev/shop.sqlite, built by
+# `cargo run -p kuery-sqlite --example seed`.
 
 [project]
 name = "Checkout v2"
@@ -30,6 +32,23 @@ environment = "development"
 host = "localhost"
 port = 22229
 user = "kuery"
+
+[[connections]]
+id = "local-mysql"
+name = "local-mysql"
+driver = "mysql"
+host = "localhost"
+port = 33069
+database = "shop"
+user = "kuery"
+environment = "development"
+
+[[connections]]
+id = "local-sqlite"
+name = "local-sqlite"
+driver = "sqlite"
+database = "dev/shop.sqlite"
+environment = "development"
 
 [[connections]]
 id = "local-analytics"

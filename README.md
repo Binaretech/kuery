@@ -2,7 +2,8 @@
 
 Desktop database manager (macOS, Windows and Linux) built with gpui.
 
-Status: early prototype. Several connections per project, a sidebar tree
+Status: early prototype. PostgreSQL, MySQL (and MariaDB), SQLite and Redis.
+Several connections per project, a sidebar tree
 (connections → schemas → tables, views, functions, triggers, enums), SQL
 query tabs that run read-only with streamed results (or, in write mode,
 inside a transaction you commit), and table tabs
@@ -76,11 +77,13 @@ change when you click Preview Impact.
 ## Development
 
 ```bash
-docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, a seeded Redis and an SSH bastion
+docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, a seeded Redis and an SSH bastion
+cargo run -p kuery-sqlite --example seed                # dev/shop.sqlite, for the local-sqlite connection
 cargo run -p kuery -- .                                 # the app, on this repo's project
 cargo test --workspace                                    # tests without a database
 cargo test -p kuery-pg -- --ignored                     # tests against the dev Postgres
 cargo test -p kuery-redis -- --ignored                  # tests against the dev Redis
+cargo test -p kuery-mysql -- --ignored                  # tests against the dev MySQL
 cargo test -p kuery -- --ignored                        # SSH tunnels through the dev bastion
 cargo run --release -p kuery-pg --example stream_bench  # streaming without a UI
 ```
@@ -174,6 +177,40 @@ Adding a driver means a crate for its protocol, a descriptor in
 `driver::ALL`, and a `Driver` implementation in `drivers::all()`. A driver of
 an existing family reuses that family's sidebar and tabs; a new family needs
 its own.
+
+The SQL drivers (`kuery-pg`, `kuery-mysql`, `kuery-sqlite`) each have a
+session with the same calls: run read-only, apply row changes, run in write
+mode (in a transaction or kept right away), preview and undo, cancel, and
+read the catalog. They speak the types in `kuery_core::session`, and the app
+holds any of them as a `SqlSession` (`crates/app/src/sql_session.rs`). What
+Kuery writes itself (filters, sorting, paging, row edits) and how it splits,
+analyses and formats SQL follows the connection's `kuery_core::sql::Dialect`.
+Query plans and Server Activity are PostgreSQL's for now.
+
+### MySQL and MariaDB
+
+A MySQL connection asks for a host, a user and optionally the database to
+start in; the sidebar lists every database the user can see as a schema
+(MySQL's own are left out), with tables, views, functions, procedures and
+triggers. Read-only queries run inside `START TRANSACTION READ ONLY`, and
+production connections also set `SESSION TRANSACTION READ ONLY`. Values show
+as the server writes them, so row edits compare against exactly that.
+
+MySQL commits `CREATE`, `ALTER`, `DROP`, `TRUNCATE` and a few others by
+itself, so nothing can undo them: write mode refuses them inside its
+transaction and in previews, and runs them in Full write. Cancelling a query
+kills it on the server (`KILL QUERY`) from a side connection.
+
+### SQLite
+
+A SQLite connection is a file: the dialog asks for its path (relative paths
+start at the project folder, `~/` works too), and opening a path where there
+is no database is an error rather than an empty new file. Its attached
+databases (`main`) are the schemas. Read-only queries also run with `PRAGMA
+query_only`; production opens the file read-only; read-write connections turn
+foreign keys on, so their cascades and checks apply. Write mode uses
+savepoints like the other drivers, and a running statement can be cancelled
+or stopped by its timeout.
 
 ## Redis
 

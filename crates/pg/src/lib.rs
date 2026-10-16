@@ -32,18 +32,48 @@ mod tls;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures::{TryStreamExt as _, pin_mut};
 use kuery_core::edit::WriteStatement;
 use kuery_core::plan;
-use kuery_core::read_only::{self, Rejection};
-use kuery_core::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
+use kuery_core::read_only;
+use kuery_core::result_set::{BatchBuilder, ColumnKind, ResultSet};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 
 use crate::tls::{Connector, Target};
+
+pub use kuery_core::session::{
+    Access, Event, QueryError, RunOptions, StatementImpact, Summary, collect,
+};
+
+/// A Postgres error as the session's [`QueryError`]: the server's code and
+/// message (with its hint), or a lost connection.
+pub(crate) fn query_error(error: tokio_postgres::Error) -> QueryError {
+    match error.as_db_error() {
+        Some(db) => QueryError::Database {
+            code: db.code().code().to_string(),
+            message: match db.hint() {
+                Some(hint) => format!("{} ({hint})", db.message()),
+                None => db.message().to_string(),
+            },
+        },
+        None => QueryError::Connection(error.to_string()),
+    }
+}
+
+/// `.pg()?` turns a Postgres error into a [`QueryError`].
+pub(crate) trait Pg<T> {
+    fn pg(self) -> Result<T, QueryError>;
+}
+
+impl<T> Pg<T> for Result<T, tokio_postgres::Error> {
+    fn pg(self) -> Result<T, QueryError> {
+        self.map_err(query_error)
+    }
+}
 
 /// Background runtime where the connections live.
 pub struct Engine {
@@ -143,15 +173,6 @@ fn with_causes(error: &tokio_postgres::Error) -> String {
     text
 }
 
-/// What a connection allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    /// Queries only. The norm in production.
-    ReadOnly,
-    /// Queries and row changes through [`Session::apply`].
-    ReadWrite,
-}
-
 /// An open connection. Cheap to clone; runs one query at a time.
 #[derive(Clone)]
 pub struct Session {
@@ -169,103 +190,6 @@ struct Inner {
     /// A transaction opened by [`Session::run_in_transaction`] is waiting
     /// for a commit or a rollback.
     in_transaction: AtomicBool,
-}
-
-#[derive(Debug, Clone)]
-pub struct RunOptions {
-    /// Maximum execution time on the server (`statement_timeout`).
-    pub statement_timeout: Duration,
-    /// Rows in the first batch: small so something shows up right away.
-    pub first_batch_rows: usize,
-    /// Maximum batch size; batches grow up to this.
-    pub max_batch_rows: usize,
-    /// How long a write waits for a lock before giving up (`lock_timeout`),
-    /// so a busy table does not leave the script hanging.
-    pub lock_timeout: Duration,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self {
-            statement_timeout: Duration::from_secs(30),
-            first_batch_rows: 500,
-            max_batch_rows: 50_000,
-            lock_timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Event {
-    Columns(Vec<String>),
-    /// The kinds of the columns just announced, when the server reported
-    /// them (single-statement reads). Comes right after their `Columns`.
-    Types(Vec<ColumnKind>),
-    Batch(Batch),
-    Finished(Summary),
-    Failed(QueryError),
-}
-
-/// What one statement of a previewed script did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatementImpact {
-    /// Rows changed, or rows returned when `returns_rows`.
-    pub rows: u64,
-    pub returns_rows: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct Summary {
-    /// Rows returned (by the last statement that returns rows).
-    pub rows: usize,
-    /// Rows changed by the statements that do not return rows.
-    pub affected: u64,
-    /// Statements the server completed.
-    pub statements: usize,
-    pub elapsed: Duration,
-    /// Time until the first batch arrived.
-    pub first_batch_after: Option<Duration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum QueryError {
-    #[error("{0}")]
-    Rejected(Rejection),
-    #[error("{message}")]
-    Database { code: String, message: String },
-    #[error("Query cancelled")]
-    Cancelled,
-    #[error("Connection lost: {0}")]
-    Connection(String),
-    #[error("This connection is read-only: changes cannot be applied")]
-    WritesDisabled,
-    #[error("A transaction is open: commit it or roll it back first")]
-    TransactionOpen,
-    #[error("{0}")]
-    Explain(String),
-    #[error(
-        "Expected to change {expected} row but {actual} changed: the row no longer exists or someone modified it. No changes were applied."
-    )]
-    RowMismatch {
-        sql: String,
-        expected: u64,
-        actual: u64,
-    },
-}
-
-impl From<tokio_postgres::Error> for QueryError {
-    fn from(error: tokio_postgres::Error) -> Self {
-        match error.as_db_error() {
-            Some(db) => QueryError::Database {
-                code: db.code().code().to_string(),
-                message: match db.hint() {
-                    Some(hint) => format!("{} ({hint})", db.message()),
-                    None => db.message().to_string(),
-                },
-            },
-            None => QueryError::Connection(error.to_string()),
-        }
-    }
 }
 
 impl Session {
@@ -495,7 +419,7 @@ impl Session {
             // Whatever happened, the server no longer has this transaction
             // open: a failed COMMIT ends it too, and so does a lost connection.
             inner.in_transaction.store(false, Ordering::SeqCst);
-            result.map_err(QueryError::from)
+            result.map_err(query_error)
         });
         async move {
             task.await
@@ -536,7 +460,8 @@ async fn stream_in_read_only_transaction(
                 "savepoint kuery_read; set local statement_timeout = {}",
                 options.statement_timeout.as_millis()
             ))
-            .await?;
+            .await
+            .pg()?;
         // No column types here: a statement that fails to prepare would
         // abort the open transaction.
         let outcome = stream_rows(client, sql, options, tx, started, None).await;
@@ -545,7 +470,8 @@ async fn stream_in_read_only_transaction(
         }
         client
             .batch_execute("rollback to savepoint kuery_read; release savepoint kuery_read")
-            .await?;
+            .await
+            .pg()?;
         return outcome;
     }
 
@@ -570,7 +496,8 @@ async fn stream_in_read_only_transaction(
             "begin transaction read only; set local statement_timeout = {}; select 1",
             options.statement_timeout.as_millis()
         ))
-        .await?;
+        .await
+        .pg()?;
 
     let outcome = stream_rows(client, sql, options, tx, started, kinds).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
@@ -596,7 +523,10 @@ async fn stream_in_write_transaction(
     let started = Instant::now();
 
     if !inner.in_transaction.load(Ordering::SeqCst) {
-        client.batch_execute("begin transaction read write").await?;
+        client
+            .batch_execute("begin transaction read write")
+            .await
+            .pg()?;
         inner.in_transaction.store(true, Ordering::SeqCst);
     }
     client
@@ -607,7 +537,8 @@ async fn stream_in_write_transaction(
             options.lock_timeout.as_millis()
         ))
         .await
-        .inspect_err(|_| inner.in_transaction.store(false, Ordering::SeqCst))?;
+        .inspect_err(|_| inner.in_transaction.store(false, Ordering::SeqCst))
+        .pg()?;
 
     let outcome = stream_rows(client, sql, options, tx, started, None).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
@@ -624,7 +555,7 @@ async fn stream_in_write_transaction(
         inner.in_transaction.store(false, Ordering::SeqCst);
         return Err(match outcome {
             Err(original) => original,
-            Ok(_) => error.into(),
+            Ok(_) => query_error(error),
         });
     }
     outcome
@@ -657,7 +588,7 @@ async fn preview_and_undo(
             "rollback",
         )
     };
-    client.batch_execute(&open).await?;
+    client.batch_execute(&open).await.pg()?;
     let outcome = count_statements(client, sql).await;
     // Undo whatever happened, even if the script failed halfway.
     let undone = client.batch_execute(undo).await;
@@ -666,7 +597,7 @@ async fn preview_and_undo(
         inner.in_transaction.store(false, Ordering::SeqCst);
     }
     let impacts = outcome?;
-    undone?;
+    undone.pg()?;
     Ok(impacts)
 }
 
@@ -692,14 +623,14 @@ async fn explain_read_only(
             "rollback",
         )
     };
-    client.batch_execute(&open).await?;
+    client.batch_execute(&open).await.pg()?;
     let outcome = first_value(client, sql).await;
     let closed = client.batch_execute(close).await;
     if closed.is_err() && in_transaction {
         inner.in_transaction.store(false, Ordering::SeqCst);
     }
     let plan = outcome?;
-    closed?;
+    closed.pg()?;
     Ok(plan)
 }
 
@@ -731,7 +662,7 @@ async fn explain_and_undo(
             "rollback",
         )
     };
-    client.batch_execute(&open).await?;
+    client.batch_execute(&open).await.pg()?;
     let outcome = first_value(client, sql).await;
     // Undo whatever happened, even if it failed halfway.
     let undone = client.batch_execute(undo).await;
@@ -739,7 +670,7 @@ async fn explain_and_undo(
         inner.in_transaction.store(false, Ordering::SeqCst);
     }
     let plan = outcome?;
-    undone?;
+    undone.pg()?;
     Ok(plan)
 }
 
@@ -747,7 +678,8 @@ async fn explain_and_undo(
 async fn first_value(client: &Client, sql: &str) -> Result<String, QueryError> {
     client
         .simple_query(sql)
-        .await?
+        .await
+        .pg()?
         .into_iter()
         .find_map(|message| match message {
             SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
@@ -758,11 +690,11 @@ async fn first_value(client: &Client, sql: &str) -> Result<String, QueryError> {
 
 /// Runs `sql` and counts each statement's rows, discarding returned rows.
 async fn count_statements(client: &Client, sql: &str) -> Result<Vec<StatementImpact>, QueryError> {
-    let stream = client.simple_query_raw(sql).await?;
+    let stream = client.simple_query_raw(sql).await.pg()?;
     pin_mut!(stream);
     let mut impacts = Vec::new();
     let mut returns_rows = false;
-    while let Some(message) = stream.try_next().await? {
+    while let Some(message) = stream.try_next().await.pg()? {
         match message {
             SimpleQueryMessage::RowDescription(_) => returns_rows = true,
             SimpleQueryMessage::CommandComplete(rows) => {
@@ -799,7 +731,8 @@ async fn stream_autocommit(
             options.statement_timeout.as_millis(),
             options.lock_timeout.as_millis()
         ))
-        .await?;
+        .await
+        .pg()?;
     let outcome = stream_rows(client, sql, options, tx, started, None).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
         let _ = inner.connector.cancel(inner.cancel.clone()).await;
@@ -830,7 +763,7 @@ async fn stream_rows(
     started: Instant,
     mut kinds: Option<Vec<ColumnKind>>,
 ) -> Result<Summary, QueryError> {
-    let stream = client.simple_query_raw(sql).await?;
+    let stream = client.simple_query_raw(sql).await.pg()?;
     pin_mut!(stream);
 
     let mut builder: Option<BatchBuilder> = None;
@@ -842,7 +775,7 @@ async fn stream_rows(
     // Whether the statement being read returns rows: its count is not a change.
     let mut returns_rows = false;
 
-    while let Some(message) = stream.try_next().await? {
+    while let Some(message) = stream.try_next().await.pg()? {
         match message {
             SimpleQueryMessage::RowDescription(columns) => {
                 let names = columns
@@ -904,20 +837,6 @@ async fn send(tx: &async_channel::Sender<Event>, event: Event) -> Result<(), Que
     tx.send(event).await.map_err(|_| QueryError::Cancelled)
 }
 
-async fn collect(rx: async_channel::Receiver<Event>) -> Result<ResultSet, QueryError> {
-    let mut set = ResultSet::default();
-    while let Ok(event) = rx.recv().await {
-        match event {
-            Event::Columns(names) => set = ResultSet::new(names),
-            Event::Types(kinds) => set.set_kinds(kinds),
-            Event::Batch(batch) => set.push(batch),
-            Event::Finished(_) => return Ok(set),
-            Event::Failed(error) => return Err(error),
-        }
-    }
-    Err(QueryError::Cancelled)
-}
-
 async fn apply_in_transaction(
     inner: &Inner,
     statements: &[WriteStatement],
@@ -932,14 +851,16 @@ async fn apply_in_transaction(
     let client = &inner.client;
     client
         .batch_execute("begin transaction read write; set local statement_timeout = 15000")
-        .await?;
+        .await
+        .pg()?;
 
     let outcome = async {
         let mut total = 0;
         for statement in statements {
             let actual = client
                 .simple_query(statement.sql())
-                .await?
+                .await
+                .pg()?
                 .into_iter()
                 .find_map(|message| match message {
                     SimpleQueryMessage::CommandComplete(rows) => Some(rows),
@@ -961,7 +882,7 @@ async fn apply_in_transaction(
 
     match outcome {
         Ok(total) => {
-            client.batch_execute("commit").await?;
+            client.batch_execute("commit").await.pg()?;
             Ok(total)
         }
         Err(error) => {
@@ -978,6 +899,10 @@ mod tests {
     //!
     //! The TLS ones also need a Postgres with `ssl = on` at
     //! `KUERY_TLS_DATABASE_URL` (without `sslmode`); if it is not set, they do nothing.
+
+    use std::time::Duration;
+
+    use kuery_core::read_only::Rejection;
 
     use super::*;
 
@@ -1234,6 +1159,7 @@ mod tests {
             table: kuery_core::catalog::TableRef::new("public", "playground_items"),
             columns: vec!["id".into(), "name".into(), "quantity".into(), "note".into()],
             primary_key: vec!["id".into()],
+            dialect: kuery_core::sql::Dialect::Postgres,
         }
     }
 

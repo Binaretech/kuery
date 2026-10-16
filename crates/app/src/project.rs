@@ -42,8 +42,11 @@ pub struct ConnectionSpec {
     /// for Postgres, which projects had before there was a choice.
     #[serde(default = "default_driver", skip_serializing_if = "is_default_driver")]
     pub driver: String,
+    /// Empty for a database file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
-    #[serde(default = "default_port")]
+    /// 0 for a database file.
+    #[serde(default = "default_port", skip_serializing_if = "is_zero")]
     pub port: u16,
     /// Postgres: the database name. Redis: the database index the console
     /// starts on (empty is 0).
@@ -84,6 +87,10 @@ fn default_port() -> u16 {
     5432
 }
 
+fn is_zero(port: &u16) -> bool {
+    *port == 0
+}
+
 fn default_driver() -> String {
     driver::DEFAULT.to_string()
 }
@@ -94,9 +101,10 @@ fn is_default_driver(id: &str) -> bool {
 
 impl ConnectionSpec {
     /// Through SSH the SSH host decides: the server's `localhost` is the
-    /// SSH host's, not this machine's.
+    /// SSH host's, not this machine's. A database file is on this machine.
     pub fn environment(&self) -> Environment {
         let host = match &self.ssh {
+            _ if self.is_file() => "localhost",
             Some(ssh) => &ssh.host,
             None => &self.host,
         };
@@ -112,8 +120,47 @@ impl ConnectionSpec {
         self.driver_info().map(|info| info.family)
     }
 
-    /// `host:port/database`, and the SSH host it goes through, for display.
+    /// The SQL it speaks, for SQL drivers.
+    pub fn dialect(&self) -> kuery_core::sql::Dialect {
+        match self.driver.as_str() {
+            "sqlite" => kuery_core::sql::Dialect::Sqlite,
+            "mysql" => kuery_core::sql::Dialect::Mysql,
+            _ => kuery_core::sql::Dialect::Postgres,
+        }
+    }
+
+    /// The database is a file (SQLite): `database` is its path.
+    pub fn is_file(&self) -> bool {
+        self.driver_info().is_some_and(|info| info.file)
+    }
+
+    /// The connection with a database file's relative path (or `~/`) made
+    /// absolute: relative paths start at the project folder `root`.
+    pub fn resolved(&self, root: &Path) -> ConnectionSpec {
+        if !self.is_file() {
+            return self.clone();
+        }
+        let written = self.database.trim();
+        let path = match written.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| Path::new(&home).join(rest))
+                .unwrap_or_else(|| PathBuf::from(written)),
+            None if Path::new(written).is_absolute() => PathBuf::from(written),
+            None => root.join(written),
+        };
+        ConnectionSpec {
+            database: path.display().to_string(),
+            ..self.clone()
+        }
+    }
+
+    /// `host:port/database`, and the SSH host it goes through, for display;
+    /// a database file's path.
     pub fn target(&self) -> String {
+        if self.is_file() {
+            return self.database.clone();
+        }
         let target = match self.family() {
             Some(Family::KeyValue) => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
             _ => format!("{}:{}/{}", self.host, self.port, self.database),
@@ -142,6 +189,30 @@ impl ConnectionSpec {
             db: self.redis_db(),
             username: Some(self.user.trim().to_string()).filter(|user| !user.is_empty()),
             password: password.filter(|p| !p.is_empty()).map(str::to_string),
+            tls: self
+                .sslmode
+                .as_deref()
+                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+        }
+    }
+
+    /// Where and how to connect to MySQL, through the local end of a tunnel
+    /// when `tunnel` gives its port. The password is only ever added here,
+    /// in memory.
+    pub fn mysql_target(
+        &self,
+        password: Option<String>,
+        tunnel: Option<u16>,
+    ) -> kuery_mysql::Target {
+        kuery_mysql::Target {
+            host: match tunnel {
+                Some(_) => "127.0.0.1".into(),
+                None => self.host.clone(),
+            },
+            port: tunnel.unwrap_or(self.port),
+            user: self.user.trim().to_string(),
+            password: password.filter(|p| !p.is_empty()),
+            database: self.database.trim().to_string(),
             tls: self
                 .sslmode
                 .as_deref()
@@ -555,6 +626,34 @@ mod tests {
         assert!(!spec.conninfo(None, None).contains("password"));
         assert_eq!(spec.target(), "localhost:54329/kuery");
         assert_eq!(spec.environment(), Environment::Development);
+    }
+
+    #[test]
+    fn finds_database_files_from_the_project_folder() {
+        let file = ConnectionSpec {
+            driver: "sqlite".into(),
+            host: String::new(),
+            database: "dev/shop.sqlite".into(),
+            ..spec("shop")
+        };
+        assert!(file.is_file());
+        assert_eq!(file.environment(), Environment::Development);
+        assert_eq!(file.target(), "dev/shop.sqlite");
+        let root = Path::new("/work/app");
+        assert_eq!(file.resolved(root).database, "/work/app/dev/shop.sqlite");
+        let absolute = ConnectionSpec {
+            database: "/data/x.db".into(),
+            ..file.clone()
+        };
+        assert_eq!(absolute.resolved(root).database, "/data/x.db");
+        let production = ConnectionSpec {
+            environment: Some("production".into()),
+            ..file
+        };
+        assert_eq!(production.environment(), Environment::Production);
+        // Servers are left as they are.
+        let server = spec("pg");
+        assert_eq!(server.resolved(root), server);
     }
 
     #[test]

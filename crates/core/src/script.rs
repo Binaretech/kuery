@@ -4,15 +4,22 @@
 
 use std::ops::Range;
 
-use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::tokenizer::{Location, Token, Tokenizer, Whitespace};
+
+use crate::sql::Dialect;
 
 /// Byte ranges of the statements in `sql`, without the semicolon that ends
 /// them. A comment right before a statement belongs to it; text with nothing
 /// but comments and whitespace is no statement. `None` if `sql` cannot be
 /// tokenized (an unterminated string, for example).
 pub fn statements(sql: &str) -> Option<Vec<Range<usize>>> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+    statements_in(Dialect::Postgres, sql)
+}
+
+/// The same, for a database speaking `dialect` (MySQL's `#` comments and
+/// backslash escapes, say).
+pub fn statements_in(dialect: Dialect, sql: &str) -> Option<Vec<Range<usize>>> {
+    let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
     let offsets = Offsets::new(sql);
@@ -53,7 +60,12 @@ pub fn statements(sql: &str) -> Option<Vec<Range<usize>>> {
 /// else the last one that ends before it (the cursor sits after its `;`), or
 /// the first one.
 pub fn statement_at(sql: &str, offset: usize) -> Option<Range<usize>> {
-    let ranges = statements(sql)?;
+    statement_at_in(Dialect::Postgres, sql, offset)
+}
+
+/// The same, for a database speaking `dialect`.
+pub fn statement_at_in(dialect: Dialect, sql: &str, offset: usize) -> Option<Range<usize>> {
+    let ranges = statements_in(dialect, sql)?;
     ranges
         .iter()
         .find(|range| range.start <= offset && offset <= range.end)

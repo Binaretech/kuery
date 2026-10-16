@@ -10,10 +10,10 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{AlterTableOperation, FromTable, Statement, Visit, Visitor};
-use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::read_only::{self, Rejection};
+use crate::sql::Dialect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
@@ -92,9 +92,14 @@ impl Analysis {
     }
 }
 
-/// Analyses a script of one or more statements.
+/// Analyses a PostgreSQL script of one or more statements.
 pub fn analyze(sql: &str) -> Result<Analysis, Rejection> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+    analyze_in(Dialect::Postgres, sql)
+}
+
+/// The same, for a database speaking `dialect`.
+pub fn analyze_in(dialect: Dialect, sql: &str) -> Result<Analysis, Rejection> {
+    let statements = Parser::parse_sql(&*dialect.parser(), sql)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
     if statements.is_empty() {
         return Err(Rejection::Empty);

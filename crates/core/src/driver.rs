@@ -96,6 +96,9 @@ pub struct DriverInfo {
     pub tls: Tls,
     /// What production means for it, under the form's environment.
     pub production_note: &'static str,
+    /// The database is a file: the form asks for its path (in the database
+    /// field), not for a server, a user or TLS.
+    pub file: bool,
 }
 
 impl DriverInfo {
@@ -112,7 +115,7 @@ impl DriverInfo {
 
     /// Checks the form's database and user against the fields.
     pub fn validate(&self, host: &str, database: &str, user: &str) -> Result<(), String> {
-        if host.trim().is_empty() {
+        if !self.file && host.trim().is_empty() {
             return Err("The host is required".into());
         }
         for (field, value) in [(&self.database, database), (&self.user, user)] {
@@ -154,6 +157,7 @@ pub const POSTGRES: DriverInfo = DriverInfo {
     },
     tls: Tls::Modes(&["disable", "prefer", "require", "verify-ca", "verify-full"]),
     production_note: "Production connections always open read-only and cannot edit rows.",
+    file: false,
 };
 
 pub const REDIS: DriverInfo = DriverInfo {
@@ -178,10 +182,61 @@ pub const REDIS: DriverInfo = DriverInfo {
     },
     tls: Tls::Toggle,
     production_note: "Production connections only write once writes are allowed for the session.",
+    file: false,
+};
+
+pub const MYSQL: DriverInfo = DriverInfo {
+    id: "mysql",
+    name: "MySQL",
+    aliases: &["mariadb", "my", "percona"],
+    family: Family::Sql,
+    default_port: 3306,
+    database: Field {
+        label: "Database",
+        placeholder: "shop",
+        required: false,
+        numeric: false,
+        help: Some("The database queries start in; the sidebar lists every one you can see."),
+    },
+    user: Field {
+        label: "User",
+        placeholder: "root",
+        required: true,
+        numeric: false,
+        help: None,
+    },
+    tls: Tls::Toggle,
+    production_note: "Production connections always open read-only and cannot edit rows.",
+    file: false,
+};
+
+pub const SQLITE: DriverInfo = DriverInfo {
+    id: "sqlite",
+    name: "SQLite",
+    aliases: &["sqlite3", "file", "embedded"],
+    family: Family::Sql,
+    default_port: 0,
+    database: Field {
+        label: "File",
+        placeholder: "data/app.sqlite",
+        required: true,
+        numeric: false,
+        help: Some("The database file; a relative path starts at the project folder."),
+    },
+    user: Field {
+        label: "User",
+        placeholder: "",
+        required: false,
+        numeric: false,
+        help: None,
+    },
+    tls: Tls::Toggle,
+    production_note: "Production connections open the file read-only and cannot edit rows.",
+    file: true,
 };
 
 /// Every driver, in the order the list shows them.
-pub const ALL: &[&DriverInfo] = &[&POSTGRES, &REDIS];
+pub const ALL: &[&DriverInfo] = &[&POSTGRES, &MYSQL, &SQLITE, &REDIS];
 
 /// The id connections have when they do not name one (projects from before
 /// there was a choice).
@@ -232,6 +287,9 @@ mod tests {
                 .contains("number")
         );
         assert!(REDIS.validate(" ", "0", "").is_err());
+        // A file needs its path, not a host.
+        assert!(SQLITE.validate("", "shop.sqlite", "").is_ok());
+        assert!(SQLITE.validate("", "", "").unwrap_err().contains("file"));
     }
 
     #[test]

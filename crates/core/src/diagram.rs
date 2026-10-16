@@ -118,6 +118,18 @@ pub enum OnDelete {
 }
 
 impl OnDelete {
+    /// From the rule's name, as SQLite and MySQL report it (`CASCADE`,
+    /// `SET NULL`…).
+    pub fn from_rule(rule: &str) -> Self {
+        match rule.trim().to_uppercase().as_str() {
+            "RESTRICT" => OnDelete::Restrict,
+            "CASCADE" => OnDelete::Cascade,
+            "SET NULL" => OnDelete::SetNull,
+            "SET DEFAULT" => OnDelete::SetDefault,
+            _ => OnDelete::NoAction,
+        }
+    }
+
     /// From `pg_constraint.confdeltype`.
     pub fn from_code(code: &str) -> Self {
         match code {

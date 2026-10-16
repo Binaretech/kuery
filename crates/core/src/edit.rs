@@ -9,7 +9,7 @@
 use std::fmt;
 
 use crate::catalog::TableRef;
-use crate::sql::{SqlError, quote_ident, quote_nullable, quote_qualified};
+use crate::sql::{Dialect, SqlError};
 
 /// What we need to know about the table to write to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub struct EditTarget {
     pub table: TableRef,
     pub columns: Vec<String>,
     pub primary_key: Vec<String>,
+    pub dialect: Dialect,
 }
 
 /// One primary key value of the row.
@@ -109,7 +110,8 @@ impl From<SqlError> for EditError {
 }
 
 pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, EditError> {
-    let table = quote_qualified(&target.table.schema, &target.table.name);
+    let dialect = target.dialect;
+    let table = dialect.quote_qualified(&target.table.schema, &target.table.name);
     let sql = match change {
         RowChange::Update { key, cells } => {
             let key_condition = key_condition(target, key)?;
@@ -123,13 +125,13 @@ pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, 
                 let column = column(target, &cell.column)?;
                 assignments.push(format!(
                     "{column} = {}",
-                    quote_nullable(cell.new.as_deref())?
+                    dialect.quote_nullable(cell.new.as_deref())?
                 ));
                 // Compared as text, which is how the value was shown; this also
                 // works for types without equality (json, point…).
-                unchanged.push(format!(
-                    "{column}::text is not distinct from {}",
-                    quote_nullable(cell.old.as_deref())?
+                unchanged.push(dialect.same(
+                    &dialect.as_text(&column),
+                    &dialect.quote_nullable(cell.old.as_deref())?,
                 ));
             }
             format!(
@@ -142,7 +144,7 @@ pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, 
             let values: Vec<&(String, Option<String>)> =
                 values.iter().filter(|(_, value)| value.is_some()).collect();
             if values.is_empty() {
-                format!("insert into {table} default values")
+                dialect.insert_defaults(&table)
             } else {
                 let columns = values
                     .iter()
@@ -150,7 +152,7 @@ pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, 
                     .collect::<Result<Vec<_>, _>>()?;
                 let literals = values
                     .iter()
-                    .map(|(_, value)| quote_nullable(value.as_deref()))
+                    .map(|(_, value)| dialect.quote_nullable(value.as_deref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 format!(
                     "insert into {table} ({}) values ({})",
@@ -187,7 +189,7 @@ fn key_condition(target: &EditTarget, key: &[KeyValue]) -> Result<String, EditEr
             Ok(format!(
                 "{} = {}",
                 column(target, &k.column)?,
-                quote_nullable(Some(&k.value))?
+                target.dialect.quote_nullable(Some(&k.value))?
             ))
         })
         .collect::<Result<Vec<_>, EditError>>()?;
@@ -196,7 +198,7 @@ fn key_condition(target: &EditTarget, key: &[KeyValue]) -> Result<String, EditEr
 
 fn column(target: &EditTarget, name: &str) -> Result<String, EditError> {
     if target.columns.iter().any(|c| c == name) {
-        Ok(quote_ident(name))
+        Ok(target.dialect.quote_ident(name))
     } else {
         Err(EditError::UnknownColumn(name.to_string()))
     }
@@ -211,6 +213,7 @@ mod tests {
             table: TableRef::new("public", "orders"),
             columns: vec!["id".into(), "status".into(), "total".into(), "note".into()],
             primary_key: vec!["id".into()],
+            dialect: Dialect::Postgres,
         }
     }
 
@@ -227,6 +230,38 @@ mod tests {
             old: old.map(Into::into),
             new: new.map(Into::into),
         }
+    }
+
+    #[test]
+    fn writes_each_dialect() {
+        let update = RowChange::Update {
+            key: key("7"),
+            cells: vec![cell("status", Some("new"), Some("paid"))],
+        };
+        let mysql = EditTarget {
+            table: TableRef::new("shop", "orders"),
+            dialect: Dialect::Mysql,
+            ..orders()
+        };
+        assert_eq!(
+            build(&mysql, &update).unwrap().sql(),
+            "update `shop`.`orders` set `status` = 'paid' where `id` = '7' and cast(`status` as char) <=> 'new'"
+        );
+        assert_eq!(
+            build(&mysql, &RowChange::Insert { values: vec![] })
+                .unwrap()
+                .sql(),
+            "insert into `shop`.`orders` () values ()"
+        );
+        let sqlite = EditTarget {
+            table: TableRef::new("main", "orders"),
+            dialect: Dialect::Sqlite,
+            ..orders()
+        };
+        assert_eq!(
+            build(&sqlite, &update).unwrap().sql(),
+            "update \"main\".\"orders\" set \"status\" = 'paid' where \"id\" = '7' and cast(\"status\" as text) is 'new'"
+        );
     }
 
     #[test]

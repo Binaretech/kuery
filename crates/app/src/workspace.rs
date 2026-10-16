@@ -16,7 +16,6 @@ use gpui_kit::{
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use kuery_core::catalog::TableInfo;
-use kuery_core::sql::quote_qualified;
 
 use crate::activity_tab::{ActivityEvent, ActivityTab};
 use crate::assets::AppIcon;
@@ -471,7 +470,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(db) = self.active_db(cx) {
+        if let Some(db) = self.active_db(cx).filter(|db| db.session.has_activity()) {
             self.open_activity(db, window, cx);
         }
     }
@@ -1147,7 +1146,7 @@ impl WorkspaceView {
                             )),
                     )
                     .child(div().child(db.target.clone()));
-                right = right.child(format!("PostgreSQL {}", db.session.server_version()));
+                right = right.child(db.session.server_label());
             }
             None => match &redis {
                 Some(redis) => {
@@ -1185,10 +1184,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(
-                        db.as_ref()
-                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
-                    );
+                    .children(db.as_ref().map(|db| db.session.server_label()));
             }
             Some(Tab::Activity(activity)) => {
                 let tab = activity.read(cx);
@@ -1197,10 +1193,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(
-                        db.as_ref()
-                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
-                    );
+                    .children(db.as_ref().map(|db| db.session.server_label()));
             }
             Some(Tab::RedisKey(key)) => {
                 let tab = key.read(cx);
@@ -1304,20 +1297,18 @@ impl WorkspaceView {
                         )
                     })
                     .child(tab.cursor_status(cx))
-                    .children(
-                        db.as_ref()
-                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
-                    );
+                    .children(db.as_ref().map(|db| db.session.server_label()));
             }
             Some(Tab::Table(table)) => {
                 let tab = table.read(cx);
                 let name = &tab.info().table;
                 left = left.child(format!("{}.{}", name.schema, name.name));
                 if let Some(status) = tab.page_status() {
-                    right = h_flex().gap_4().flex_shrink_0().child(status).children(
-                        db.as_ref()
-                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
-                    );
+                    right = h_flex()
+                        .gap_4()
+                        .flex_shrink_0()
+                        .child(status)
+                        .children(db.as_ref().map(|db| db.session.server_label()));
                 }
             }
             None => {}
@@ -1448,8 +1439,14 @@ impl WorkspaceView {
                         };
                         let table = match tab {
                             Tab::Table(table) => {
-                                let table = &table.read(cx).info().table;
-                                Some(quote_qualified(&table.schema, &table.name))
+                                let tab = table.read(cx);
+                                let table = &tab.info().table;
+                                Some(
+                                    tab.db()
+                                        .session
+                                        .dialect()
+                                        .quote_qualified(&table.schema, &table.name),
+                                )
                             }
                             _ => None,
                         };

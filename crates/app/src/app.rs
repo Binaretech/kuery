@@ -19,6 +19,7 @@ use crate::workspace::WorkspaceView;
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub redis: Arc<kuery_redis::Engine>,
+    pub mysql: Arc<kuery_mysql::Engine>,
     pub secrets: Arc<dyn SecretStore>,
     /// Open project windows, so opening a project twice focuses it.
     windows: Vec<ProjectWindowEntry>,
@@ -73,12 +74,14 @@ impl Render for ProjectWindow {
 pub fn init(
     engine: Arc<Engine>,
     redis: Arc<kuery_redis::Engine>,
+    mysql: Arc<kuery_mysql::Engine>,
     secrets: Arc<dyn SecretStore>,
     cx: &mut App,
 ) {
     cx.set_global(AppState {
         engine,
         redis,
+        mysql,
         secrets,
         windows: Vec::new(),
         welcome: None,
@@ -99,6 +102,7 @@ impl AppState {
         crate::drivers::Engines {
             postgres: self.engine.clone(),
             redis: self.redis.clone(),
+            mysql: self.mysql.clone(),
         }
     }
 }

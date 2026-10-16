@@ -21,8 +21,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::activity::{Activity, Backend, Concern, State, duration};
+use kuery_core::session::Access;
+use kuery_pg::Session;
 use kuery_pg::activity::Signal;
-use kuery_pg::{Access, Session};
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
@@ -66,10 +67,15 @@ impl EventEmitter<ActivityEvent> for ActivityTab {}
 
 impl ActivityTab {
     pub fn new(db: Db, project: PathBuf, cx: &mut Context<Self>) -> Self {
-        let engine = crate::app::state(cx).engine.clone();
-        let connecting = db.reconnect.open(&engine, Access::ReadOnly);
+        let engines = crate::app::state(cx).engines();
+        let connecting = db.reconnect.open(&engines, Access::ReadOnly);
         cx.spawn(async move |this, cx| {
-            let result = connecting.await;
+            let result = connecting.await.and_then(|session| {
+                session
+                    .postgres()
+                    .cloned()
+                    .ok_or_else(|| "Server activity is only for PostgreSQL".to_string())
+            });
             this.update(cx, |this, cx| {
                 match result {
                     Ok(session) => {

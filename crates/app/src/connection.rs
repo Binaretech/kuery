@@ -5,13 +5,13 @@
 //! a query tab follows [`WritePolicy`]; in production it needs writes allowed
 //! for the connection session first, which is never saved anywhere.
 
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::SharedString;
-use kuery_pg::{Access, ConnectError, Engine, Session};
+use kuery_core::session::Access;
 
+use crate::sql_session::{Reconnect, SqlSession};
 use crate::theme;
 use crate::tunnel::Tunnel;
 
@@ -129,42 +129,13 @@ impl WritePolicy {
     }
 }
 
-/// Opens more connections like the one in [`Db`], for write mode. It holds
-/// the connection string, password included, only in memory.
-#[derive(Clone)]
-pub struct Reconnect {
-    conninfo: Arc<str>,
-}
-
-impl Reconnect {
-    pub fn new(conninfo: String) -> Self {
-        Self {
-            conninfo: conninfo.into(),
-        }
-    }
-
-    pub fn open(
-        &self,
-        engine: &Engine,
-        access: Access,
-    ) -> impl Future<Output = Result<Session, ConnectError>> + Send + use<> {
-        engine.connect_with(self.conninfo.to_string(), access)
-    }
-}
-
-impl fmt::Debug for Reconnect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Reconnect(…)")
-    }
-}
-
 /// An open connection, shared by the sidebar and the tabs opened from it.
 #[derive(Clone)]
 pub struct Db {
     /// Name from the project configuration, e.g. `local-dev`.
     pub name: SharedString,
     pub environment: Environment,
-    pub session: Session,
+    pub session: SqlSession,
     /// `host:port/database`, without credentials.
     pub target: SharedString,
     pub reconnect: Reconnect,
@@ -180,7 +151,7 @@ impl Db {
     pub fn new(
         name: SharedString,
         environment: Environment,
-        session: Session,
+        session: SqlSession,
         target: SharedString,
         reconnect: Reconnect,
         tunnel: Option<Arc<Tunnel>>,

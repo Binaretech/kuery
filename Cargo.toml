@@ -10,6 +10,8 @@ edition = "2024"
 kuery-core = { path = "crates/core" }
 kuery-pg = { path = "crates/pg" }
 kuery-redis = { path = "crates/redis" }
+kuery-sqlite = { path = "crates/sqlite" }
+kuery-mysql = { path = "crates/mysql" }
 
 anyhow = "1"
 arrow-array = "60"
@@ -25,6 +27,10 @@ thiserror = "2"
 toml = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 tokio-postgres = "0.7"
+# SQLite compiled in, so no system library is needed anywhere.
+# MySQL and MariaDB over rustls with `ring`, like the rest.
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks", "column_decltype"] }
 # TLS with rustls and the `ring` provider (no aws-lc, which needs cmake and NASM on Windows).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"

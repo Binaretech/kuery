@@ -1,1 +1,3 @@
 /target
+# Built by `cargo run -p kuery-sqlite --example seed`.
+/dev/shop.sqlite
