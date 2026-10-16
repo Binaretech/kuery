@@ -92,7 +92,8 @@ that folder, so it can live in a code repository:
 ```text
 <folder>/.kuery/
 ├─ project.toml      project name and connections (no passwords)
-└─ queries/          saved queries as .sql files, in any folder layout
+├─ queries/          saved queries as .sql files, in any folder layout
+└─ diagrams/         where diagram cards were moved, per connection and schema
 ```
 
 Open a folder from the welcome window, with "Open Project…" (`secondary-o`),
@@ -224,10 +225,18 @@ reads one way: tables others refer to sit on the left and the tables that
 depend on them to their right, each layer ordered to keep lines from
 crossing; tables without relations are set apart on the right.
 
+Cards can be dragged; where they were left is saved in
+`.kuery/diagrams/<connection>-<schema>.toml` (only positions, fine to commit)
+and "Reset layout" forgets it and goes back to the automatic layout.
+
 Clicking a table highlights it, its relations and its neighbors, and the
 footer says what it refers to (with its delete rule when it cascades or sets
-NULL) and what refers to it; double-clicking opens it. The diagram zooms in
-steps (click the percentage for 100%) and exports to SVG.
+NULL) and what refers to it; double-clicking opens it. With a table selected,
+"Neighbors" and "2 hops" narrow the diagram to the tables within one or two
+relations of it, laid out on their own ("Whole schema" goes back; cards moved
+there are not saved). The diagram zooms in steps (click the percentage for
+100%) or to fit the view, and exports what is shown as an SVG image, a
+Mermaid `erDiagram` (`.mmd`) or DBML (`.dbml`), to a file or the clipboard.
 
 ## Write mode
 

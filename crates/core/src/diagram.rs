@@ -6,7 +6,10 @@
 //! the referencing column to the referenced one.
 //!
 //! Everything here is geometry over plain data, so it is testable without a
-//! database and shared by the diagram tab and its SVG export.
+//! database and shared by the diagram tab and its exports (SVG, Mermaid and
+//! DBML). A diagram can also be narrowed to one table's neighborhood
+//! ([`Diagram::around`]), and cards can be moved and placed back
+//! ([`Layout::place`]).
 
 use crate::catalog::TableRef;
 
@@ -164,6 +167,177 @@ impl Diagram {
             .filter(|(_, r)| self.index_of(&r.from).is_some() && self.index_of(&r.to).is_some())
     }
 
+    /// The part of the diagram within `hops` relations of `table`: those
+    /// tables and the relations between them.
+    pub fn around(&self, table: usize, hops: usize) -> Diagram {
+        let mut kept = vec![table];
+        let mut frontier = vec![table];
+        for _ in 0..hops {
+            let mut next = Vec::new();
+            for &current in &frontier {
+                for neighbor in self.neighbors(current) {
+                    if !kept.contains(&neighbor) {
+                        kept.push(neighbor);
+                        next.push(neighbor);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        kept.sort_unstable();
+        let tables: Vec<Table> = kept.iter().map(|i| self.tables[*i].clone()).collect();
+        let relations = self
+            .relations
+            .iter()
+            .filter(|r| {
+                tables.iter().any(|t| t.table == r.from) && tables.iter().any(|t| t.table == r.to)
+            })
+            .cloned()
+            .collect();
+        Diagram {
+            schema: self.schema.clone(),
+            tables,
+            relations,
+        }
+    }
+
+    /// A table's name as the text exports write it: bare in `public`,
+    /// qualified elsewhere.
+    fn export_name(&self, table: &TableRef) -> String {
+        if table.schema == "public" {
+            table.name.clone()
+        } else {
+            format!("{}.{}", table.schema, table.name)
+        }
+    }
+
+    /// The diagram as a Mermaid `erDiagram`: each table with its columns
+    /// (types without spaces or commas, which Mermaid does not take) and
+    /// each relation from the referenced table to the referencing one.
+    pub fn to_mermaid(&self) -> String {
+        let name = |table: &TableRef| {
+            let name = self.export_name(table);
+            if name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                name
+            } else {
+                format!("\"{}\"", name.replace('"', "'"))
+            }
+        };
+        let word = |text: &str| -> String {
+            text.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric()
+                        || c == '_'
+                        || c == '('
+                        || c == ')'
+                        || c == '['
+                        || c == ']'
+                    {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let mut out = String::from("erDiagram\n");
+        for table in &self.tables {
+            out.push_str(&format!("    {} {{\n", name(&table.table)));
+            for column in &table.columns {
+                let keys = match (column.primary_key, column.foreign_key) {
+                    (true, true) => " PK, FK",
+                    (true, false) => " PK",
+                    (false, true) => " FK",
+                    (false, false) => "",
+                };
+                out.push_str(&format!(
+                    "        {} {}{keys}\n",
+                    word(&column.short_type()),
+                    word(&column.name)
+                ));
+            }
+            out.push_str("    }\n");
+        }
+        for relation in &self.relations {
+            // `||` exactly one parent, `|o` at most one when the key is
+            // optional; `o{` any number of children.
+            let parent = if relation.optional { "|o" } else { "||" };
+            out.push_str(&format!(
+                "    {} {parent}--o{{ {} : \"{}\"\n",
+                name(&relation.to),
+                name(&relation.from),
+                relation.from_columns.join(", ").replace('"', "'")
+            ));
+        }
+        out
+    }
+
+    /// The diagram as DBML (dbdiagram.io): tables with their columns and a
+    /// `Ref` per foreign key, many-to-one, with its delete rule.
+    pub fn to_dbml(&self) -> String {
+        let quote = |text: &str| {
+            if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                text.to_string()
+            } else {
+                format!("\"{}\"", text.replace('"', "\\\""))
+            }
+        };
+        let table_name = |table: &TableRef| {
+            if table.schema == "public" {
+                quote(&table.name)
+            } else {
+                format!("{}.{}", quote(&table.schema), quote(&table.name))
+            }
+        };
+        let columns = |table: &TableRef, columns: &[String]| {
+            let names: Vec<String> = columns.iter().map(|c| quote(c)).collect();
+            if names.len() == 1 {
+                format!("{}.{}", table_name(table), names[0])
+            } else {
+                format!("{}.({})", table_name(table), names.join(", "))
+            }
+        };
+        let mut out = String::new();
+        for table in &self.tables {
+            out.push_str(&format!("Table {} {{\n", table_name(&table.table)));
+            for column in &table.columns {
+                let mut settings = Vec::new();
+                if column.primary_key {
+                    settings.push("pk");
+                } else if !column.nullable {
+                    settings.push("not null");
+                }
+                let settings = if settings.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", settings.join(", "))
+                };
+                out.push_str(&format!(
+                    "  {} {}{settings}\n",
+                    quote(&column.name),
+                    quote(&column.data_type)
+                ));
+            }
+            out.push_str("}\n\n");
+        }
+        for relation in &self.relations {
+            let delete = match relation.on_delete {
+                OnDelete::NoAction => String::new(),
+                other => format!(" [delete: {}]", other.label().to_lowercase()),
+            };
+            out.push_str(&format!(
+                "Ref {}: {} > {}{delete}\n",
+                quote(&relation.name),
+                columns(&relation.from, &relation.from_columns),
+                columns(&relation.to, &relation.to_columns)
+            ));
+        }
+        out
+    }
+
     /// Tables related to `table` either way.
     pub fn neighbors(&self, table: usize) -> Vec<usize> {
         let name = &self.tables[table].table;
@@ -201,6 +375,30 @@ pub struct Layout {
     pub cards: Vec<Card>,
     pub width: f32,
     pub height: f32,
+}
+
+impl Layout {
+    /// Moves card `index` to `(x, y)` (never above or left of the margin)
+    /// and grows the layout to hold it.
+    pub fn place(&mut self, index: usize, x: f32, y: f32) {
+        let Some(card) = self.cards.get_mut(index) else {
+            return;
+        };
+        card.x = x.max(MARGIN / 2.);
+        card.y = y.max(MARGIN / 2.);
+        self.fit();
+    }
+
+    /// The size that holds every card, with a margin.
+    fn fit(&mut self) {
+        self.width = self.cards.iter().map(|c| c.x + c.width).fold(0.0, f32::max) + MARGIN;
+        self.height = self
+            .cards
+            .iter()
+            .map(|c| c.y + c.height)
+            .fold(0.0, f32::max)
+            + MARGIN;
+    }
 }
 
 /// Lays the tables out in layers (see the module docs).
@@ -778,6 +976,57 @@ mod tests {
         assert_eq!(typed("bigint").short_type(), "int8");
         assert_eq!(typed("numeric(10,2)").short_type(), "numeric(10,2)");
         assert_eq!(typed("user_role[]").short_type(), "user_role[]");
+    }
+
+    #[test]
+    fn narrows_to_a_tables_neighborhood() {
+        let diagram = shop();
+        let orders = diagram
+            .index_of(&TableRef::new("public", "orders"))
+            .unwrap();
+        let near = diagram.around(orders, 1);
+        let names: Vec<&str> = near.tables.iter().map(|t| t.table.name.as_str()).collect();
+        assert_eq!(names, ["order_items", "orders", "customers"]);
+        assert_eq!(near.relations.len(), 2);
+        let wider = diagram.around(orders, 2);
+        assert!(wider.tables.iter().any(|t| t.table.name == "products"));
+        assert!(!wider.tables.iter().any(|t| t.table.name == "audit_log"));
+    }
+
+    #[test]
+    fn moves_cards_and_grows_the_layout() {
+        let diagram = shop();
+        let mut layout = layout(&diagram, false);
+        let height = layout.height;
+        layout.place(1, 900., height + 400.);
+        assert_eq!(
+            (layout.cards[1].x, layout.cards[1].y),
+            (900., height + 400.)
+        );
+        assert!(layout.height > height + 400.);
+        layout.place(1, -50., -50.);
+        assert!(layout.cards[1].x > 0. && layout.cards[1].y > 0.);
+    }
+
+    #[test]
+    fn exports_mermaid_and_dbml() {
+        let diagram = shop();
+        let mermaid = diagram.to_mermaid();
+        assert!(mermaid.starts_with("erDiagram\n"));
+        assert!(
+            mermaid.contains("    orders {\n        int8 id PK\n        int8 customer_id FK\n")
+        );
+        assert!(mermaid.contains("customers |o--o{ orders : \"customer_id\""));
+        assert!(mermaid.contains("orders ||--o{ order_items : \"order_id\""));
+        assert!(mermaid.contains("billing.invoices"));
+
+        let dbml = diagram.to_dbml();
+        assert!(dbml.contains("Table orders {\n  id bigint [pk]\n  customer_id bigint\n}"));
+        assert!(dbml.contains("Ref order_items_order_id_fkey: order_items.order_id > orders.id\n"));
+        assert!(dbml.contains("orders.customer_id > billing.invoices.id"));
+        let mut cascade = diagram.clone();
+        cascade.relations[0].on_delete = OnDelete::Cascade;
+        assert!(cascade.to_dbml().contains("customers.id [delete: cascade]"));
     }
 
     #[test]
