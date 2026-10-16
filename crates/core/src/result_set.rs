@@ -69,10 +69,50 @@ impl BatchBuilder {
     }
 }
 
+/// What a column holds, as far as statistics care. Values are always kept
+/// as the text PostgreSQL sent; the kind says how to read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnKind {
+    Integer,
+    /// Floating point or numeric.
+    Number,
+    Boolean,
+    Date,
+    Timestamp,
+    Text,
+    /// Not reported by the server: infer it from the values.
+    #[default]
+    Unknown,
+}
+
+impl ColumnKind {
+    pub fn is_numeric(self) -> bool {
+        matches!(self, ColumnKind::Integer | ColumnKind::Number)
+    }
+
+    pub fn is_temporal(self) -> bool {
+        matches!(self, ColumnKind::Date | ColumnKind::Timestamp)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColumnKind::Integer => "integer",
+            ColumnKind::Number => "number",
+            ColumnKind::Boolean => "boolean",
+            ColumnKind::Date => "date",
+            ColumnKind::Timestamp => "timestamp",
+            ColumnKind::Text => "text",
+            ColumnKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// A query result: column names and the batches received so far.
 #[derive(Debug, Clone, Default)]
 pub struct ResultSet {
     columns: Vec<String>,
+    /// One per column; `Unknown` until the driver reports them.
+    kinds: Vec<ColumnKind>,
     batches: Vec<Batch>,
     /// First row of each batch, to locate a row with binary search.
     batch_starts: Vec<usize>,
@@ -82,6 +122,7 @@ pub struct ResultSet {
 impl ResultSet {
     pub fn new(columns: Vec<String>) -> Self {
         Self {
+            kinds: vec![ColumnKind::Unknown; columns.len()],
             columns,
             ..Default::default()
         }
@@ -89,6 +130,27 @@ impl ResultSet {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    pub fn kinds(&self) -> &[ColumnKind] {
+        &self.kinds
+    }
+
+    /// Sets the columns' kinds; ignored if the count does not match.
+    pub fn set_kinds(&mut self, kinds: Vec<ColumnKind>) {
+        if kinds.len() == self.columns.len() {
+            self.kinds = kinds;
+        }
+    }
+
+    /// Every value of one column, in order; `None` is NULL.
+    pub fn column_values(&self, column: usize) -> impl Iterator<Item = Option<&str>> + '_ {
+        self.batches.iter().flat_map(move |batch| {
+            let array = batch.columns.get(column);
+            (0..batch.rows).map(move |offset| {
+                array.and_then(|array| (!array.is_null(offset)).then(|| array.value(offset)))
+            })
+        })
     }
 
     pub fn rows(&self) -> usize {

@@ -5,11 +5,12 @@
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
-use kuery_core::result_set::{Batch, ResultSet};
+use kuery_core::result_set::{Batch, ColumnKind, ResultSet};
 
 use crate::context_menus::{Cell, copy_cell_items};
 use crate::theme;
@@ -46,6 +47,10 @@ impl ResultsDelegate {
             })
             .collect();
         self.set = ResultSet::new(names);
+    }
+
+    pub fn set_kinds(&mut self, kinds: Vec<ColumnKind>) {
+        self.set.set_kinds(kinds);
     }
 
     pub fn push(&mut self, batch: Batch) {
@@ -102,6 +107,11 @@ impl TableDelegate for ResultsDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
+        let numeric = self
+            .set
+            .kinds()
+            .get(col_ix)
+            .is_some_and(|kind| kind.is_numeric());
         let cell: AnyElement = match self.set.cell(row_ix, col_ix) {
             Some(Some(text)) => div()
                 .font_family(mono)
@@ -120,6 +130,7 @@ impl TableDelegate for ResultsDelegate {
             .size_full()
             .flex()
             .items_center()
+            .when(numeric, |cell| cell.justify_end())
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |table, _, _, _| {

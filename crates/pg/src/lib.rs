@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use futures::{TryStreamExt as _, pin_mut};
 use kuery_core::edit::WriteStatement;
 use kuery_core::read_only::{self, Rejection};
-use kuery_core::result_set::{Batch, BatchBuilder, ResultSet};
+use kuery_core::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
@@ -196,6 +196,9 @@ impl Default for RunOptions {
 #[derive(Debug)]
 pub enum Event {
     Columns(Vec<String>),
+    /// The kinds of the columns just announced, when the server reported
+    /// them (single-statement reads). Comes right after their `Columns`.
+    Types(Vec<ColumnKind>),
     Batch(Batch),
     Finished(Summary),
     Failed(QueryError),
@@ -281,10 +284,11 @@ impl Session {
         }
         let inner = self.inner.clone();
         self.inner.handle.spawn(async move {
-            let event = match stream_in_read_only_transaction(&inner, &sql, &options, &tx).await {
-                Ok(summary) => Event::Finished(summary),
-                Err(error) => Event::Failed(error),
-            };
+            let event =
+                match stream_in_read_only_transaction(&inner, &sql, &options, &tx, true).await {
+                    Ok(summary) => Event::Finished(summary),
+                    Err(error) => Event::Failed(error),
+                };
             let _ = tx.send(event).await;
         });
         rx
@@ -313,10 +317,11 @@ impl Session {
         let inner = self.inner.clone();
         self.inner.handle.spawn(async move {
             let options = RunOptions::default();
-            let event = match stream_in_read_only_transaction(&inner, &sql, &options, &tx).await {
-                Ok(summary) => Event::Finished(summary),
-                Err(error) => Event::Failed(error),
-            };
+            let event =
+                match stream_in_read_only_transaction(&inner, &sql, &options, &tx, false).await {
+                    Ok(summary) => Event::Finished(summary),
+                    Err(error) => Event::Failed(error),
+                };
             let _ = tx.send(event).await;
         });
         collect(rx)
@@ -469,6 +474,7 @@ async fn stream_in_read_only_transaction(
     sql: &str,
     options: &RunOptions,
     tx: &async_channel::Sender<Event>,
+    typed: bool,
 ) -> Result<Summary, QueryError> {
     let _busy = inner.busy.lock().await;
     let client = &inner.client;
@@ -483,7 +489,9 @@ async fn stream_in_read_only_transaction(
                 options.statement_timeout.as_millis()
             ))
             .await?;
-        let outcome = stream_rows(client, sql, options, tx, started).await;
+        // No column types here: a statement that fails to prepare would
+        // abort the open transaction.
+        let outcome = stream_rows(client, sql, options, tx, started, None).await;
         if matches!(outcome, Err(QueryError::Cancelled)) {
             let _ = inner.connector.cancel(inner.cancel.clone()).await;
         }
@@ -492,6 +500,20 @@ async fn stream_in_read_only_transaction(
             .await?;
         return outcome;
     }
+
+    // The column types, from preparing the statement outside any
+    // transaction (a failure there aborts nothing; the run reports it).
+    let kinds = if typed {
+        client.prepare(sql).await.ok().map(|statement| {
+            statement
+                .columns()
+                .iter()
+                .map(|c| kind_of(c.type_()))
+                .collect()
+        })
+    } else {
+        None
+    };
 
     // `select 1` takes the first snapshot: from then on PostgreSQL does not
     // allow switching the transaction to read-write.
@@ -502,7 +524,7 @@ async fn stream_in_read_only_transaction(
         ))
         .await?;
 
-    let outcome = stream_rows(client, sql, options, tx, started).await;
+    let outcome = stream_rows(client, sql, options, tx, started, kinds).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
         let _ = inner.connector.cancel(inner.cancel.clone()).await;
     }
@@ -539,7 +561,7 @@ async fn stream_in_write_transaction(
         .await
         .inspect_err(|_| inner.in_transaction.store(false, Ordering::SeqCst))?;
 
-    let outcome = stream_rows(client, sql, options, tx, started).await;
+    let outcome = stream_rows(client, sql, options, tx, started, None).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
         let _ = inner.connector.cancel(inner.cancel.clone()).await;
     }
@@ -644,19 +666,35 @@ async fn stream_autocommit(
             options.lock_timeout.as_millis()
         ))
         .await?;
-    let outcome = stream_rows(client, sql, options, tx, started).await;
+    let outcome = stream_rows(client, sql, options, tx, started, None).await;
     if matches!(outcome, Err(QueryError::Cancelled)) {
         let _ = inner.connector.cancel(inner.cancel.clone()).await;
     }
     outcome
 }
 
+/// How statistics read a PostgreSQL type.
+fn kind_of(ty: &tokio_postgres::types::Type) -> ColumnKind {
+    use tokio_postgres::types::Type;
+    match *ty {
+        Type::INT2 | Type::INT4 | Type::INT8 | Type::OID => ColumnKind::Integer,
+        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => ColumnKind::Number,
+        Type::BOOL => ColumnKind::Boolean,
+        Type::DATE => ColumnKind::Date,
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => ColumnKind::Timestamp,
+        _ => ColumnKind::Text,
+    }
+}
+
+/// `kinds`, when known, are sent after the columns of the result they
+/// describe (a single statement has one).
 async fn stream_rows(
     client: &Client,
     sql: &str,
     options: &RunOptions,
     tx: &async_channel::Sender<Event>,
     started: Instant,
+    mut kinds: Option<Vec<ColumnKind>>,
 ) -> Result<Summary, QueryError> {
     let stream = client.simple_query_raw(sql).await?;
     pin_mut!(stream);
@@ -680,7 +718,11 @@ async fn stream_rows(
                 builder = Some(BatchBuilder::new(names.len(), batch_rows));
                 rows = 0;
                 returns_rows = true;
+                let count = names.len();
                 send(tx, Event::Columns(names)).await?;
+                if let Some(kinds) = kinds.take().filter(|kinds| kinds.len() == count) {
+                    send(tx, Event::Types(kinds)).await?;
+                }
             }
             SimpleQueryMessage::CommandComplete(count) => {
                 statements += 1;
@@ -733,6 +775,7 @@ async fn collect(rx: async_channel::Receiver<Event>) -> Result<ResultSet, QueryE
     while let Ok(event) = rx.recv().await {
         match event {
             Event::Columns(names) => set = ResultSet::new(names),
+            Event::Types(kinds) => set.set_kinds(kinds),
             Event::Batch(batch) => set.push(batch),
             Event::Finished(_) => return Ok(set),
             Event::Failed(error) => return Err(error),
@@ -825,6 +868,7 @@ mod tests {
                 .expect("the driver always ends with a final event")
             {
                 Event::Columns(names) => columns = names,
+                Event::Types(_) => {}
                 Event::Batch(batch) => {
                     rows += batch.rows();
                     batches += 1;
@@ -837,7 +881,8 @@ mod tests {
     /// Runs without the upfront analysis, to test the second layer alone.
     async fn run_unchecked(session: &Session, sql: &str) -> Result<Summary, QueryError> {
         let (tx, _rx) = async_channel::unbounded();
-        stream_in_read_only_transaction(&session.inner, sql, &RunOptions::default(), &tx).await
+        stream_in_read_only_transaction(&session.inner, sql, &RunOptions::default(), &tx, false)
+            .await
     }
 
     async fn order_count(session: &Session) -> usize {
@@ -853,6 +898,7 @@ mod tests {
         while let Ok(event) = rx.recv().await {
             match event {
                 Event::Columns(names) => set = Some(kuery_core::result_set::ResultSet::new(names)),
+                Event::Types(kinds) => set.as_mut().unwrap().set_kinds(kinds),
                 Event::Batch(batch) => set.as_mut().unwrap().push(batch),
                 _ => {}
             }
@@ -1541,6 +1587,41 @@ mod tests {
             assert_eq!(order_count(&writer).await, before - 1);
             writer.rollback().await.unwrap();
             assert_eq!(order_count(&writer).await, before);
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn reads_report_column_kinds() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = session(&engine).await;
+            let set = session
+                .fetch_all(
+                    "select id, total, status::text, created_at, created_at::date, true \
+                     from orders limit 3"
+                        .into(),
+                    RunOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                set.kinds(),
+                [
+                    ColumnKind::Integer,
+                    ColumnKind::Number,
+                    ColumnKind::Text,
+                    ColumnKind::Timestamp,
+                    ColumnKind::Date,
+                    ColumnKind::Boolean,
+                ]
+            );
+            // A statement that cannot be prepared still runs (and reports
+            // its own error).
+            let failed = session
+                .fetch_all("select * from no_such_table".into(), RunOptions::default())
+                .await;
+            assert!(matches!(failed, Err(QueryError::Database { code, .. }) if code == "42P01"));
         });
     }
 }

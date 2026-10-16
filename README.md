@@ -168,10 +168,56 @@ for suggestions where typing alone does not, like an empty select list. The
 tab loads the catalog when it opens and again after DDL runs or a commit.
 
 In a query tab the editor and the bottom panel are split by a divider you can
-drag (double-click it to reset). The panel has a Results tab with the grid and
-an Output tab that logs each run (SQL, rows and time, or the error); it
-collapses to its tab strip with `secondary-j`, its button or a double-click on
-the strip, and running a query brings it back.
+drag (double-click it to reset). The panel has a Results tab with the grid, a
+Profile tab and an Output tab that logs each run (SQL, rows and time, or the
+error); it collapses to its tab strip with `secondary-j`, its button or a
+double-click on the strip, and running a query brings it back.
+
+Profile computes nothing until asked. The list on the left shows every
+column's name and kind ("Profile all" adds nulls, distinct values and a small
+chart to each). Above the result, a builder picks a column (click it, or the
+first dropdown), optionally a second one to compare (⌘-click, or the "vs"
+dropdown), and an analysis; Analyze runs it. Double-clicking a column
+analyzes it at once. While a result is on screen, its options (bins, groups,
+periods, aggregate…) update it right away; changing the columns or the
+analysis waits for Analyze.
+
+One column, "Analyze as":
+
+- Auto chooses from the kind and the values: keys get their range,
+  booleans a true/false split, integers with few values and short lists of
+  text their categories, other numbers a histogram, dates a timeline.
+- Numeric: a histogram (bins, log scale, hiding outliers beyond 1.5 × IQR)
+  with mean, standard deviation and percentiles.
+- Categorical: the most frequent values with their share (top 5 to 50,
+  NULL included on request).
+- Temporal: counts by hour, day, week, month or year (too many buckets fall
+  back to a coarser one), or by weekday or hour of day to show patterns.
+  Hours are read as written, offset ignored.
+- Text: the distribution of lengths, blank values and the most frequent
+  values.
+
+Two columns, offered by what their kinds allow (integers count both as
+numbers and as categories):
+
+- By group (number × category): a box plot per group on a shared scale with
+  n, mean, median, min and max, and η², the share of the variance the
+  groups explain. Smaller groups fold into "Other".
+- Cross tab (category × category): counts per pair, shaded, optionally as
+  row percentages, with Cramér's V for the strength of the association.
+- Over time (date × number): sum, avg, min, max, median or count per period.
+- Breakdown over time (date × category): stacked bars per period, as counts
+  or 100%.
+- Correlation (number × number): Pearson and Spearman coefficients, r² and
+  the least-squares line.
+
+Hidden columns (the eye on a row) and the builder's choices are kept by
+column name while the tab is open, so re-running a query keeps them (the
+previous result is dropped: its rows are gone). Kinds come from Postgres
+when a single read runs (the query is prepared first to learn them; numeric
+cells then align right in the grid); otherwise they are inferred from the
+first thousand values, and the result says so. Everything runs in the
+background over the rows the grid holds.
 
 The download icon in the panel (or `secondary-shift-e`, the palette or the editor's
 menu) saves the results to a file: the extension picks CSV (RFC 4180), TSV

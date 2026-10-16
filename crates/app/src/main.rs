@@ -21,6 +21,8 @@ mod keymap;
 mod menus;
 mod palette;
 mod paths;
+mod profile_charts;
+mod profile_view;
 mod project;
 mod query_tab;
 mod recent;

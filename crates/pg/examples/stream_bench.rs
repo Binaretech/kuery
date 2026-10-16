@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
         while let Ok(event) = rx.recv().await {
             match event {
                 Event::Columns(names) => set = ResultSet::new(names),
+                Event::Types(kinds) => set.set_kinds(kinds),
                 Event::Batch(batch) => {
                     batches += 1;
                     set.push(batch);

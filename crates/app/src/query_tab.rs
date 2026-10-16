@@ -21,10 +21,10 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyBinding,
-    ParentElement as _, Pixels, PromptLevel, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Task, Window, actions, div, px,
+    AnyElement, App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
+    KeyBinding, ParentElement as _, Pixels, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
 };
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::export::{self, Format};
@@ -37,6 +37,8 @@ use crate::chrome;
 use crate::completion::{SharedCatalog, SqlCompletions};
 use crate::connection::{Db, WriteKind};
 use crate::history::HistoryEntry;
+use crate::profile_charts;
+use crate::profile_view::ProfilePanel;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
@@ -131,6 +133,7 @@ const MIN_PANEL_HEIGHT: Pixels = px(110.);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PanelTab {
     Results,
+    Profile,
     Output,
 }
 
@@ -202,6 +205,7 @@ pub struct QueryTab {
     panel_tab: PanelTab,
     output: Vec<OutputEntry>,
     write: WriteState,
+    profile: Entity<ProfilePanel>,
     /// Whether the run in progress goes into the write transaction.
     run_writes: bool,
     /// Checks the open transaction for idleness while write mode is on.
@@ -267,6 +271,7 @@ impl QueryTab {
             panel_tab: PanelTab::Results,
             output: Vec::new(),
             write: WriteState::Off,
+            profile: cx.new(|_| ProfilePanel::default()),
             run_writes: false,
             idle_watch: None,
             completion_catalog,
@@ -559,6 +564,7 @@ impl QueryTab {
         };
         // Dropping the previous task drops its receiver and cancels that query.
         self.run_task = None;
+        self.profile.update(cx, |profile, cx| profile.clear(cx));
         self.table.update(cx, |table, cx| {
             table.delegate_mut().start();
             table.refresh(cx);
@@ -599,6 +605,10 @@ impl QueryTab {
             Event::Columns(names) => self.table.update(cx, |table, cx| {
                 table.delegate_mut().set_columns(names);
                 table.refresh(cx);
+            }),
+            Event::Types(kinds) => self.table.update(cx, |table, cx| {
+                table.delegate_mut().set_kinds(kinds);
+                cx.notify();
             }),
             Event::Batch(batch) => self.table.update(cx, |table, cx| {
                 table.delegate_mut().push(batch);
@@ -649,6 +659,9 @@ impl QueryTab {
                     changed,
                     applied,
                 };
+                if self.panel_tab == PanelTab::Profile {
+                    self.compute_profile(cx);
+                }
             }
             Event::Failed(error) => {
                 self.finish_table(cx);
@@ -1123,6 +1136,9 @@ impl QueryTab {
     fn select_panel_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         self.panel_tab = tab;
         self.panel_collapsed = false;
+        if tab == PanelTab::Profile {
+            self.compute_profile(cx);
+        }
         cx.notify();
     }
 
@@ -1552,6 +1568,14 @@ impl QueryTab {
                 cx,
             ))
             .child(tab(
+                "panel-profile",
+                AppIcon::Chart,
+                "Profile",
+                None,
+                PanelTab::Profile,
+                cx,
+            ))
+            .child(tab(
                 "panel-output",
                 AppIcon::History,
                 "Output",
@@ -1625,6 +1649,40 @@ impl QueryTab {
                     }
                 }),
             )
+    }
+
+    /// Profiles the results, unless already done or a query is still
+    /// running.
+    fn compute_profile(&mut self, cx: &mut Context<Self>) {
+        if !self.profile.read(cx).is_stale() || self.is_running() {
+            return;
+        }
+        let set = self.table.read(cx).delegate().results().clone();
+        if set.columns().is_empty() {
+            return;
+        }
+        self.profile.update(cx, |profile, cx| profile.load(set, cx));
+    }
+
+    fn render_profile(&self, cx: &App) -> AnyElement {
+        if !self.profile.read(cx).is_stale() {
+            return self.profile.clone().into_any_element();
+        }
+        let message = if self.is_running() {
+            "The profile is computed when the query finishes"
+        } else if self
+            .table
+            .read(cx)
+            .delegate()
+            .results()
+            .columns()
+            .is_empty()
+        {
+            "Run a query to profile its columns"
+        } else {
+            "Profiling columns…"
+        };
+        profile_charts::message(message).into_any_element()
     }
 
     /// Copies all the results to the clipboard as tab-separated text.
@@ -1793,6 +1851,7 @@ impl Render for QueryTab {
                                     .bordered(false)
                                     .into_any_element(),
                                 PanelTab::Output => self.render_output(mono).into_any_element(),
+                                PanelTab::Profile => self.render_profile(cx),
                             }),
                         )
                     }),

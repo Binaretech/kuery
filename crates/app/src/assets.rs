@@ -54,6 +54,10 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/zap.svg",
     "icons/download.svg",
     "icons/chevrons-down-up.svg",
+    "icons/chart-column.svg",
+    "icons/hash.svg",
+    "icons/type.svg",
+    "icons/toggle-right.svg",
 ];
 
 const BRANDING: &[(&str, &[u8])] = &[(crate::app_icon::PATH, crate::app_icon::PNG)];
@@ -82,11 +86,15 @@ pub enum AppIcon {
     FullWrite,
     Download,
     CollapseAll,
+    Chart,
+    Hash,
+    TextType,
+    Toggle,
 }
 
 #[cfg(test)]
 impl AppIcon {
-    const ALL: [AppIcon; 21] = [
+    const ALL: [AppIcon; 25] = [
         AppIcon::Lock,
         AppIcon::Database,
         AppIcon::Table,
@@ -108,6 +116,10 @@ impl AppIcon {
         AppIcon::FullWrite,
         AppIcon::Download,
         AppIcon::CollapseAll,
+        AppIcon::Chart,
+        AppIcon::Hash,
+        AppIcon::TextType,
+        AppIcon::Toggle,
     ];
 }
 
@@ -135,6 +147,10 @@ impl IconNamed for AppIcon {
             AppIcon::FullWrite => "icons/zap.svg",
             AppIcon::Download => "icons/download.svg",
             AppIcon::CollapseAll => "icons/chevrons-down-up.svg",
+            AppIcon::Chart => "icons/chart-column.svg",
+            AppIcon::Hash => "icons/hash.svg",
+            AppIcon::TextType => "icons/type.svg",
+            AppIcon::Toggle => "icons/toggle-right.svg",
         }
         .into()
     }
