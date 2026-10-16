@@ -192,8 +192,8 @@ One column, "Analyze as":
 - Categorical: the most frequent values with their share (top 5 to 50,
   NULL included on request).
 - Temporal: counts by hour, day, week, month or year (too many buckets fall
-  back to a coarser one), or by weekday or hour of day to show patterns.
-  Hours are read as written, offset ignored.
+  back to a coarser one), or by weekday or hour of day to show patterns,
+  as a line or as bars. Hours are read as written, offset ignored.
 - Text: the distribution of lengths, blank values and the most frequent
   values.
 
@@ -205,11 +205,13 @@ numbers and as categories):
   groups explain. Smaller groups fold into "Other".
 - Cross tab (category × category): counts per pair, shaded, optionally as
   row percentages, with Cramér's V for the strength of the association.
-- Over time (date × number): sum, avg, min, max, median or count per period.
+- Over time (date × number): sum, avg, min, max, median or count per
+  period, as a line (broken where a period has no values) or as bars.
 - Breakdown over time (date × category): stacked bars per period, as counts
   or 100%.
-- Correlation (number × number): Pearson and Spearman coefficients, r² and
-  the least-squares line.
+- Correlation (number × number): Pearson and Spearman coefficients, r², and
+  a scatter plot with the least-squares line (up to 4,000 points, spread
+  evenly over the rows; the coefficients use every pair).
 
 Hidden columns (the eye on a row) and the builder's choices are kept by
 column name while the tab is open, so re-running a query keeps them (the

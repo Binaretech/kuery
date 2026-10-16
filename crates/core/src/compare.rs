@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use crate::result_set::{ColumnKind, ResultSet};
 use crate::stats::{self, Buckets, Granularity};
 
+/// Points a scatter plot draws; more pairs are sampled down to this.
+pub const MAX_POINTS: usize = 4_000;
+
 /// Categories a stacked chart shows before folding the rest into "Other".
 pub const MAX_STACKED: usize = 8;
 
@@ -275,6 +278,12 @@ pub struct Correlation {
     /// The least-squares line `y = slope · x + intercept`.
     pub slope: Option<f64>,
     pub intercept: Option<f64>,
+    /// Up to [`MAX_POINTS`] of the pairs, evenly spread over the rows, for a
+    /// scatter plot.
+    pub points: Vec<(f64, f64)>,
+    /// The smallest and largest of each column, over every pair.
+    pub x_range: (f64, f64),
+    pub y_range: (f64, f64),
 }
 
 /// Runs `comparison` over `set`, whose kinds must be known (see
@@ -533,7 +542,24 @@ fn correlation<'a>(pairs: impl Iterator<Item = (Option<&'a str>, Option<&'a str>
     let xs: Vec<f64> = points.iter().map(|p| p.0).collect();
     let ys: Vec<f64> = points.iter().map(|p| p.1).collect();
     let line = least_squares(&xs, &ys);
+    let range = |values: &[f64]| {
+        values
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(*v), hi.max(*v))
+            })
+    };
+    let sample = if points.len() > MAX_POINTS {
+        (0..MAX_POINTS)
+            .map(|i| points[i * points.len() / MAX_POINTS])
+            .collect()
+    } else {
+        points.clone()
+    };
     Outcome::Correlation(Correlation {
+        x_range: range(&xs),
+        y_range: range(&ys),
+        points: sample,
         n: points.len(),
         pearson: pearson(&xs, &ys),
         spearman: pearson(&ranks(&xs), &ranks(&ys)),
@@ -762,5 +788,23 @@ mod tests {
             panic!("correlation");
         };
         assert_eq!((flat.pearson, flat.slope), (None, None));
+        assert_eq!((flat.x_range, flat.y_range), ((1.0, 1.0), (2.0, 3.0)));
+    }
+
+    #[test]
+    fn scatter_points_are_sampled_evenly() {
+        let values: Vec<String> = (0..10_000).map(|n| n.to_string()).collect();
+        let rows: Vec<(Option<&str>, Option<&str>)> = values
+            .iter()
+            .map(|v| (Some(v.as_str()), Some(v.as_str())))
+            .collect();
+        let Outcome::Correlation(found) = correlation(pairs(&rows)) else {
+            panic!("correlation");
+        };
+        assert_eq!(found.n, 10_000);
+        assert_eq!(found.points.len(), MAX_POINTS);
+        assert_eq!(found.points[0], (0.0, 0.0));
+        assert_eq!(found.points[MAX_POINTS - 1], (9_997.0, 9_997.0));
+        assert_eq!(found.x_range, (0.0, 9_999.0));
     }
 }

@@ -1,14 +1,16 @@
-//! What the Profile tab draws for an analysis: histograms, timelines, value
-//! lists, group box plots, cross tabs and stacked periods. Plain elements
-//! built from computed results; the options around them live in
+//! What the Profile tab draws for an analysis: histograms, timelines and
+//! lines, value lists, group box plots, cross tabs, stacked periods and
+//! scatter plots. Plain elements built from computed results (lines and
+//! points are painted on a canvas); the options around them live in
 //! `profile_view`.
 
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px, relative,
+    AnyElement, Bounds, ContentMask, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathBuilder, Pixels, Point, SharedString, StatefulInteractiveElement as _,
+    Styled as _, canvas, div, fill, point, px, relative, size,
 };
 use kuery_core::compare::{Breakdown, Correlation, CrossTab, GroupTable, Key, Series};
 use kuery_core::stats::{Bin, CategoricalSummary, NumericSummary, TemporalSummary, TextSummary};
@@ -27,7 +29,8 @@ const PALETTE: [u32; 9] = [
 /// One bar: its axis label, its height, and its tooltip.
 pub struct Bar {
     pub label: String,
-    pub value: f64,
+    /// `None` is a gap: a period without values.
+    pub value: Option<f64>,
     pub tip: String,
 }
 
@@ -36,7 +39,7 @@ impl Bar {
         Bar {
             tip: format!("{label} · {}", thousands(count as u64)),
             label,
-            value: count as f64,
+            value: Some(count as f64),
         }
     }
 }
@@ -112,7 +115,7 @@ pub fn bars(
     };
     let tallest = bars
         .iter()
-        .map(|bar| scale(bar.value))
+        .map(|bar| scale(bar.value.unwrap_or(0.0)))
         .fold(0.0, f64::max)
         .max(1e-9);
     let few = bars.len() <= 12;
@@ -134,7 +137,7 @@ pub fn bars(
                 .items_end()
                 .gap(px(gap))
                 .children(bars.into_iter().enumerate().map(|(index, bar)| {
-                    let share = (scale(bar.value) / tallest) as f32;
+                    let share = (scale(bar.value.unwrap_or(0.0)) / tallest) as f32;
                     let tip = bar.tip;
                     div()
                         .id((id, index))
@@ -145,7 +148,7 @@ pub fn bars(
                         .child(
                             div()
                                 .w_full()
-                                .h(relative(if bar.value > 0.0 {
+                                .h(relative(if bar.value.is_some_and(|v| v > 0.0) {
                                     share.max(0.02)
                                 } else {
                                     0.0
@@ -159,6 +162,187 @@ pub fn bars(
                 .child(baseline()),
         )
         .child(axis_labels(axis, few, gap, mono))
+}
+
+/// A small square centered on `at`.
+fn dot(at: Point<Pixels>, side: f32, tone: Hsla) -> gpui_kit::PaintQuad {
+    let half = px(side / 2.);
+    fill(
+        Bounds::new(point(at.x - half, at.y - half), size(px(side), px(side))),
+        tone,
+    )
+    .corner_radii(half)
+}
+
+/// Values joined by a line, broken where a period has none (a lone value
+/// between gaps gets a dot). Hovering a period shows its tooltip.
+pub fn line_chart(
+    id: &'static str,
+    bars: Vec<Bar>,
+    height: f32,
+    mono: SharedString,
+) -> impl IntoElement {
+    let values: Vec<Option<f64>> = bars.iter().map(|bar| bar.value).collect();
+    let low = values.iter().flatten().copied().fold(0.0, f64::min);
+    let high = values
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(low + 1e-9);
+    let few = bars.len() <= 12;
+    let axis: Vec<String> = if few {
+        bars.iter().map(|bar| bar.label.clone()).collect()
+    } else {
+        [bars.first(), bars.last()]
+            .into_iter()
+            .map(|bar| bar.map(|b| b.label.clone()).unwrap_or_default())
+            .collect()
+    };
+    let tone = color(theme::ACCENT);
+    let plot = canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let count = values.len() as f32;
+            let pad = px(4.);
+            let span = bounds.size.height - pad * 2.;
+            let at = |index: usize, value: f64| {
+                point(
+                    bounds.origin.x + bounds.size.width * ((index as f32 + 0.5) / count),
+                    bounds.origin.y + pad + span * (1.0 - ((value - low) / (high - low)) as f32),
+                )
+            };
+            let mut path = PathBuilder::stroke(px(1.5));
+            let mut open = false;
+            for (index, value) in values.iter().enumerate() {
+                match value {
+                    Some(value) if open => path.line_to(at(index, *value)),
+                    Some(value) => {
+                        path.move_to(at(index, *value));
+                        open = true;
+                    }
+                    None => open = false,
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, tone);
+            }
+            let dots = values.len() <= 60;
+            for (index, value) in values.iter().enumerate() {
+                let Some(value) = value else {
+                    continue;
+                };
+                let alone = (index == 0 || values[index - 1].is_none())
+                    && values.get(index + 1).is_none_or(|next| next.is_none());
+                if dots || alone {
+                    window.paint_quad(dot(at(index, *value), 5., tone));
+                }
+            }
+        },
+    )
+    .absolute()
+    .size_full();
+    v_flex()
+        .gap(px(6.))
+        .child(
+            h_flex()
+                .relative()
+                .h(px(height))
+                .child(plot)
+                .children(bars.into_iter().enumerate().map(|(index, bar)| {
+                    let tip = bar.tip;
+                    div()
+                        .id((id, index))
+                        .flex_1()
+                        .h_full()
+                        .hover(|s| s.bg(color(theme::ACTIVE).opacity(0.6)))
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                }))
+                .child(baseline()),
+        )
+        .child(axis_labels(axis, few, 0., mono))
+}
+
+/// Pairs as points on a canvas, with the least-squares line over them.
+fn scatter(found: &Correlation, mono: SharedString) -> impl IntoElement {
+    const HEIGHT: f32 = 260.;
+    let points = found.points.clone();
+    let ((x0, x1), (y0, y1)) = (found.x_range, found.y_range);
+    let line = found.slope.zip(found.intercept);
+    let tone = color(theme::ACCENT).opacity(if points.len() > 1_000 { 0.35 } else { 0.65 });
+    let (rule, trend) = (color(theme::HAIRLINE), color(theme::AMBER));
+    let fraction = |value: f64, low: f64, high: f64| {
+        if high > low {
+            ((value - low) / (high - low)) as f32
+        } else {
+            0.5
+        }
+    };
+    let plot = canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let pad = px(5.);
+            let (width, height) = (bounds.size.width - pad * 2., bounds.size.height - pad * 2.);
+            let at = |x: f64, y: f64| {
+                point(
+                    bounds.origin.x + pad + width * fraction(x, x0, x1),
+                    bounds.origin.y + pad + height * (1.0 - fraction(y, y0, y1)),
+                )
+            };
+            for step in 0..=4 {
+                let y = bounds.origin.y + pad + height * (step as f32 / 4.0);
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, px(1.))),
+                    rule,
+                ));
+            }
+            for (x, y) in &points {
+                window.paint_quad(dot(at(*x, *y), 4., tone));
+            }
+            if let Some((slope, intercept)) = line {
+                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    let mut path = PathBuilder::stroke(px(1.5));
+                    path.move_to(at(x0, slope * x0 + intercept));
+                    path.line_to(at(x1, slope * x1 + intercept));
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, trend);
+                    }
+                });
+            }
+        },
+    )
+    .size_full();
+    let quiet = |text: String| {
+        div()
+            .font_family(mono.clone())
+            .text_size(px(11.))
+            .text_color(color(theme::TEXT_QUIET))
+            .child(text)
+    };
+    v_flex()
+        .gap(px(6.))
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .child(
+                    v_flex()
+                        .w(px(64.))
+                        .h(px(HEIGHT))
+                        .flex_shrink_0()
+                        .justify_between()
+                        .items_end()
+                        .child(quiet(format_number(y1)))
+                        .child(quiet(format_number(y0))),
+                )
+                .child(div().flex_1().h(px(HEIGHT)).child(plot)),
+        )
+        .child(
+            h_flex()
+                .pl(px(72.))
+                .justify_between()
+                .child(quiet(format_number(x0)))
+                .child(quiet(format_number(x1))),
+        )
 }
 
 fn baseline() -> impl IntoElement {
@@ -254,20 +438,31 @@ pub fn numeric(numbers: &NumericSummary, log_scale: bool, mono: SharedString) ->
         .into_any_element()
 }
 
-pub fn temporal(timeline: &TemporalSummary, mono: SharedString) -> AnyElement {
+pub fn temporal(timeline: &TemporalSummary, line: bool, mono: SharedString) -> AnyElement {
     let buckets = timeline
         .buckets
         .iter()
         .map(|(label, count)| Bar::count(label.clone(), *count))
         .collect();
     panel()
-        .child(bars(
-            "profile-bucket",
-            buckets,
-            CHART_HEIGHT,
-            false,
-            mono.clone(),
-        ))
+        .map(|panel| {
+            if line {
+                panel.child(line_chart(
+                    "profile-bucket",
+                    buckets,
+                    CHART_HEIGHT,
+                    mono.clone(),
+                ))
+            } else {
+                panel.child(bars(
+                    "profile-bucket",
+                    buckets,
+                    CHART_HEIGHT,
+                    false,
+                    mono.clone(),
+                ))
+            }
+        })
         .child(
             h_flex()
                 .gap_2()
@@ -754,7 +949,7 @@ pub fn cross_tab(
 }
 
 /// A measure aggregated per period.
-pub fn series(series: &Series, measure: &str, mono: SharedString) -> AnyElement {
+pub fn series(series: &Series, measure: &str, line: bool, mono: SharedString) -> AnyElement {
     let aggregate = series.aggregate.label();
     let points = series
         .points
@@ -770,7 +965,7 @@ pub fn series(series: &Series, measure: &str, mono: SharedString) -> AnyElement 
                 None => format!("{} · no values", point.label),
             },
             label: point.label.clone(),
-            value: point.value.unwrap_or(0.0),
+            value: point.value,
         })
         .collect();
     let negative = series
@@ -785,8 +980,14 @@ pub fn series(series: &Series, measure: &str, mono: SharedString) -> AnyElement 
             ),
             format!("{} periods", thousands(series.points.len() as u64)),
         ))
-        .child(bars("profile-series", points, CHART_HEIGHT, false, mono))
-        .when(negative, |panel| {
+        .map(|panel| {
+            if line {
+                panel.child(line_chart("profile-series", points, CHART_HEIGHT, mono))
+            } else {
+                panel.child(bars("profile-series", points, CHART_HEIGHT, false, mono))
+            }
+        })
+        .when(negative && !line, |panel| {
             panel.child(footnote("Negative values are drawn as empty bars."))
         })
         .into_any_element()
@@ -982,6 +1183,7 @@ pub fn correlation(found: &Correlation, x: &str, y: &str, mono: SharedString) ->
                     found.pearson.map(|r| r * r),
                 )),
         )
+        .child(scatter(found, mono.clone()))
         .child(
             h_flex()
                 .gap_2()
@@ -991,8 +1193,16 @@ pub fn correlation(found: &Correlation, x: &str, y: &str, mono: SharedString) ->
                         .text_color(color(theme::TEXT_TERTIARY))
                         .child("Best line"),
                 )
+                .child(div().w(px(14.)).h(px(2.)).bg(color(theme::AMBER)))
                 .child(div().font_family(mono).child(line)),
         )
+        .when(found.points.len() < found.n, |panel| {
+            panel.child(footnote(format!(
+                "Showing {} of {} points, spread evenly over the rows.",
+                thousands(found.points.len() as u64),
+                thousands(found.n as u64)
+            )))
+        })
         .into_any_element()
 }
 

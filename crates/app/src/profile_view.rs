@@ -87,6 +87,8 @@ pub struct ProfilePanel {
     compare_options: CompareOptions,
     shown: Option<Shown>,
     task: Option<Task<()>>,
+    /// Timelines drawn as bars instead of a line.
+    bars_over_time: bool,
 }
 
 impl ProfilePanel {
@@ -932,8 +934,9 @@ impl ProfilePanel {
                     false,
                     cx,
                 )
+                .child(self.shape_choice(cx))
                 .into_any_element(),
-                charts::temporal(timeline, mono),
+                charts::temporal(timeline, !self.bars_over_time, mono),
             ),
             Summary::Categorical(categories) => with(
                 option_row()
@@ -983,6 +986,24 @@ impl ProfilePanel {
                 }
             }))
         }))
+    }
+
+    /// Line or bars, for timelines. Only the drawing changes, so nothing is
+    /// recomputed.
+    fn shape_choice(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        chrome::segmented().children([("Line", false), ("Bars", true)].into_iter().map(
+            |(text, bars)| {
+                choice(
+                    SharedString::from(format!("profile-shape-{text}")),
+                    text,
+                    self.bars_over_time == bars,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bars_over_time = bars;
+                    cx.notify();
+                }))
+            },
+        ))
     }
 
     fn granularity_row(
@@ -1098,14 +1119,17 @@ impl ProfilePanel {
                             ))
                         })),
                     ))
-                    .child(self.granularity_row(
-                        options.granularity,
-                        series.granularity,
-                        dates_only(time),
-                        true,
-                        cx,
-                    )),
-                charts::series(series, &name(measure), mono),
+                    .child(
+                        self.granularity_row(
+                            options.granularity,
+                            series.granularity,
+                            dates_only(time),
+                            true,
+                            cx,
+                        )
+                        .child(self.shape_choice(cx)),
+                    ),
+                charts::series(series, &name(measure), !self.bars_over_time, mono),
             ),
             (Comparison::Breakdown { time, category }, Outcome::Breakdown(breakdown)) => with(
                 v_flex()
