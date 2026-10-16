@@ -293,6 +293,69 @@ fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
     }
 }
 
+/// Quits, asking first if a project window has work that would be lost:
+/// unsaved SQL, an open transaction (rolled back on quit) or staged row
+/// changes.
+///
+/// Deferred: the Quit action arrives while a window is handling the event,
+/// and that window could not show the question then.
+pub fn request_quit(cx: &mut App) {
+    cx.defer(|cx| {
+        let open = cx.windows();
+        let unsaved: Vec<AnyWindowHandle> = state(cx)
+            .windows
+            .iter()
+            .filter(|entry| open.contains(&entry.handle))
+            .filter(|entry| {
+                entry
+                    .view
+                    .read(cx)
+                    .workspace
+                    .read(cx)
+                    .has_unsaved_changes(cx)
+            })
+            .map(|entry| entry.handle)
+            .collect();
+        let Some(&first) = unsaved.first() else {
+            cx.quit();
+            return;
+        };
+        let handle = cx
+            .active_window()
+            .filter(|active| unsaved.contains(active))
+            .unwrap_or(first);
+        let detail = format!(
+            "{} unsaved SQL, an open transaction or staged row changes. They will \
+             be lost, and open transactions rolled back.",
+            if unsaved.len() == 1 {
+                "A window has".to_string()
+            } else {
+                format!("{} windows have", unsaved.len())
+            }
+        );
+        let answer = handle.update(cx, |_, window, cx| {
+            window.activate_window();
+            window.prompt(
+                PromptLevel::Warning,
+                "Quit Kuery?",
+                Some(&detail),
+                &["Quit", "Cancel"],
+                cx,
+            )
+        });
+        let Ok(answer) = answer else {
+            cx.quit();
+            return;
+        };
+        cx.spawn(async move |cx| {
+            if let Ok(0) = answer.await {
+                cx.update(|cx| cx.quit());
+            }
+        })
+        .detach();
+    });
+}
+
 /// Refreshes what shows the recent projects: the menu bar and the welcome
 /// window (deferred, since the change may come from the welcome window).
 pub fn recents_changed(cx: &mut App) {

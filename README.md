@@ -96,7 +96,21 @@ In both write modes:
 - Writes have a 60 s `statement_timeout` and a 5 s `lock_timeout`. A
   transaction with no runs for 10 minutes is rolled back (the bar counts down
   over the last two). Closing the tab asks whether to commit; closing the
-  window or turning write mode off with a transaction open asks first too.
+  window or turning write mode off with a transaction open asks first too,
+  and so does quitting (which also asks about unsaved SQL and staged row
+  changes).
+
+- **Preview Impact**, in the confirmation or as a command (palette and the
+  editor's menu), runs the script inside a transaction (or under a savepoint
+  in the open one), lists the rows each statement would change or return,
+  and undoes it all; from the confirmation it then asks whether to run it
+  for real. Statements that cannot run in a transaction block (`VACUUM`)
+  cannot be previewed.
+- Every write run, preview, commit and rollback is appended to an **audit
+  log**, `audit.jsonl` in the user config directory (one JSON object per
+  line: time, project, connection, environment, mode, action, SQL,
+  statements and rows changed, outcome). "Open Audit Log" in the palette
+  opens it.
 
 Table tabs keep their own staged row editing, which stays off on production.
 
@@ -110,7 +124,7 @@ Right-click shows what can be done with the thing under the pointer:
   it in a new tab, copy its name or a `SELECT`. Functions, triggers and enums:
   open them and copy names, signatures or values. Saved queries and folders:
   open, reveal in the file manager, copy the path, delete (asks first).
-  History: open in a new tab, copy the SQL.
+  History: open in a new tab, copy the SQL, remove it.
 - **Tabs** — close, close others, close tabs to the right, close all (tabs with
   unsaved work are left for last and ask one at a time), and reveal or copy
   the file of a saved query or the name of a table.
@@ -122,8 +136,12 @@ Right-click shows what can be done with the thing under the pointer:
 
 ## Editor
 
-In the SQL editor `secondary-enter` runs the query (or the selection) and
-`secondary-shift-enter` inserts a new line. Command shortcuts are also bound
+In the SQL editor `secondary-enter` runs the selection or, without one, the
+statement under the cursor (statements are split on semicolons outside
+strings, comments and `$$` bodies); `secondary-alt-enter` runs everything, and
+`secondary-shift-enter` inserts a new line. `secondary-shift-f` formats the
+selection or the whole script (one clause per line, keyword case and function
+bodies left as written; undo brings the old text back). Command shortcuts are also bound
 inside text fields, so a field's own keys never shadow them.
 
 In a query tab the editor and the bottom panel are split by a divider you can
@@ -137,6 +155,11 @@ menu) saves the results to a file: the extension picks CSV (RFC 4180), TSV
 (tabs and line breaks escaped) or JSON (an array of objects; values as text,
 NULL as `null`). It writes in the background; a million rows take well under
 a second.
+
+The sidebar's History lists what ran, newest first, with its connection,
+outcome and how long ago. It survives restarts: the last 200 entries of each
+project are kept in `history/` in the user config directory, never in the
+project folder (the SQL may hold data). "Clear" empties it.
 
 Query tabs save with `secondary-s` into `.kuery/queries/`. The first line of
 a saved query, `-- connection: <name>`, records its connection and is not

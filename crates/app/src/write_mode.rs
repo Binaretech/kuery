@@ -19,9 +19,11 @@ use gpui_kit::{
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::read_only::Rejection;
 
+use kuery_pg::StatementImpact;
+
 use crate::connection::{Db, Environment, WriteKind, WritePolicy};
 use crate::theme::{self, color};
-use crate::ui::muted;
+use crate::ui::{muted, thousands};
 
 /// What to do with a script in write mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +129,34 @@ fn plural(count: usize, noun: &str) -> String {
     } else {
         format!("{count} {noun}s")
     }
+}
+
+/// One line per statement of a previewed script, e.g. `UPDATE orders: 1,204
+/// rows would change`. Statements are named from the analysis when it lines
+/// up with what the server ran, and numbered otherwise.
+pub fn describe_impact(sql: &str, impacts: &[StatementImpact]) -> Vec<String> {
+    let summaries: Option<Vec<String>> = analysis::analyze(sql)
+        .ok()
+        .map(|a| a.statements.into_iter().map(|s| s.summary).collect())
+        .filter(|summaries: &Vec<String>| summaries.len() == impacts.len());
+    impacts
+        .iter()
+        .enumerate()
+        .map(|(index, impact)| {
+            let name = summaries
+                .as_ref()
+                .map_or_else(|| format!("Statement {}", index + 1), |s| s[index].clone());
+            let rows = match impact.rows {
+                1 => "1 row".to_string(),
+                n => format!("{} rows", thousands(n)),
+            };
+            if impact.returns_rows {
+                format!("{name}: {rows} returned")
+            } else {
+                format!("{name}: {rows} would change")
+            }
+        })
+        .collect()
 }
 
 /// Short description of the policy for the write-mode banner.
@@ -384,5 +414,31 @@ mod tests {
             review("begin", "db", Environment::Development, WriteKind::Full),
             Review::Refuse(message) if message.contains("switch to Write")
         ));
+    }
+
+    #[test]
+    fn describes_what_a_preview_found() {
+        let impacts = [
+            StatementImpact {
+                rows: 1_204,
+                returns_rows: false,
+            },
+            StatementImpact {
+                rows: 1,
+                returns_rows: true,
+            },
+        ];
+        assert_eq!(
+            describe_impact("update orders set a = 1; select 1", &impacts),
+            [
+                "UPDATE orders: 1,204 rows would change",
+                "SELECT: 1 row returned"
+            ]
+        );
+        // When the analysis does not line up, statements are numbered.
+        assert_eq!(
+            describe_impact("updat t", &impacts[..1]),
+            ["Statement 1: 1,204 rows would change"]
+        );
     }
 }

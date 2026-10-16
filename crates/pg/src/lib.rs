@@ -20,6 +20,8 @@
 //!   transaction stays usable. Write mode uses a session of its own per tab.
 //! - [`Session::run_autocommit`] runs a script and keeps its changes as soon
 //!   as it finishes: all of it, or none of it if a statement fails.
+//! - [`Session::preview`] runs a script, counts what each statement changes,
+//!   and undoes it all.
 //!
 //! TLS honours the URL's `sslmode` (see [`tls`]).
 
@@ -197,6 +199,14 @@ pub enum Event {
     Batch(Batch),
     Finished(Summary),
     Failed(QueryError),
+}
+
+/// What one statement of a previewed script did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatementImpact {
+    /// Rows changed, or rows returned when `returns_rows`.
+    pub rows: u64,
+    pub returns_rows: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +390,29 @@ impl Session {
         rx
     }
 
+    /// Runs a script that may write and reports what each statement did,
+    /// then undoes everything: inside the open transaction under a savepoint,
+    /// or in a transaction of its own that is rolled back. Rows a statement
+    /// returns are counted, not kept. A statement that cannot run inside a
+    /// transaction block (`VACUUM`) makes the preview fail.
+    ///
+    /// The SQL is not analysed here. Only on [`Access::ReadWrite`] sessions.
+    pub fn preview(
+        &self,
+        sql: String,
+        options: RunOptions,
+    ) -> impl Future<Output = Result<Vec<StatementImpact>, QueryError>> + use<> {
+        let inner = self.inner.clone();
+        let task = self
+            .inner
+            .handle
+            .spawn(async move { preview_and_undo(&inner, &sql, &options).await });
+        async move {
+            task.await
+                .unwrap_or_else(|error| Err(QueryError::Connection(error.to_string())))
+        }
+    }
+
     /// Whether a transaction is waiting for a commit or a rollback.
     pub fn in_transaction(&self) -> bool {
         self.inner.in_transaction.load(Ordering::SeqCst)
@@ -525,6 +558,65 @@ async fn stream_in_write_transaction(
         });
     }
     outcome
+}
+
+async fn preview_and_undo(
+    inner: &Inner,
+    sql: &str,
+    options: &RunOptions,
+) -> Result<Vec<StatementImpact>, QueryError> {
+    if inner.access != Access::ReadWrite {
+        return Err(QueryError::WritesDisabled);
+    }
+    let _busy = inner.busy.lock().await;
+    let client = &inner.client;
+    let in_transaction = inner.in_transaction.load(Ordering::SeqCst);
+    let timeouts = format!(
+        "set local statement_timeout = {}; set local lock_timeout = {}",
+        options.statement_timeout.as_millis(),
+        options.lock_timeout.as_millis()
+    );
+    let (open, undo) = if in_transaction {
+        (
+            format!("savepoint kuery_preview; {timeouts}"),
+            "rollback to savepoint kuery_preview; release savepoint kuery_preview",
+        )
+    } else {
+        (
+            format!("begin transaction read write; {timeouts}"),
+            "rollback",
+        )
+    };
+    client.batch_execute(&open).await?;
+    let outcome = count_statements(client, sql).await;
+    // Undo whatever happened, even if the script failed halfway.
+    let undone = client.batch_execute(undo).await;
+    if undone.is_err() && in_transaction {
+        // The savepoint is gone only if the transaction is.
+        inner.in_transaction.store(false, Ordering::SeqCst);
+    }
+    let impacts = outcome?;
+    undone?;
+    Ok(impacts)
+}
+
+/// Runs `sql` and counts each statement's rows, discarding returned rows.
+async fn count_statements(client: &Client, sql: &str) -> Result<Vec<StatementImpact>, QueryError> {
+    let stream = client.simple_query_raw(sql).await?;
+    pin_mut!(stream);
+    let mut impacts = Vec::new();
+    let mut returns_rows = false;
+    while let Some(message) = stream.try_next().await? {
+        match message {
+            SimpleQueryMessage::RowDescription(_) => returns_rows = true,
+            SimpleQueryMessage::CommandComplete(rows) => {
+                impacts.push(StatementImpact { rows, returns_rows });
+                returns_rows = false;
+            }
+            _ => {}
+        }
+    }
+    Ok(impacts)
 }
 
 /// Runs `sql` outside any explicit transaction, so its changes are kept.
@@ -1354,6 +1446,70 @@ mod tests {
             finish(writer.run_autocommit(format!("drop table {table}"), options))
                 .await
                 .unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn previews_count_changes_and_undo_them() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let writer = write_session(&engine).await;
+            let before = order_count(&writer).await;
+            let options = RunOptions::default();
+
+            // Outside a transaction: counted, then rolled back.
+            let impacts = writer
+                .preview(
+                    "delete from orders where id in (select id from orders limit 3); \
+                     select * from orders limit 2"
+                        .into(),
+                    options.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                impacts,
+                [
+                    StatementImpact {
+                        rows: 3,
+                        returns_rows: false
+                    },
+                    StatementImpact {
+                        rows: 2,
+                        returns_rows: true
+                    },
+                ]
+            );
+            assert!(!writer.in_transaction());
+            assert_eq!(order_count(&writer).await, before);
+
+            // Inside an open transaction: earlier changes stay, the preview goes.
+            finish(writer.run_in_transaction(
+                "delete from orders where id in (select id from orders limit 1)".into(),
+                options.clone(),
+            ))
+            .await
+            .unwrap();
+            writer
+                .preview(
+                    "delete from orders where id in (select id from orders limit 5)".into(),
+                    options.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(writer.in_transaction());
+            assert_eq!(order_count(&writer).await, before - 1);
+
+            // A failing script is undone too, and reports the error.
+            let failed = writer
+                .preview("delete from orders; select 1/0".into(), options)
+                .await;
+            assert!(matches!(failed, Err(QueryError::Database { code, .. }) if code == "22012"));
+            assert!(writer.in_transaction());
+            assert_eq!(order_count(&writer).await, before - 1);
+            writer.rollback().await.unwrap();
+            assert_eq!(order_count(&writer).await, before);
         });
     }
 }

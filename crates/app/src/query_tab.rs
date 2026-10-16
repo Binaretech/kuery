@@ -30,11 +30,13 @@ use gpui_kit::{
     Styled as _, Task, Window, actions, div, px,
 };
 use kuery_core::export::{self, Format};
+use kuery_core::{format, script};
 use kuery_pg::{Access, Event, QueryError, RunOptions, Session};
 
 use crate::assets::AppIcon;
+use crate::audit::{self, AuditAction, AuditRecord};
 use crate::connection::{Db, WriteKind, WritePolicy};
-use crate::explorer::HistoryEntry;
+use crate::history::HistoryEntry;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
@@ -45,6 +47,8 @@ actions!(
     kuery,
     [
         RunQuery,
+        RunAll,
+        FormatSql,
         CancelQuery,
         SaveQuery,
         SaveQueryAs,
@@ -53,6 +57,7 @@ actions!(
         UseWrite,
         UseFullWrite,
         ExportResults,
+        PreviewImpact,
         CommitTransaction,
         RollbackTransaction,
     ]
@@ -144,7 +149,8 @@ impl Render for SplitDrag {
 }
 
 pub const EXAMPLE_SQL: &str = "-- Read-only: runs inside BEGIN TRANSACTION READ ONLY.\n\
--- ⌘↵ / Ctrl+↵ to run, ⌘⇧↵ for a new line, ⌘S to save it in the project.\n\
+-- ⌘↵ runs the statement under the cursor (or the selection), ⌥⌘↵ runs it all.\n\
+-- ⌘⇧↵ inserts a new line, ⌘⇧F formats, ⌘S saves it in the project.\n\
 select current_database(), current_user, version();\n";
 
 enum RunState {
@@ -325,16 +331,56 @@ impl QueryTab {
         cx.notify();
     }
 
+    /// Runs the selection, or else the statement under the cursor.
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = {
-            let editor = self.editor.read(cx);
+        let sql = self.sql_to_run(cx);
+        self.run_sql(sql, window, cx);
+    }
+
+    /// Runs everything in the editor.
+    fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.editor.read(cx).text().to_string();
+        self.run_sql(sql, window, cx);
+    }
+
+    /// The selection if there is one; otherwise the statement under the
+    /// cursor, or the whole text when it holds a single statement (or cannot
+    /// be split).
+    fn sql_to_run(&self, cx: &App) -> String {
+        let editor = self.editor.read(cx);
+        let selected = editor.selected_text().to_string();
+        if !selected.trim().is_empty() {
+            return selected;
+        }
+        let text = editor.text().to_string();
+        match script::statements(&text) {
+            Some(ranges) if ranges.len() > 1 => script::statement_at(&text, editor.cursor())
+                .map(|range| text[range].to_string())
+                .unwrap_or(text),
+            _ => text,
+        }
+    }
+
+    /// Formats the selection, or the whole text; undo brings it back.
+    fn format_sql(&mut self, _: &FormatSql, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
             let selected = editor.selected_text().to_string();
-            if selected.trim().is_empty() {
-                editor.text().to_string()
+            if !selected.trim().is_empty() {
+                let formatted = format::format_sql(&selected);
+                if formatted != selected {
+                    editor.replace(formatted, window, cx);
+                }
             } else {
-                selected
+                let text = editor.text().to_string();
+                let formatted = format::format_sql(&text);
+                if formatted != text {
+                    editor.replace_all(formatted, window, cx);
+                }
             }
-        };
+        });
+    }
+
+    fn run_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
         match &self.write {
             WriteState::Off | WriteState::Failed(_) => self.execute(sql, false, cx),
             WriteState::Connecting => {}
@@ -355,19 +401,125 @@ impl QueryTab {
                             PromptLevel::Warning,
                             &message,
                             Some(&detail),
-                            &["Run", "Cancel"],
+                            &["Run", "Preview Impact", "Cancel"],
                             cx,
                         );
-                        cx.spawn(async move |this, cx| {
-                            if let Ok(0) = answer.await {
+                        cx.spawn_in(window, async move |this, cx| match answer.await {
+                            Ok(0) => {
                                 this.update(cx, |this, cx| this.execute(sql, true, cx)).ok();
                             }
+                            Ok(1) => {
+                                this.update_in(cx, |this, window, cx| {
+                                    this.preview(sql, true, window, cx)
+                                })
+                                .ok();
+                            }
+                            _ => {}
                         })
                         .detach();
                     }
                 }
             }
         }
+    }
+
+    /// Previews the selection or the statement under the cursor, without
+    /// asking: the result goes to the Output tab.
+    fn preview_impact(&mut self, _: &PreviewImpact, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.sql_to_run(cx);
+        let WriteState::On(write) = &self.write else {
+            self.refuse(
+                sql,
+                "Turn on Write or Full write to preview what a script changes".into(),
+                cx,
+            );
+            return;
+        };
+        match write_mode::review(&sql, &self.db.name, self.db.environment, write.kind) {
+            Review::Refuse(reason) => self.refuse(sql, reason, cx),
+            Review::Run { .. } | Review::Confirm { .. } => self.preview(sql, false, window, cx),
+        }
+    }
+
+    /// Runs `sql` and undoes it, to see what it would change. With
+    /// `then_ask`, shows the result and offers to run it for real; otherwise
+    /// only logs it.
+    fn preview(
+        &mut self,
+        sql: String,
+        then_ask: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let WriteState::On(write) = &self.write else {
+            return;
+        };
+        let preview = write.session.preview(
+            sql.clone(),
+            RunOptions {
+                statement_timeout: Duration::from_secs(60),
+                ..RunOptions::default()
+            },
+        );
+        let (name, environment) = (self.db.name.clone(), self.db.environment);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = preview.await;
+            this.update_in(cx, |this, window, cx| {
+                let lines = match &result {
+                    Ok(impacts) => write_mode::describe_impact(&sql, impacts),
+                    Err(error) => vec![describe_error(error.clone())],
+                };
+                let failed = result.is_err();
+                let outcome = if failed {
+                    format!("Preview failed: {}", lines.join(" · "))
+                } else {
+                    format!("Preview (undone): {}", lines.join(" · "))
+                };
+                this.audit(AuditAction::Preview, &sql, &outcome, None, failed, cx);
+                this.log(&sql, outcome, failed, cx);
+                if !then_ask {
+                    this.panel_collapsed = false;
+                    this.panel_tab = PanelTab::Output;
+                    cx.notify();
+                    return;
+                }
+                let (message, buttons): (String, &[&str]) = if failed {
+                    ("The preview failed".into(), &["OK"])
+                } else {
+                    (
+                        format!("Preview on {name} ({})", environment.label()),
+                        &["Run", "Cancel"],
+                    )
+                };
+                let mut detail = lines
+                    .iter()
+                    .map(|line| format!("• {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !failed {
+                    detail.push_str("\n\nThe preview was undone. Run the script for real?");
+                }
+                let answer = window.prompt(
+                    if failed {
+                        PromptLevel::Critical
+                    } else {
+                        PromptLevel::Warning
+                    },
+                    &message,
+                    Some(&detail),
+                    buttons,
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    if let (Ok(0), false) = (answer.await, failed) {
+                        this.update(cx, |this, cx| this.execute(sql, true, cx)).ok();
+                    }
+                })
+                .detach();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Logs a script that write mode will not run.
@@ -463,6 +615,11 @@ impl QueryTab {
                         format_duration(summary.elapsed)
                     ),
                 };
+                if self.run_writes {
+                    let sql = self.last_sql.clone();
+                    let changed = Some((summary.statements, summary.affected));
+                    self.audit(AuditAction::Run, &sql, &outcome, changed, false, cx);
+                }
                 self.record(outcome, false, cx);
                 self.run = RunState::Done {
                     rows: summary.rows,
@@ -488,11 +645,56 @@ impl QueryTab {
                         }
                     }
                 }
+                if self.run_writes {
+                    let sql = self.last_sql.clone();
+                    self.audit(AuditAction::Run, &sql, &message, None, true, cx);
+                }
                 self.record(message.clone(), true, cx);
                 self.run = RunState::Failed(message);
             }
         }
         cx.notify();
+    }
+
+    /// Appends a write-mode event to the audit log, off the UI thread.
+    fn audit(
+        &self,
+        action: AuditAction,
+        sql: &str,
+        outcome: &str,
+        changed: Option<(usize, u64)>,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = match &self.write {
+            WriteState::On(write) => write.kind.label(),
+            _ => WriteKind::Transactional.label(),
+        };
+        let record = AuditRecord {
+            at: AuditRecord::now_at(),
+            // `<project>/.kuery/queries` → `<project>`.
+            project: self
+                .queries_dir
+                .ancestors()
+                .nth(2)
+                .unwrap_or(&self.queries_dir)
+                .display()
+                .to_string(),
+            connection: self.db.name.to_string(),
+            environment: self.db.environment.label().to_string(),
+            mode: mode.to_string(),
+            action,
+            sql: sql.to_string(),
+            outcome: outcome.to_string(),
+            changed,
+            failed,
+        };
+        cx.background_spawn(async move {
+            if let Err(error) = audit::append(&record) {
+                eprintln!("kuery: could not write the audit log: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Adds a line to the Output tab for something that is not a script run.
@@ -510,12 +712,12 @@ impl QueryTab {
             outcome: outcome.clone(),
             failed,
         });
-        cx.emit(QueryRan(HistoryEntry {
-            connection: self.db.name.clone(),
-            sql: self.last_sql.clone(),
+        cx.emit(QueryRan(HistoryEntry::now(
+            &self.db.name,
+            &self.last_sql,
             outcome,
             failed,
-        }));
+        )));
     }
 
     pub fn db(&self) -> &Db {
@@ -766,6 +968,19 @@ impl QueryTab {
                         true,
                     ),
                 };
+                let action = if commit {
+                    AuditAction::Commit
+                } else {
+                    AuditAction::Rollback
+                };
+                this.audit(
+                    action,
+                    "",
+                    &outcome,
+                    Some((statements, affected)),
+                    failed,
+                    cx,
+                );
                 this.log(
                     if commit { "COMMIT" } else { "ROLLBACK" },
                     outcome,
@@ -1001,8 +1216,18 @@ impl QueryTab {
                 .trim()
                 .is_empty();
             menu.menu(
-                if selection { "Run Selection" } else { "Run" },
+                if selection {
+                    "Run Selection"
+                } else {
+                    "Run Statement"
+                },
                 Box::new(RunQuery),
+            )
+            .menu("Run All", Box::new(RunAll))
+            .menu_with_disabled(
+                "Preview Impact",
+                mode.is_none() || running,
+                Box::new(PreviewImpact),
             )
             .menu_with_disabled("Cancel Query", !running, Box::new(CancelQuery))
             .separator()
@@ -1011,6 +1236,7 @@ impl QueryTab {
             .menu("Paste", Box::new(Paste))
             .menu("Select All", Box::new(SelectAll))
             .separator()
+            .menu("Format SQL", Box::new(FormatSql))
             .menu("Save Query", Box::new(SaveQuery))
             .menu("Save Query As…", Box::new(SaveQueryAs))
             .menu_with_disabled("Export Results…", running, Box::new(ExportResults))
@@ -1496,6 +1722,9 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::use_write))
             .on_action(cx.listener(Self::use_full_write))
             .on_action(cx.listener(Self::export_results))
+            .on_action(cx.listener(Self::preview_impact))
+            .on_action(cx.listener(Self::run_all))
+            .on_action(cx.listener(Self::format_sql))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))

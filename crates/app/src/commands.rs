@@ -10,10 +10,11 @@ use std::path::PathBuf;
 
 use gpui_kit::{Action, actions};
 
+use crate::audit::OpenAuditLog;
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
-    CancelQuery, CommitTransaction, ExportResults, RollbackTransaction, RunQuery, SaveQuery,
-    SaveQueryAs, ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
+    CancelQuery, CommitTransaction, ExportResults, FormatSql, PreviewImpact, RollbackTransaction,
+    RunAll, RunQuery, SaveQuery, SaveQueryAs, ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
 };
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
@@ -134,10 +135,26 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         id: "query.run",
-        title: "Run Query",
+        title: "Run Statement or Selection",
         category: "Query",
         action: action!(RunQuery),
         defaults: &["secondary-enter"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.run_all",
+        title: "Run All",
+        category: "Query",
+        action: action!(RunAll),
+        defaults: &["secondary-alt-enter"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.format",
+        title: "Format SQL",
+        category: "Query",
+        action: action!(FormatSql),
+        defaults: &["secondary-shift-f"],
         context: Some("QueryTab"),
     },
     Command {
@@ -179,6 +196,22 @@ pub const COMMANDS: &[Command] = &[
         action: action!(ExportResults),
         defaults: &["secondary-shift-e"],
         context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.preview",
+        title: "Preview Impact",
+        category: "Query",
+        action: action!(PreviewImpact),
+        defaults: &[],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "audit.open",
+        title: "Open Audit Log",
+        category: "Preferences",
+        action: action!(OpenAuditLog),
+        defaults: &[],
+        context: None,
     },
     Command {
         id: "query.read_only",

@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -29,6 +30,7 @@ use crate::app;
 use crate::assets::AppIcon;
 use crate::connection::{Db, Reconnect};
 use crate::context_menus::{copy, item, reveal};
+use crate::history::{self, HistoryEntry};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
@@ -54,15 +56,6 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
-}
-
-/// A query that ran in this session, newest first in the History list.
-#[derive(Clone)]
-pub struct HistoryEntry {
-    pub connection: SharedString,
-    pub sql: String,
-    pub outcome: String,
-    pub failed: bool,
 }
 
 enum ConnectionState {
@@ -202,6 +195,10 @@ pub struct Explorer {
     search: Entity<InputState>,
     mode: Mode,
     history: Vec<HistoryEntry>,
+    /// Saves run in the background; each gets a number, and an older one
+    /// never overwrites a newer one. Holds the last number written.
+    history_saved: Arc<Mutex<u64>>,
+    history_saves: u64,
 }
 
 impl EventEmitter<ExplorerEvent> for Explorer {}
@@ -238,7 +235,9 @@ impl Explorer {
             selected: None,
             search,
             mode: Mode::Explorer,
-            history: Vec::new(),
+            history: history::load(&project.root),
+            history_saved: Arc::new(Mutex::new(0)),
+            history_saves: 0,
         };
         if !explorer.connections.is_empty() {
             explorer.expanded.insert("0".into());
@@ -282,7 +281,41 @@ impl Explorer {
 
     pub fn record(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
         self.history.insert(0, entry);
-        self.history.truncate(200);
+        self.history.truncate(history::LIMIT);
+        self.save_history(cx);
+    }
+
+    fn remove_history_entry(&mut self, position: usize, cx: &mut Context<Self>) {
+        if position < self.history.len() {
+            self.history.remove(position);
+            self.save_history(cx);
+        }
+    }
+
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        self.history.clear();
+        self.save_history(cx);
+    }
+
+    /// Writes the history to disk off the UI thread.
+    fn save_history(&mut self, cx: &mut Context<Self>) {
+        let root = self.model.read(cx).project.root.clone();
+        let entries = self.history.clone();
+        self.history_saves += 1;
+        let (number, saved) = (self.history_saves, self.history_saved.clone());
+        cx.background_spawn(async move {
+            let mut last = saved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if number <= *last {
+                return;
+            }
+            match history::save(&root, &entries) {
+                Ok(()) => *last = number,
+                Err(error) => eprintln!("kuery: could not save the query history: {error}"),
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1263,11 +1296,11 @@ impl Explorer {
                         h_flex()
                             .gap_2()
                             .text_size(px(11.))
-                            .child(
-                                div()
-                                    .text_color(color(theme::TEXT_TERTIARY))
-                                    .child(entry.connection.clone()),
-                            )
+                            .child(div().text_color(color(theme::TEXT_TERTIARY)).child(format!(
+                                "{} · {}",
+                                entry.connection,
+                                history::ago(entry.at)
+                            )))
                             .child(
                                 div()
                                     .flex_1()
@@ -1292,6 +1325,12 @@ impl Explorer {
                                 this.open_history(&connection, &open, cx)
                             }))
                             .item(copy("Copy SQL", sql.clone()))
+                            .separator()
+                            .item(item(
+                                "Remove from History",
+                                &this,
+                                move |this, _, cx| this.remove_history_entry(position, cx),
+                            ))
                         }
                     })
                     .into_any_element()
@@ -1473,6 +1512,17 @@ impl Render for Explorer {
                     "+",
                     cx.listener(|_, _, _, cx| cx.emit(ExplorerEvent::NewConnection)),
                 )))
+            })
+            .when(self.mode == Mode::History, |col| {
+                col.child(
+                    section_header("History").when(!self.history.is_empty(), |header| {
+                        header.child(header_button(
+                            "clear-history",
+                            "Clear",
+                            cx.listener(|this, _, _, cx| this.clear_history(cx)),
+                        ))
+                    }),
+                )
             })
             .when(self.mode == Mode::Queries, |col| {
                 col.child(

@@ -6,6 +6,7 @@
 mod app;
 mod app_icon;
 mod assets;
+mod audit;
 mod commands;
 mod connection;
 mod connection_editor;
@@ -13,6 +14,7 @@ mod context_menus;
 mod definition;
 mod explorer;
 mod grid;
+mod history;
 mod keymap;
 mod menus;
 mod palette;
@@ -48,6 +50,7 @@ fn main() {
             theme::apply(cx);
             app::init(engine.clone(), Arc::new(secrets::Keyring), cx);
             menus::init(cx);
+            audit::init(cx);
             // After gpui_kit::init, so the keymap can keep its bindings.
             keymap::init(cx);
             cx.on_window_closed(|cx, _| {

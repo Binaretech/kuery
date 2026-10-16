@@ -15,7 +15,7 @@ actions!(kuery, [Quit, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
 
 /// Registers the app- and window-level actions.
 pub fn init(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| crate::app::request_quit(cx));
     cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
