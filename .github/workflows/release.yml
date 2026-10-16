@@ -98,82 +98,10 @@ jobs:
           </plist>
           EOF
           plutil -lint "$app/Contents/Info.plist"
+          # Ad-hoc signature: Apple Silicon refuses to run unsigned binaries.
+          codesign --force --deep --sign - "$app"
           cp README.md "dist/$ARCHIVE/"
-
-      # With the Apple secrets set, the app is signed with the Developer ID
-      # certificate, notarized and stapled, so Gatekeeper opens it without a
-      # warning. Without them it falls back to an ad-hoc signature (Apple
-      # Silicon refuses to run unsigned binaries) and users have to right-click
-      # → Open the first time.
-      - name: Sign and notarize (macOS)
-        if: runner.os == 'macOS'
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-        run: |
-          app="dist/$ARCHIVE/Kuery.app"
-          if [[ -z "$MACOS_CERTIFICATE" || -z "$APPLE_API_KEY" ]]; then
-            echo "::warning::Apple signing secrets are not set; Kuery.app gets an ad-hoc signature and is not notarized."
-            codesign --force --deep --sign - "$app"
-            exit 0
-          fi
-
-          # A throwaway keychain holding only the Developer ID certificate.
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          keychain_password="$(openssl rand -base64 32)"
-          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
-          # Keep the existing keychains in the search list (their paths have no spaces).
-          # shellcheck disable=SC2046
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          rm "$RUNNER_TEMP/certificate.p12"
-          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ { print $2; exit }')"
-          if [[ -z "$identity" ]]; then
-            echo "::error::MACOS_CERTIFICATE holds no Developer ID Application identity."
-            exit 1
-          fi
-
-          # Notarization requires the hardened runtime and a secure timestamp.
-          codesign --force --options runtime --timestamp --sign "$identity" "$app"
-          codesign --verify --strict --verbose=2 "$app"
-
-          echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Kuery-notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/Kuery-notarize.zip" \
-            --key "$RUNNER_TEMP/AuthKey.p8" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID" \
-            --wait --timeout 30m --output-format json | tee "$RUNNER_TEMP/notarization.json"
-          status="$(jq -r .status "$RUNNER_TEMP/notarization.json")"
-          if [[ "$status" != Accepted ]]; then
-            xcrun notarytool log "$(jq -r .id "$RUNNER_TEMP/notarization.json")" \
-              --key "$RUNNER_TEMP/AuthKey.p8" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER_ID" || true
-            echo "::error::Notarization finished with status $status."
-            exit 1
-          fi
-          rm "$RUNNER_TEMP/AuthKey.p8"
-
-          # Staple the ticket so the app opens offline without asking Apple.
-          xcrun stapler staple "$app"
-          spctl --assess --type execute --verbose=2 "$app"
-
-      - name: Archive (macOS)
-        if: runner.os == 'macOS'
-        run: (cd dist && ditto -c -k --keepParent "$ARCHIVE" "$ARCHIVE.zip")
-
-      - name: Remove signing keychain (macOS)
-        if: always() && runner.os == 'macOS'
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          (cd dist && ditto -c -k --keepParent "$ARCHIVE" "$ARCHIVE.zip")
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
