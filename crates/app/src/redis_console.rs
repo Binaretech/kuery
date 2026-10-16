@@ -90,7 +90,10 @@ impl ConsoleTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
+            // No Redis grammar exists; Bash colors the command name, quoted
+            // strings, numbers and comments of redis-cli lines.
             let mut editor = EditorState::new(window, cx)
+                .language("bash")
                 .line_number(true)
                 .default_value(EXAMPLE);
             editor.lsp_mut().completion_provider = Some(Rc::new(RedisCompletions));

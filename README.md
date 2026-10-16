@@ -127,7 +127,8 @@ entries at a time; stream fields become columns.
 
 The console (from a database's hover icon or menu, or a connection's menu)
 runs commands one per line, as `redis-cli` reads them, with command-name
-completion: `secondary-enter` runs the line under the cursor or the selected
+completion and shell-style highlighting (there is no Redis grammar; Bash colors
+the command, strings, numbers and comments): `secondary-enter` runs the line under the cursor or the selected
 lines, `secondary-alt-enter` every line. The last reply fills the grid; the
 Output tab logs each reply the way `redis-cli` prints it. Commands that would
 change or hold the connection never run (`SELECT`, `SUBSCRIBE`, `MONITOR`,

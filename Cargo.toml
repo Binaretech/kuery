@@ -33,7 +33,9 @@ tokio-postgres-rustls = "0.14"
 redis = { version = "1.7", default-features = false, features = ["acl", "streams", "tokio-comp", "tokio-rustls-comp", "connection-manager"] }
 
 # gpui-kit pins its own gpui version; upgrade it on purpose, never by accident.
-gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql"] }
+# SQL for query tabs; Bash for the Redis console, whose lines are shell-like
+# (words, quoted strings, `#` comments).
+gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql", "tree-sitter-bash"] }
 # The editor's completion types; must be the version gpui-kit uses.
 lsp-types = "0.97"
 
