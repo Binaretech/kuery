@@ -268,3 +268,15 @@ by `AppAssets`, which delegates the rest to `gpui_kit::assets::Assets`.
 `cargo test --workspace` on macOS, Windows and Linux, plus the ignored
 `kuery-pg` tests against `postgres:16` (and a second Postgres with TLS) on Linux.
 The Rust toolchain is pinned in `rust-toolchain.toml` (gpui uses APIs stabilized after Rust 1.93).
+
+`.github/workflows/release.yml` builds release binaries for Linux (x86_64),
+macOS (Apple Silicon and Intel, as an ad-hoc signed `Kuery.app`) and Windows
+(x86_64). Pushing a tag publishes them as a GitHub release with a
+`SHA256SUMS` file:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Running the workflow by hand (Actions → Release → Run workflow) only builds the
+archives and keeps them as workflow artifacts.

@@ -1,0 +1,145 @@
+name: Release
+
+# Pushing a tag such as `v0.1.0` builds Kuery for every platform and publishes
+# the archives as a GitHub release. Running it by hand only builds them and
+# keeps the archives as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # What gpui needs to link on Linux (X11, Wayland and fonts).
+      - name: System dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev
+
+      # The version comes from rust-toolchain.toml.
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p kuery --target ${{ matrix.target }}
+
+      - name: Archive name
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
+          echo "ARCHIVE=kuery-$version-${{ matrix.target }}" >> "$GITHUB_ENV"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "dist/$ARCHIVE"
+          cp target/${{ matrix.target }}/release/kuery README.md "dist/$ARCHIVE/"
+          tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+
+      # A minimal app bundle so Finder and the Dock show Kuery with its icon.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "kuery") | .version')"
+          app="dist/$ARCHIVE/Kuery.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/${{ matrix.target }}/release/kuery "$app/Contents/MacOS/kuery"
+          cp crates/app/assets/branding/kuery.icns "$app/Contents/Resources/kuery.icns"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Kuery</string>
+            <key>CFBundleDisplayName</key><string>Kuery</string>
+            <key>CFBundleIdentifier</key><string>dev.kuery.Kuery</string>
+            <key>CFBundleExecutable</key><string>kuery</string>
+            <key>CFBundleIconFile</key><string>kuery</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$app/Contents/Info.plist"
+          # Ad-hoc signature: Apple Silicon refuses to run unsigned binaries.
+          codesign --force --deep --sign - "$app"
+          cp README.md "dist/$ARCHIVE/"
+          (cd dist && ditto -c -k --keepParent "$ARCHIVE" "$ARCHIVE.zip")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/$env:ARCHIVE" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/kuery.exe", README.md "dist/$env:ARCHIVE/"
+          Compress-Archive -Path "dist/$env:ARCHIVE" -DestinationPath "dist/$env:ARCHIVE.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Kuery $GITHUB_REF_NAME" \
+            --generate-notes
