@@ -3,6 +3,9 @@
 //! `kuery [folder]` opens the project in `folder` (creating its `.kuery/`
 //! if needed); without an argument the welcome window lists recent projects.
 
+// Release builds on Windows open no console window next to the app.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod app_icon;
 mod assets;
