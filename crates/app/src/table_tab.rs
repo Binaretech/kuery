@@ -16,8 +16,8 @@ use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IndexPath, Selectable as _, Sizable as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Selectable as _, Sizable as _,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -33,13 +33,14 @@ use kuery_pg::{RunOptions, catalog};
 actions!(kuery, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
+use crate::chrome;
 use crate::connection::Db;
 use crate::context_menus::{Cell, item};
 use crate::definition;
 use crate::grid::BrowseDelegate;
 use crate::query_tab::describe_error;
 use crate::theme::{self, color};
-use crate::ui::{format_duration, muted, placeholder, segment_body, segmented, thousands};
+use crate::ui::{format_duration, muted, placeholder, thousands};
 
 type TextSelect = SelectState<SearchableVec<SharedString>>;
 
@@ -221,6 +222,18 @@ impl TableTab {
             count_task: None,
             apply_task: None,
             focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// The loaded page, for the status bar.
+    pub fn page_status(&self) -> Option<String> {
+        match &self.page {
+            PageState::Loaded { rows, elapsed } => Some(format!(
+                "{} rows · loaded in {}",
+                thousands(*rows as u64),
+                format_duration(*elapsed)
+            )),
+            _ => None,
         }
     }
 
@@ -828,97 +841,228 @@ impl TableTab {
         let sort = self.browse.as_ref().and_then(|b| b.sort.first().cloned());
         let writable = self.read_only_reason().is_none() && self.definition().is_some();
         let locked = self.has_pending();
+        let data = self.view == TableView::Data;
+        let mac = cfg!(target_os = "macos");
 
         h_flex()
-            .h(px(44.))
+            .h(px(46.))
             .px_3()
-            .gap_2()
+            .gap(px(6.))
             .flex_shrink_0()
-            .bg(color(theme::TOOLBAR))
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
+            .text_size(px(12.5))
             .child(
-                Button::new("filters")
-                    .small()
-                    .ghost()
-                    .icon(Icon::new(AppIcon::Filter))
-                    .label(if filters > 0 {
-                        format!("Filter ({filters})")
-                    } else {
-                        "Filter".into()
-                    })
-                    .selected(self.show_filters)
-                    .disabled(self.view != TableView::Data)
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_filters(window, cx))),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .text_size(px(12.5))
-                    .text_color(color(theme::TEXT_SECONDARY))
-                    .child(Icon::new(AppIcon::Sort).size(px(13.)))
-                    .child(match &sort {
-                        Some(sort) => format!(
-                            "{} {}",
-                            sort.column,
-                            if sort.direction == Direction::Ascending {
-                                "↑"
-                            } else {
-                                "↓"
-                            }
-                        ),
-                        None => "Sorted by primary key · click a header to sort".into(),
-                    })
-                    .when(sort.is_some() && !locked, |row| {
-                        row.child(
-                            Button::new("clear-sort")
-                                .xsmall()
-                                .ghost()
-                                .label("Remove")
-                                .on_click(cx.listener(|this, _, _, cx| this.clear_sort(cx))),
-                        )
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("refresh")
-                    .small()
-                    .ghost()
-                    .icon(Icon::new(AppIcon::Reload))
-                    .tooltip("Reload")
-                    .disabled(locked)
-                    .on_click(cx.listener(|this, _, _, cx| this.load_page(cx))),
-            )
-            .child(
-                Button::new("insert")
-                    .small()
-                    .primary()
-                    .label("Add row")
-                    .disabled(!writable)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.view = TableView::Data;
-                        this.open_insert(window, cx);
-                    })),
-            )
-            .child(
-                segmented()
+                chrome::segmented()
                     .child(
-                        segment_body("Data", self.view == TableView::Data)
-                            .id("view-data")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        chrome::segment("view-data", AppIcon::Table, "Data", data).on_click(
+                            cx.listener(|this, _, _, cx| {
                                 this.view = TableView::Data;
                                 cx.notify();
-                            })),
+                            }),
+                        ),
                     )
                     .child(
-                        segment_body("Definition", self.view == TableView::Definition)
-                            .id("view-definition")
+                        chrome::segment("view-definition", IconName::FileText, "Definition", !data)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.view = TableView::Definition;
                                 cx.notify();
                             })),
                     ),
             )
+            .child(chrome::toolbar_divider())
+            .when(data, |row| {
+                row.child(
+                    h_flex()
+                        .id("filters")
+                        .h(px(30.))
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .rounded(px(7.))
+                        .when(self.show_filters, |b| b.bg(color(theme::ACTIVE)))
+                        .text_color(color(theme::TEXT))
+                        .hover(|s| s.bg(color(theme::ACTIVE)))
+                        .child(Icon::new(AppIcon::Filter).size(px(13.)))
+                        .child("Filter")
+                        .when(filters > 0, |b| {
+                            b.child(
+                                div()
+                                    .min_w(px(16.))
+                                    .h(px(16.))
+                                    .px(px(4.))
+                                    .rounded(px(8.))
+                                    .bg(color(theme::ACCENT))
+                                    .text_color(color(0xffffff))
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(filters.to_string()),
+                            )
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_filters(window, cx)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .h(px(30.))
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .text_color(color(0xc7c7cc))
+                        .child(Icon::new(AppIcon::Sort).size(px(13.)))
+                        .child(match &sort {
+                            Some(sort) => format!(
+                                "{}, {}",
+                                sort.column,
+                                if sort.direction == Direction::Ascending {
+                                    "ascending"
+                                } else {
+                                    "descending"
+                                }
+                            ),
+                            None => "Primary key order · click a header to sort".into(),
+                        })
+                        .when(sort.is_some() && !locked, |row| {
+                            row.child(
+                                div()
+                                    .id("clear-sort")
+                                    .size(px(18.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .text_color(color(theme::TEXT_TERTIARY))
+                                    .hover(|s| {
+                                        s.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT))
+                                    })
+                                    .child(Icon::new(IconName::Close).size(px(11.)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.clear_sort(cx))),
+                            )
+                        }),
+                )
+                .child(
+                    chrome::icon_button(
+                        "refresh",
+                        AppIcon::Reload,
+                        if mac {
+                            "Reload  ⌘R"
+                        } else {
+                            "Reload  Ctrl+R"
+                        },
+                        !locked,
+                    )
+                    .when(!locked, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.load_page(cx)))
+                    }),
+                )
+                .child(
+                    h_flex()
+                        .id("insert")
+                        .h(px(30.))
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .rounded(px(7.))
+                        .text_color(color(if writable { 0xc7c7cc } else { 0x4a4a50 }))
+                        .when(writable, |b| {
+                            b.hover(|s| s.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.view = TableView::Data;
+                                    this.open_insert(window, cx);
+                                }))
+                        })
+                        .child(Icon::new(IconName::Plus).size(px(14.)))
+                        .child("Add row"),
+                )
+            })
+            .child(div().flex_1())
+            .children(self.render_apply_status())
+            .children(self.render_changes_pill(cx))
+            .when(!self.db.can_write(), |row| {
+                row.child(
+                    h_flex()
+                        .h(px(30.))
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(color(theme::CONTROL_BORDER))
+                        .text_color(color(theme::TEXT_SECONDARY))
+                        .child(Icon::new(AppIcon::Lock).size(px(12.)))
+                        .child("Read-only"),
+                )
+            })
+    }
+
+    /// Staged row changes, in the toolbar: Review shows their SQL.
+    fn render_changes_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let pending = self.pending.len();
+        if pending == 0 {
+            return None;
+        }
+        let saving = matches!(self.apply, ApplyState::Applying);
+        Some(
+            chrome::pill()
+                .child(chrome::dot(theme::AMBER))
+                .child(div().text_color(color(0xc7c7cc)).child(if pending == 1 {
+                    "1 change staged".to_string()
+                } else {
+                    format!("{pending} changes staged")
+                }))
+                .child(
+                    chrome::pill_button(
+                        "show-sql",
+                        if self.show_sql { "Hide SQL" } else { "Review" },
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_sql = !this.show_sql;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    chrome::pill_button("discard", "Discard", false).when(!saving, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.discard(cx)))
+                    }),
+                )
+                .child(
+                    chrome::pill_button("apply", if saving { "Saving…" } else { "Save" }, true)
+                        .when(!saving, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.apply_pending(cx)))
+                        }),
+                ),
+        )
+    }
+
+    /// The outcome of the last save, next to the changes.
+    fn render_apply_status(&self) -> Option<AnyElement> {
+        match &self.apply {
+            ApplyState::Failed(error) => Some(
+                div()
+                    .max_w(px(420.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(color(theme::RED))
+                    .child(error.clone())
+                    .into_any_element(),
+            ),
+            ApplyState::Applied(rows) if self.pending.is_empty() => Some(
+                div()
+                    .text_size(px(12.))
+                    .text_color(color(theme::TEXT_TERTIARY))
+                    .child(format!(
+                        "Saved · {}",
+                        if *rows == 1 {
+                            "1 row".to_string()
+                        } else {
+                            format!("{rows} rows")
+                        }
+                    ))
+                    .into_any_element(),
+            ),
+            _ => None,
+        }
     }
 
     fn render_filters(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1180,136 +1324,85 @@ impl TableTab {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(browse) = self.browse.as_ref() else {
-            return h_flex().h(px(38.)).into_any_element();
+            return h_flex().h(px(36.)).into_any_element();
         };
         let page = browse.page;
         let pages = self.page_count();
         let locked = self.has_pending() || matches!(self.page, PageState::Loading);
         let total = match &self.total {
-            Some(Ok(total)) => format!("{} records", thousands(*total)),
-            Some(Err(_)) => "Total unavailable (count took too long)".into(),
+            Some(Ok(total)) => format!("{} rows", thousands(*total)),
+            Some(Err(_)) => "Total unavailable (counting took too long)".into(),
             None => "Counting…".into(),
         };
-        let status = match &self.page {
-            PageState::Loaded { rows, elapsed } => {
-                format!("{rows} rows in {}", format_duration(*elapsed))
-            }
-            PageState::Loading => "Loading…".into(),
-            PageState::Failed(error) => error.clone(),
-            PageState::Idle => String::new(),
-        };
-        let status_tone = if matches!(self.page, PageState::Failed(_)) {
-            theme::RED
-        } else {
-            theme::TEXT_TERTIARY
-        };
-
-        let pending = self.pending.len();
-        let changes = match &self.apply {
-            ApplyState::Applying => Some(muted("Saving…").into_any_element()),
-            ApplyState::Failed(error) => Some(
-                div()
-                    .max_w(px(420.))
-                    .truncate()
-                    .text_size(px(12.))
-                    .text_color(color(theme::RED))
-                    .child(error.clone())
-                    .into_any_element(),
-            ),
-            ApplyState::Applied(rows) if pending == 0 => Some(
-                div()
-                    .text_size(px(12.))
-                    .text_color(color(theme::GREEN))
-                    .child(format!("Changes saved · {rows} rows"))
-                    .into_any_element(),
-            ),
+        let failure = match &self.page {
+            PageState::Failed(error) => Some(error.clone()),
             _ => None,
         };
+        let first = page * browse.page_size;
+        let shown = match &self.page {
+            PageState::Loaded { rows, .. } if *rows > 0 => format!(
+                "{}–{} of {total}",
+                thousands(first + 1),
+                thousands(first + *rows as u64)
+            ),
+            PageState::Loading => "Loading…".into(),
+            _ => total,
+        };
+        let can_back = !locked && page > 0;
+        let can_forward = !locked && !pages.is_some_and(|p| page + 1 >= p);
 
         h_flex()
-            .h(px(38.))
+            .h(px(36.))
             .px_3()
-            .gap_2()
+            .gap(px(10.))
             .flex_shrink_0()
-            .bg(color(0x1c1c1e))
             .border_t_1()
             .border_color(color(theme::HAIRLINE))
             .text_size(px(12.))
+            .text_color(color(theme::TEXT_SECONDARY))
+            .child(div().child(shown))
+            .children(failure.map(|error| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(color(theme::RED))
+                    .child(error)
+            }))
+            .child(div().flex_1())
             .child(
-                Button::new("prev-page")
-                    .xsmall()
-                    .ghost()
-                    .label("←")
-                    .disabled(locked || page == 0)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.go_to_page(page.saturating_sub(1), cx)
-                    })),
+                div()
+                    .w(px(130.))
+                    .child(Select::new(&self.page_size).xsmall().disabled(locked)),
             )
-            .child(muted(format!(
+            .child(
+                chrome::icon_button(
+                    "prev-page",
+                    IconName::ChevronLeft,
+                    "Previous Page",
+                    can_back,
+                )
+                .when(can_back, |b| {
+                    b.on_click(cx.listener(move |this, _, _, cx| {
+                        this.go_to_page(page.saturating_sub(1), cx)
+                    }))
+                }),
+            )
+            .child(div().child(format!(
                 "Page {} of {}",
                 page + 1,
                 pages.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
             )))
             .child(
-                Button::new("next-page")
-                    .xsmall()
-                    .ghost()
-                    .label("→")
-                    .disabled(locked || pages.is_some_and(|p| page + 1 >= p))
-                    .on_click(cx.listener(move |this, _, _, cx| this.go_to_page(page + 1, cx))),
+                chrome::icon_button(
+                    "next-page",
+                    IconName::ChevronRight,
+                    "Next Page",
+                    can_forward,
+                )
+                .when(can_forward, |b| {
+                    b.on_click(cx.listener(move |this, _, _, cx| this.go_to_page(page + 1, cx)))
+                }),
             )
-            .child(
-                div()
-                    .w(px(120.))
-                    .child(Select::new(&self.page_size).xsmall().disabled(locked)),
-            )
-            .child(muted(total))
-            .child(
-                div()
-                    .text_color(color(status_tone))
-                    .truncate()
-                    .child(status),
-            )
-            .child(div().flex_1())
-            .children(changes)
-            .when(pending > 0, |row| {
-                row.child(
-                    h_flex()
-                        .gap_1()
-                        .text_color(color(0xffd58a))
-                        .child(div().size(px(6.)).rounded_full().bg(color(theme::AMBER)))
-                        .child(format!("{pending} unsaved changes")),
-                )
-                .child(
-                    Button::new("show-sql")
-                        .xsmall()
-                        .ghost()
-                        .label(if self.show_sql {
-                            "Hide SQL"
-                        } else {
-                            "Show SQL"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_sql = !this.show_sql;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("discard")
-                        .xsmall()
-                        .ghost()
-                        .label("Discard")
-                        .on_click(cx.listener(|this, _, _, cx| this.discard(cx))),
-                )
-                .child(
-                    Button::new("apply")
-                        .xsmall()
-                        .primary()
-                        .label("Save changes")
-                        .loading(matches!(self.apply, ApplyState::Applying))
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_pending(cx))),
-                )
-            })
             .into_any_element()
     }
 }
@@ -1330,23 +1423,6 @@ impl Focusable for TableTab {
 impl Render for TableTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
-        let read_only_banner = (!self.db.can_write()).then(|| {
-            h_flex()
-                .h(px(28.))
-                .px_3()
-                .gap_2()
-                .flex_shrink_0()
-                .bg(color(0x2b2414))
-                .border_b_1()
-                .border_color(color(theme::HAIRLINE))
-                .text_size(px(12.))
-                .text_color(color(0xffd58a))
-                .child(Icon::new(AppIcon::Lock).size(px(13.)))
-                .child(
-                    "Read-only production connection: you can view and filter, but not edit rows.",
-                )
-        });
-
         let content: AnyElement = match (&self.definition, self.view) {
             (Load::Loading, _) => placeholder("Loading definition…"),
             (Load::Failed(error), _) => placeholder(error.clone()),
@@ -1377,7 +1453,6 @@ impl Render for TableTab {
                 }
             }))
             .child(self.render_toolbar(cx))
-            .children(read_only_banner)
             .when(self.show_filters && self.view == TableView::Data, |col| {
                 col.child(self.render_filters(cx))
             })
@@ -1404,13 +1479,17 @@ fn cell_menu(tab: &WeakEntity<TableTab>, menu: PopupMenu, cell: &Cell, cx: &App)
         cell.column_name().to_string(),
         cell.value().map(str::to_owned),
     );
-    menu.item(item("Edit Row…", tab, move |tab, window, cx| {
-        tab.open_edit(row, window, cx)
-    }))
+    menu.item(
+        item("Edit Row…", tab, move |tab, window, cx| {
+            tab.open_edit(row, window, cx)
+        })
+        .icon(AppIcon::Pencil),
+    )
     .item(
         item("Delete Row", tab, move |tab, window, cx| {
             tab.delete_row(row, window, cx)
         })
+        .icon(AppIcon::Trash)
         .disabled(!writable),
     )
     .separator()
@@ -1424,6 +1503,7 @@ fn cell_menu(tab: &WeakEntity<TableTab>, menu: PopupMenu, cell: &Cell, cx: &App)
             tab,
             move |tab, window, cx| tab.filter_by(column.clone(), value.clone(), window, cx),
         )
+        .icon(AppIcon::Filter)
         // Filters reload the page, which would drop staged changes.
         .disabled(locked),
     )

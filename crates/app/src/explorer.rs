@@ -29,13 +29,12 @@ use kuery_pg::catalog;
 use crate::app;
 use crate::assets::AppIcon;
 use crate::connection::{Db, Reconnect};
-use crate::context_menus::{copy, item, reveal};
+use crate::context_menus::{copy, item, item_icon, reveal};
 use crate::history::{self, HistoryEntry};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
-use crate::ui::{segment_body, segmented};
 
 pub enum ExplorerEvent {
     /// A connection finished opening.
@@ -76,8 +75,9 @@ struct ConnectionNode {
     state: ConnectionState,
 }
 
+/// What the sidebar shows; picked from the workspace's activity rail.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub enum Mode {
     Explorer,
     Queries,
     History,
@@ -205,7 +205,7 @@ impl EventEmitter<ExplorerEvent> for Explorer {}
 
 impl Explorer {
     pub fn new(model: Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search objects…"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter objects"));
         cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
@@ -249,6 +249,33 @@ impl Explorer {
     }
 
     /// The connection of the selected node, or the first open one.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        if mode == Mode::Queries {
+            self.refresh_queries(cx);
+        }
+        cx.notify();
+    }
+
+    /// Collapses every expanded node.
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.expanded.clear();
+        cx.notify();
+    }
+
+    /// Reloads the catalog of every open connection.
+    fn refresh_catalogs(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.connections.len() {
+            if matches!(self.connections[index].state, ConnectionState::Ready { .. }) {
+                self.load_catalog(index, cx);
+            }
+        }
+    }
+
     pub fn current_db(&self) -> Option<Db> {
         let selected = self
             .selected
@@ -748,38 +775,51 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let environment = node.spec.environment();
+        let ready = matches!(node.state, ConnectionState::Ready { .. });
+        // The environment's color: filled once connected, an outline before;
+        // amber while connecting, red when it failed.
         let dot = match &node.state {
+            ConnectionState::Ready { .. } => div()
+                .size(px(6.))
+                .rounded_full()
+                .bg(color(environment.color())),
+            ConnectionState::Connecting => {
+                div().size(px(6.)).rounded_full().bg(color(theme::AMBER))
+            }
+            ConnectionState::Failed(_) => div().size(px(6.)).rounded_full().bg(color(theme::RED)),
             ConnectionState::Idle => div()
-                .size(px(8.))
+                .size(px(6.))
                 .rounded_full()
                 .border_1()
-                .border_color(color(theme::TEXT_TERTIARY)),
-            ConnectionState::Connecting => {
-                div().size(px(8.)).rounded_full().bg(color(theme::AMBER))
-            }
-            ConnectionState::Ready { .. } => {
-                div().size(px(8.)).rounded_full().bg(color(theme::GREEN))
-            }
-            ConnectionState::Failed(_) => div().size(px(8.)).rounded_full().bg(color(theme::RED)),
+                .border_color(color(environment.color())),
         };
-        let ready = matches!(node.state, ConnectionState::Ready { .. });
+        let group = SharedString::from(format!("connection-row-{index}"));
         tree_row(
             SharedString::from(format!("connection-{index}")),
             0,
             Some(expanded),
             false,
         )
+        .group(group.clone())
         .child(
             Icon::new(AppIcon::Database)
-                .size(px(14.))
-                .text_color(color(theme::TEXT_SECONDARY)),
+                .size(px(15.))
+                .text_color(color(if ready {
+                    theme::TEXT_SECONDARY
+                } else {
+                    theme::TEXT_QUIET
+                })),
         )
-        .child(dot)
         .child(
             div()
                 .flex_1()
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
+                .text_color(color(if ready {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_SECONDARY
+                }))
                 .child(node.spec.name.clone()),
         )
         .child(
@@ -787,6 +827,8 @@ impl Explorer {
                 .id(SharedString::from(format!("edit-{index}")))
                 .px_1()
                 .rounded(px(4.))
+                .invisible()
+                .group_hover(group.clone(), |s| s.visible())
                 .hover(|s| s.bg(color(0x3a3a3e)))
                 .child(
                     Icon::new(AppIcon::Pencil)
@@ -807,6 +849,8 @@ impl Explorer {
                     .id(SharedString::from(format!("refresh-{index}")))
                     .px_1()
                     .rounded(px(4.))
+                    .invisible()
+                    .group_hover(group.clone(), |s| s.visible())
                     .text_size(px(11.))
                     .text_color(color(theme::TEXT_TERTIARY))
                     .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
@@ -818,11 +862,12 @@ impl Explorer {
             )
         })
         .child(
-            div()
-                .text_size(px(10.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(color(environment.color()))
-                .child(environment.short_label()),
+            h_flex()
+                .gap(px(5.))
+                .text_size(px(10.5))
+                .text_color(color(theme::TEXT_TERTIARY))
+                .child(dot)
+                .child(environment.short_label().to_lowercase()),
         )
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(index, cx)))
         .context_menu({
@@ -831,27 +876,41 @@ impl Explorer {
             let target = node.spec.target();
             move |menu, _, _| {
                 let menu = if ready {
-                    menu.item(item("New Query", &this, move |this, _, cx| {
-                        this.new_query(index, cx)
-                    }))
-                    .item(item("Refresh Catalog", &this, move |this, _, cx| {
-                        this.load_catalog(index, cx)
-                    }))
+                    menu.item(item_icon(
+                        "New Query",
+                        IconName::Plus,
+                        &this,
+                        move |this, _, cx| this.new_query(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Refresh Catalog",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.load_catalog(index, cx),
+                    ))
                     .item(item("Disconnect", &this, move |this, _, cx| {
                         this.disconnect(index, cx)
                     }))
                 } else {
-                    menu.item(item("Connect", &this, move |this, _, cx| {
-                        this.expanded.insert(index.to_string());
-                        this.expanded.insert(format!("{index}/public"));
-                        this.connect(index, cx)
-                    }))
+                    menu.item(item_icon(
+                        "Connect",
+                        AppIcon::Database,
+                        &this,
+                        move |this, _, cx| {
+                            this.expanded.insert(index.to_string());
+                            this.expanded.insert(format!("{index}/public"));
+                            this.connect(index, cx)
+                        },
+                    ))
                 };
                 let id = id.clone();
                 menu.separator()
-                    .item(item("Edit Connection…", &this, move |_, _, cx| {
-                        cx.emit(ExplorerEvent::EditConnection(id.clone()))
-                    }))
+                    .item(item_icon(
+                        "Edit Connection…",
+                        AppIcon::Pencil,
+                        &this,
+                        move |_, _, cx| cx.emit(ExplorerEvent::EditConnection(id.clone())),
+                    ))
                     .item(copy("Copy Host and Database", target.clone()))
                     .separator()
                     .item(item(
@@ -896,12 +955,18 @@ impl Explorer {
                 let this = cx.entity().downgrade();
                 let name = schema.to_owned();
                 move |menu, _, _| {
-                    menu.item(item("New Query", &this, move |this, _, cx| {
-                        this.new_query(index, cx)
-                    }))
-                    .item(item("Refresh Catalog", &this, move |this, _, cx| {
-                        this.load_catalog(index, cx)
-                    }))
+                    menu.item(item_icon(
+                        "New Query",
+                        IconName::Plus,
+                        &this,
+                        move |this, _, cx| this.new_query(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Refresh Catalog",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.load_catalog(index, cx),
+                    ))
                     .separator()
                     .item(copy("Copy Name", name.clone()))
                 }
@@ -968,8 +1033,9 @@ impl Explorer {
                                     )),
                                 )
                                 .child(
-                                    counter(function.kind.label())
-                                        .when(selected, |c| c.text_color(color(0xdde9ff))),
+                                    counter(function.kind.label()).when(selected, |c| {
+                                        c.text_color(color(theme::TEXT_SECONDARY))
+                                    }),
                                 )
                                 .on_click({
                                     let function = function.clone();
@@ -1019,7 +1085,9 @@ impl Explorer {
                                 .child(div().flex_1().truncate().child(trigger.name.clone()))
                                 .child(
                                     counter(format!("on {}", trigger.table.name))
-                                        .when(selected, |c| c.text_color(color(0xdde9ff))),
+                                        .when(selected, |c| {
+                                            c.text_color(color(theme::TEXT_SECONDARY))
+                                        }),
                                 )
                                 .on_click({
                                     let trigger = trigger.clone();
@@ -1056,8 +1124,9 @@ impl Explorer {
                                 .child(icon(AppIcon::Filter, theme::GREEN, selected))
                                 .child(div().flex_1().truncate().child(info.name.clone()))
                                 .child(
-                                    counter(info.values.len().to_string())
-                                        .when(selected, |c| c.text_color(color(0xdde9ff))),
+                                    counter(info.values.len().to_string()).when(selected, |c| {
+                                        c.text_color(color(theme::TEXT_SECONDARY))
+                                    }),
                                 )
                                 .on_click({
                                     let info = info.clone();
@@ -1105,7 +1174,7 @@ impl Explorer {
                 selected,
             ))
             .child(div().flex_1().truncate().child(info.table.name.clone()))
-            .child(counter(rows).when(selected, |c| c.text_color(color(0xdde9ff))))
+            .child(counter(rows).when(selected, |c| c.text_color(color(theme::TEXT_SECONDARY))))
             .on_click({
                 let info = info.clone();
                 cx.listener(move |this, _, _, cx| {
@@ -1117,15 +1186,28 @@ impl Explorer {
                 move |menu, _, _| {
                     let (data, definition, query) = (info.clone(), info.clone(), info.clone());
                     let name = quote_qualified(&info.table.schema, &info.table.name);
-                    menu.item(item("Open Data", &this, move |this, _, cx| {
-                        this.open_table(index, data.clone(), TableView::Data, cx)
-                    }))
-                    .item(item("Open Definition", &this, move |this, _, cx| {
-                        this.open_table(index, definition.clone(), TableView::Definition, cx)
-                    }))
-                    .item(item("Query in New Tab", &this, move |this, _, cx| {
-                        this.query_table(index, &query.table, cx)
-                    }))
+                    menu.item(item_icon(
+                        "Open Data",
+                        AppIcon::Table,
+                        &this,
+                        move |this, _, cx| {
+                            this.open_table(index, data.clone(), TableView::Data, cx)
+                        },
+                    ))
+                    .item(item_icon(
+                        "Open Definition",
+                        IconName::FileText,
+                        &this,
+                        move |this, _, cx| {
+                            this.open_table(index, definition.clone(), TableView::Definition, cx)
+                        },
+                    ))
+                    .item(item_icon(
+                        "Query in New Tab",
+                        AppIcon::Code,
+                        &this,
+                        move |this, _, cx| this.query_table(index, &query.table, cx),
+                    ))
                     .separator()
                     .item(copy("Copy Name", name))
                     .item(copy("Copy SELECT Statement", select_sql(&info.table)))
@@ -1321,9 +1403,12 @@ impl Explorer {
                         let this = cx.entity().downgrade();
                         move |menu, _, _| {
                             let (connection, open) = (connection.clone(), sql.clone());
-                            menu.item(item("Open in New Tab", &this, move |this, _, cx| {
-                                this.open_history(&connection, &open, cx)
-                            }))
+                            menu.item(item_icon(
+                                "Open in New Tab",
+                                AppIcon::Code,
+                                &this,
+                                move |this, _, cx| this.open_history(&connection, &open, cx),
+                            ))
                             .item(copy("Copy SQL", sql.clone()))
                             .separator()
                             .item(item(
@@ -1347,31 +1432,40 @@ fn select_sql(table: &TableRef) -> String {
     )
 }
 
+/// The sidebar's title row: what it shows, then its actions.
 fn section_header(title: &'static str) -> gpui_kit::Div {
     h_flex()
-        .px_4()
-        .pt_1()
-        .pb_1()
-        .gap_1()
+        .h(px(38.))
+        .flex_shrink_0()
+        .pl(px(14.))
+        .pr_2()
+        .gap(px(2.))
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color(theme::TEXT_TERTIARY))
         .child(div().flex_1().child(title))
 }
 
+/// A small icon button in the sidebar header, with a tooltip.
 fn header_button(
     id: &'static str,
-    label: impl IntoElement,
+    icon: impl Into<Icon>,
+    tooltip: &'static str,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
-        .px_1()
-        .rounded(px(4.))
-        .text_size(px(12.))
+        .size(px(26.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
         .text_color(color(theme::TEXT_SECONDARY))
-        .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
-        .child(label)
+        .hover(|s| s.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT)))
+        .child(icon.into().size(px(14.)))
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+        })
         .on_click(on_click)
 }
 
@@ -1395,33 +1489,29 @@ fn tree_row(
     };
     h_flex()
         .id(id)
-        .h(px(26.))
-        .pl(px(8. + depth as f32 * 14.))
+        .h(px(28.))
+        .pl(px(8. + depth as f32 * 16.))
         .pr_2()
         .gap(px(7.))
         .rounded(px(6.))
         .text_size(px(13.))
-        .when(selected, |row| {
-            row.bg(color(theme::SELECTION)).text_color(color(0xffffff))
-        })
-        .when(!selected, |row| {
-            row.text_color(color(theme::TEXT))
-                .hover(|s| s.bg(color(0x2e2e32)))
-        })
+        .text_color(color(theme::TEXT))
+        .when(selected, |row| row.bg(color(theme::ACTIVE)))
+        .when(!selected, |row| row.hover(|s| s.bg(color(0x242428))))
         .child(chevron)
 }
 
 fn icon(icon: AppIcon, tone: u32, selected: bool) -> Icon {
     Icon::new(icon)
         .size(px(14.))
-        .text_color(color(if selected { 0xffffff } else { tone }))
+        .text_color(color(if selected { theme::ACCENT } else { tone }))
 }
 
 fn counter(text: impl Into<SharedString>) -> gpui_kit::Div {
     div()
         .flex_shrink_0()
-        .text_size(px(11.5))
-        .text_color(color(theme::TEXT_TERTIARY))
+        .text_size(px(11.))
+        .text_color(color(theme::TEXT_QUIET))
         .child(text.into())
 }
 
@@ -1458,89 +1548,67 @@ impl Render for Explorer {
             .filter(|c| matches!(c.state, ConnectionState::Ready { .. }))
             .count();
 
+        let header = match self.mode {
+            Mode::Explorer => section_header("EXPLORER")
+                .child(header_button(
+                    "new-connection",
+                    IconName::Plus,
+                    "New Connection",
+                    cx.listener(|_, _, _, cx| cx.emit(ExplorerEvent::NewConnection)),
+                ))
+                .child(header_button(
+                    "refresh-catalogs",
+                    AppIcon::Reload,
+                    "Refresh Catalogs",
+                    cx.listener(|this, _, _, cx| this.refresh_catalogs(cx)),
+                ))
+                .child(header_button(
+                    "collapse-all",
+                    AppIcon::CollapseAll,
+                    "Collapse All",
+                    cx.listener(|this, _, _, cx| this.collapse_all(cx)),
+                )),
+            Mode::Queries => section_header("SAVED QUERIES")
+                .child(header_button(
+                    "reveal-queries",
+                    IconName::FolderOpen,
+                    crate::context_menus::REVEAL_LABEL,
+                    cx.listener(|this, _, _, cx| {
+                        let dir = this.model.read(cx).project.queries_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        cx.reveal_path(&dir);
+                    }),
+                ))
+                .child(header_button(
+                    "refresh-queries",
+                    AppIcon::Reload,
+                    "Refresh",
+                    cx.listener(|this, _, _, cx| this.refresh_queries(cx)),
+                )),
+            Mode::History => section_header("HISTORY").when(!self.history.is_empty(), |header| {
+                header.child(header_button(
+                    "clear-history",
+                    AppIcon::Trash,
+                    "Clear History",
+                    cx.listener(|this, _, _, cx| this.clear_history(cx)),
+                ))
+            }),
+        };
+
         v_flex()
-            .w(px(272.))
+            .w(px(256.))
             .h_full()
             .flex_shrink_0()
             .bg(color(theme::SIDEBAR))
             .border_r_1()
             .border_color(color(theme::HAIRLINE))
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_2()
-                    .child(
-                        segmented()
-                            .child(
-                                segment_body("Explorer", self.mode == Mode::Explorer)
-                                    .flex_1()
-                                    .justify_center()
-                                    .id("mode-explorer")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.mode = Mode::Explorer;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                segment_body("Queries", self.mode == Mode::Queries)
-                                    .flex_1()
-                                    .justify_center()
-                                    .id("mode-queries")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.mode = Mode::Queries;
-                                        this.refresh_queries(cx);
-                                    })),
-                            )
-                            .child(
-                                segment_body("History", self.mode == Mode::History)
-                                    .flex_1()
-                                    .justify_center()
-                                    .id("mode-history")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.mode = Mode::History;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .when(self.mode == Mode::Explorer, |col| {
-                        col.child(Input::new(&self.search).small().cleanable(true))
-                    }),
-            )
+            .child(header)
             .when(self.mode == Mode::Explorer, |col| {
-                col.child(section_header("Connections").child(header_button(
-                    "new-connection",
-                    "+",
-                    cx.listener(|_, _, _, cx| cx.emit(ExplorerEvent::NewConnection)),
-                )))
-            })
-            .when(self.mode == Mode::History, |col| {
                 col.child(
-                    section_header("History").when(!self.history.is_empty(), |header| {
-                        header.child(header_button(
-                            "clear-history",
-                            "Clear",
-                            cx.listener(|this, _, _, cx| this.clear_history(cx)),
-                        ))
-                    }),
-                )
-            })
-            .when(self.mode == Mode::Queries, |col| {
-                col.child(
-                    section_header("Saved queries")
-                        .child(header_button(
-                            "reveal-queries",
-                            "Show",
-                            cx.listener(|this, _, _, cx| {
-                                let dir = this.model.read(cx).project.queries_dir();
-                                let _ = std::fs::create_dir_all(&dir);
-                                cx.reveal_path(&dir);
-                            }),
-                        ))
-                        .child(header_button(
-                            "refresh-queries",
-                            Icon::new(AppIcon::Reload).size(px(12.)),
-                            cx.listener(|this, _, _, cx| this.refresh_queries(cx)),
-                        )),
+                    div()
+                        .px(px(10.))
+                        .pb_2()
+                        .child(Input::new(&self.search).small().cleanable(true)),
                 )
             })
             .child(
@@ -1548,7 +1616,7 @@ impl Render for Explorer {
                     .id("explorer-body")
                     .flex_1()
                     .overflow_y_scroll()
-                    .px_2()
+                    .px(px(6.))
                     .pb_3()
                     .child(v_flex().gap(px(1.)).children(body)),
             )

@@ -19,14 +19,16 @@ use kuery_core::catalog::TableInfo;
 use kuery_core::sql::quote_qualified;
 
 use crate::assets::AppIcon;
+use crate::audit::OpenAuditLog;
+use crate::chrome;
 use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenProject, PreviousTab, ToggleSidebar,
+    OpenKeymapFile, OpenProject, PreviousTab, ToggleSidebar,
 };
-use crate::connection::Db;
+use crate::connection::{Db, Environment, WriteKind};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
-use crate::explorer::{Explorer, ExplorerEvent};
+use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
@@ -643,168 +645,406 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let db = self
-            .tabs
+    /// The connection of the active tab, or the sidebar's.
+    fn active_db(&self, cx: &App) -> Option<Db> {
+        self.tabs
             .get(self.active)
             .and_then(|tab| tab.db(cx))
-            .or_else(|| self.explorer.read(cx).current_db());
+            .or_else(|| self.explorer.read(cx).current_db())
+    }
+
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let project = self.model.read(cx).project.clone();
         let project_name: SharedString = project.name.clone().into();
         let workspace_name: Option<SharedString> = project.workspace.clone().map(Into::into);
-        let search_shortcut = if cfg!(target_os = "macos") {
-            "⌘K"
-        } else {
-            "Ctrl+K"
-        };
+        let mac = cfg!(target_os = "macos");
+        let mono = cx.theme().mono_font_family.clone();
         let root = project.root.clone();
         let initials: String = workspace_name
             .as_ref()
             .unwrap_or(&project_name)
-            .split_whitespace()
+            .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
             .filter_map(|word| word.chars().next())
             .take(2)
             .collect::<String>()
             .to_uppercase();
-
-        let connection = match db {
-            Some(db) => h_flex()
-                .gap_2()
-                .px_2()
-                .h(px(24.))
-                .rounded(px(6.))
-                .bg(color(0x2a2a2d))
-                .child(div().size(px(7.)).rounded_full().bg(color(theme::GREEN)))
-                .child(div().font_weight(FontWeight::MEDIUM).child(db.name.clone()))
-                .child(
-                    div()
-                        .text_color(color(theme::TEXT_SECONDARY))
-                        .child(format!(
-                            "{} · PostgreSQL {}",
-                            db.target,
-                            db.session.server_version()
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(db.environment.color()))
-                        .child(db.environment.label()),
-                ),
-            None => h_flex()
-                .gap_2()
-                .px_2()
-                .h(px(24.))
-                .rounded(px(6.))
-                .bg(color(0x2a2a2d))
-                .text_color(color(theme::TEXT_SECONDARY))
-                .child(div().size(px(7.)).rounded_full().bg(color(theme::AMBER)))
-                .child("No open connection"),
-        };
+        let panel_toggle = matches!(self.tabs.get(self.active), Some(Tab::Query(_)));
 
         TitleBar::new().child(
             h_flex()
                 .w_full()
                 .h_full()
-                .gap_3()
                 .pr_3()
                 .text_size(px(12.5))
                 .child(
-                    Button::new("project-switcher")
-                        .ghost()
-                        .compact()
-                        .small()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .size(px(18.))
-                                        .rounded(px(5.))
-                                        .bg(color(0x1fa971))
-                                        .text_color(color(0x04140c))
-                                        .text_size(px(8.5))
-                                        .font_weight(FontWeight::BOLD)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(initials),
-                                )
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(project_name.clone()),
-                                )
-                                .when_some(workspace_name.clone(), |row, workspace| {
-                                    row.child(
-                                        div().text_color(color(theme::TEXT_TERTIARY)).child("/"),
+                    h_flex().flex_1().min_w_0().child(
+                        Button::new("project-switcher")
+                            .ghost()
+                            .compact()
+                            .small()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .size(px(20.))
+                                            .rounded(px(5.))
+                                            .bg(color(theme::ACTIVE))
+                                            .border_1()
+                                            .border_color(color(0x36363b))
+                                            .text_color(color(0xc7c7cc))
+                                            .text_size(px(9.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(initials),
                                     )
                                     .child(
                                         div()
-                                            .text_color(color(theme::TEXT_SECONDARY))
-                                            .child(workspace),
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(project_name.clone()),
                                     )
-                                })
-                                .child(
-                                    Icon::new(IconName::ChevronDown)
-                                        .size(px(12.))
-                                        .text_color(color(theme::TEXT_TERTIARY)),
-                                ),
-                        )
-                        .dropdown_menu(move |menu, _, _| {
-                            // Read when the menu opens, not on every render.
-                            let recent_projects = recent_projects_except(&root);
-                            let mut menu = menu.label("Recent Projects");
-                            if recent_projects.is_empty() {
-                                menu = menu
-                                    .item(PopupMenuItem::new("No other projects").disabled(true));
-                            }
-                            for project in recent_projects.iter() {
-                                let path = project.path.clone();
-                                menu =
-                                    menu.item(PopupMenuItem::new(project.name.clone()).on_click(
-                                        move |_, window, cx| {
-                                            crate::app::request_open(
-                                                Some(path.clone()),
-                                                Some(window.window_handle()),
-                                                cx,
-                                            )
-                                        },
-                                    ));
-                            }
-                            menu.separator()
-                                .menu("Open Folder…", Box::new(OpenProject))
-                                .menu("Clear Recent Projects", Box::new(ClearRecentProjects))
-                        }),
+                                    .when_some(workspace_name.clone(), |row, workspace| {
+                                        row.child(
+                                            div()
+                                                .text_color(color(theme::TEXT_TERTIARY))
+                                                .child("/"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(color(theme::TEXT_SECONDARY))
+                                                .child(workspace),
+                                        )
+                                    })
+                                    .child(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(px(12.))
+                                            .text_color(color(theme::TEXT_TERTIARY)),
+                                    ),
+                            )
+                            .dropdown_menu(move |menu, _, _| {
+                                // Read when the menu opens, not on every render.
+                                let recent_projects = recent_projects_except(&root);
+                                let mut menu = menu.label("Recent Projects");
+                                if recent_projects.is_empty() {
+                                    menu = menu.item(
+                                        PopupMenuItem::new("No other projects").disabled(true),
+                                    );
+                                }
+                                for project in recent_projects.iter() {
+                                    let path = project.path.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(project.name.clone()).on_click(
+                                            move |_, window, cx| {
+                                                crate::app::request_open(
+                                                    Some(path.clone()),
+                                                    Some(window.window_handle()),
+                                                    cx,
+                                                )
+                                            },
+                                        ),
+                                    );
+                                }
+                                menu.separator()
+                                    .menu("Open Folder…", Box::new(OpenProject))
+                                    .menu("Clear Recent Projects", Box::new(ClearRecentProjects))
+                            }),
+                    ),
                 )
-                .child(connection)
-                .child(div().flex_1())
                 .child(
                     h_flex()
-                        .w(px(240.))
-                        .h(px(26.))
-                        .px_2()
+                        .id("open-palette")
+                        .w(px(420.))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .px(px(10.))
                         .gap_2()
                         .rounded(px(7.))
-                        .bg(color(0x2a2a2d))
+                        .bg(color(theme::CONTROL))
+                        .border_1()
+                        .border_color(color(theme::CONTROL_BORDER))
                         .text_color(color(theme::TEXT_TERTIARY))
-                        .child(div().flex_1().child("Search or run a command"))
+                        .hover(|s| s.border_color(color(0x3a3a40)))
+                        .child(Icon::new(IconName::Search).size(px(13.)))
+                        .child(div().flex_1().child("Search tables, queries and commands"))
+                        .child(chrome::kbd(if mac { "⌘K" } else { "Ctrl+K" }, mono))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_palette(&OpenCommandPalette, window, cx)
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .justify_end()
+                        .gap(px(2.))
                         .child(
-                            div()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(px(10.5))
-                                .child(search_shortcut),
+                            chrome::icon_button(
+                                "title-toggle-sidebar",
+                                IconName::PanelLeft,
+                                if mac {
+                                    "Toggle Sidebar  ⌘B"
+                                } else {
+                                    "Toggle Sidebar  Ctrl+B"
+                                },
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            chrome::icon_button(
+                                "title-toggle-panel",
+                                IconName::PanelBottom,
+                                if mac {
+                                    "Toggle Results Panel  ⌘J"
+                                } else {
+                                    "Toggle Results Panel  Ctrl+J"
+                                },
+                                panel_toggle,
+                            )
+                            .when(panel_toggle, |b| {
+                                b.on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(Tab::Query(query)) = this.tabs.get(this.active) {
+                                        query.update(cx, |query, cx| query.toggle_panel(cx));
+                                    }
+                                }))
+                            }),
                         ),
                 ),
         )
     }
 
+    /// The narrow column of view icons left of the sidebar. Clicking the
+    /// active one hides the sidebar.
+    fn render_activity_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.explorer.read(cx).mode();
+        let visible = self.sidebar_visible;
+        let view = |id: &'static str,
+                    icon: AppIcon,
+                    tooltip: &'static str,
+                    mode: ExplorerMode,
+                    cx: &mut Context<Self>| {
+            let active = visible && current == mode;
+            div()
+                .id(id)
+                .size(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .when(active, |b| {
+                    b.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT))
+                })
+                .when(!active, |b| {
+                    b.text_color(color(theme::TEXT_TERTIARY))
+                        .hover(|s| s.text_color(color(theme::TEXT)))
+                })
+                .child(Icon::new(icon).size(px(18.)))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let showing = this.sidebar_visible && this.explorer.read(cx).mode() == mode;
+                    if showing {
+                        this.sidebar_visible = false;
+                    } else {
+                        this.sidebar_visible = true;
+                        this.explorer
+                            .update(cx, |explorer, cx| explorer.set_mode(mode, cx));
+                    }
+                    cx.notify();
+                }))
+        };
+        let action = |id: &'static str,
+                      icon: AppIcon,
+                      tooltip: &'static str,
+                      action: fn() -> Box<dyn gpui_kit::Action>| {
+            div()
+                .id(id)
+                .size(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .text_color(color(theme::TEXT_TERTIARY))
+                .hover(|s| s.text_color(color(theme::TEXT)))
+                .child(Icon::new(icon).size(px(18.)))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                })
+                .on_click(move |_, window, cx| window.dispatch_action(action(), cx))
+        };
+        v_flex()
+            .w(px(48.))
+            .h_full()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(4.))
+            .py_2()
+            .bg(color(theme::TOOLBAR))
+            .border_r_1()
+            .border_color(color(theme::HAIRLINE))
+            .child(view(
+                "rail-explorer",
+                AppIcon::Database,
+                "Explorer",
+                ExplorerMode::Explorer,
+                cx,
+            ))
+            .child(view(
+                "rail-queries",
+                AppIcon::Queries,
+                "Saved Queries",
+                ExplorerMode::Queries,
+                cx,
+            ))
+            .child(view(
+                "rail-history",
+                AppIcon::History,
+                "History",
+                ExplorerMode::History,
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(action(
+                "rail-audit",
+                AppIcon::Audit,
+                "Open Audit Log",
+                || Box::new(OpenAuditLog),
+            ))
+            .child(action(
+                "rail-keymap",
+                AppIcon::Keyboard,
+                "Keyboard Shortcuts",
+                || Box::new(OpenKeymapFile),
+            ))
+    }
+
+    /// The bottom bar: the active connection and mode on the left, the last
+    /// run and the cursor on the right.
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let db = self.active_db(cx);
+        let mut left = h_flex().gap_4().min_w_0();
+        let mut right = h_flex().gap_4().flex_shrink_0();
+        match &db {
+            Some(db) => {
+                left = left
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .text_color(color(if db.environment == Environment::Production {
+                                0xffcf7f
+                            } else {
+                                0xc7c7cc
+                            }))
+                            .child(chrome::dot(db.environment.color()))
+                            .child(format!(
+                                "{} · {}",
+                                db.name,
+                                db.environment.label().to_lowercase()
+                            )),
+                    )
+                    .child(div().child(db.target.clone()));
+                right = right.child(format!("PostgreSQL {}", db.session.server_version()));
+            }
+            None => left = left.child("No open connection"),
+        }
+        match self.tabs.get(self.active) {
+            Some(Tab::Query(query)) => {
+                let tab = query.read(cx);
+                let writing = tab.mode_status() != "Read-only";
+                left = left.child(
+                    h_flex()
+                        .gap(px(5.))
+                        .min_w_0()
+                        .child(
+                            Icon::new(if writing {
+                                AppIcon::Pencil
+                            } else {
+                                AppIcon::Lock
+                            })
+                            .size(px(11.)),
+                        )
+                        .child(div().truncate().child(tab.mode_status())),
+                );
+                if let Some(db) = &db
+                    && db.environment == Environment::Production
+                    && db.allows(WriteKind::Transactional)
+                {
+                    let query = query.clone();
+                    left = left.child(
+                        div()
+                            .id("stop-allowing-writes")
+                            .text_color(color(0xc7c7cc))
+                            .hover(|s| s.text_color(color(theme::TEXT)))
+                            .child("Stop allowing writes")
+                            .on_click(move |_, window, cx| {
+                                query.update(cx, |query, cx| query.stop_allowing_writes(window, cx))
+                            }),
+                    );
+                }
+                let (run, tone) = tab.run_status(cx);
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .when(run != "Ready", |row| {
+                        row.child(
+                            div()
+                                .max_w(px(420.))
+                                .truncate()
+                                .text_color(color(if tone == theme::RED {
+                                    theme::RED
+                                } else {
+                                    theme::TEXT_TERTIARY
+                                }))
+                                .child(run),
+                        )
+                    })
+                    .child(tab.cursor_status(cx))
+                    .children(
+                        db.as_ref()
+                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
+                    );
+            }
+            Some(Tab::Table(table)) => {
+                let tab = table.read(cx);
+                let name = &tab.info().table;
+                left = left.child(format!("{}.{}", name.schema, name.name));
+                if let Some(status) = tab.page_status() {
+                    right = h_flex().gap_4().flex_shrink_0().child(status).children(
+                        db.as_ref()
+                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
+                    );
+                }
+            }
+            None => {}
+        }
+        h_flex()
+            .h(px(26.))
+            .flex_shrink_0()
+            .px_3()
+            .gap_4()
+            .bg(color(theme::TOOLBAR))
+            .border_t_1()
+            .border_color(color(theme::HAIRLINE))
+            .text_size(px(11.5))
+            .text_color(color(theme::TEXT_TERTIARY))
+            .child(left.flex_1())
+            .child(right)
+    }
+
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut strip = h_flex()
-            .h(px(34.))
+            .h(px(36.))
             .flex_shrink_0()
-            .bg(color(0x19191b))
+            .items_end()
+            .gap(px(2.))
+            .px_2()
+            .bg(color(theme::TOOLBAR))
             .border_b_1()
             .border_color(color(theme::HAIRLINE));
         for (index, tab) in self.tabs.iter().enumerate() {
@@ -827,55 +1067,64 @@ impl WorkspaceView {
                     )
                 }
             };
-            let connection = tab.db(cx).map(|db| db.name).unwrap_or_default();
+            let tooltip: SharedString = match tab.db(cx) {
+                Some(db) => format!("{title} · {}", db.name).into(),
+                None => title.clone(),
+            };
+            let group = SharedString::from(format!("tab-{index}"));
             strip = strip.child(
                 h_flex()
                     .id(("tab", index))
-                    .h_full()
-                    .min_w(px(150.))
-                    .max_w(px(260.))
-                    .px_3()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(color(theme::HAIRLINE))
+                    .group(group.clone())
+                    .h(px(30.))
+                    .max_w(px(240.))
+                    .pl(px(12.))
+                    .pr(px(8.))
+                    .gap(px(8.))
+                    .rounded_t(px(7.))
                     .text_size(px(12.5))
                     .when(active, |t| {
-                        t.bg(color(theme::GROUND)).text_color(color(theme::TEXT))
+                        t.bg(color(theme::GROUND))
+                            .border_1()
+                            .border_b_0()
+                            .border_color(color(theme::HAIRLINE))
+                            .mb(px(-1.))
+                            .text_color(color(theme::TEXT))
                     })
                     .when(!active, |t| {
-                        t.text_color(color(theme::TEXT_SECONDARY))
-                            .hover(|s| s.bg(color(0x222225)))
+                        t.text_color(color(theme::TEXT_TERTIARY))
+                            .hover(|s| s.text_color(color(theme::TEXT)))
                     })
                     .child(Icon::new(icon).size(px(13.)).text_color(color(if active {
-                        theme::ACCENT
+                        0x4da3ff
                     } else {
                         theme::TEXT_TERTIARY
                     })))
                     .child(div().truncate().child(title))
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(color(theme::TEXT_TERTIARY))
-                            .child(connection),
-                    )
-                    .when(pending, |t| {
-                        t.child(div().size(px(6.)).rounded_full().bg(color(theme::AMBER)))
-                    })
+                    .when(pending, |t| t.child(chrome::dot(theme::AMBER)))
                     .child(
                         div()
                             .id(("close-tab", index))
-                            .px_1()
+                            .size(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded(px(4.))
                             .text_color(color(theme::TEXT_TERTIARY))
-                            .hover(|s| s.bg(color(0x2e2e32)).text_color(color(theme::TEXT)))
-                            .child("×")
+                            .when(!active, |b| {
+                                b.invisible().group_hover(group.clone(), |s| s.visible())
+                            })
+                            .hover(|s| s.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT)))
+                            .child(Icon::new(IconName::Close).size(px(11.)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close(index, window, cx);
                             })),
                     )
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
+                            .build(window, cx)
+                    })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
                     )
@@ -895,9 +1144,12 @@ impl WorkspaceView {
                         };
                         move |menu, _, _| {
                             let mut menu = menu
-                                .item(item("Close", &this, move |this, window, cx| {
-                                    this.close(index, window, cx)
-                                }))
+                                .item(
+                                    item("Close", &this, move |this, window, cx| {
+                                        this.close(index, window, cx)
+                                    })
+                                    .icon(IconName::Close),
+                                )
                                 .item(
                                     item("Close Others", &this, move |this, window, cx| {
                                         this.close_tabs(|i| i != index, window, cx)
@@ -999,11 +1251,18 @@ impl Render for WorkspaceView {
             .text_color(color(theme::TEXT))
             .text_size(px(13.))
             .child(self.render_title_bar(cx))
+            // Production is marked by a thin line under the title bar.
+            .when(
+                self.active_db(cx)
+                    .is_some_and(|db| db.environment == Environment::Production),
+                |root| root.child(div().h(px(2.)).flex_shrink_0().bg(color(theme::AMBER))),
+            )
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .items_start()
+                    .child(self.render_activity_rail(cx))
                     .when(self.sidebar_visible, |row| row.child(self.explorer.clone()))
                     .child(
                         v_flex()
@@ -1014,6 +1273,7 @@ impl Render for WorkspaceView {
                             .child(div().flex_1().min_h_0().child(self.render_content())),
                     ),
             )
+            .child(self.render_status_bar(cx))
             .when_some(self.palette.clone(), |root, palette| {
                 root.child(
                     div()

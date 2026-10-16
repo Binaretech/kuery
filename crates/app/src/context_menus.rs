@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::component::IconName;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::{ClipboardItem, Context, SharedString, WeakEntity, Window};
 use kuery_core::export::json_string;
@@ -28,6 +29,16 @@ pub fn item<V: 'static>(
     })
 }
 
+/// [`item`] with an icon.
+pub fn item_icon<V: 'static>(
+    label: impl Into<SharedString>,
+    icon: impl Into<gpui_kit::component::Icon>,
+    view: &WeakEntity<V>,
+    run: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+) -> PopupMenuItem {
+    item(label, view, run).icon(icon)
+}
+
 /// An item that copies `text` to the clipboard.
 pub fn copy(label: impl Into<SharedString>, text: impl Into<String>) -> PopupMenuItem {
     let text = text.into();
@@ -38,7 +49,9 @@ pub fn copy(label: impl Into<SharedString>, text: impl Into<String>) -> PopupMen
 
 /// An item that shows `path` in the platform's file manager.
 pub fn reveal(path: PathBuf) -> PopupMenuItem {
-    PopupMenuItem::new(REVEAL_LABEL).on_click(move |_, _, cx| cx.reveal_path(&path))
+    PopupMenuItem::new(REVEAL_LABEL)
+        .icon(IconName::FolderOpen)
+        .on_click(move |_, _, cx| cx.reveal_path(&path))
 }
 
 /// A right-clicked grid cell, with its whole row, for the grids' menus.
@@ -62,16 +75,13 @@ impl Cell {
 
 /// Copy Value, Copy Row, Copy Row as JSON and Copy Column Name.
 pub fn copy_cell_items(menu: PopupMenu, cell: &Cell) -> PopupMenu {
-    menu.item(copy(
-        "Copy Value",
-        cell.value().unwrap_or("NULL").to_string(),
-    ))
-    .item(copy("Copy Row", row_as_tsv(&cell.values)))
-    .item(copy(
-        "Copy Row as JSON",
-        row_as_json(&cell.columns, &cell.values),
-    ))
-    .item(copy("Copy Column Name", cell.column_name().to_string()))
+    menu.item(copy("Copy Value", cell.value().unwrap_or("NULL").to_string()).icon(IconName::Copy))
+        .item(copy("Copy Row", row_as_tsv(&cell.values)))
+        .item(copy(
+            "Copy Row as JSON",
+            row_as_json(&cell.columns, &cell.values),
+        ))
+        .item(copy("Copy Column Name", cell.column_name().to_string()))
 }
 
 /// Tab-separated values, NULL as empty, ready to paste into a spreadsheet.

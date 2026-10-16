@@ -6,6 +6,7 @@ use kuery_core::catalog::{
     FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef,
     TriggerInfo, TriggerRef,
 };
+use kuery_core::completion;
 use kuery_core::result_set::ResultSet;
 use kuery_core::sql::{quote_literal, quote_qualified};
 
@@ -68,6 +69,25 @@ join pg_catalog.pg_class c on c.oid = t.tgrelid
 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
 where not t.tgisinternal and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
 order by 1, 3";
+
+/// Every column of every table and view in a user schema, for completion.
+const COLUMNS_SQL: &str = r"
+select n.nspname,
+       c.relname,
+       c.relkind::text,
+       a.attname,
+       pg_catalog.format_type(a.atttypid, a.atttypmod)
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+left join pg_catalog.pg_attribute a
+  on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+where c.relkind in ('r', 'p', 'v', 'm', 'f')
+  and not c.relispartition
+  and n.nspname not in ('pg_catalog', 'information_schema')
+  and n.nspname !~ '^pg_(toast|temp)'
+order by 1, 2, a.attnum";
+
+const SEARCH_PATH_SQL: &str = "select pg_catalog.unnest(pg_catalog.current_schemas(false))";
 
 /// Everything the explorer tree needs for one connection.
 pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
@@ -138,17 +158,52 @@ pub async fn tables(session: Session) -> Result<Vec<TableInfo>, QueryError> {
     Ok(rows(&set)
         .map(|row| TableInfo {
             table: TableRef::new(row.text(0), row.text(1)),
-            kind: match row.text(2).as_str() {
-                "p" => TableKind::PartitionedTable,
-                "v" => TableKind::View,
-                "m" => TableKind::MaterializedView,
-                "f" => TableKind::ForeignTable,
-                _ => TableKind::Table,
-            },
+            kind: table_kind(&row.text(2)),
             estimated_rows: row.optional(3).and_then(|v| v.parse().ok()),
             comment: row.optional(4),
         })
         .collect())
+}
+
+/// Schemas, tables and columns for the SQL editor's completion.
+pub async fn completion_catalog(session: Session) -> Result<completion::Catalog, QueryError> {
+    let search_path = session.fetch_trusted(SEARCH_PATH_SQL.into()).await?;
+    let schemas = session.fetch_trusted(SCHEMAS_SQL.into()).await?;
+    let columns = session.fetch_trusted(COLUMNS_SQL.into()).await?;
+    let mut tables: Vec<completion::Table> = Vec::new();
+    for row in rows(&columns) {
+        let table = TableRef::new(row.text(0), row.text(1));
+        if tables.last().is_none_or(|last| last.table != table) {
+            tables.push(completion::Table {
+                table,
+                kind: table_kind(&row.text(2)),
+                columns: Vec::new(),
+            });
+        }
+        // A table without columns comes with a NULL one.
+        if let (Some(name), Some(last)) = (row.optional(3), tables.last_mut()) {
+            last.columns.push(completion::Column {
+                name,
+                data_type: row.text(4),
+            });
+        }
+    }
+    Ok(completion::Catalog {
+        search_path: rows(&search_path).map(|row| row.text(0)).collect(),
+        schemas: rows(&schemas).map(|row| row.text(0)).collect(),
+        tables,
+    })
+}
+
+/// `pg_class.relkind` of a table or view.
+fn table_kind(relkind: &str) -> TableKind {
+    match relkind {
+        "p" => TableKind::PartitionedTable,
+        "v" => TableKind::View,
+        "m" => TableKind::MaterializedView,
+        "f" => TableKind::ForeignTable,
+        _ => TableKind::Table,
+    }
 }
 
 /// A table's full definition.

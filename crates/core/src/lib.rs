@@ -5,6 +5,7 @@
 pub mod analysis;
 pub mod browse;
 pub mod catalog;
+pub mod completion;
 pub mod edit;
 pub mod export;
 pub mod format;

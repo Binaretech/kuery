@@ -10,18 +10,15 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, Enter, InputEvent, Paste, SelectAll,
+    Copy, Cut, Editor, EditorState, Enter, InputEvent, Paste, SelectAll, ShowCompletions,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::native_menu::NativeMenu;
 use gpui_kit::component::table::{DataTable, TableState};
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter,
@@ -29,13 +26,16 @@ use gpui_kit::{
     ParentElement as _, Pixels, PromptLevel, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Task, Window, actions, div, px,
 };
+use kuery_core::analysis::{self, StatementKind};
 use kuery_core::export::{self, Format};
 use kuery_core::{format, script};
-use kuery_pg::{Access, Event, QueryError, RunOptions, Session};
+use kuery_pg::{Access, Event, QueryError, RunOptions, Session, StatementImpact, catalog};
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
-use crate::connection::{Db, WriteKind, WritePolicy};
+use crate::chrome;
+use crate::completion::{SharedCatalog, SqlCompletions};
+use crate::connection::{Db, WriteKind};
 use crate::history::HistoryEntry;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
@@ -108,15 +108,19 @@ impl WriteSession {
 
 /// Editor keys that are not commands: `secondary-enter` runs the query (it is
 /// the `query.run` shortcut), so a new line moves to `secondary-shift-enter`.
+/// `ctrl-space` asks for completions where typing alone would not.
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new(
-        "secondary-shift-enter",
-        Enter {
-            secondary: false,
-            shift: true,
-        },
-        Some("QueryTab > Input"),
-    )]
+    vec![
+        KeyBinding::new(
+            "secondary-shift-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            Some("QueryTab > Input"),
+        ),
+        KeyBinding::new("ctrl-space", ShowCompletions, Some("QueryTab > Input")),
+    ]
 }
 
 const DEFAULT_EDITOR_HEIGHT: Pixels = px(240.);
@@ -202,6 +206,9 @@ pub struct QueryTab {
     run_writes: bool,
     /// Checks the open transaction for idleness while write mode is on.
     idle_watch: Option<Task<()>>,
+    /// Tables and columns the editor completes, reloaded after schema changes.
+    completion_catalog: SharedCatalog,
+    catalog_task: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -217,11 +224,15 @@ impl QueryTab {
     ) -> Self {
         let sql = sql.to_string();
         let saved_text = sql.clone();
+        let completion_catalog = SharedCatalog::default();
         let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut editor = EditorState::new(window, cx)
                 .language("sql")
                 .line_number(true)
-                .default_value(sql)
+                .default_value(sql);
+            editor.lsp_mut().completion_provider =
+                Some(Rc::new(SqlCompletions::new(completion_catalog.clone())));
+            editor
         });
         cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -238,7 +249,7 @@ impl QueryTab {
             Some(path) => file_title(path),
             None => title.into(),
         };
-        Self {
+        let mut tab = Self {
             db,
             last_sql: String::new(),
             title,
@@ -258,8 +269,24 @@ impl QueryTab {
             write: WriteState::Off,
             run_writes: false,
             idle_watch: None,
+            completion_catalog,
+            catalog_task: None,
             focus_handle: cx.focus_handle(),
-        }
+        };
+        tab.load_completion_catalog(cx);
+        tab
+    }
+
+    /// Loads what the editor completes. On failure the previous catalog
+    /// stays, and completion offers keywords only until a later load works.
+    fn load_completion_catalog(&mut self, cx: &mut Context<Self>) {
+        let load = catalog::completion_catalog(self.db.session.clone());
+        let shared = self.completion_catalog.clone();
+        self.catalog_task = Some(cx.spawn(async move |_, _| {
+            if let Ok(loaded) = load.await {
+                *shared.borrow_mut() = loaded;
+            }
+        }));
     }
 
     pub fn title(&self) -> SharedString {
@@ -393,30 +420,32 @@ impl QueryTab {
                 self.refuse(sql, reason, cx);
             }
             WriteState::On(write) => {
-                match write_mode::review(&sql, &self.db.name, self.db.environment, write.kind) {
+                let kind = write.kind;
+                match write_mode::review(&sql, self.db.environment, kind) {
                     Review::Run { writes } => self.execute(sql, writes, cx),
                     Review::Refuse(reason) => self.refuse(sql, reason, cx),
-                    Review::Confirm { message, detail } => {
-                        let answer = window.prompt(
-                            PromptLevel::Warning,
-                            &message,
-                            Some(&detail),
-                            &["Run", "Preview Impact", "Cancel"],
+                    Review::Confirm(confirmation) => {
+                        let (preview_tab, run_tab) = (cx.weak_entity(), cx.weak_entity());
+                        let (preview_sql, run_sql) = (sql.clone(), sql);
+                        write_mode::open_review(
+                            confirmation,
+                            &self.db,
+                            kind,
+                            window,
                             cx,
+                            move |dialog, _, cx| {
+                                let sql = preview_sql.clone();
+                                preview_tab
+                                    .update(cx, |tab, cx| tab.preview_into(sql, dialog, cx))
+                                    .ok();
+                            },
+                            move |_, cx| {
+                                let sql = run_sql.clone();
+                                run_tab
+                                    .update(cx, |tab, cx| tab.execute(sql, true, cx))
+                                    .ok();
+                            },
                         );
-                        cx.spawn_in(window, async move |this, cx| match answer.await {
-                            Ok(0) => {
-                                this.update(cx, |this, cx| this.execute(sql, true, cx)).ok();
-                            }
-                            Ok(1) => {
-                                this.update_in(cx, |this, window, cx| {
-                                    this.preview(sql, true, window, cx)
-                                })
-                                .ok();
-                            }
-                            _ => {}
-                        })
-                        .detach();
                     }
                 }
             }
@@ -425,7 +454,7 @@ impl QueryTab {
 
     /// Previews the selection or the statement under the cursor, without
     /// asking: the result goes to the Output tab.
-    fn preview_impact(&mut self, _: &PreviewImpact, window: &mut Window, cx: &mut Context<Self>) {
+    fn preview_impact(&mut self, _: &PreviewImpact, _: &mut Window, cx: &mut Context<Self>) {
         let sql = self.sql_to_run(cx);
         let WriteState::On(write) = &self.write else {
             self.refuse(
@@ -435,24 +464,53 @@ impl QueryTab {
             );
             return;
         };
-        match write_mode::review(&sql, &self.db.name, self.db.environment, write.kind) {
+        match write_mode::review(&sql, self.db.environment, write.kind) {
             Review::Refuse(reason) => self.refuse(sql, reason, cx),
-            Review::Run { .. } | Review::Confirm { .. } => self.preview(sql, false, window, cx),
+            Review::Run { .. } | Review::Confirm(_) => {
+                if let Some(preview) = self.run_preview(sql, cx) {
+                    cx.spawn(async move |this, cx| {
+                        preview.await.ok();
+                        this.update(cx, |this, cx| {
+                            this.panel_collapsed = false;
+                            this.panel_tab = PanelTab::Output;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            }
         }
     }
 
-    /// Runs `sql` and undoes it, to see what it would change. With
-    /// `then_ask`, shows the result and offers to run it for real; otherwise
-    /// only logs it.
-    fn preview(
+    /// Previews for the review dialog and hands it the result.
+    fn preview_into(
         &mut self,
         sql: String,
-        then_ask: bool,
-        window: &mut Window,
+        dialog: gpui_kit::WeakEntity<write_mode::ReviewDialog>,
         cx: &mut Context<Self>,
     ) {
-        let WriteState::On(write) = &self.write else {
+        let Some(preview) = self.run_preview(sql, cx) else {
             return;
+        };
+        cx.spawn(async move |_, cx| {
+            let result = preview.await;
+            dialog
+                .update(cx, |dialog, cx| dialog.set_preview(result, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Runs `sql` and undoes it, to see what it would change; logs it in
+    /// Output and the audit log. `None` outside write mode.
+    fn run_preview(
+        &mut self,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Vec<StatementImpact>, String>>> {
+        let WriteState::On(write) = &self.write else {
+            return None;
         };
         let preview = write.session.preview(
             sql.clone(),
@@ -461,65 +519,25 @@ impl QueryTab {
                 ..RunOptions::default()
             },
         );
-        let (name, environment) = (self.db.name.clone(), self.db.environment);
-        cx.spawn_in(window, async move |this, cx| {
-            let result = preview.await;
-            this.update_in(cx, |this, window, cx| {
-                let lines = match &result {
-                    Ok(impacts) => write_mode::describe_impact(&sql, impacts),
-                    Err(error) => vec![describe_error(error.clone())],
-                };
-                let failed = result.is_err();
-                let outcome = if failed {
-                    format!("Preview failed: {}", lines.join(" · "))
-                } else {
-                    format!("Preview (undone): {}", lines.join(" · "))
+        Some(cx.spawn(async move |this, cx| {
+            let result = preview.await.map_err(describe_error);
+            this.update(cx, |this, cx| {
+                let (outcome, failed) = match &result {
+                    Ok(impacts) => (
+                        format!(
+                            "Preview (undone): {}",
+                            write_mode::describe_impact(&sql, impacts).join(" · ")
+                        ),
+                        false,
+                    ),
+                    Err(error) => (format!("Preview failed: {error}"), true),
                 };
                 this.audit(AuditAction::Preview, &sql, &outcome, None, failed, cx);
                 this.log(&sql, outcome, failed, cx);
-                if !then_ask {
-                    this.panel_collapsed = false;
-                    this.panel_tab = PanelTab::Output;
-                    cx.notify();
-                    return;
-                }
-                let (message, buttons): (String, &[&str]) = if failed {
-                    ("The preview failed".into(), &["OK"])
-                } else {
-                    (
-                        format!("Preview on {name} ({})", environment.label()),
-                        &["Run", "Cancel"],
-                    )
-                };
-                let mut detail = lines
-                    .iter()
-                    .map(|line| format!("• {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !failed {
-                    detail.push_str("\n\nThe preview was undone. Run the script for real?");
-                }
-                let answer = window.prompt(
-                    if failed {
-                        PromptLevel::Critical
-                    } else {
-                        PromptLevel::Warning
-                    },
-                    &message,
-                    Some(&detail),
-                    buttons,
-                    cx,
-                );
-                cx.spawn(async move |this, cx| {
-                    if let (Ok(0), false) = (answer.await, failed) {
-                        this.update(cx, |this, cx| this.execute(sql, true, cx)).ok();
-                    }
-                })
-                .detach();
             })
             .ok();
-        })
-        .detach();
+            result
+        }))
     }
 
     /// Logs a script that write mode will not run.
@@ -621,6 +639,9 @@ impl QueryTab {
                     self.audit(AuditAction::Run, &sql, &outcome, changed, false, cx);
                 }
                 self.record(outcome, false, cx);
+                if changes_schema(&self.last_sql) {
+                    self.load_completion_catalog(cx);
+                }
                 self.run = RunState::Done {
                     rows: summary.rows,
                     elapsed: summary.elapsed,
@@ -901,7 +922,7 @@ impl QueryTab {
     }
 
     /// Production: stops allowing writes on this connection session.
-    fn stop_allowing_writes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_allowing_writes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.db.revoke_writes();
         self.leave_write_mode(window, cx);
     }
@@ -987,6 +1008,10 @@ impl QueryTab {
                     failed,
                     cx,
                 );
+                // Committed DDL becomes visible to the catalog connection.
+                if commit && result.is_ok() {
+                    this.load_completion_catalog(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1115,81 +1140,239 @@ impl QueryTab {
         matches!(self.run, RunState::Running { .. })
     }
 
-    /// `local-dev · reports/monthly_sales.sql · edited`.
-    fn subtitle(&self) -> String {
-        let place = match &self.file {
-            Some(path) => path
-                .strip_prefix(&self.queries_dir)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| path.display().to_string()),
-            None => "not saved".into(),
-        };
-        let edited = if self.dirty && self.file.is_some() {
-            " · edited"
-        } else {
-            ""
-        };
-        format!("{} · {place}{edited}", self.db.name)
-    }
-
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.is_running();
-        let run_shortcut = if cfg!(target_os = "macos") {
-            "⌘↵"
-        } else {
-            "Ctrl+↵"
+        let mac = cfg!(target_os = "macos");
+        let mode = match &self.write {
+            WriteState::On(write) => Some(write.kind),
+            _ => None,
         };
+        let writing = mode.is_some();
+        let segment = |id: &'static str,
+                       icon: AppIcon,
+                       label: &'static str,
+                       target: Option<WriteKind>,
+                       cx: &mut Context<Self>| {
+            chrome::segment(id, icon, label, mode == target)
+                .on_click(cx.listener(move |this, _, window, cx| this.set_mode(target, window, cx)))
+        };
+
         h_flex()
-            .h(px(44.))
-            .px_4()
-            .gap_2()
+            .h(px(46.))
+            .px_3()
+            .gap(px(6.))
             .flex_shrink_0()
-            .bg(color(theme::TOOLBAR))
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
             .child(
-                Icon::new(AppIcon::Code)
-                    .size(px(16.))
-                    .text_color(color(theme::TEXT_SECONDARY)),
+                chrome::primary_button(
+                    "run",
+                    IconName::Play,
+                    if running { "Running" } else { "Run" },
+                    Some(if mac { "⌘↵" } else { "Ctrl+↵" }),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.run_query(&RunQuery, window, cx))),
             )
             .child(
-                v_flex()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(color(theme::TEXT_TERTIARY))
-                            .child(self.subtitle()),
-                    ),
+                chrome::icon_button(
+                    "run-all",
+                    AppIcon::RunAll,
+                    if mac {
+                        "Run All  ⌥⌘↵"
+                    } else {
+                        "Run All  Ctrl+Alt+↵"
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.run_all(&RunAll, window, cx))),
+            )
+            .child(
+                chrome::icon_button(
+                    "cancel-query",
+                    IconName::Square,
+                    if mac {
+                        "Cancel  ⌘."
+                    } else {
+                        "Cancel  Ctrl+."
+                    },
+                    running,
+                )
+                .when(running, |b| {
+                    b.on_click(cx.listener(|this, _, window, cx| {
+                        this.cancel_query(&CancelQuery, window, cx)
+                    }))
+                }),
+            )
+            .child(chrome::toolbar_divider())
+            .child(
+                chrome::icon_button(
+                    "preview-impact",
+                    IconName::Eye,
+                    if writing {
+                        "Preview Impact"
+                    } else {
+                        "Preview Impact (needs Write or Full)"
+                    },
+                    writing && !running,
+                )
+                .when(writing && !running, |b| {
+                    b.on_click(cx.listener(|this, _, window, cx| {
+                        this.preview_impact(&PreviewImpact, window, cx)
+                    }))
+                }),
+            )
+            .child(
+                chrome::icon_button(
+                    "format-sql",
+                    AppIcon::Format,
+                    if mac {
+                        "Format SQL  ⌘⇧F"
+                    } else {
+                        "Format SQL  Ctrl+Shift+F"
+                    },
+                    true,
+                )
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.format_sql(&FormatSql, window, cx)),
+                ),
+            )
+            .child(
+                chrome::icon_button(
+                    "save-query",
+                    AppIcon::Save,
+                    if mac { "Save  ⌘S" } else { "Save  Ctrl+S" },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.save(&SaveQuery, window, cx))),
             )
             .children(self.save_error.clone().map(|error| {
                 div()
+                    .min_w_0()
                     .text_size(px(12.))
                     .text_color(color(theme::RED))
                     .truncate()
                     .child(error)
             }))
             .child(div().flex_1())
-            .child(self.render_mode_selector(cx))
-            .when(running, |row| {
-                row.child(Button::new("cancel").small().label("Cancel").on_click(
-                    cx.listener(|this, _, window, cx| this.cancel_query(&CancelQuery, window, cx)),
-                ))
-            })
+            .children(self.render_transaction_pill(cx))
             .child(
-                Button::new("run")
-                    .small()
-                    .primary()
-                    .label(format!("Run  {run_shortcut}"))
-                    .loading(running)
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.run_query(&RunQuery, window, cx)),
-                    ),
+                h_flex()
+                    .id("query-connection")
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .gap(px(7.))
+                    .px(px(9.))
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(color(theme::CONTROL_BORDER))
+                    .text_size(px(12.5))
+                    .child(chrome::dot(self.db.environment.color()))
+                    .child(self.db.name.clone())
+                    .tooltip({
+                        let text: SharedString = format!(
+                            "{} · {}",
+                            self.db.target,
+                            self.db.environment.label().to_lowercase()
+                        )
+                        .into();
+                        move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                .build(window, cx)
+                        }
+                    }),
             )
+            .child(
+                chrome::segmented()
+                    .child(segment("mode-read", AppIcon::Lock, "Read", None, cx))
+                    .child(segment(
+                        "mode-write",
+                        AppIcon::Pencil,
+                        "Write",
+                        Some(WriteKind::Transactional),
+                        cx,
+                    ))
+                    .child(segment(
+                        "mode-full",
+                        AppIcon::FullWrite,
+                        "Full",
+                        Some(WriteKind::Full),
+                        cx,
+                    )),
+            )
+    }
+
+    /// The open transaction, in the toolbar: what it holds, Roll Back and Commit.
+    fn render_transaction_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let WriteState::On(write) = &self.write else {
+            return None;
+        };
+        if !write.session.in_transaction() {
+            return None;
+        }
+        let busy = self.is_running();
+        Some(
+            chrome::pill()
+                .child(chrome::dot(theme::AMBER))
+                .child(div().text_color(color(0xc7c7cc)).child(format!(
+                    "{} · {}",
+                    plural(write.statements, "statement"),
+                    plural_rows(write.affected)
+                )))
+                .child(
+                    chrome::pill_button("rollback", "Roll Back", false).when(!busy, |b| {
+                        b.on_click(cx.listener(|this, _, window, cx| {
+                            this.rollback(&RollbackTransaction, window, cx)
+                        }))
+                    }),
+                )
+                .child(
+                    chrome::pill_button("commit", "Commit", true).when(!busy, |b| {
+                        b.on_click(cx.listener(|this, _, window, cx| {
+                            this.commit(&CommitTransaction, window, cx)
+                        }))
+                    }),
+                ),
+        )
+    }
+
+    /// What the status bar says about this tab's mode.
+    pub fn mode_status(&self) -> String {
+        let hint = write_mode::policy_hint(self.db.environment.write_policy());
+        match &self.write {
+            WriteState::Off => "Read-only".into(),
+            WriteState::Connecting => "Opening a write connection…".into(),
+            WriteState::Failed(error) => format!("Write mode failed: {error}"),
+            WriteState::On(write) => match write.kind {
+                WriteKind::Full => format!("Full write · {hint}"),
+                WriteKind::Transactional => match write.opened {
+                    Some(opened) if write.session.in_transaction() => {
+                        let open = opened.elapsed().as_secs();
+                        format!(
+                            "Write · transaction open {}:{:02} · {hint}",
+                            open / 60,
+                            open % 60
+                        )
+                    }
+                    _ => format!("Write · {hint}"),
+                },
+            },
+        }
+    }
+
+    /// The last run's outcome for the status bar, and its tone.
+    pub fn run_status(&self, cx: &App) -> (String, u32) {
+        self.status(cx)
+    }
+
+    /// `Ln 9, Col 16`, 1-based.
+    pub fn cursor_status(&self, cx: &App) -> String {
+        let position = self.editor.read(cx).cursor_position();
+        format!("Ln {}, Col {}", position.line + 1, position.character + 1)
+    }
+
+    pub fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        self.panel_collapsed = !self.panel_collapsed;
+        cx.notify();
     }
 
     /// The SQL editor's right-click menu: run, edit, save and mode.
@@ -1259,213 +1442,6 @@ impl QueryTab {
         }
     }
 
-    /// Read-only / Write / Full write selector in the toolbar.
-    fn render_mode_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let environment = self.db.environment;
-        let current = match &self.write {
-            WriteState::On(write) => Some(write.kind),
-            _ => None,
-        };
-        let (label, tone): (SharedString, u32) = match &self.write {
-            WriteState::Off => ("Read-only".into(), 0x4da3ff),
-            WriteState::Connecting => ("Connecting…".into(), theme::TEXT_SECONDARY),
-            WriteState::On(write) => (
-                format!("{} · {}", write.kind.label(), environment.short_label()).into(),
-                match write.kind {
-                    WriteKind::Transactional => environment.color(),
-                    WriteKind::Full => theme::RED,
-                },
-            ),
-            WriteState::Failed(_) => ("Write mode failed".into(), theme::RED),
-        };
-        let on = current.is_some();
-        let pill = h_flex()
-            .gap_1()
-            .px_2()
-            .py(px(3.))
-            .rounded(px(6.))
-            .bg(color(tone).opacity(if on { 0.22 } else { 0.14 }))
-            .text_color(color(tone))
-            .text_size(px(12.))
-            .font_weight(if on {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
-            .child(Icon::new(if on { AppIcon::Pencil } else { AppIcon::Lock }).size(px(12.)))
-            .child(label)
-            .child(Icon::new(IconName::ChevronDown).size(px(11.)));
-
-        let this = cx.weak_entity();
-        Button::new("write-mode")
-            .ghost()
-            .compact()
-            .child(pill)
-            .dropdown_menu(move |menu, _, _| {
-                let item = |label: &'static str, mode: Option<WriteKind>, hint: &'static str| {
-                    let this = this.clone();
-                    PopupMenuItem::new(format!("{label}  ·  {hint}"))
-                        .checked(current == mode)
-                        .on_click(move |_, window, cx| {
-                            this.update(cx, |this, cx| this.set_mode(mode, window, cx))
-                                .ok();
-                        })
-                };
-                menu.item(item("Read-only", None, "nothing can change"))
-                    .item(item(
-                        "Write",
-                        Some(WriteKind::Transactional),
-                        "in a transaction you commit",
-                    ))
-                    .item(item(
-                        "Full write",
-                        Some(WriteKind::Full),
-                        "each script applied right away",
-                    ))
-            })
-    }
-
-    fn render_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let banner = h_flex()
-            .h(px(28.))
-            .px_4()
-            .gap_2()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(color(theme::HAIRLINE))
-            .text_size(px(12.));
-        let environment = self.db.environment;
-        match &self.write {
-            WriteState::On(write) => {
-                let policy = environment.write_policy();
-                let hint = write_mode::policy_hint(policy);
-                let (tone, text) = match write.kind {
-                    WriteKind::Transactional => (
-                        environment.color(),
-                        format!(
-                            "Write mode on {} ({}) · changes stay in a transaction until you \
-                             commit · {hint}",
-                            self.db.name,
-                            environment.label()
-                        ),
-                    ),
-                    WriteKind::Full => (
-                        theme::RED,
-                        format!(
-                            "Full write on {} ({}) · each script is applied when it finishes, \
-                             with no Roll Back · {hint}",
-                            self.db.name,
-                            environment.label()
-                        ),
-                    ),
-                };
-                banner
-                    .bg(color(tone).opacity(0.14))
-                    .text_color(color(tone))
-                    .child(Icon::new(AppIcon::Pencil).size(px(13.)))
-                    .child(div().flex_1().truncate().child(text))
-                    .when(policy == WritePolicy::SessionUnlock, |banner| {
-                        banner.child(
-                            Button::new("stop-allowing-writes")
-                                .ghost()
-                                .xsmall()
-                                .label("Stop Allowing Writes")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.stop_allowing_writes(window, cx)
-                                })),
-                        )
-                    })
-                    .into_any_element()
-            }
-            WriteState::Failed(error) => banner
-                .bg(color(theme::RED).opacity(0.14))
-                .text_color(color(theme::RED))
-                .child(
-                    div()
-                        .truncate()
-                        .child(format!("Could not open a write connection: {error}")),
-                )
-                .into_any_element(),
-            WriteState::Off | WriteState::Connecting => banner
-                .bg(color(theme::READ_ONLY_BG))
-                .text_color(color(theme::READ_ONLY_FG))
-                .child(Icon::new(AppIcon::Lock).size(px(13.)))
-                .child(
-                    "Read-only query: runs in a READ ONLY transaction. INSERT, UPDATE, DELETE and \
-                     DDL are blocked.",
-                )
-                .into_any_element(),
-        }
-    }
-
-    /// Shown while a transaction is open: what it holds, and Commit / Roll Back.
-    fn render_transaction_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let WriteState::On(write) = &self.write else {
-            return None;
-        };
-        if !write.session.in_transaction() {
-            return None;
-        }
-        let idle = write.last_run.elapsed();
-        let countdown = (idle + IDLE_WARNING >= IDLE_ROLLBACK).then(|| {
-            let left = IDLE_ROLLBACK.saturating_sub(idle).as_secs();
-            format!(" · rolls back in {}:{:02} if idle", left / 60, left % 60)
-        });
-        let open_for = write
-            .opened
-            .map(|opened| format!(" · open {}", format_duration(opened.elapsed())))
-            .unwrap_or_default();
-        let busy = self.is_running();
-        Some(
-            h_flex()
-                .h(px(34.))
-                .px_4()
-                .gap_2()
-                .flex_shrink_0()
-                .bg(color(theme::AMBER).opacity(0.1))
-                .border_b_1()
-                .border_color(color(theme::HAIRLINE))
-                .text_size(px(12.5))
-                .child(div().size(px(7.)).rounded_full().bg(color(theme::AMBER)))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Transaction open"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .text_color(color(theme::TEXT_SECONDARY))
-                        .child(format!(
-                            "{} · {} changed{open_for}{}",
-                            plural(write.statements, "statement"),
-                            plural_rows(write.affected),
-                            countdown.unwrap_or_default()
-                        )),
-                )
-                .child(
-                    Button::new("rollback")
-                        .small()
-                        .label("Roll Back")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.rollback(&RollbackTransaction, window, cx)
-                        })),
-                )
-                .child(
-                    Button::new("commit")
-                        .small()
-                        .primary()
-                        .label("Commit")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.commit(&CommitTransaction, window, cx)
-                        })),
-                ),
-        )
-    }
-
     /// The run's status, shown next to the panel tabs.
     fn status(&self, cx: &App) -> (String, u32) {
         let loaded = self.table.read(cx).delegate().rows();
@@ -1517,106 +1493,129 @@ impl QueryTab {
     }
 
     fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (status, tone) = self.status(cx);
-        let has_results = !self
-            .table
-            .read(cx)
-            .delegate()
-            .results()
-            .columns()
-            .is_empty();
-        let toggle_shortcut = if cfg!(target_os = "macos") {
-            "⌘J"
-        } else {
-            "Ctrl+J"
-        };
-        let tab = |id: &'static str, label: SharedString, tab: PanelTab, cx: &mut Context<Self>| {
+        let results = self.table.read(cx).delegate().results();
+        let has_results = !results.columns().is_empty();
+        let rows = results.rows();
+        let mac = cfg!(target_os = "macos");
+        let tab = |id: &'static str,
+                   icon: AppIcon,
+                   label: &'static str,
+                   count: Option<String>,
+                   tab: PanelTab,
+                   cx: &mut Context<Self>| {
             let active = self.panel_tab == tab && !self.panel_collapsed;
-            div()
+            h_flex()
                 .id(id)
-                .h_full()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_1()
-                .border_b_2()
-                .border_color(if active {
-                    color(theme::ACCENT)
-                } else {
-                    color(theme::ACCENT).opacity(0.)
-                })
-                .text_color(color(if active {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_SECONDARY
-                }))
+                .h(px(26.))
+                .gap(px(6.))
+                .px(px(10.))
+                .rounded(px(6.))
                 .font_weight(FontWeight::MEDIUM)
-                .hover(|s| s.text_color(color(theme::TEXT)))
+                .when(active, |t| {
+                    t.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT))
+                })
+                .when(!active, |t| {
+                    t.text_color(color(theme::TEXT_TERTIARY))
+                        .hover(|s| s.text_color(color(theme::TEXT)))
+                })
+                .child(Icon::new(icon).size(px(13.)))
                 .child(label)
+                .children(count.map(|count| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(color(theme::TEXT_TERTIARY))
+                        .child(count)
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| this.select_panel_tab(tab, cx)))
         };
-        let output_label: SharedString = if self.output.is_empty() {
-            "Output".into()
-        } else {
-            format!("Output · {}", self.output.len()).into()
+        let failure = match &self.run {
+            RunState::Failed(message) => Some(message.clone()),
+            _ => None,
         };
 
         h_flex()
             .id("panel-header")
-            .h(px(34.))
-            .pl_1()
-            .pr_2()
-            .gap_1()
+            .h(px(36.))
+            .px_2()
+            .gap(px(2.))
             .flex_shrink_0()
-            .bg(color(0x1c1c1e))
             .border_t_1()
             .border_b_1()
             .border_color(color(theme::HAIRLINE))
             .text_size(px(12.5))
             .child(tab(
                 "panel-results",
-                "Results".into(),
+                AppIcon::Table,
+                "Results",
+                has_results.then(|| thousands(rows as u64)),
                 PanelTab::Results,
                 cx,
             ))
-            .child(tab("panel-output", output_label, PanelTab::Output, cx))
+            .child(tab(
+                "panel-output",
+                AppIcon::History,
+                "Output",
+                (!self.output.is_empty()).then(|| self.output.len().to_string()),
+                PanelTab::Output,
+                cx,
+            ))
             .child(
+                // Failures stay in sight here; everything else is in the status bar.
                 div()
                     .flex_1()
                     .min_w_0()
                     .pl_2()
                     .text_size(px(12.))
-                    .text_color(color(tone))
+                    .text_color(color(theme::RED))
                     .truncate()
-                    .child(status),
+                    .children(failure),
             )
             .child(
-                Button::new("export-results")
-                    .ghost()
-                    .xsmall()
-                    .label("Export…")
-                    .tooltip("Save the results as CSV, TSV or JSON")
-                    .disabled(self.is_running() || !has_results)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.export_results(&ExportResults, window, cx)
-                    })),
+                chrome::icon_button(
+                    "copy-results",
+                    IconName::Copy,
+                    "Copy Results",
+                    has_results && !self.is_running(),
+                )
+                .when(has_results && !self.is_running(), |b| {
+                    b.on_click(cx.listener(|this, _, _, cx| this.copy_results(cx)))
+                }),
             )
             .child(
-                Button::new("toggle-results")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(if self.panel_collapsed {
-                        AppIcon::PanelBottomOpen
+                chrome::icon_button(
+                    "export-results",
+                    AppIcon::Download,
+                    if mac {
+                        "Export Results…  ⌘⇧E"
                     } else {
-                        AppIcon::PanelBottomClose
+                        "Export Results…  Ctrl+Shift+E"
+                    },
+                    has_results && !self.is_running(),
+                )
+                .when(has_results && !self.is_running(), |b| {
+                    b.on_click(cx.listener(|this, _, window, cx| {
+                        this.export_results(&ExportResults, window, cx)
                     }))
-                    .tooltip(format!(
-                        "{} panel  {toggle_shortcut}",
-                        if self.panel_collapsed { "Show" } else { "Hide" }
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_results(&ToggleResults, window, cx)
-                    })),
+                }),
+            )
+            .child(
+                chrome::icon_button(
+                    "toggle-results",
+                    if self.panel_collapsed {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    },
+                    format!(
+                        "{} Panel  {}",
+                        if self.panel_collapsed { "Show" } else { "Hide" },
+                        if mac { "⌘J" } else { "Ctrl+J" }
+                    ),
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_results(&ToggleResults, window, cx)
+                })),
             )
             // Double-clicking the strip collapses or expands the panel.
             .on_click(
@@ -1626,6 +1625,22 @@ impl QueryTab {
                     }
                 }),
             )
+    }
+
+    /// Copies all the results to the clipboard as tab-separated text.
+    fn copy_results(&mut self, cx: &mut Context<Self>) {
+        let set = self.table.read(cx).delegate().results().clone();
+        let mut out = Vec::new();
+        if export::write(&set, Format::Tsv, &mut out).is_ok() {
+            let text = String::from_utf8_lossy(&out).into_owned();
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+            self.log(
+                "COPY",
+                format!("Copied {} to the clipboard", plural_rows(set.rows() as u64)),
+                false,
+                cx,
+            );
+        }
     }
 
     fn render_output(&self, mono: SharedString) -> impl IntoElement {
@@ -1728,8 +1743,6 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))
-            .child(self.render_banner(cx))
-            .children(self.render_transaction_bar(cx))
             .child(
                 v_flex()
                     .id("query-split")
@@ -1785,6 +1798,16 @@ impl Render for QueryTab {
                     }),
             )
     }
+}
+
+/// Whether `sql` creates, alters or drops something completion lists.
+fn changes_schema(sql: &str) -> bool {
+    analysis::analyze(sql).is_ok_and(|analysis| {
+        analysis
+            .statements
+            .iter()
+            .any(|statement| statement.kind == StatementKind::Schema)
+    })
 }
 
 fn plural(count: usize, noun: &str) -> String {

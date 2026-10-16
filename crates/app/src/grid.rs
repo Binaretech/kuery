@@ -226,14 +226,19 @@ impl TableDelegate for BrowseDelegate {
                     table.delegate_mut().menu_cell = Some((row_ix, col_ix));
                 }),
             );
+        // Staged changes are marked with a thin line on the left, not a fill:
+        // amber for an edited value, red and struck through for a deleted row.
         if deleted {
             cell = cell
-                .bg(color(theme::RED).opacity(0.14))
-                .text_color(color(0xff9a94));
+                .border_l_2()
+                .border_color(color(theme::RED).opacity(if col_ix == 0 { 1. } else { 0. }))
+                .line_through()
+                .text_color(color(theme::TEXT_QUIET));
         } else if edited.is_some() {
             cell = cell
-                .bg(color(theme::AMBER).opacity(0.16))
-                .text_color(color(0xffd58a));
+                .border_l_2()
+                .border_color(color(theme::AMBER))
+                .text_color(color(0xffcf7f));
         }
         let content: AnyElement = match value {
             Some(Some(text)) => div()
@@ -243,7 +248,7 @@ impl TableDelegate for BrowseDelegate {
             Some(None) => div()
                 .italic()
                 .text_color(if edited.is_some() {
-                    color(0xffd58a)
+                    color(0xffcf7f)
                 } else {
                     cx.theme().muted_foreground
                 })

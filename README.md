@@ -17,6 +17,22 @@ row editing through staged changes (never on production connections).
 | `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, transactional row changes, and write transactions with a savepoint per run. |
 | `crates/app` | The gpui app (`gpui-kit`, pinned version). Custom fonts and icons in `crates/app/assets`. |
 
+## Interface
+
+The window has a title bar (project switcher, the search that opens the
+command palette, sidebar and panel toggles), an activity rail on the left
+(Explorer, Saved Queries, History; Audit Log and Keyboard Shortcuts at the
+bottom; clicking the active view hides the sidebar), the sidebar, tabs, and a
+status bar with the active connection and environment, the tab's mode or
+transaction, the last run and the cursor position.
+
+Toolbars put actions behind icon buttons whose tooltips name the shortcut.
+There are no colored banners: a query tab's mode is the Read / Write / Full
+control, an open transaction or staged row changes are a pill with their
+actions, and before a script that writes runs, a review dialog lists its
+statements, flags the risky ones, and fills in the rows each one would
+change when you click Preview Impact.
+
 ## Development
 
 ```bash
@@ -62,8 +78,8 @@ if not set; production connections open read-only (the session also sets
 
 ## Write mode
 
-Each query tab has three modes, chosen in the toolbar selector or from the
-command palette ("Read-only Mode", "Write Mode (Transactional)", "Full Write
+Each query tab has three modes, chosen in the toolbar's Read / Write / Full
+control or from the command palette ("Read-only Mode", "Write Mode (Transactional)", "Full Write
 Mode"):
 
 - **Read-only** (the default): nothing can change, as described above.
@@ -78,7 +94,7 @@ In both write modes:
 
 - The tab opens a connection of its own. In Write, the first script that writes opens a
   transaction that stays open until **Commit** or **Roll Back** in the
-  transaction bar, which shows the statements and rows changed so far. Reads in
+  toolbar, next to the statements and rows changed so far. Reads in
   that tab see the uncommitted changes; other tabs and sessions do not.
 - In Write, every run gets a savepoint: if a script fails, only its own changes
   are undone and the transaction stays usable.
@@ -91,11 +107,11 @@ In both write modes:
 - Production needs writes allowed first, by typing the connection's name, and
   full write needs a second, separate permission (typing the name again). Both
   last for the connection session only (until it disconnects or the app
-  quits), are never saved in the project, and "Stop Allowing Writes" ends
-  them.
+  quits), are never saved in the project, and "Stop allowing writes" in the
+  status bar ends them. A thin amber line under the title bar marks a
+  production connection.
 - Writes have a 60 s `statement_timeout` and a 5 s `lock_timeout`. A
-  transaction with no runs for 10 minutes is rolled back (the bar counts down
-  over the last two). Closing the tab asks whether to commit; closing the
+  transaction with no runs for 10 minutes is rolled back. Closing the tab asks whether to commit; closing the
   window or turning write mode off with a transaction open asks first too,
   and so does quitting (which also asks about unsaved SQL and staged row
   changes).
@@ -103,8 +119,8 @@ In both write modes:
 - **Preview Impact**, in the confirmation or as a command (palette and the
   editor's menu), runs the script inside a transaction (or under a savepoint
   in the open one), lists the rows each statement would change or return,
-  and undoes it all; from the confirmation it then asks whether to run it
-  for real. Statements that cannot run in a transaction block (`VACUUM`)
+  and undoes it all; in the review dialog the counts fill its Rows column,
+  and Run then runs the script for real. Statements that cannot run in a transaction block (`VACUUM`)
   cannot be previewed.
 - Every write run, preview, commit and rollback is appended to an **audit
   log**, `audit.jsonl` in the user config directory (one JSON object per
@@ -144,13 +160,20 @@ selection or the whole script (one clause per line, keyword case and function
 bodies left as written; undo brings the old text back). Command shortcuts are also bound
 inside text fields, so a field's own keys never shadow them.
 
+The editor completes as you type: keywords (in the case you type them), tables
+and views after `FROM`, `JOIN`, `UPDATE` and `INTO` (those outside the
+`search_path` schema-qualified), and columns of the tables the statement reads,
+also through an alias (`o.` in `select o.| from orders o`). `ctrl-space` asks
+for suggestions where typing alone does not, like an empty select list. The
+tab loads the catalog when it opens and again after DDL runs or a commit.
+
 In a query tab the editor and the bottom panel are split by a divider you can
 drag (double-click it to reset). The panel has a Results tab with the grid and
 an Output tab that logs each run (SQL, rows and time, or the error); it
 collapses to its tab strip with `secondary-j`, its button or a double-click on
 the strip, and running a query brings it back.
 
-"Export…" in the panel (or `secondary-shift-e`, the palette or the editor's
+The download icon in the panel (or `secondary-shift-e`, the palette or the editor's
 menu) saves the results to a file: the extension picks CSV (RFC 4180), TSV
 (tabs and line breaks escaped) or JSON (an array of objects; values as text,
 NULL as `null`). It writes in the background; a million rows take well under

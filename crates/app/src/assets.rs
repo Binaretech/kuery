@@ -42,10 +42,18 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/arrow-down-up.svg",
     "icons/trash.svg",
     "icons/refresh-cw.svg",
-    "icons/panel-bottom-close.svg",
-    "icons/panel-bottom-open.svg",
     "icons/code.svg",
     "icons/pencil.svg",
+    "icons/fast-forward.svg",
+    "icons/wand.svg",
+    "icons/save.svg",
+    "icons/clock.svg",
+    "icons/file-code.svg",
+    "icons/shield-check.svg",
+    "icons/keyboard.svg",
+    "icons/zap.svg",
+    "icons/download.svg",
+    "icons/chevrons-down-up.svg",
 ];
 
 const BRANDING: &[(&str, &[u8])] = &[(crate::app_icon::PATH, crate::app_icon::PNG)];
@@ -62,15 +70,23 @@ pub enum AppIcon {
     Sort,
     Trash,
     Reload,
-    PanelBottomClose,
-    PanelBottomOpen,
     Code,
     Pencil,
+    RunAll,
+    Format,
+    Save,
+    History,
+    Queries,
+    Audit,
+    Keyboard,
+    FullWrite,
+    Download,
+    CollapseAll,
 }
 
 #[cfg(test)]
 impl AppIcon {
-    const ALL: [AppIcon; 13] = [
+    const ALL: [AppIcon; 21] = [
         AppIcon::Lock,
         AppIcon::Database,
         AppIcon::Table,
@@ -80,10 +96,18 @@ impl AppIcon {
         AppIcon::Sort,
         AppIcon::Trash,
         AppIcon::Reload,
-        AppIcon::PanelBottomClose,
-        AppIcon::PanelBottomOpen,
         AppIcon::Code,
         AppIcon::Pencil,
+        AppIcon::RunAll,
+        AppIcon::Format,
+        AppIcon::Save,
+        AppIcon::History,
+        AppIcon::Queries,
+        AppIcon::Audit,
+        AppIcon::Keyboard,
+        AppIcon::FullWrite,
+        AppIcon::Download,
+        AppIcon::CollapseAll,
     ];
 }
 
@@ -99,10 +123,18 @@ impl IconNamed for AppIcon {
             AppIcon::Sort => "icons/arrow-down-up.svg",
             AppIcon::Trash => "icons/trash.svg",
             AppIcon::Reload => "icons/refresh-cw.svg",
-            AppIcon::PanelBottomClose => "icons/panel-bottom-close.svg",
-            AppIcon::PanelBottomOpen => "icons/panel-bottom-open.svg",
             AppIcon::Code => "icons/code.svg",
             AppIcon::Pencil => "icons/pencil.svg",
+            AppIcon::RunAll => "icons/fast-forward.svg",
+            AppIcon::Format => "icons/wand.svg",
+            AppIcon::Save => "icons/save.svg",
+            AppIcon::History => "icons/clock.svg",
+            AppIcon::Queries => "icons/file-code.svg",
+            AppIcon::Audit => "icons/shield-check.svg",
+            AppIcon::Keyboard => "icons/keyboard.svg",
+            AppIcon::FullWrite => "icons/zap.svg",
+            AppIcon::Download => "icons/download.svg",
+            AppIcon::CollapseAll => "icons/chevrons-down-up.svg",
         }
         .into()
     }

@@ -100,32 +100,6 @@ pub fn muted(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// Segmented control container.
-pub fn segmented() -> Div {
-    h_flex()
-        .p(px(2.))
-        .gap(px(2.))
-        .rounded(px(7.))
-        .bg(color(0x2a2a2d))
-}
-
-/// Visual segment (the caller adds the click handler, with an `id`).
-pub fn segment_body(label: impl Into<SharedString>, selected: bool) -> Div {
-    let base = div()
-        .px_3()
-        .h(px(22.))
-        .flex()
-        .items_center()
-        .rounded(px(5.))
-        .text_size(px(12.5))
-        .child(label.into());
-    if selected {
-        base.bg(color(0x636366)).text_color(color(0xffffff))
-    } else {
-        base.text_color(color(0xc7c7cc))
-    }
-}
-
 /// Centered message for empty or loading states.
 pub fn placeholder(text: impl Into<SharedString>) -> AnyElement {
     div()

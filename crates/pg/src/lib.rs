@@ -1258,6 +1258,37 @@ mod tests {
 
     #[test]
     #[ignore = "needs the dev Postgres"]
+    fn loads_tables_and_columns_for_completion() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = session(&engine).await;
+            let catalog = catalog::completion_catalog(session).await.unwrap();
+            assert_eq!(catalog.search_path, ["public"]);
+            assert!(catalog.schemas.iter().any(|s| s == "public"));
+            let orders = catalog
+                .tables
+                .iter()
+                .find(|t| t.table.schema == "public" && t.table.name == "orders")
+                .unwrap();
+            assert_eq!(orders.columns[0].name, "id");
+            assert!(
+                orders
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "status" && c.data_type == "order_status")
+            );
+            let view = catalog
+                .tables
+                .iter()
+                .find(|t| t.table.name == "v_daily_sales")
+                .unwrap();
+            assert_eq!(view.kind, kuery_core::catalog::TableKind::View);
+            assert!(!view.columns.is_empty());
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
     fn reads_a_second_database_on_the_same_server() {
         let engine = Engine::new().unwrap();
         engine.runtime.block_on(async {

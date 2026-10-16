@@ -9,11 +9,11 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    KeyBinding, MouseButton, ParentElement as _, Render, SharedString,
+    AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, actions, div, px,
 };
 use kuery_core::catalog::TableInfo;
@@ -73,6 +73,8 @@ pub struct CommandPalette {
     matches: Vec<usize>,
     selected: usize,
     problems: Vec<String>,
+    /// Nothing typed: commands are grouped under their category.
+    browsing: bool,
 }
 
 impl EventEmitter<PaletteEvent> for CommandPalette {}
@@ -123,6 +125,7 @@ impl CommandPalette {
             matches: Vec::new(),
             selected: 0,
             problems: keymap::problems(cx),
+            browsing: true,
         };
         palette.refilter(cx);
         palette
@@ -131,6 +134,7 @@ impl CommandPalette {
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.input.read(cx).value().to_string();
         let query = query.trim();
+        self.browsing = query.is_empty();
         let mut scored: Vec<(i64, usize)> = self
             .entries
             .iter()
@@ -146,6 +150,16 @@ impl CommandPalette {
             .collect();
         if !query.is_empty() {
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        } else {
+            // Browsing: each category once, in the order it first appears.
+            let rank = |index: usize| match &self.entries[index].item {
+                Item::Command(command) => COMMANDS
+                    .iter()
+                    .position(|c| c.category == command.category)
+                    .unwrap_or(usize::MAX),
+                _ => usize::MAX,
+            };
+            scored.sort_by_key(|&(_, index)| (rank(index), index));
         }
         self.matches = scored
             .into_iter()
@@ -202,29 +216,81 @@ impl CommandPalette {
     }
 }
 
+/// The icon a command shows in the palette.
+fn command_icon(id: &str) -> Icon {
+    match id {
+        "palette.open" => Icon::new(IconName::Search),
+        "project.open" => Icon::new(IconName::FolderOpen),
+        "project.clear_recent" => Icon::new(AppIcon::Trash),
+        "connection.new" => Icon::new(AppIcon::Database),
+        "tab.new_query" => Icon::new(IconName::Plus),
+        "tab.close" | "window.close" | "app.quit" => Icon::new(IconName::Close),
+        "tab.next" => Icon::new(IconName::ChevronRight),
+        "tab.previous" => Icon::new(IconName::ChevronLeft),
+        "sidebar.toggle" => Icon::new(IconName::PanelLeft),
+        "query.run" => Icon::new(IconName::Play),
+        "query.run_all" => Icon::new(AppIcon::RunAll),
+        "query.format" => Icon::new(AppIcon::Format),
+        "query.save" | "query.save_as" | "table.save" => Icon::new(AppIcon::Save),
+        "query.cancel" => Icon::new(IconName::Square),
+        "query.toggle_results" => Icon::new(IconName::PanelBottom),
+        "query.export" => Icon::new(AppIcon::Download),
+        "query.preview" => Icon::new(IconName::Eye),
+        "audit.open" => Icon::new(AppIcon::Audit),
+        "query.read_only" => Icon::new(AppIcon::Lock),
+        "query.write" => Icon::new(AppIcon::Pencil),
+        "query.full_write" => Icon::new(AppIcon::FullWrite),
+        "query.commit" => Icon::new(IconName::Check),
+        "query.rollback" => Icon::new(IconName::Undo),
+        "table.reload" => Icon::new(AppIcon::Reload),
+        "keymap.open" | "keymap.reload" => Icon::new(AppIcon::Keyboard),
+        "window.minimize" => Icon::new(IconName::Minimize),
+        "window.zoom" | "window.fullscreen" => Icon::new(IconName::Maximize),
+        _ => Icon::new(AppIcon::Code),
+    }
+}
+
 impl Render for CommandPalette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mono = cx.theme().mono_font_family.clone();
         let mut list = v_flex().gap(px(1.));
+        let mut last_category: Option<&str> = None;
         for (position, &index) in self.matches.iter().enumerate() {
             let entry = &self.entries[index];
             let selected = position == self.selected;
+            if self.browsing
+                && let Item::Command(command) = &entry.item
+                && last_category != Some(command.category)
+            {
+                last_category = Some(command.category);
+                list = list.child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(if position == 0 { 6. } else { 10. }))
+                        .pb(px(4.))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color(theme::TEXT_QUIET))
+                        .child(command.category.to_uppercase()),
+                );
+            }
             let (icon, tone) = match &entry.item {
-                Item::Command(_) => (Icon::new(AppIcon::Code), theme::TEXT_SECONDARY),
+                Item::Command(command) => (command_icon(command.id), theme::TEXT_SECONDARY),
                 Item::Table { info, .. } if info.kind.is_editable() => {
                     (Icon::new(AppIcon::Table), 0x4da3ff)
                 }
-                Item::Table { .. } => (Icon::new(AppIcon::Code), 0xc49bff),
-                Item::Project(_) => (Icon::new(IconName::FolderClosed), theme::ACCENT),
+                Item::Table { .. } => (Icon::new(AppIcon::Code), 0xb9a3e6),
+                Item::Project(_) => (Icon::new(IconName::FolderClosed), theme::TEXT_SECONDARY),
             };
             list = list.child(
                 h_flex()
                     .id(("palette-entry", position))
-                    .h(px(32.))
-                    .px_3()
-                    .gap_3()
-                    .rounded(px(6.))
-                    .when(selected, |row| row.bg(color(theme::SELECTION)))
-                    .when(!selected, |row| row.hover(|s| s.bg(color(0x2e2e32))))
+                    .h(px(34.))
+                    .px(px(10.))
+                    .gap(px(10.))
+                    .rounded(px(7.))
+                    .when(selected, |row| row.bg(color(theme::ACCENT)))
+                    .when(!selected, |row| row.hover(|s| s.bg(color(theme::ACTIVE))))
                     .child(icon.size(px(14.)).text_color(color(if selected {
                         0xffffff
                     } else {
@@ -246,15 +312,23 @@ impl Render for CommandPalette {
                             } else {
                                 theme::TEXT_TERTIARY
                             }))
-                            .child(entry.detail.clone()),
+                            .when(
+                                !self.browsing || !matches!(entry.item, Item::Command(_)),
+                                |d| d.child(entry.detail.clone()),
+                            ),
                     )
                     .children(entry.shortcut.clone().map(|shortcut| {
                         div()
-                            .px_2()
+                            .px(px(6.))
                             .py(px(1.))
                             .rounded(px(4.))
-                            .bg(color(if selected { 0x2b73e0 } else { 0x2e2e32 }))
-                            .text_size(px(11.5))
+                            .bg(if selected {
+                                gpui_kit::white().opacity(0.18)
+                            } else {
+                                color(theme::ACTIVE)
+                            })
+                            .font_family(mono.clone())
+                            .text_size(px(11.))
                             .text_color(color(if selected {
                                 0xffffff
                             } else {
@@ -280,9 +354,9 @@ impl Render for CommandPalette {
                 .text_color(color(theme::AMBER))
                 .truncate()
                 .child(format!("Keymap: {problem}")),
-            None => div().text_color(color(theme::TEXT_TERTIARY)).child(
-                "↑↓ to move · ↵ to run · esc to close · \"Open Keymap File\" to change shortcuts",
-            ),
+            None => div()
+                .text_color(color(theme::TEXT_TERTIARY))
+                .child("↑↓ move · ↵ run · esc close · type to search tables and recent projects"),
         };
 
         v_flex()
@@ -293,11 +367,11 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::on_dismiss))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(620.))
-            .max_h(px(460.))
-            .rounded(px(12.))
-            .bg(color(0x2a2a2d))
+            .max_h(px(480.))
+            .rounded(px(14.))
+            .bg(color(0x1f1f22))
             .border_1()
-            .border_color(color(theme::HAIRLINE))
+            .border_color(color(0x36363b))
             .shadow_lg()
             .overflow_hidden()
             .child(
