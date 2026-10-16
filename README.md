@@ -280,3 +280,15 @@ git tag v0.1.0 && git push origin v0.1.0
 
 Running the workflow by hand (Actions → Release → Run workflow) only builds the
 archives and keeps them as workflow artifacts.
+
+The macOS app is signed with a Developer ID certificate, notarized and stapled
+when these repository secrets are set; without them it gets an ad-hoc signature
+and users have to right-click → Open it the first time:
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERTIFICATE` | The "Developer ID Application" certificate and its private key exported as `.p12`, base64-encoded (`base64 -i cert.p12 \| pbcopy`) |
+| `MACOS_CERTIFICATE_PASSWORD` | The password chosen when exporting the `.p12` |
+| `APPLE_API_KEY` | An App Store Connect API key (`AuthKey_XXXX.p8`, "Developer" access), base64-encoded |
+| `APPLE_API_KEY_ID` | That key's ID |
+| `APPLE_API_ISSUER_ID` | The issuer ID shown above the keys in App Store Connect → Users and Access → Integrations |
