@@ -25,6 +25,7 @@
 //!
 //! TLS honours the URL's `sslmode` (see [`tls`]).
 
+pub mod activity;
 pub mod catalog;
 mod tls;
 
@@ -1599,6 +1600,84 @@ mod tests {
                 .await
                 .unwrap();
             writer.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn sees_who_blocks_whom_and_ends_the_blocker() {
+        use crate::activity::{Signal, activity, signal};
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let holder = write_session(&engine).await;
+            let waiter = write_session(&engine).await;
+            let monitor = session(&engine).await;
+            let table = scratch_table("locks");
+            let options = RunOptions::default();
+            let setup = write_session(&engine).await;
+            finish(setup.run_in_transaction(
+                format!("create table {table} (n int); insert into {table} values (1)"),
+                options.clone(),
+            ))
+            .await
+            .unwrap();
+            setup.commit().await.unwrap();
+
+            // The holder keeps the row locked in an open transaction; the
+            // waiter's update waits for it.
+            finish(holder.run_in_transaction(format!("update {table} set n = 2"), options.clone()))
+                .await
+                .unwrap();
+            let waiting =
+                waiter.run_in_transaction(format!("update {table} set n = 3"), options.clone());
+            let mut seen = None;
+            for _ in 0..50 {
+                let now = activity(monitor.clone()).await.unwrap();
+                // Other sessions on the server may block each other too.
+                let ours = now.blockers().into_iter().find(|root| {
+                    root.waiting
+                        .iter()
+                        .any(|pid| now.backend(*pid).is_some_and(|b| b.query.contains(&table)))
+                });
+                if let Some(root) = ours {
+                    seen = Some((now, root));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let (now, root) = seen.expect("sees the waiter blocked");
+            assert!(now.max_connections.is_some_and(|max| max > 0));
+            assert!(now.backends.iter().any(|b| b.own));
+            let blocked = now.backend(root.waiting[0]).unwrap();
+            assert_eq!(blocked.blocked_by, [root.pid]);
+            assert!(
+                blocked
+                    .waiting_for
+                    .as_deref()
+                    .is_some_and(|w| w.contains("transactionid") || w.contains(&table)),
+                "{:?}",
+                blocked.waiting_for
+            );
+            assert!(blocked.query.contains("set n = 3"));
+
+            // Ending the holder lets the waiter through.
+            assert!(
+                signal(monitor.clone(), root.pid, Signal::Terminate)
+                    .await
+                    .unwrap()
+            );
+            finish(waiting).await.unwrap();
+            waiter.rollback().await.unwrap();
+            assert!(
+                !signal(monitor.clone(), 999_999, Signal::Cancel)
+                    .await
+                    .unwrap()
+            );
+
+            finish(setup.run_in_transaction(format!("drop table {table}"), options))
+                .await
+                .unwrap();
+            setup.commit().await.unwrap();
         });
     }
 

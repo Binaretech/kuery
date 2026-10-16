@@ -276,6 +276,25 @@ there are not saved). The diagram zooms in steps (click the percentage for
 100%) or to fit the view, and exports what is shown as an SVG image, a
 Mermaid `erDiagram` (`.mmd`) or DBML (`.dbml`), to a file or the clipboard.
 
+## Server activity
+
+"Server Activity" in a Postgres connection's menu (or "Show Server
+Activity" in the command palette) opens a tab with the server's sessions:
+state, how long each has been at it (its query, or its open transaction
+when idle in one), user and application, the lock it waits for and its
+query. It refreshes every two seconds on a connection of its own, so a long
+query on the others never holds it up; pause it to read. "Busy" shows
+sessions that run something, hold a transaction open or block others; "All
+sessions" adds idle ones and background processes.
+
+Sessions that need a look stand out: those blocking others (a banner names
+the root of each chain and how many sessions wait on it), those waiting,
+queries running for over a minute and transactions idle for over a minute,
+which keep their locks. Selecting a session shows its query in full, to
+copy or open in a query tab, and offers to cancel its query or end the
+session. Both are confirmed first; on production they need writes allowed
+for the connection session, like any write, and both go to the audit log.
+
 ## Write mode
 
 Each query tab has three modes, chosen in the toolbar's Read / Write / Full

@@ -4,6 +4,7 @@
 //! results, readable query plans, schema diagrams, Redis command and key-name
 //! helpers, and the drivers' descriptors.
 
+pub mod activity;
 pub mod analysis;
 pub mod browse;
 pub mod catalog;

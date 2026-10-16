@@ -18,12 +18,13 @@ use gpui_kit::{
 use kuery_core::catalog::TableInfo;
 use kuery_core::sql::quote_qualified;
 
+use crate::activity_tab::{ActivityEvent, ActivityTab};
 use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
 use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, ToggleSidebar,
+    OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, ShowServerActivity, ToggleSidebar,
 };
 use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
@@ -47,6 +48,7 @@ enum Tab {
     RedisKey(Entity<KeyTab>),
     RedisConsole(Entity<ConsoleTab>),
     Diagram(Entity<DiagramTab>),
+    Activity(Entity<ActivityTab>),
 }
 
 impl Tab {
@@ -57,6 +59,7 @@ impl Tab {
             Tab::RedisKey(key) => key.entity_id(),
             Tab::RedisConsole(console) => console.entity_id(),
             Tab::Diagram(diagram) => diagram.entity_id(),
+            Tab::Activity(activity) => activity.entity_id(),
         }
     }
 
@@ -65,7 +68,7 @@ impl Tab {
         match self {
             Tab::RedisKey(key) => Some(key.read(cx).db().clone()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().clone()),
-            Tab::Query(_) | Tab::Table(_) | Tab::Diagram(_) => None,
+            Tab::Query(_) | Tab::Table(_) | Tab::Diagram(_) | Tab::Activity(_) => None,
         }
     }
 
@@ -76,7 +79,7 @@ impl Tab {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
-            Tab::RedisConsole(_) | Tab::Diagram(_) => false,
+            Tab::RedisConsole(_) | Tab::Diagram(_) | Tab::Activity(_) => false,
         }
     }
 
@@ -85,6 +88,7 @@ impl Tab {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
+            Tab::Activity(activity) => Some(activity.read(cx).db().clone()),
             Tab::RedisKey(_) | Tab::RedisConsole(_) => None,
         }
     }
@@ -107,6 +111,10 @@ impl Tab {
             }
             Tab::Diagram(diagram) => {
                 let handle = diagram.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            Tab::Activity(activity) => {
+                let handle = activity.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
             }
         }
@@ -186,6 +194,7 @@ impl WorkspaceView {
                     window,
                     cx,
                 ),
+                ExplorerEvent::OpenActivity(db) => this.open_activity(db.clone(), window, cx),
                 ExplorerEvent::OpenDiagram { db, schema } => {
                     this.open_diagram(db.clone(), schema.clone(), window, cx)
                 }
@@ -422,6 +431,49 @@ impl WorkspaceView {
             self.tabs.len() - 1
         });
         self.activate(index, window, cx);
+    }
+
+    /// Opens a connection's server activity, or shows the tab it is already
+    /// open in.
+    fn open_activity(&mut self, db: Db, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.tabs.iter().position(|tab| match tab {
+            Tab::Activity(tab) => tab.read(cx).db().name == db.name,
+            _ => false,
+        });
+        let index = existing.unwrap_or_else(|| {
+            let project = self.model.read(cx).project.root.clone();
+            let tab = cx.new(|cx| ActivityTab::new(db.clone(), project, cx));
+            cx.subscribe_in(
+                &tab,
+                window,
+                move |this, _, event: &ActivityEvent, window, cx| match event {
+                    ActivityEvent::OpenQuery(sql) => this.open_query(
+                        db.clone(),
+                        Some("Session query".into()),
+                        Some(sql.clone()),
+                        None,
+                        window,
+                        cx,
+                    ),
+                },
+            )
+            .detach();
+            self.tabs.push(Tab::Activity(tab));
+            self.tabs.len() - 1
+        });
+        self.activate(index, window, cx);
+    }
+
+    /// The palette's Show Server Activity, for the active connection.
+    fn show_server_activity(
+        &mut self,
+        _: &ShowServerActivity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(db) = self.active_db(cx) {
+            self.open_activity(db, window, cx);
+        }
     }
 
     /// The palette's Open Schema Diagram: the schema of the table in view,
@@ -1138,6 +1190,18 @@ impl WorkspaceView {
                             .map(|db| format!("PostgreSQL {}", db.session.server_version())),
                     );
             }
+            Some(Tab::Activity(activity)) => {
+                let tab = activity.read(cx);
+                left = left.child(format!("Server activity of {}", tab.db().name));
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .children(tab.status())
+                    .children(
+                        db.as_ref()
+                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
+                    );
+            }
             Some(Tab::RedisKey(key)) => {
                 let tab = key.read(cx);
                 left = left.child(div().truncate().child(format!(
@@ -1311,6 +1375,7 @@ impl WorkspaceView {
                 }
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
                 Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
+                Tab::Activity(activity) => (AppIcon::Activity, activity.read(cx).title(), false),
             };
             let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {
                 (Some(db), _) => format!("{title} · {}", db.name).into(),
@@ -1452,6 +1517,7 @@ impl WorkspaceView {
             Some(Tab::RedisKey(key)) => key.clone().into_any_element(),
             Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
             Some(Tab::Diagram(diagram)) => diagram.clone().into_any_element(),
+            Some(Tab::Activity(activity)) => activity.clone().into_any_element(),
             None => placeholder(
                 "Open a table or saved query from the sidebar, or add a connection with +",
             ),
@@ -1496,6 +1562,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::open_schema_diagram))
+            .on_action(cx.listener(Self::show_server_activity))
             .on_action(cx.listener(Self::close_window))
             .bg(color(theme::GROUND))
             .text_color(color(theme::TEXT))

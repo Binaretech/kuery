@@ -224,6 +224,7 @@ fn command_icon(id: &str) -> Icon {
         "project.clear_recent" => Icon::new(AppIcon::Trash),
         "connection.new" => Icon::new(AppIcon::Database),
         "diagram.open" => Icon::new(IconName::Network),
+        "activity.open" => Icon::new(AppIcon::Activity),
         "tab.new_query" => Icon::new(IconName::Plus),
         "tab.close" | "window.close" | "app.quit" => Icon::new(IconName::Close),
         "tab.next" => Icon::new(IconName::ChevronRight),

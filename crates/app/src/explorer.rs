@@ -61,6 +61,8 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
+    /// The server's sessions and locks.
+    OpenActivity(Db),
     /// A schema's diagram.
     OpenDiagram {
         db: Db,
@@ -712,6 +714,12 @@ impl Explorer {
         }
     }
 
+    fn open_activity(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(db) = self.db(index) {
+            cx.emit(ExplorerEvent::OpenActivity(db));
+        }
+    }
+
     fn new_query(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(db) = self.db(index) {
             cx.emit(ExplorerEvent::NewQuery(db));
@@ -995,6 +1003,12 @@ impl Explorer {
                         IconName::Plus,
                         &this,
                         move |this, _, cx| this.new_query(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Server Activity",
+                        AppIcon::Activity,
+                        &this,
+                        move |this, _, cx| this.open_activity(index, cx),
                     ))
                     .item(item_icon(
                         "Refresh Catalog",

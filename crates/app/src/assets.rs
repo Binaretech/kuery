@@ -59,6 +59,7 @@ const ICONS: &[(&str, &[u8])] = embed![
     "icons/type.svg",
     "icons/toggle-right.svg",
     "icons/list-tree.svg",
+    "icons/activity.svg",
 ];
 
 const BRANDING: &[(&str, &[u8])] = &[(crate::app_icon::PATH, crate::app_icon::PNG)];
@@ -92,11 +93,12 @@ pub enum AppIcon {
     TextType,
     Toggle,
     Plan,
+    Activity,
 }
 
 #[cfg(test)]
 impl AppIcon {
-    const ALL: [AppIcon; 26] = [
+    const ALL: [AppIcon; 27] = [
         AppIcon::Lock,
         AppIcon::Database,
         AppIcon::Table,
@@ -123,6 +125,7 @@ impl AppIcon {
         AppIcon::TextType,
         AppIcon::Toggle,
         AppIcon::Plan,
+        AppIcon::Activity,
     ];
 }
 
@@ -155,6 +158,7 @@ impl IconNamed for AppIcon {
             AppIcon::TextType => "icons/type.svg",
             AppIcon::Toggle => "icons/toggle-right.svg",
             AppIcon::Plan => "icons/list-tree.svg",
+            AppIcon::Activity => "icons/activity.svg",
         }
         .into()
     }

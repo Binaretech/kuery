@@ -439,28 +439,28 @@ order by tgname"
     )
 }
 
-struct Row<'a> {
+pub(crate) struct Row<'a> {
     set: &'a ResultSet,
     index: usize,
 }
 
 impl Row<'_> {
-    fn optional(&self, column: usize) -> Option<String> {
+    pub(crate) fn optional(&self, column: usize) -> Option<String> {
         self.set
             .cell(self.index, column)
             .flatten()
             .map(str::to_owned)
     }
 
-    fn text(&self, column: usize) -> String {
+    pub(crate) fn text(&self, column: usize) -> String {
         self.optional(column).unwrap_or_default()
     }
 
-    fn flag(&self, column: usize) -> bool {
+    pub(crate) fn flag(&self, column: usize) -> bool {
         self.set.cell(self.index, column).flatten() == Some("t")
     }
 }
 
-fn rows(set: &ResultSet) -> impl Iterator<Item = Row<'_>> {
+pub(crate) fn rows(set: &ResultSet) -> impl Iterator<Item = Row<'_>> {
     (0..set.rows()).map(move |index| Row { set, index })
 }

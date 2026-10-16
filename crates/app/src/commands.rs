@@ -34,6 +34,7 @@ actions!(
         ClearRecentProjects,
         NewConnection,
         OpenSchemaDiagram,
+        ShowServerActivity,
     ]
 );
 
@@ -92,6 +93,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Open Schema Diagram",
         category: "Project",
         action: action!(OpenSchemaDiagram),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "activity.open",
+        title: "Show Server Activity",
+        category: "Project",
+        action: action!(ShowServerActivity),
         defaults: &[],
         context: None,
     },
