@@ -11,6 +11,43 @@ row editing through staged changes (never on production connections).
 Redis connections get a key browser, key tabs with staged edits and a console
 (see [Redis](#redis)).
 
+![A query and its results](docs/screenshots/query.png)
+
+## Screenshots
+
+**Profile.** Compare a measure across groups with box plots and η², or see
+how a category splits over time. Nothing is computed until you press
+Analyze. See [Editor](#editor).
+
+![Order totals by status](docs/screenshots/profile-groups.png)
+![Order status per hour](docs/screenshots/profile-breakdown.png)
+
+**Plan.** Explain Analyze as a readable tree, with each step's share of the
+time, estimated against actual rows and the details of the selected step, or
+as a graph.
+
+![A measured plan as a tree](docs/screenshots/plan-tree.png)
+![The same plan as a graph](docs/screenshots/plan-graph.png)
+
+**Write mode.** Before a script that writes runs, a review lists its
+statements, flags the risky ones and fills in the rows each would change
+from a preview that is undone. See [Write mode](#write-mode).
+
+![Reviewing two changes](docs/screenshots/write-review.png)
+
+**Redis.** Databases and keys grouped by `:` in the sidebar, a key tab per
+type (JSON strings indented, streams as a grid) and a console. See
+[Redis](#redis).
+
+![A JSON string key](docs/screenshots/redis-string.png)
+![A stream key](docs/screenshots/redis-stream.png)
+![The Redis console](docs/screenshots/redis-console.png)
+
+**Drivers.** The connection dialog picks the driver from a searchable list
+grouped by family. See [Drivers](#drivers).
+
+![Picking a driver](docs/screenshots/connection-drivers.png)
+
 ## Layout
 
 | Crate | What it does |
