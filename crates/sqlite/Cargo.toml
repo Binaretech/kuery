@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 kuery-core.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+kuery-core = { workspace = true, features = ["conformance"] }
 async-channel.workspace = true
 futures.workspace = true
-rusqlite.workspace = true

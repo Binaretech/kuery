@@ -642,7 +642,7 @@ impl Explorer {
             function.schema, function.name, function.oid
         ));
         let title: SharedString = format!("{}()", function.name).into();
-        let load = db.session.function_definition(function);
+        let load = db.session.routine_source(function);
         cx.spawn(async move |this, cx| {
             let sql = match load.await {
                 Ok(definition) => definition,
@@ -1304,8 +1304,8 @@ impl Explorer {
         let dialect = self
             .connections
             .get(index)
-            .map(|node| node.spec.dialect())
-            .unwrap_or_default();
+            .and_then(|node| node.spec.dialect())
+            .unwrap_or(&kuery_core::sql::POSTGRES);
         let key = format!("{index}/{}/table/{}", info.table.schema, info.table.name);
         let selected = self.selected.as_deref() == Some(key.as_str());
         let editable = info.kind.is_editable();
@@ -1576,7 +1576,7 @@ impl Explorer {
 }
 
 /// `select * from "schema"."table" limit 100;`, for a new query tab.
-fn select_sql(dialect: Dialect, table: &TableRef) -> String {
+fn select_sql(dialect: &Dialect, table: &TableRef) -> String {
     format!(
         "select *\nfrom {}\nlimit 100;\n",
         dialect.quote_qualified(&table.schema, &table.name)

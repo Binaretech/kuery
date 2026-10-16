@@ -31,7 +31,7 @@ use kuery_core::export::{self, Format};
 use kuery_core::session::{Access, Event, QueryError, RunOptions, StatementImpact};
 use kuery_core::{format, plan, script};
 
-use crate::sql_session::SqlSession;
+use kuery_core::session::Session;
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
@@ -85,7 +85,7 @@ enum WriteState {
 
 /// The tab's own read-write connection and its open transaction, if any.
 struct WriteSession {
-    session: SqlSession,
+    session: Session,
     kind: WriteKind,
     /// Statements and rows changed since the transaction opened.
     statements: usize,
@@ -95,7 +95,7 @@ struct WriteSession {
 }
 
 impl WriteSession {
-    fn new(session: SqlSession, kind: WriteKind) -> Self {
+    fn new(session: Session, kind: WriteKind) -> Self {
         Self {
             session,
             kind,
@@ -1017,8 +1017,7 @@ impl QueryTab {
     fn enter_write_mode(&mut self, kind: WriteKind, cx: &mut Context<Self>) {
         self.write = WriteState::Connecting;
         cx.notify();
-        let engines = crate::app::state(cx).engines();
-        let connecting = self.db.reconnect.open(&engines, Access::ReadWrite);
+        let connecting = self.db.session.reopen(Access::ReadWrite);
         cx.spawn(async move |this, cx| {
             let result = connecting.await;
             this.update(cx, |this, cx| {
@@ -2073,7 +2072,7 @@ impl Render for QueryTab {
 }
 
 /// Whether `sql` creates, alters or drops something completion lists.
-fn changes_schema(dialect: kuery_core::sql::Dialect, sql: &str) -> bool {
+fn changes_schema(dialect: &kuery_core::sql::Dialect, sql: &str) -> bool {
     analysis::analyze_in(dialect, sql).is_ok_and(|analysis| {
         analysis
             .statements

@@ -135,30 +135,51 @@ impl DriverInfo {
     }
 }
 
-pub const POSTGRES: DriverInfo = DriverInfo {
-    id: "postgres",
-    name: "PostgreSQL",
-    aliases: &["postgresql", "pg", "psql"],
-    family: Family::Sql,
-    default_port: 5432,
-    database: Field {
-        label: "Database",
-        placeholder: "postgres",
-        required: true,
-        numeric: false,
-        help: None,
-    },
-    user: Field {
-        label: "User",
-        placeholder: "postgres",
-        required: true,
-        numeric: false,
-        help: None,
-    },
-    tls: Tls::Modes(&["disable", "prefer", "require", "verify-ca", "verify-full"]),
-    production_note: "Production connections always open read-only and cannot edit rows.",
-    file: false,
-};
+/// Where and how to reach a database, the same for every driver: each
+/// reads what it needs (a SQLite file has only `database`, its path).
+#[derive(Clone, Default)]
+pub struct ConnectOptions {
+    /// The server as named (also the name TLS checks).
+    pub host: String,
+    pub port: u16,
+    /// The database, or a database file's path.
+    pub database: String,
+    pub user: String,
+    /// Only ever in memory.
+    pub password: Option<String>,
+    /// The TLS choice as stored (see [`Tls::stored`]); `None` for the
+    /// driver's default.
+    pub tls: Option<String>,
+    /// The local port of an SSH tunnel to connect to instead of
+    /// `host:port`.
+    pub tunnel: Option<u16>,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("tls", &self.tls)
+            .field("tunnel", &self.tunnel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opens a connection with a driver.
+pub type Open =
+    fn(&ConnectOptions, crate::session::Access) -> Result<Box<dyn crate::adapter::Adapter>, String>;
+
+/// A SQL driver, which its crate exports as `DRIVER`: what the app shows
+/// for it, the SQL it speaks, and how it opens a connection (on the
+/// session's thread; see [`crate::session::Session::open`]).
+pub struct SqlDriver {
+    pub info: DriverInfo,
+    pub dialect: &'static crate::sql::Dialect,
+    pub open: Open,
+}
 
 pub const REDIS: DriverInfo = DriverInfo {
     id: "redis",
@@ -185,96 +206,66 @@ pub const REDIS: DriverInfo = DriverInfo {
     file: false,
 };
 
-pub const MYSQL: DriverInfo = DriverInfo {
-    id: "mysql",
-    name: "MySQL",
-    aliases: &["mariadb", "my", "percona"],
-    family: Family::Sql,
-    default_port: 3306,
-    database: Field {
-        label: "Database",
-        placeholder: "shop",
-        required: false,
-        numeric: false,
-        help: Some("The database queries start in; the sidebar lists every one you can see."),
-    },
-    user: Field {
-        label: "User",
-        placeholder: "root",
-        required: true,
-        numeric: false,
-        help: None,
-    },
-    tls: Tls::Toggle,
-    production_note: "Production connections always open read-only and cannot edit rows.",
-    file: false,
-};
-
-pub const SQLITE: DriverInfo = DriverInfo {
-    id: "sqlite",
-    name: "SQLite",
-    aliases: &["sqlite3", "file", "embedded"],
-    family: Family::Sql,
-    default_port: 0,
-    database: Field {
-        label: "File",
-        placeholder: "data/app.sqlite",
-        required: true,
-        numeric: false,
-        help: Some("The database file; a relative path starts at the project folder."),
-    },
-    user: Field {
-        label: "User",
-        placeholder: "",
-        required: false,
-        numeric: false,
-        help: None,
-    },
-    tls: Tls::Toggle,
-    production_note: "Production connections open the file read-only and cannot edit rows.",
-    file: true,
-};
-
-/// Every driver, in the order the list shows them.
-pub const ALL: &[&DriverInfo] = &[&POSTGRES, &MYSQL, &SQLITE, &REDIS];
-
-/// The id connections have when they do not name one (projects from before
-/// there was a choice).
-pub const DEFAULT: &str = POSTGRES.id;
-
-pub fn find(id: &str) -> Option<&'static DriverInfo> {
-    ALL.iter().copied().find(|driver| driver.id == id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn ids_are_unique_and_found() {
-        for (i, a) in ALL.iter().enumerate() {
-            assert_eq!(find(a.id), Some(*a));
-            assert!(ALL[i + 1..].iter().all(|b| b.id != a.id));
-        }
-        assert_eq!(find(DEFAULT), Some(&POSTGRES));
-        assert_eq!(find("nope"), None);
-    }
+    const FIELD: Field = Field {
+        label: "Database",
+        placeholder: "postgres",
+        required: true,
+        numeric: false,
+        help: None,
+    };
+
+    /// A server with named TLS modes, like PostgreSQL.
+    const SERVER: DriverInfo = DriverInfo {
+        id: "server",
+        name: "Some Server",
+        aliases: &["pg"],
+        family: Family::Sql,
+        default_port: 5432,
+        database: FIELD,
+        user: Field {
+            label: "User",
+            ..FIELD
+        },
+        tls: Tls::Modes(&["disable", "prefer", "require"]),
+        production_note: "",
+        file: false,
+    };
+
+    /// A database file, like SQLite.
+    const FILE: DriverInfo = DriverInfo {
+        id: "file",
+        name: "Some File",
+        database: Field {
+            label: "File",
+            ..FIELD
+        },
+        user: Field {
+            required: false,
+            ..FIELD
+        },
+        file: true,
+        ..SERVER
+    };
 
     #[test]
     fn searches_by_name_alias_and_family() {
-        assert!(POSTGRES.matches("postg"));
-        assert!(POSTGRES.matches("PG"));
-        assert!(POSTGRES.matches("sql"));
+        assert!(SERVER.matches("some s"));
+        assert!(SERVER.matches("PG"));
+        assert!(SERVER.matches("sql"));
         assert!(REDIS.matches("key-value"));
         assert!(REDIS.matches(""));
-        assert!(!REDIS.matches("postgres"));
+        assert!(!REDIS.matches("server"));
     }
 
     #[test]
     fn validates_the_form_by_its_fields() {
-        assert!(POSTGRES.validate("localhost", "kuery", "kuery").is_ok());
+        assert!(SERVER.validate("localhost", "kuery", "kuery").is_ok());
         assert!(
-            POSTGRES
+            SERVER
                 .validate("localhost", "", "kuery")
                 .unwrap_err()
                 .contains("database")
@@ -288,13 +279,13 @@ mod tests {
         );
         assert!(REDIS.validate(" ", "0", "").is_err());
         // A file needs its path, not a host.
-        assert!(SQLITE.validate("", "shop.sqlite", "").is_ok());
-        assert!(SQLITE.validate("", "", "").unwrap_err().contains("file"));
+        assert!(FILE.validate("", "shop.sqlite", "").is_ok());
+        assert!(FILE.validate("", "", "").unwrap_err().contains("file"));
     }
 
     #[test]
     fn maps_tls_choices_to_what_is_stored() {
-        let modes = POSTGRES.tls;
+        let modes = SERVER.tls;
         assert_eq!(modes.options()[0], "default");
         assert_eq!(modes.stored(0), None);
         assert_eq!(modes.stored(3).as_deref(), Some("require"));

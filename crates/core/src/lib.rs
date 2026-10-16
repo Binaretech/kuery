@@ -5,11 +5,14 @@
 //! helpers, and the drivers' descriptors.
 
 pub mod activity;
+pub mod adapter;
 pub mod analysis;
 pub mod browse;
 pub mod catalog;
 pub mod compare;
 pub mod completion;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod diagram;
 pub mod driver;
 pub mod edit;

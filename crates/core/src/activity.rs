@@ -71,6 +71,25 @@ pub struct Backend {
     pub waiting_for: Option<String>,
 }
 
+/// What to do to a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// Stop its current query; the session stays.
+    Cancel,
+    /// End the session, rolling back its open transaction.
+    Terminate,
+}
+
+impl Signal {
+    /// For the audit log: `cancel 4521`, `terminate 4521`.
+    pub fn describe(self, pid: i32) -> String {
+        match self {
+            Signal::Cancel => format!("cancel {pid}"),
+            Signal::Terminate => format!("terminate {pid}"),
+        }
+    }
+}
+
 /// A query running this long is worth a look, and an idle transaction
 /// open this long holds its locks for nothing.
 pub const LONG_SECONDS: f64 = 60.;

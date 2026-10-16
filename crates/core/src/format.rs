@@ -11,11 +11,11 @@ use crate::sql::Dialect;
 /// strings and dollar-quoted bodies. SQL that cannot be tokenized comes back
 /// unchanged.
 pub fn format_sql(sql: &str) -> String {
-    format_sql_in(Dialect::Postgres, sql)
+    format_sql_in(&crate::sql::POSTGRES, sql)
 }
 
 /// The same, for a database speaking `dialect`.
-pub fn format_sql_in(dialect: Dialect, sql: &str) -> String {
+pub fn format_sql_in(dialect: &Dialect, sql: &str) -> String {
     // The formatter would reformat function bodies as if they were plain
     // SQL: swap them for placeholders and put them back afterwards.
     let Some((protected, bodies)) = protect_dollar_quotes(dialect, sql) else {
@@ -37,7 +37,7 @@ fn placeholder(index: usize) -> String {
 
 /// `sql` with each dollar-quoted string replaced by a placeholder, and the
 /// strings in order.
-fn protect_dollar_quotes(dialect: Dialect, sql: &str) -> Option<(String, Vec<String>)> {
+fn protect_dollar_quotes(dialect: &Dialect, sql: &str) -> Option<(String, Vec<String>)> {
     let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
@@ -56,15 +56,12 @@ fn protect_dollar_quotes(dialect: Dialect, sql: &str) -> Option<(String, Vec<Str
     Some((out, bodies))
 }
 
-fn format_plain(dialect: Dialect, sql: &str) -> String {
+fn format_plain(dialect: &Dialect, sql: &str) -> String {
     let options = FormatOptions {
         indent: Indent::Spaces(2),
         uppercase: None,
         lines_between_queries: 2,
-        dialect: match dialect {
-            Dialect::Postgres => sqlformat::Dialect::PostgreSql,
-            Dialect::Sqlite | Dialect::Mysql => sqlformat::Dialect::Generic,
-        },
+        dialect: dialect.formatter,
         ..FormatOptions::default()
     };
     sqlformat::format(sql, &QueryParams::None, &options)

@@ -6,6 +6,11 @@ use kuery_core::diagram::OnDelete;
 use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange};
 use kuery_core::read_only::Rejection;
 
+use futures::executor::block_on;
+use kuery_core::adapter::Discard;
+use kuery_core::session::{Event, Opener, Session, StatementImpact, Summary};
+use std::time::Instant;
+
 use super::*;
 
 fn target() -> Target {
@@ -22,23 +27,18 @@ fn target() -> Target {
     }
 }
 
-fn session(engine: &Engine, access: Access) -> Session {
-    engine
-        .runtime
-        .block_on(engine.connect(target(), access))
-        .expect("connects to the dev MySQL")
+fn session(access: Access) -> Session {
+    let opener: Opener = Arc::new(|access| open(&target(), access));
+    block_on(Session::open(opener, access)).expect("connects to the dev MySQL")
 }
 
-fn scalar(engine: &Engine, session: &Session, sql: &str) -> Option<String> {
-    let set = engine
-        .runtime
-        .block_on(session.fetch_all(sql.into(), RunOptions::default()))
-        .unwrap();
+fn scalar(session: &Session, sql: &str) -> Option<String> {
+    let set = block_on(session.fetch_all(sql.into(), RunOptions::default())).unwrap();
     set.cell(0, 0).flatten().map(str::to_string)
 }
 
-fn drain(engine: &Engine, rx: async_channel::Receiver<Event>) -> Result<Summary, QueryError> {
-    engine.runtime.block_on(async {
+fn drain(rx: async_channel::Receiver<Event>) -> Result<Summary, QueryError> {
+    block_on(async {
         while let Ok(event) = rx.recv().await {
             match event {
                 Event::Finished(summary) => return Ok(summary),
@@ -51,48 +51,38 @@ fn drain(engine: &Engine, rx: async_channel::Receiver<Event>) -> Result<Summary,
 }
 
 /// A table of its own for a test that writes, dropped at the end.
-fn scratch(engine: &Engine, writer: &Session, name: &str) -> String {
+fn scratch(writer: &Session, name: &str) -> String {
     let table = format!("scratch_{name}_{}", std::process::id());
-    drain(
-        engine,
-        writer.run_autocommit(
-            format!(
-                "drop table if exists {table}; \
+    drain(writer.run_autocommit(
+        format!(
+            "drop table if exists {table}; \
                  create table {table} (id int primary key, name varchar(20), qty int); \
                  insert into {table} values (1, 'one', 1), (2, 'two', 2), (3, NULL, 3)"
-            ),
-            RunOptions::default(),
         ),
-    )
+        RunOptions::default(),
+    ))
     .unwrap();
     table
 }
 
-fn drop_scratch(engine: &Engine, writer: &Session, table: &str) {
-    drain(
-        engine,
-        writer.run_autocommit(format!("drop table {table}"), RunOptions::default()),
-    )
-    .unwrap();
+fn drop_scratch(writer: &Session, table: &str) {
+    drain(writer.run_autocommit(format!("drop table {table}"), RunOptions::default())).unwrap();
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn reads_rows_as_the_server_writes_them() {
-    let engine = Engine::new().unwrap();
-    let reader = session(&engine, Access::ReadOnly);
-    assert!(!reader.server_version().is_empty());
-    let set = engine
-        .runtime
-        .block_on(
-            reader.fetch_all(
-                "select id, status, total, created_at, shipping, note \
+    let reader = session(Access::ReadOnly);
+    assert!(reader.server_label().starts_with("MySQL"));
+    let set = block_on(
+        reader.fetch_all(
+            "select id, status, total, created_at, shipping, note \
              from orders where id in (11, 12) order by id"
-                    .into(),
-                RunOptions::default(),
-            ),
-        )
-        .unwrap();
+                .into(),
+            RunOptions::default(),
+        ),
+    )
+    .unwrap();
     assert_eq!(
         set.columns(),
         ["id", "status", "total", "created_at", "shipping", "note"]
@@ -117,49 +107,47 @@ fn reads_rows_as_the_server_writes_them() {
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn refuses_writes_twice_when_reading() {
-    let engine = Engine::new().unwrap();
-    let reader = session(&engine, Access::ReadOnly);
-    let rejected = engine
-        .runtime
-        .block_on(reader.fetch_all("delete from orders".into(), RunOptions::default()));
+    let reader = session(Access::ReadOnly);
+    let rejected = block_on(reader.fetch_all("delete from orders".into(), RunOptions::default()));
     assert!(matches!(
         rejected,
         Err(QueryError::Rejected(Rejection::Statement(_)))
     ));
     // The second layer on its own: the READ ONLY transaction refuses it.
-    let writer = session(&engine, Access::ReadWrite);
-    let table = scratch(&engine, &writer, "readonly");
-    let blocked = engine
-        .runtime
-        .block_on(writer.fetch_trusted(format!("delete from {table}")));
+    let writer = session(Access::ReadWrite);
+    let table = scratch(&writer, "readonly");
+    let mut adapter = open(&target(), Access::ReadWrite).unwrap();
+    for statement in MYSQL.transactions.begin_read_only {
+        adapter.execute(statement, &mut Discard).unwrap();
+    }
+    let blocked = adapter.execute(&format!("delete from {table}"), &mut Discard);
+    let _ = adapter.execute("rollback", &mut Discard);
+    drop(adapter);
     assert!(
         matches!(blocked, Err(QueryError::Database { .. })),
         "{blocked:?}"
     );
     assert_eq!(
-        scalar(&engine, &writer, &format!("select count(*) from {table}")).as_deref(),
+        scalar(&writer, &format!("select count(*) from {table}")).as_deref(),
         Some("3")
     );
     // A read-only session refuses write mode.
-    let refused = drain(
-        &engine,
-        reader.run_in_transaction("delete from orders".into(), RunOptions::default()),
-    );
+    let refused =
+        drain(reader.run_in_transaction("delete from orders".into(), RunOptions::default()));
     assert!(matches!(refused, Err(QueryError::WritesDisabled)));
-    drop_scratch(&engine, &writer, &table);
+    drop_scratch(&writer, &table);
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn applies_row_changes_with_optimistic_checks() {
-    let engine = Engine::new().unwrap();
-    let writer = session(&engine, Access::ReadWrite);
-    let table = scratch(&engine, &writer, "apply");
+    let writer = session(Access::ReadWrite);
+    let table = scratch(&writer, "apply");
     let target = EditTarget {
         table: TableRef::new("shop", table.clone()),
         columns: vec!["id".into(), "name".into(), "qty".into()],
         primary_key: vec!["id".into()],
-        dialect: Dialect::Mysql,
+        dialect: &kuery_core::sql::MYSQL,
     };
     let change_in = |column: &str, old: Option<&str>, new: &str| {
         edit::build(
@@ -180,26 +168,14 @@ fn applies_row_changes_with_optimistic_checks() {
     };
     let change = |old: Option<&str>, new: &str| change_in("name", old, new);
     // NULL compared as NULL, and a value with a backslash goes as hex.
+    assert_eq!(block_on(writer.apply(vec![change(None, r"a\b")])), Ok(1));
     assert_eq!(
-        engine
-            .runtime
-            .block_on(writer.apply(vec![change(None, r"a\b")])),
-        Ok(1)
-    );
-    assert_eq!(
-        scalar(
-            &engine,
-            &writer,
-            &format!("select name from {table} where id = 3")
-        )
-        .as_deref(),
+        scalar(&writer, &format!("select name from {table} where id = 3")).as_deref(),
         Some(r"a\b")
     );
     // `03` is the 3 it already has: the row matches though nothing changes.
     assert_eq!(
-        engine
-            .runtime
-            .block_on(writer.apply(vec![change_in("qty", Some("3"), "03")])),
+        block_on(writer.apply(vec![change_in("qty", Some("3"), "03")])),
         Ok(1)
     );
     // A stale edit changes nothing, and nothing of its batch is kept.
@@ -215,87 +191,71 @@ fn applies_row_changes_with_optimistic_checks() {
     .unwrap();
     let stale = change(Some("old"), "new");
     assert!(matches!(
-        engine.runtime.block_on(writer.apply(vec![delete, stale])),
+        block_on(writer.apply(vec![delete, stale])),
         Err(QueryError::RowMismatch { actual: 0, .. })
     ));
     assert_eq!(
-        scalar(&engine, &writer, &format!("select count(*) from {table}")).as_deref(),
+        scalar(&writer, &format!("select count(*) from {table}")).as_deref(),
         Some("3")
     );
-    drop_scratch(&engine, &writer, &table);
+    drop_scratch(&writer, &table);
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn keeps_write_transactions_open_until_commit() {
-    let engine = Engine::new().unwrap();
-    let writer = session(&engine, Access::ReadWrite);
-    let other = session(&engine, Access::ReadOnly);
-    let table = scratch(&engine, &writer, "transaction");
-    let summary = drain(
-        &engine,
-        writer.run_in_transaction(
-            format!("update {table} set qty = qty + 10; delete from {table} where id = 1"),
-            RunOptions::default(),
-        ),
-    )
+    let writer = session(Access::ReadWrite);
+    let other = session(Access::ReadOnly);
+    let table = scratch(&writer, "transaction");
+    let summary = drain(writer.run_in_transaction(
+        format!("update {table} set qty = qty + 10; delete from {table} where id = 1"),
+        RunOptions::default(),
+    ))
     .unwrap();
     assert_eq!((summary.affected, summary.statements), (4, 2));
     assert!(writer.in_transaction());
     let sum = format!("select sum(qty) from {table}");
-    assert_eq!(scalar(&engine, &writer, &sum).as_deref(), Some("25"));
-    assert_eq!(scalar(&engine, &other, &sum).as_deref(), Some("6"));
+    assert_eq!(scalar(&writer, &sum).as_deref(), Some("25"));
+    assert_eq!(scalar(&other, &sum).as_deref(), Some("6"));
 
     // A failing script undoes only itself.
-    let failed = drain(
-        &engine,
-        writer.run_in_transaction(
-            format!("update {table} set qty = 0; insert into nowhere values (1)"),
-            RunOptions::default(),
-        ),
-    );
+    let failed = drain(writer.run_in_transaction(
+        format!("update {table} set qty = 0; insert into nowhere values (1)"),
+        RunOptions::default(),
+    ));
     assert!(matches!(failed, Err(QueryError::Database { .. })));
     assert!(writer.in_transaction());
-    assert_eq!(scalar(&engine, &writer, &sum).as_deref(), Some("25"));
+    assert_eq!(scalar(&writer, &sum).as_deref(), Some("25"));
 
     // DDL would commit by itself: refused here.
-    let ddl = drain(
-        &engine,
-        writer.run_in_transaction(
-            format!("alter table {table} add column x int"),
-            RunOptions::default(),
-        ),
-    );
+    let ddl = drain(writer.run_in_transaction(
+        format!("alter table {table} add column x int"),
+        RunOptions::default(),
+    ));
     assert!(matches!(ddl, Err(QueryError::Unsupported(_))), "{ddl:?}");
 
-    engine.runtime.block_on(writer.rollback()).unwrap();
-    assert_eq!(scalar(&engine, &writer, &sum).as_deref(), Some("6"));
-    drain(
-        &engine,
-        writer.run_in_transaction(format!("delete from {table}"), RunOptions::default()),
-    )
-    .unwrap();
-    engine.runtime.block_on(writer.commit()).unwrap();
+    block_on(writer.rollback()).unwrap();
+    assert_eq!(scalar(&writer, &sum).as_deref(), Some("6"));
+    drain(writer.run_in_transaction(format!("delete from {table}"), RunOptions::default()))
+        .unwrap();
+    block_on(writer.commit()).unwrap();
     assert_eq!(
-        scalar(&engine, &other, &format!("select count(*) from {table}")).as_deref(),
+        scalar(&other, &format!("select count(*) from {table}")).as_deref(),
         Some("0")
     );
-    drop_scratch(&engine, &writer, &table);
+    drop_scratch(&writer, &table);
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn previews_count_changes_and_undo_them() {
-    let engine = Engine::new().unwrap();
-    let writer = session(&engine, Access::ReadWrite);
-    let table = scratch(&engine, &writer, "preview");
-    let impacts = engine
-        .runtime
-        .block_on(writer.preview(
-            format!("update {table} set qty = 0 where id < 3; select * from {table}"),
-            RunOptions::default(),
-        ))
-        .unwrap();
+    let writer = session(Access::ReadWrite);
+    let table = scratch(&writer, "preview");
+    let impacts = block_on(writer.preview(
+        format!("update {table} set qty = 0 where id < 3; select * from {table}"),
+        RunOptions::default(),
+    ))
+    .unwrap();
     assert_eq!(
         impacts,
         [
@@ -310,22 +270,19 @@ fn previews_count_changes_and_undo_them() {
         ]
     );
     assert_eq!(
-        scalar(&engine, &writer, &format!("select sum(qty) from {table}")).as_deref(),
+        scalar(&writer, &format!("select sum(qty) from {table}")).as_deref(),
         Some("6")
     );
-    let ddl = engine
-        .runtime
-        .block_on(writer.preview(format!("truncate table {table}"), RunOptions::default()));
+    let ddl = block_on(writer.preview(format!("truncate table {table}"), RunOptions::default()));
     assert!(matches!(ddl, Err(QueryError::Unsupported(_))));
-    drop_scratch(&engine, &writer, &table);
+    drop_scratch(&writer, &table);
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn cancels_and_times_out_long_queries() {
-    let engine = Engine::new().unwrap();
-    let reader = session(&engine, Access::ReadOnly);
-    let slow = engine.runtime.block_on(reader.fetch_all(
+    let reader = session(Access::ReadOnly);
+    let slow = block_on(reader.fetch_all(
         "select sleep(5) from dual where 1 = (select 1)".into(),
         RunOptions {
             statement_timeout: Duration::from_millis(300),
@@ -343,24 +300,20 @@ fn cancels_and_times_out_long_queries() {
     );
     std::thread::sleep(Duration::from_millis(300));
     reader.cancel();
-    let cancelled = drain(&engine, rx);
+    let cancelled = drain(rx);
     assert!(
         matches!(cancelled, Err(QueryError::Cancelled)),
         "{cancelled:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(scalar(&engine, &reader, "select 1").as_deref(), Some("1"));
+    assert_eq!(scalar(&reader, "select 1").as_deref(), Some("1"));
 }
 
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn reads_the_catalog() {
-    let engine = Engine::new().unwrap();
-    let reader = session(&engine, Access::ReadOnly);
-    let overview = engine
-        .runtime
-        .block_on(catalog::overview(reader.clone()))
-        .unwrap();
+    let reader = session(Access::ReadOnly);
+    let overview = block_on(reader.overview()).unwrap();
     assert!(overview.schemas.contains(&"shop".to_string()));
     assert!(!overview.schemas.contains(&"mysql".to_string()));
     let shop: Vec<(&str, TableKind)> = overview
@@ -391,23 +344,14 @@ fn reads_the_catalog() {
         .find(|f| f.name == "order_count")
         .unwrap();
     assert!(count.arguments.contains("customer"));
-    let body = engine
-        .runtime
-        .block_on(catalog::function_definition(reader.clone(), count.clone()))
-        .unwrap();
+    let body = block_on(reader.routine_source(count.clone())).unwrap();
     assert!(
         body.contains("CREATE") && body.contains("order_count"),
         "{body}"
     );
     assert_eq!(overview.triggers.len(), 1);
 
-    let orders = engine
-        .runtime
-        .block_on(catalog::definition(
-            reader.clone(),
-            TableRef::new("shop", "orders"),
-        ))
-        .unwrap();
+    let orders = block_on(reader.definition(TableRef::new("shop", "orders"))).unwrap();
     assert_eq!(orders.primary_key(), ["id"]);
     let customer = orders.column("customer_id").unwrap();
     assert_eq!(
@@ -425,13 +369,7 @@ fn reads_the_catalog() {
         |c| c.kind == ConstraintKind::ForeignKey && c.definition.contains("ON DELETE CASCADE")
     ));
     assert!(orders.indexes.iter().any(|i| i.name == "orders_by_created"));
-    let products = engine
-        .runtime
-        .block_on(catalog::definition(
-            reader.clone(),
-            TableRef::new("shop", "products"),
-        ))
-        .unwrap();
+    let products = block_on(reader.definition(TableRef::new("shop", "products"))).unwrap();
     assert!(
         products
             .constraints
@@ -444,20 +382,11 @@ fn reads_the_catalog() {
             .iter()
             .any(|c| c.kind == ConstraintKind::Unique)
     );
-    let lines = engine
-        .runtime
-        .block_on(catalog::definition(
-            reader.clone(),
-            TableRef::new("shop", "order_lines"),
-        ))
-        .unwrap();
+    let lines = block_on(reader.definition(TableRef::new("shop", "order_lines"))).unwrap();
     assert_eq!(lines.primary_key(), ["order_id", "line"]);
     assert_eq!(lines.triggers[0].name, "order_lines_total");
 
-    let diagram = engine
-        .runtime
-        .block_on(catalog::diagram(reader.clone(), "shop".into()))
-        .unwrap();
+    let diagram = block_on(reader.diagram("shop".into())).unwrap();
     let to_orders = diagram
         .relations
         .iter()
@@ -466,10 +395,7 @@ fn reads_the_catalog() {
     assert_eq!(to_orders.on_delete, OnDelete::Cascade);
     assert!(!to_orders.optional);
 
-    let completion = engine
-        .runtime
-        .block_on(catalog::completion_catalog(reader))
-        .unwrap();
+    let completion = block_on(reader.completion_catalog()).unwrap();
     assert_eq!(completion.search_path, ["shop"]);
     assert!(
         completion
@@ -477,4 +403,14 @@ fn reads_the_catalog() {
             .iter()
             .any(|t| t.table.name == "paid_orders" && t.kind == TableKind::View)
     );
+}
+
+#[test]
+#[ignore = "needs the dev MySQL"]
+fn conforms() {
+    kuery_core::conformance::run(&kuery_core::conformance::Fixture {
+        opener: Arc::new(|access| open(&target(), access)),
+        schema: "shop".into(),
+        slow_query: "select benchmark(2000000000, md5('kuery'))".into(),
+    });
 }

@@ -3710,6 +3710,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "async-channel",
+ "futures",
  "serde_json",
  "sqlformat",
  "sqlparser",
@@ -3721,9 +3722,9 @@ name = "kuery-mysql"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "futures",
  "kuery-core",
  "mysql_async",
- "thiserror 2.0.21",
  "tokio",
 ]
 

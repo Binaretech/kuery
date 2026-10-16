@@ -13,12 +13,12 @@ use crate::sql::Dialect;
 /// but comments and whitespace is no statement. `None` if `sql` cannot be
 /// tokenized (an unterminated string, for example).
 pub fn statements(sql: &str) -> Option<Vec<Range<usize>>> {
-    statements_in(Dialect::Postgres, sql)
+    statements_in(&crate::sql::POSTGRES, sql)
 }
 
 /// The same, for a database speaking `dialect` (MySQL's `#` comments and
 /// backslash escapes, say).
-pub fn statements_in(dialect: Dialect, sql: &str) -> Option<Vec<Range<usize>>> {
+pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> {
     let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
@@ -60,11 +60,11 @@ pub fn statements_in(dialect: Dialect, sql: &str) -> Option<Vec<Range<usize>>> {
 /// else the last one that ends before it (the cursor sits after its `;`), or
 /// the first one.
 pub fn statement_at(sql: &str, offset: usize) -> Option<Range<usize>> {
-    statement_at_in(Dialect::Postgres, sql, offset)
+    statement_at_in(&crate::sql::POSTGRES, sql, offset)
 }
 
 /// The same, for a database speaking `dialect`.
-pub fn statement_at_in(dialect: Dialect, sql: &str, offset: usize) -> Option<Range<usize>> {
+pub fn statement_at_in(dialect: &Dialect, sql: &str, offset: usize) -> Option<Range<usize>> {
     let ranges = statements_in(dialect, sql)?;
     ranges
         .iter()

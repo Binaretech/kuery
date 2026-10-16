@@ -21,7 +21,7 @@
 //! level with the tables they relate to, and every wire passes the columns
 //! between its ends through their gaps.
 
-use crate::catalog::TableRef;
+use crate::catalog::{CatalogColumn, ForeignKey, TableInfo, TableKind, TableRef};
 
 /// Card width, header height and column row height, in points.
 pub const CARD_WIDTH: f32 = 248.;
@@ -189,6 +189,61 @@ impl Table {
 }
 
 impl Diagram {
+    /// A schema's tables (from the catalog's list), with their columns and
+    /// the foreign keys between them.
+    pub fn compose(
+        schema: &str,
+        tables: &[TableInfo],
+        columns: Vec<CatalogColumn>,
+        keys: Vec<ForeignKey>,
+    ) -> Diagram {
+        let in_key = |table: &TableRef, column: &str| {
+            keys.iter()
+                .any(|k| k.from == *table && k.from_columns.iter().any(|c| c == column))
+        };
+        let tables: Vec<Table> = tables
+            .iter()
+            .filter(|info| info.table.schema == schema && info.kind != TableKind::View)
+            .map(|info| Table {
+                table: info.table.clone(),
+                rows: info.estimated_rows,
+                columns: columns
+                    .iter()
+                    .filter(|c| c.table == info.table)
+                    .map(|c| Column {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                        nullable: c.nullable,
+                        primary_key: c.primary_key,
+                        foreign_key: in_key(&info.table, &c.name),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let relations = keys
+            .into_iter()
+            .map(|key| {
+                let optional = columns.iter().any(|c| {
+                    c.table == key.from && c.nullable && key.from_columns.contains(&c.name)
+                });
+                Relation {
+                    name: key.name,
+                    from: key.from,
+                    from_columns: key.from_columns,
+                    to: key.to,
+                    to_columns: key.to_columns,
+                    optional,
+                    on_delete: key.on_delete,
+                }
+            })
+            .collect();
+        Diagram {
+            schema: schema.to_string(),
+            tables,
+            relations,
+        }
+    }
+
     pub fn index_of(&self, table: &TableRef) -> Option<usize> {
         self.tables.iter().position(|t| t.table == *table)
     }

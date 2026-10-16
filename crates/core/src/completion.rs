@@ -10,16 +10,63 @@
 
 use std::ops::Range;
 
-use crate::catalog::{TableKind, TableRef};
-use crate::sql::quote_ident;
+use crate::catalog::{CatalogColumn, CatalogOverview, TableKind, TableRef};
+use crate::sql::Dialect;
 
 /// What completion knows about a database.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Catalog {
     /// Schemas in `search_path` order: their tables are written unqualified.
     pub search_path: Vec<String>,
     pub schemas: Vec<String>,
     pub tables: Vec<Table>,
+    /// What quotes identifiers that need it (`"`, or `` ` `` in MySQL).
+    pub quote: char,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            search_path: Vec::new(),
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            quote: '"',
+        }
+    }
+}
+
+impl Catalog {
+    /// From a catalog's overview and every column, in `dialect`.
+    pub fn compose(
+        search_path: Vec<String>,
+        overview: &CatalogOverview,
+        columns: Vec<CatalogColumn>,
+        dialect: &Dialect,
+    ) -> Self {
+        let mut tables: Vec<Table> = overview
+            .tables
+            .iter()
+            .map(|info| Table {
+                table: info.table.clone(),
+                kind: info.kind,
+                columns: Vec::new(),
+            })
+            .collect();
+        for column in columns {
+            if let Some(table) = tables.iter_mut().find(|t| t.table == column.table) {
+                table.columns.push(Column {
+                    name: column.name,
+                    data_type: column.data_type,
+                });
+            }
+        }
+        Self {
+            search_path,
+            schemas: overview.schemas.clone(),
+            tables,
+            quote: dialect.ident_quote,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +176,7 @@ pub fn complete(sql: &str, offset: usize, catalog: &Catalog, invoked: bool) -> C
 
     let mut builder = Builder {
         prefix: &prefix,
+        quote: catalog.quote,
         quoted,
         suggestions: Vec::new(),
     };
@@ -677,6 +725,8 @@ fn qualified_table<'a>(
 
 struct Builder<'a> {
     prefix: &'a str,
+    /// What quotes identifiers.
+    quote: char,
     /// The word started with `"`: identifiers are inserted quoted.
     quoted: bool,
     suggestions: Vec<Suggestion>,
@@ -700,7 +750,11 @@ impl Builder<'_> {
 
     fn identifier(&self, name: &str) -> String {
         if self.quoted || needs_quotes(name) {
-            quote_ident(name)
+            let quote = self.quote;
+            format!(
+                "{quote}{}{quote}",
+                name.replace(quote, &format!("{quote}{quote}"))
+            )
         } else {
             name.to_owned()
         }
@@ -1120,6 +1174,7 @@ mod tests {
                 ),
                 table("sales", "invoices", TableKind::Table, &[("number", "text")]),
             ],
+            quote: '"',
         }
     }
 

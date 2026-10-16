@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 kuery-core.workspace = true
-async-channel.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -15,4 +14,6 @@ rustls-native-certs.workspace = true
 tokio-postgres-rustls.workspace = true
 
 [dev-dependencies]
+kuery-core = { workspace = true, features = ["conformance"] }
+async-channel.workspace = true
 anyhow.workspace = true

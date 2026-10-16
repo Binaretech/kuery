@@ -5,7 +5,10 @@ edition.workspace = true
 
 [dependencies]
 kuery-core.workspace = true
-async-channel.workspace = true
 mysql_async.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+kuery-core = { workspace = true, features = ["conformance"] }
+async-channel.workspace = true
+futures.workspace = true

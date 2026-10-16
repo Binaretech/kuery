@@ -160,32 +160,52 @@ connections without one are Postgres), and the rest of the form follows the
 driver: its default port, what its database and user fields mean and whether
 they are required, and how it asks about TLS.
 
-Drivers follow one contract in two parts:
+A SQL driver is an adapter: everything that differs between databases,
+and nothing else. Everything that must work the same lives once, in core:
 
-- **The descriptor** (`kuery_core::driver::DriverInfo`), plain data: id,
-  name and aliases, family, default port, the database and user fields, the
-  TLS choices and what production means for it. `driver::ALL` lists them.
-- **The implementation** (`Driver` in `crates/app/src/drivers.rs`): `test`
-  connects read-only and says what it reached, `connect` opens the
-  connection the sidebar keeps. What it opens is a `Connection` of its
-  family, and the family decides the rest: SQL drivers get schemas, query
-  tabs and table tabs; key-value drivers get databases and keys, key tabs and
-  a console. `drivers::all()` registers them, in the descriptors' order (a
-  test checks the two lists match).
+```
+            app (query tabs, table tabs, explorer, write mode…)
+                                  │  one type: Session
+┌─────────────────────────────────▼──────────────────────────────────┐
+│ kuery_core::session::Session                                        │
+│  read-only in two layers · write mode (transaction, a savepoint per │
+│  script) · full writes (a whole script or nothing) · previews that   │
+│  undo · row edits with their checks · batches · timeouts · cancel · │
+│  catalog views (completion, diagrams) · a thread per connection     │
+└─────────────────────────────────┬──────────────────────────────────┘
+                     kuery_core::adapter::Adapter
+        ┌──────────────┬──────────┴──────┬──────────────┐
+     kuery-pg      kuery-mysql     kuery-sqlite     kuery-<new>
+```
 
-Adding a driver means a crate for its protocol, a descriptor in
-`driver::ALL`, and a `Driver` implementation in `drivers::all()`. A driver of
-an existing family reuses that family's sidebar and tabs; a new family needs
-its own.
+- **The adapter** (`kuery_core::adapter::Adapter`) is one blocking
+  connection: it runs one statement exactly as given (rows to a sink, or the
+  rows it changed), sets the statement and lock timeouts, says how to stop
+  what runs, and reads the catalog in bulk (overview, a table's definition,
+  columns, foreign keys, the search path; optionally a routine's source and
+  the server's activity). A driver over an async client waits on its own
+  runtime; the session gives each connection a thread of its own.
+- **The dialect** (`kuery_core::sql::Dialect`) is data, not code: how it
+  quotes, casts to text, matches without case, sorts NULLs, compares with
+  NULL, opens read-only transactions and savepoints, whether schema changes
+  commit by themselves (MySQL: refused wherever an undo is promised), and
+  how to EXPLAIN for the Plan tab. `POSTGRES`, `MYSQL` and `SQLITE` are
+  there; a new driver can bring its own.
+- **The registration** is one `DRIVER` (`kuery_core::driver::SqlDriver`)
+  per crate: the descriptor the form follows (id, name and aliases, default
+  port, the database and user fields, TLS choices, whether it is a file),
+  the dialect, and how to open an adapter from the same `ConnectOptions`
+  every driver gets. The app lists them in `drivers::SQL`, and connects,
+  tests, tunnels through SSH and reopens (write mode, Server Activity) the
+  same way for all.
 
-The SQL drivers (`kuery-pg`, `kuery-mysql`, `kuery-sqlite`) each have a
-session with the same calls: run read-only, apply row changes, run in write
-mode (in a transaction or kept right away), preview and undo, cancel, and
-read the catalog. They speak the types in `kuery_core::session`, and the app
-holds any of them as a `SqlSession` (`crates/app/src/sql_session.rs`). What
-Kuery writes itself (filters, sorting, paging, row edits) and how it splits,
-analyses and formats SQL follows the connection's `kuery_core::sql::Dialect`.
-Query plans and Server Activity are PostgreSQL's for now.
+Adding a SQL database means a crate with an adapter, its dialect and its
+`DRIVER`, one line in `drivers::SQL`, and passing the conformance tests
+(`kuery_core::conformance`, behind the `conformance` feature): the same
+checks every driver runs against its real database, so behaving like the
+others is tested, not promised. The session's own rules are tested once,
+against a fake adapter. Redis is the key-value family, with its own session,
+sidebar and tabs.
 
 ### MySQL and MariaDB
 

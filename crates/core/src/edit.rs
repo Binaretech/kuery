@@ -17,7 +17,7 @@ pub struct EditTarget {
     pub table: TableRef,
     pub columns: Vec<String>,
     pub primary_key: Vec<String>,
-    pub dialect: Dialect,
+    pub dialect: &'static Dialect,
 }
 
 /// One primary key value of the row.
@@ -213,7 +213,7 @@ mod tests {
             table: TableRef::new("public", "orders"),
             columns: vec!["id".into(), "status".into(), "total".into(), "note".into()],
             primary_key: vec!["id".into()],
-            dialect: Dialect::Postgres,
+            dialect: &crate::sql::POSTGRES,
         }
     }
 
@@ -240,7 +240,7 @@ mod tests {
         };
         let mysql = EditTarget {
             table: TableRef::new("shop", "orders"),
-            dialect: Dialect::Mysql,
+            dialect: &crate::sql::MYSQL,
             ..orders()
         };
         assert_eq!(
@@ -255,7 +255,7 @@ mod tests {
         );
         let sqlite = EditTarget {
             table: TableRef::new("main", "orders"),
-            dialect: Dialect::Sqlite,
+            dialect: &crate::sql::SQLITE,
             ..orders()
         };
         assert_eq!(

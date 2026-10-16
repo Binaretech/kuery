@@ -2,10 +2,11 @@
 //! blocks it (`pg_blocking_pids`) and the lock it waits for, and signals to
 //! cancel a session's query or end the session.
 
-use kuery_core::activity::{Activity, Backend, State, parse_pids};
+use kuery_core::activity::{Activity, Backend, Signal, State, parse_pids};
+use kuery_core::adapter::fetch;
 
 use crate::catalog::rows;
-use crate::{QueryError, Session};
+use crate::{Postgres, QueryError};
 
 /// One row per session. Times are measured from the statement's start, so
 /// every row shares one "now"; `pg_blocking_pids` comes joined with commas.
@@ -33,8 +34,8 @@ from pg_catalog.pg_stat_activity a
 order by a.pid";
 
 /// What the server is doing now.
-pub async fn activity(session: Session) -> Result<Activity, QueryError> {
-    let set = session.fetch_trusted(ACTIVITY_SQL.to_string()).await?;
+pub(crate) fn activity(adapter: &mut Postgres) -> Result<Activity, QueryError> {
+    let set = fetch(adapter, ACTIVITY_SQL)?;
     let mut max_connections = None;
     let backends = rows(&set)
         .map(|row| {
@@ -64,27 +65,12 @@ pub async fn activity(session: Session) -> Result<Activity, QueryError> {
     })
 }
 
-/// What to do to a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signal {
-    /// Stop its current query; the session stays.
-    Cancel,
-    /// End the session, rolling back its open transaction.
-    Terminate,
-}
-
-impl Signal {
-    pub fn sql(self, pid: i32) -> String {
-        match self {
-            Signal::Cancel => format!("select pg_catalog.pg_cancel_backend({pid})"),
-            Signal::Terminate => format!("select pg_catalog.pg_terminate_backend({pid})"),
-        }
-    }
-}
-
 /// Sends `signal` to session `pid`; `false` when there was no such session
 /// to signal.
-pub async fn signal(session: Session, pid: i32, signal: Signal) -> Result<bool, QueryError> {
-    let set = session.fetch_trusted(signal.sql(pid)).await?;
-    Ok(set.cell(0, 0).flatten() == Some("t"))
+pub(crate) fn signal(adapter: &mut Postgres, pid: i32, signal: Signal) -> Result<bool, QueryError> {
+    let sql = match signal {
+        Signal::Cancel => format!("select pg_catalog.pg_cancel_backend({pid})"),
+        Signal::Terminate => format!("select pg_catalog.pg_terminate_backend({pid})"),
+    };
+    Ok(fetch(adapter, &sql)?.get(0, 0) == Some("t"))
 }

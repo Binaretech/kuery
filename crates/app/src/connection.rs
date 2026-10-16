@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::SharedString;
-use kuery_core::session::Access;
+use kuery_core::session::{Access, Session};
 
-use crate::sql_session::{Reconnect, SqlSession};
 use crate::theme;
 use crate::tunnel::Tunnel;
 
@@ -135,10 +134,9 @@ pub struct Db {
     /// Name from the project configuration, e.g. `local-dev`.
     pub name: SharedString,
     pub environment: Environment,
-    pub session: SqlSession,
+    pub session: Session,
     /// `host:port/database`, without credentials.
     pub target: SharedString,
-    pub reconnect: Reconnect,
     /// Production only: what is allowed for this connection session. Shared
     /// by every tab on it, gone when it disconnects or the app quits.
     writes_allowed: Arc<AtomicBool>,
@@ -151,9 +149,8 @@ impl Db {
     pub fn new(
         name: SharedString,
         environment: Environment,
-        session: SqlSession,
+        session: Session,
         target: SharedString,
-        reconnect: Reconnect,
         tunnel: Option<Arc<Tunnel>>,
     ) -> Self {
         Self {
@@ -161,7 +158,6 @@ impl Db {
             environment,
             session,
             target,
-            reconnect,
             writes_allowed: Arc::new(AtomicBool::new(false)),
             full_writes_allowed: Arc::new(AtomicBool::new(false)),
             _tunnel: tunnel,

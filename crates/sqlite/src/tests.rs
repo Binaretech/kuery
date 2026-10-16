@@ -1,13 +1,22 @@
 use std::time::Duration;
 
 use futures::executor::block_on;
+use kuery_core::adapter::Discard;
 use kuery_core::catalog::{ConstraintKind, TableKind, TableRef};
 use kuery_core::diagram::OnDelete;
 use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange};
 use kuery_core::read_only::Rejection;
-use kuery_core::result_set::ColumnKind;
+use kuery_core::result_set::{ColumnKind, ResultSet};
+use kuery_core::session::{Event, Opener, Session, StatementImpact, Summary};
+use std::path::PathBuf;
 
 use super::*;
+
+/// A session on the database at `path`, the way the app opens one.
+fn session_at(path: PathBuf, access: Access) -> Result<Session, String> {
+    let opener: Opener = Arc::new(move |access| open(&path, access));
+    block_on(Session::open(opener, access))
+}
 
 const SCHEMA: &str = r"
 create table customers (
@@ -64,7 +73,7 @@ impl Database {
     }
 
     fn open(&self, access: Access) -> Session {
-        block_on(Session::open(self.0.clone(), access)).unwrap()
+        session_at(self.0.clone(), access).unwrap()
     }
 }
 
@@ -100,16 +109,13 @@ fn drain(rx: async_channel::Receiver<Event>) -> Result<Summary, QueryError> {
 
 #[test]
 fn opens_only_existing_databases() {
-    let missing = block_on(Session::open(
-        "/nowhere/at/all.sqlite".into(),
-        Access::ReadOnly,
-    ));
+    let missing = session_at("/nowhere/at/all.sqlite".into(), Access::ReadOnly);
     assert!(missing.err().unwrap().contains("There is no database file"));
     let dir = std::env::temp_dir().join(format!("kuery-sqlite-not-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let text = dir.join("notes.txt");
     std::fs::write(&text, "not a database at all, just some words in a file").unwrap();
-    let wrong = block_on(Session::open(text, Access::ReadOnly));
+    let wrong = session_at(text, Access::ReadOnly);
     assert!(wrong.err().unwrap().contains("is not a database"));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -118,7 +124,7 @@ fn opens_only_existing_databases() {
 fn reads_rows_with_their_kinds() {
     let database = Database::new("reads");
     let session = database.open(Access::ReadOnly);
-    assert!(session.server_version().starts_with('3'));
+    assert!(session.server_label().starts_with("SQLite 3"));
     let set = fetch(
         &session,
         "select c.id, c.name, c.credit, o.total, o.placed_at, x'cafe' as raw \
@@ -185,10 +191,17 @@ fn refuses_writes_twice_when_reading() {
         fetch(&session, "delete from orders"),
         Err(QueryError::Rejected(Rejection::Statement(_)))
     ));
-    // The second layer holds on its own: query_only refuses the change.
-    let rx =
-        session.stream(|worker, tx| worker.read("delete from orders", &RunOptions::default(), tx));
-    assert!(matches!(drain(rx), Err(QueryError::Database { .. })));
+    // The second layer holds on its own: inside the dialect's read-only
+    // transaction, query_only refuses the change.
+    let mut adapter = open(&database.0, Access::ReadWrite).unwrap();
+    for statement in SQLITE.transactions.begin_read_only {
+        adapter.execute(statement, &mut Discard).unwrap();
+    }
+    assert!(matches!(
+        adapter.execute("delete from orders", &mut Discard),
+        Err(QueryError::Database { .. })
+    ));
+    drop(adapter);
     assert_eq!(
         scalar(&session, "select count(*) from orders").as_deref(),
         Some("3")
@@ -207,7 +220,7 @@ fn applies_row_changes_with_optimistic_checks() {
         table: TableRef::new("main", "customers"),
         columns: vec!["id".into(), "email".into(), "name".into(), "credit".into()],
         primary_key: vec!["id".into()],
-        dialect: Dialect::Sqlite,
+        dialect: &kuery_core::sql::SQLITE,
     };
     let key = |id: &str| {
         vec![KeyValue {
@@ -402,7 +415,7 @@ fn stops_statements_that_run_too_long() {
 fn reads_the_catalog() {
     let database = Database::new("catalog");
     let session = database.open(Access::ReadOnly);
-    let overview = block_on(catalog::overview(session.clone())).unwrap();
+    let overview = block_on(session.overview()).unwrap();
     assert_eq!(overview.schemas, ["main"]);
     let names: Vec<(&str, TableKind)> = overview
         .tables
@@ -420,11 +433,7 @@ fn reads_the_catalog() {
     );
     assert_eq!(overview.triggers.len(), 1);
 
-    let orders = block_on(catalog::definition(
-        session.clone(),
-        TableRef::new("main", "orders"),
-    ))
-    .unwrap();
+    let orders = block_on(session.definition(TableRef::new("main", "orders"))).unwrap();
     assert_eq!(orders.primary_key(), ["id"]);
     let customer = orders.column("customer_id").unwrap();
     let reference = customer.foreign_key.as_ref().unwrap();
@@ -444,17 +453,9 @@ fn reads_the_catalog() {
     );
     assert_eq!(orders.triggers[0].name, "orders_placed");
 
-    let lines = block_on(catalog::definition(
-        session.clone(),
-        TableRef::new("main", "order_lines"),
-    ))
-    .unwrap();
+    let lines = block_on(session.definition(TableRef::new("main", "order_lines"))).unwrap();
     assert_eq!(lines.primary_key(), ["order_id", "line"]);
-    let customers = block_on(catalog::definition(
-        session.clone(),
-        TableRef::new("main", "customers"),
-    ))
-    .unwrap();
+    let customers = block_on(session.definition(TableRef::new("main", "customers"))).unwrap();
     assert!(
         customers
             .constraints
@@ -462,7 +463,7 @@ fn reads_the_catalog() {
             .any(|c| c.kind == ConstraintKind::Unique)
     );
 
-    let diagram = block_on(catalog::diagram(session.clone(), "main".into())).unwrap();
+    let diagram = block_on(session.diagram("main".into())).unwrap();
     assert_eq!(diagram.tables.len(), 3);
     let to_customers = diagram
         .relations
@@ -474,7 +475,7 @@ fn reads_the_catalog() {
     assert_eq!(to_customers.on_delete, OnDelete::Cascade);
     assert!(to_customers.optional);
 
-    let completion = block_on(catalog::completion_catalog(session)).unwrap();
+    let completion = block_on(session.completion_catalog()).unwrap();
     let customers = completion
         .tables
         .iter()
@@ -495,4 +496,25 @@ fn writes_reals_like_sqlite() {
     assert_eq!(kind_of(Some("BIGINT")), ColumnKind::Integer);
     assert_eq!(kind_of(Some("DECIMAL(10,2)")), ColumnKind::Number);
     assert_eq!(kind_of(None), ColumnKind::Unknown);
+}
+
+#[test]
+fn conforms() {
+    let dir = std::env::temp_dir().join(format!("kuery-sqlite-conformance-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("empty.sqlite");
+    let _ = std::fs::remove_file(&path);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("create table seed (n integer)")
+        .unwrap();
+    let opener: Opener = Arc::new(move |access| open(&path, access));
+    kuery_core::conformance::run(&kuery_core::conformance::Fixture {
+        opener,
+        schema: "main".into(),
+        slow_query: "with recursive n(i) as (select 1 union all select i + 1 from n) \
+                     select count(*) from n"
+            .into(),
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }

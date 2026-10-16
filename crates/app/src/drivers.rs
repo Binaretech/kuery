@@ -1,37 +1,39 @@
-//! The contract every driver meets in the app, and the registry that pairs
-//! each descriptor in [`kuery_core::driver`] with its implementation.
+//! The drivers Kuery has, and the one way the app connects with each
+//! family.
 //!
-//! A driver tests and opens connections from a [`ConnectionSpec`]. What it
-//! opens is a [`Connection`] of its family, and the family decides the rest:
-//! the sidebar tree, the tabs and the write rules (SQL: schemas, query and
-//! table tabs; key-value: databases and keys, key tabs and a console).
-//!
-//! Adding a driver: describe it in `kuery_core::driver`, implement
-//! [`Driver`] here (usually over a crate of its own), and list it in
-//! [`all`]. A driver of an existing family only needs a session that the
-//! family's views can use.
+//! A SQL driver is a crate that exports a `DRIVER`
+//! ([`kuery_core::driver::SqlDriver`]): its descriptor, the SQL it speaks,
+//! and how it opens an [`kuery_core::adapter::Adapter`]. Listing it in
+//! [`SQL`] is all the app needs: testing, connecting, SSH tunnels and the
+//! extra connections write mode opens all go through [`Driver`] the same
+//! way for every one. Redis is the key-value family, with its own session.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use gpui_kit::component::{Icon, IconName};
-use kuery_core::driver::{self, DriverInfo, Family};
+use kuery_core::driver::{self, ConnectOptions, DriverInfo, Family, SqlDriver};
+use kuery_core::session::{Access, Opener, Session};
 
 use crate::assets::AppIcon;
 use crate::connection::{Db, RedisDb};
 use crate::project::ConnectionSpec;
-use crate::sql_session::{Reconnect, SqlSession};
-use crate::tunnel;
+use crate::tunnel::{self, Tunnel};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// The background runtimes the drivers run on.
+/// Every SQL driver, in the order the list shows them.
+pub static SQL: [&SqlDriver; 3] = [
+    &kuery_pg::DRIVER,
+    &kuery_mysql::DRIVER,
+    &kuery_sqlite::DRIVER,
+];
+
+/// The background runtimes drivers outside the SQL family run on.
 #[derive(Clone)]
 pub struct Engines {
-    pub postgres: Arc<kuery_pg::Engine>,
     pub redis: Arc<kuery_redis::Engine>,
-    pub mysql: Arc<kuery_mysql::Engine>,
 }
 
 /// An open connection, by family.
@@ -40,30 +42,33 @@ pub enum Connection {
     KeyValue(RedisDb),
 }
 
-pub trait Driver: Send + Sync + 'static {
-    fn info(&self) -> &'static DriverInfo;
-
-    /// Connects read-only with the form's settings and says what it
-    /// reached, such as "PostgreSQL 16.4".
-    fn test(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<String, String>>;
-
-    /// Opens the connection the sidebar keeps and the tabs share.
-    fn connect(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<Connection, String>>;
+/// A driver Kuery has: a SQL one, or Redis.
+#[derive(Clone, Copy)]
+pub enum Driver {
+    Sql(&'static SqlDriver),
+    Redis,
 }
 
-/// Every driver, in the order of [`kuery_core::driver::ALL`].
-pub fn all() -> &'static [&'static dyn Driver] {
-    &[&Postgres, &Mysql, &Sqlite, &Redis]
+/// Every driver, in the order the list shows them.
+pub fn all() -> Vec<Driver> {
+    SQL.iter()
+        .map(|sql| Driver::Sql(sql))
+        .chain([Driver::Redis])
+        .collect()
+}
+
+pub fn find(id: &str) -> Option<Driver> {
+    all().into_iter().find(|driver| driver.info().id == id)
+}
+
+/// The driver a connection names, or why there is none.
+pub fn for_spec(spec: &ConnectionSpec) -> Result<Driver, String> {
+    find(&spec.driver).ok_or_else(|| {
+        format!(
+            "This version of Kuery has no \u{201c}{}\u{201d} driver",
+            spec.driver
+        )
+    })
 }
 
 /// The icon of a driver's family, in the sidebar and the driver list.
@@ -74,244 +79,116 @@ pub fn family_icon(family: Family) -> Icon {
     }
 }
 
-pub fn find(id: &str) -> Option<&'static dyn Driver> {
-    all().iter().copied().find(|driver| driver.info().id == id)
-}
-
-/// The driver a connection names, or why there is none.
-pub fn for_spec(spec: &ConnectionSpec) -> Result<&'static dyn Driver, String> {
-    find(&spec.driver).ok_or_else(|| {
-        format!(
-            "This version of Kuery has no \u{201c}{}\u{201d} driver",
-            spec.driver
-        )
-    })
-}
-
-struct Postgres;
-
-impl Driver for Postgres {
-    fn info(&self) -> &'static DriverInfo {
-        &driver::POSTGRES
+impl Driver {
+    pub fn info(self) -> &'static DriverInfo {
+        match self {
+            Driver::Sql(sql) => &sql.info,
+            Driver::Redis => &driver::REDIS,
+        }
     }
 
-    fn test(
-        &self,
+    /// Connects read-only with the form's settings and says what it
+    /// reached, such as "Connected · PostgreSQL 16.4".
+    pub fn test(
+        self,
         spec: &ConnectionSpec,
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<String, String>> {
-        let (spec, engine) = (spec.clone(), engines.postgres.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let conninfo =
-                spec.conninfo(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-            engine
-                .connect_with(conninfo, kuery_pg::Access::ReadOnly)
-                .await
-                .map(|session| {
-                    format!(
-                        "Connected{} · PostgreSQL {}",
-                        through(&spec),
-                        session.server_version()
-                    )
-                })
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn connect(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<Connection, String>> {
-        let (spec, engine) = (spec.clone(), engines.postgres.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let conninfo =
-                spec.conninfo(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-            let session = engine
-                .connect_with(conninfo.clone(), spec.environment().access())
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Connection::Sql(Db::new(
-                spec.name.clone().into(),
-                spec.environment(),
-                SqlSession::Postgres(session),
-                spec.target().into(),
-                Reconnect::Postgres {
-                    conninfo: conninfo.into(),
-                },
-                tunnel,
-            )))
-        })
-    }
-}
-
-/// MySQL and MariaDB.
-struct Mysql;
-
-impl Driver for Mysql {
-    fn info(&self) -> &'static DriverInfo {
-        &driver::MYSQL
-    }
-
-    fn test(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<String, String>> {
-        let (spec, engine) = (spec.clone(), engines.mysql.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let target = spec.mysql_target(password, tunnel.as_ref().map(|t| t.local_port()));
-            let session = engine.connect(target, kuery_pg::Access::ReadOnly).await?;
-            Ok(format!(
-                "Connected{} · {} {}",
-                through(&spec),
-                if session.is_mariadb() {
-                    "MariaDB"
-                } else {
-                    "MySQL"
-                },
-                session.server_version()
-            ))
-        })
-    }
-
-    fn connect(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<Connection, String>> {
-        let (spec, engine) = (spec.clone(), engines.mysql.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let target = spec.mysql_target(password, tunnel.as_ref().map(|t| t.local_port()));
-            let session = engine
-                .connect(target.clone(), spec.environment().access())
-                .await?;
-            Ok(Connection::Sql(Db::new(
-                spec.name.clone().into(),
-                spec.environment(),
-                SqlSession::Mysql(session),
-                spec.target().into(),
-                Reconnect::Mysql {
-                    target: Arc::new(target),
-                },
-                tunnel,
-            )))
-        })
-    }
-}
-
-/// A database file. `database` is its path, already made absolute (see
-/// [`ConnectionSpec::resolved`]); production opens it read-only.
-struct Sqlite;
-
-impl Driver for Sqlite {
-    fn info(&self) -> &'static DriverInfo {
-        &driver::SQLITE
-    }
-
-    fn test(
-        &self,
-        spec: &ConnectionSpec,
-        _: Option<String>,
-        _: &Engines,
-    ) -> BoxFuture<Result<String, String>> {
-        let open =
-            kuery_sqlite::Session::open(spec.database.clone().into(), kuery_pg::Access::ReadOnly);
-        Box::pin(async move {
-            let session = open.await?;
-            Ok(format!("Opened · SQLite {}", session.server_version()))
-        })
-    }
-
-    fn connect(
-        &self,
-        spec: &ConnectionSpec,
-        _: Option<String>,
-        _: &Engines,
-    ) -> BoxFuture<Result<Connection, String>> {
-        let path: std::path::PathBuf = spec.database.clone().into();
-        let open = kuery_sqlite::Session::open(path.clone(), spec.environment().access());
         let spec = spec.clone();
-        Box::pin(async move {
-            let session = open.await?;
-            Ok(Connection::Sql(Db::new(
-                spec.name.clone().into(),
-                spec.environment(),
-                SqlSession::Sqlite(session),
-                spec.target().into(),
-                Reconnect::Sqlite { path },
-                None,
-            )))
-        })
-    }
-}
-
-struct Redis;
-
-impl Driver for Redis {
-    fn info(&self) -> &'static DriverInfo {
-        &driver::REDIS
-    }
-
-    fn test(
-        &self,
-        spec: &ConnectionSpec,
-        password: Option<String>,
-        engines: &Engines,
-    ) -> BoxFuture<Result<String, String>> {
-        let (spec, engine) = (spec.clone(), engines.redis.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let target =
-                spec.redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-            engine
-                .connect(target)
-                .await
-                .map(|session| {
+        match self {
+            Driver::Sql(sql) => Box::pin(async move {
+                let tunnel = tunnel::open_for(&spec).await?;
+                let session =
+                    open_sql(sql, &spec, password, tunnel.as_deref(), Access::ReadOnly).await?;
+                let verb = if sql.info.file { "Opened" } else { "Connected" };
+                Ok(format!(
+                    "{verb}{} · {}",
+                    through(&spec),
+                    session.server_label()
+                ))
+            }),
+            Driver::Redis => {
+                let engine = engines.redis.clone();
+                Box::pin(async move {
+                    let tunnel = tunnel::open_for(&spec).await?;
+                    let target = spec
+                        .redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+                    let session = engine.connect(target).await.map_err(|e| e.to_string())?;
                     let server = session.server();
-                    format!(
+                    Ok(format!(
                         "Connected{} · Redis {} · {}",
                         through(&spec),
                         server.version,
                         server.mode
-                    )
+                    ))
                 })
-                .map_err(|error| error.to_string())
-        })
+            }
+        }
     }
 
-    fn connect(
-        &self,
+    /// Opens the connection the sidebar keeps and the tabs share.
+    pub fn connect(
+        self,
         spec: &ConnectionSpec,
         password: Option<String>,
         engines: &Engines,
     ) -> BoxFuture<Result<Connection, String>> {
-        let (spec, engine) = (spec.clone(), engines.redis.clone());
-        Box::pin(async move {
-            let tunnel = tunnel::open_for(&spec).await?;
-            let target =
-                spec.redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-            let session = engine
-                .connect(target)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Connection::KeyValue(RedisDb::new(
-                spec.name.clone().into(),
-                spec.environment(),
-                session,
-                spec.target().into(),
-                tunnel,
-            )))
-        })
+        let spec = spec.clone();
+        match self {
+            Driver::Sql(sql) => Box::pin(async move {
+                let tunnel = tunnel::open_for(&spec).await?;
+                let access = spec.environment().access();
+                let session = open_sql(sql, &spec, password, tunnel.as_deref(), access).await?;
+                Ok(Connection::Sql(Db::new(
+                    spec.name.clone().into(),
+                    spec.environment(),
+                    session,
+                    spec.target().into(),
+                    tunnel,
+                )))
+            }),
+            Driver::Redis => {
+                let engine = engines.redis.clone();
+                Box::pin(async move {
+                    let tunnel = tunnel::open_for(&spec).await?;
+                    let target = spec
+                        .redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
+                    let session = engine.connect(target).await.map_err(|e| e.to_string())?;
+                    Ok(Connection::KeyValue(RedisDb::new(
+                        spec.name.clone().into(),
+                        spec.environment(),
+                        session,
+                        spec.target().into(),
+                        tunnel,
+                    )))
+                })
+            }
+        }
     }
+}
+
+/// Opens a session with a SQL driver, through the tunnel if there is one.
+/// What it connects with (password included) stays in memory, for
+/// [`Session::reopen`].
+fn open_sql(
+    sql: &'static SqlDriver,
+    spec: &ConnectionSpec,
+    password: Option<String>,
+    tunnel: Option<&Tunnel>,
+    access: Access,
+) -> impl Future<Output = Result<Session, String>> + Send + use<> {
+    let options = ConnectOptions {
+        host: spec.host.clone(),
+        port: spec.port,
+        database: spec.database.clone(),
+        user: spec.user.clone(),
+        password: password.filter(|p| !p.is_empty()),
+        tls: spec.sslmode.clone(),
+        tunnel: tunnel.map(Tunnel::local_port),
+    };
+    let opener: Opener = Arc::new(move |access| (sql.open)(&options, access));
+    Session::open(opener, access)
 }
 
 /// ` through bastion` when the connection goes through SSH.
@@ -325,26 +202,26 @@ fn through(spec: &ConnectionSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::SshSpec;
 
     #[test]
-    fn every_descriptor_has_a_driver_and_back() {
+    fn every_driver_is_found_by_its_id_once() {
         let ids: Vec<&str> = all().iter().map(|d| d.info().id).collect();
-        let described: Vec<&str> = driver::ALL.iter().map(|d| d.id).collect();
-        assert_eq!(ids, described);
-        assert!(find("redis").is_some());
+        assert_eq!(ids, ["postgres", "mysql", "sqlite", "redis"]);
+        assert!(matches!(find("redis"), Some(Driver::Redis)));
         assert!(find("oracle").is_none());
+        for sql in SQL {
+            assert_eq!(sql.info.family, Family::Sql);
+        }
     }
 
-    /// Needs the dev Postgres, Redis and bastion
+    /// Needs the dev Postgres, MySQL, Redis and bastion
     /// (`docker compose -f dev/compose.yaml up -d`).
     #[test]
     #[ignore]
     fn connects_through_the_dev_bastion() {
-        use crate::project::SshSpec;
         let engines = Engines {
-            postgres: Arc::new(kuery_pg::Engine::new().unwrap()),
             redis: Arc::new(kuery_redis::Engine::new().unwrap()),
-            mysql: Arc::new(kuery_mysql::Engine::new().unwrap()),
         };
         let ssh = Some(SshSpec {
             host: "localhost".into(),
@@ -364,8 +241,11 @@ mod tests {
             environment: None,
             ssh: ssh.clone(),
         };
-        let reached =
-            futures::executor::block_on(Postgres.test(&postgres, None, &engines)).unwrap();
+        let test = |spec: &ConnectionSpec| {
+            let driver = for_spec(spec).unwrap();
+            futures::executor::block_on(driver.test(spec, None, &engines)).unwrap()
+        };
+        let reached = test(&postgres);
         assert!(
             reached.starts_with("Connected through localhost · PostgreSQL 16"),
             "{reached}"
@@ -376,9 +256,9 @@ mod tests {
             port: 6379,
             database: "0".into(),
             user: String::new(),
-            ..postgres
+            ..postgres.clone()
         };
-        let reached = futures::executor::block_on(Redis.test(&redis, None, &engines)).unwrap();
+        let reached = test(&redis);
         assert!(
             reached.starts_with("Connected through localhost · Redis 7"),
             "{reached}"
@@ -388,10 +268,9 @@ mod tests {
             host: "mysql".into(),
             port: 3306,
             database: "shop".into(),
-            user: "kuery".into(),
-            ..redis
+            ..postgres
         };
-        let reached = futures::executor::block_on(Mysql.test(&mysql, None, &engines)).unwrap();
+        let reached = test(&mysql);
         assert!(
             reached.starts_with("Connected through localhost · MySQL 8"),
             "{reached}"

@@ -20,10 +20,10 @@ use gpui_kit::{
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
+use kuery_core::activity::Signal;
 use kuery_core::activity::{Activity, Backend, Concern, State, duration};
 use kuery_core::session::Access;
-use kuery_pg::Session;
-use kuery_pg::activity::Signal;
+use kuery_core::session::Session;
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
@@ -67,15 +67,9 @@ impl EventEmitter<ActivityEvent> for ActivityTab {}
 
 impl ActivityTab {
     pub fn new(db: Db, project: PathBuf, cx: &mut Context<Self>) -> Self {
-        let engines = crate::app::state(cx).engines();
-        let connecting = db.reconnect.open(&engines, Access::ReadOnly);
+        let connecting = db.session.reopen(Access::ReadOnly);
         cx.spawn(async move |this, cx| {
-            let result = connecting.await.and_then(|session| {
-                session
-                    .postgres()
-                    .cloned()
-                    .ok_or_else(|| "Server activity is only for PostgreSQL".to_string())
-            });
+            let result = connecting.await;
             this.update(cx, |this, cx| {
                 match result {
                     Ok(session) => {
@@ -155,7 +149,7 @@ impl ActivityTab {
             return;
         }
         self.fetching = true;
-        let fetch = kuery_pg::activity::activity(session.clone());
+        let fetch = session.activity();
         cx.spawn(async move |this, cx| {
             let result = fetch.await;
             this.update(cx, |this, cx| {
@@ -290,7 +284,7 @@ impl ActivityTab {
         let Monitor::Ready(session) = &self.monitor else {
             return;
         };
-        let sent = kuery_pg::activity::signal(session.clone(), pid, signal);
+        let sent = session.signal(pid, signal);
         let record = |outcome: String, failed: bool| AuditRecord {
             at: AuditRecord::now_at(),
             project: self.project.display().to_string(),
@@ -298,7 +292,7 @@ impl ActivityTab {
             environment: self.db.environment.label().to_string(),
             mode: "Server activity".into(),
             action: AuditAction::Run,
-            sql: signal.sql(pid),
+            sql: signal.describe(pid),
             outcome,
             changed: None,
             failed,

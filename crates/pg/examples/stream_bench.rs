@@ -4,8 +4,10 @@
 
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use kuery_core::result_set::ResultSet;
-use kuery_pg::{Engine, Event, RunOptions};
+use kuery_core::session::{Access, Event, Opener, RunOptions, Session};
 
 fn main() -> anyhow::Result<()> {
     let sql = std::env::args()
@@ -14,9 +16,10 @@ fn main() -> anyhow::Result<()> {
     let url = std::env::var("KUERY_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://kuery:kuery@localhost:54329/kuery".into());
 
-    let engine = Engine::new()?;
-    let session = futures::executor::block_on(engine.connect(url))?;
-    println!("PostgreSQL {}", session.server_version());
+    let opener: Opener = Arc::new(move |access| kuery_pg::open(&url, access));
+    let session = futures::executor::block_on(Session::open(opener, Access::ReadOnly))
+        .map_err(anyhow::Error::msg)?;
+    println!("{}", session.server_label());
 
     let started = Instant::now();
     let rx = session.run_read_only(sql, RunOptions::default());

@@ -204,3 +204,25 @@ pub struct CatalogOverview {
     pub enums: Vec<EnumInfo>,
     pub triggers: Vec<TriggerRef>,
 }
+
+/// A column of a table or view, as the catalog lists them in bulk (for
+/// completion and diagrams).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogColumn {
+    pub table: TableRef,
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
+/// A foreign key: rows of `from` refer to rows of `to`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub from: TableRef,
+    pub from_columns: Vec<String>,
+    pub to: TableRef,
+    pub to_columns: Vec<String>,
+    pub on_delete: crate::diagram::OnDelete,
+}

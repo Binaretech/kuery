@@ -3,9 +3,14 @@ name = "kuery-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# The tests every SQL driver runs against its database (see `conformance`).
+conformance = []
+
 [dependencies]
 arrow-array.workspace = true
 async-channel.workspace = true
+futures.workspace = true
 serde_json.workspace = true
 sqlformat.workspace = true
 sqlparser.workspace = true

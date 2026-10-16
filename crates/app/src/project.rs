@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use kuery_core::driver::{self, DriverInfo, Family};
+use kuery_core::driver::{DriverInfo, Family};
+
+use crate::drivers::{self, Driver};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Environment;
@@ -91,12 +93,16 @@ fn is_zero(port: &u16) -> bool {
     *port == 0
 }
 
+/// The driver of connections that name none: projects had Postgres before
+/// there was a choice.
+const DEFAULT_DRIVER: &str = "postgres";
+
 fn default_driver() -> String {
-    driver::DEFAULT.to_string()
+    DEFAULT_DRIVER.to_string()
 }
 
 fn is_default_driver(id: &str) -> bool {
-    id == driver::DEFAULT
+    id == DEFAULT_DRIVER
 }
 
 impl ConnectionSpec {
@@ -113,7 +119,7 @@ impl ConnectionSpec {
 
     /// The driver's descriptor; `None` for an id this version does not know.
     pub fn driver_info(&self) -> Option<&'static DriverInfo> {
-        driver::find(&self.driver)
+        drivers::find(&self.driver).map(Driver::info)
     }
 
     pub fn family(&self) -> Option<Family> {
@@ -121,11 +127,10 @@ impl ConnectionSpec {
     }
 
     /// The SQL it speaks, for SQL drivers.
-    pub fn dialect(&self) -> kuery_core::sql::Dialect {
-        match self.driver.as_str() {
-            "sqlite" => kuery_core::sql::Dialect::Sqlite,
-            "mysql" => kuery_core::sql::Dialect::Mysql,
-            _ => kuery_core::sql::Dialect::Postgres,
+    pub fn dialect(&self) -> Option<&'static kuery_core::sql::Dialect> {
+        match drivers::find(&self.driver)? {
+            Driver::Sql(sql) => Some(sql.dialect),
+            Driver::Redis => None,
         }
     }
 
@@ -195,58 +200,6 @@ impl ConnectionSpec {
                 .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
         }
     }
-
-    /// Where and how to connect to MySQL, through the local end of a tunnel
-    /// when `tunnel` gives its port. The password is only ever added here,
-    /// in memory.
-    pub fn mysql_target(
-        &self,
-        password: Option<String>,
-        tunnel: Option<u16>,
-    ) -> kuery_mysql::Target {
-        kuery_mysql::Target {
-            host: match tunnel {
-                Some(_) => "127.0.0.1".into(),
-                None => self.host.clone(),
-            },
-            port: tunnel.unwrap_or(self.port),
-            user: self.user.trim().to_string(),
-            password: password.filter(|p| !p.is_empty()),
-            database: self.database.trim().to_string(),
-            tls: self
-                .sslmode
-                .as_deref()
-                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
-        }
-    }
-
-    /// libpq `key=value` connection string, through the local end of a
-    /// tunnel when `tunnel` gives its port (the host still names the server,
-    /// for TLS). The password is only ever added here, in memory.
-    pub fn conninfo(&self, password: Option<&str>, tunnel: Option<u16>) -> String {
-        let mut parts = vec![format!("host={}", quote(&self.host))];
-        if tunnel.is_some() {
-            parts.push("hostaddr=127.0.0.1".into());
-        }
-        parts.extend([
-            format!("port={}", tunnel.unwrap_or(self.port)),
-            format!("dbname={}", quote(&self.database)),
-            format!("user={}", quote(&self.user)),
-            "application_name=Kuery".to_string(),
-        ]);
-        if let Some(password) = password.filter(|p| !p.is_empty()) {
-            parts.push(format!("password={}", quote(password)));
-        }
-        if let Some(mode) = self.sslmode.as_deref().filter(|m| !m.is_empty()) {
-            parts.push(format!("sslmode={}", quote(mode)));
-        }
-        parts.join(" ")
-    }
-}
-
-/// libpq quoting: single quotes, with `\` and `'` escaped by a backslash.
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// A unique id for a new connection, without pulling in a UUID crate.
@@ -615,15 +568,8 @@ mod tests {
     }
 
     #[test]
-    fn builds_a_quoted_conninfo_with_the_password_in_memory() {
-        let mut spec = spec("x");
-        spec.user = "o'brien".into();
-        spec.sslmode = Some("require".into());
-        assert_eq!(
-            spec.conninfo(Some(r"p\ss"), None),
-            r"host='localhost' port=54329 dbname='kuery' user='o\'brien' application_name=Kuery password='p\\ss' sslmode='require'"
-        );
-        assert!(!spec.conninfo(None, None).contains("password"));
+    fn describes_a_server_connection() {
+        let spec = spec("x");
         assert_eq!(spec.target(), "localhost:54329/kuery");
         assert_eq!(spec.environment(), Environment::Development);
     }
@@ -673,8 +619,6 @@ mod tests {
             through.target(),
             "localhost:54329/kuery via bastion.example.com"
         );
-        let conninfo = through.conninfo(None, Some(40001));
-        assert!(conninfo.starts_with("host='localhost' hostaddr=127.0.0.1 port=40001 "));
         let redis = through.redis_target(None, Some(40001));
         assert_eq!((redis.host.as_str(), redis.port), ("127.0.0.1", 40001));
 

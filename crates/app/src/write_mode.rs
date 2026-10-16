@@ -84,7 +84,7 @@ fn note(kind: WriteKind) -> String {
     }
 }
 
-pub fn review(dialect: Dialect, sql: &str, environment: Environment, kind: WriteKind) -> Review {
+pub fn review(dialect: &Dialect, sql: &str, environment: Environment, kind: WriteKind) -> Review {
     let policy = environment.write_policy();
     let analysis = match analysis::analyze_in(dialect, sql) {
         Ok(analysis) => analysis,
@@ -173,7 +173,7 @@ fn plural(count: usize, noun: &str) -> String {
 /// One line per statement of a previewed script, e.g. `UPDATE orders: 1,204
 /// rows would change`. Statements are named from the analysis when it lines
 /// up with what the server ran, and numbered otherwise.
-pub fn describe_impact(dialect: Dialect, sql: &str, impacts: &[StatementImpact]) -> Vec<String> {
+pub fn describe_impact(dialect: &Dialect, sql: &str, impacts: &[StatementImpact]) -> Vec<String> {
     let summaries: Option<Vec<String>> = analysis::analyze_in(dialect, sql)
         .ok()
         .map(|a| a.statements.into_iter().map(|s| s.summary).collect())
@@ -832,7 +832,7 @@ mod tests {
 
     fn review_in(environment: Environment, sql: &str) -> Review {
         review(
-            Dialect::Postgres,
+            &kuery_core::sql::POSTGRES,
             sql,
             environment,
             WriteKind::Transactional,
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn full_write_says_changes_apply_right_away() {
         let confirmation = confirmation(review(
-            Dialect::Postgres,
+            &kuery_core::sql::POSTGRES,
             "insert into t values (1)",
             Environment::Staging,
             WriteKind::Full,
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(confirmation.run_label, "Apply 1 change");
         assert!(confirmation.note.contains("There is no Roll Back"));
         assert!(matches!(
-            review(Dialect::Postgres, "begin", Environment::Development, WriteKind::Full),
+            review(&kuery_core::sql::POSTGRES, "begin", Environment::Development, WriteKind::Full),
             Review::Refuse(message) if message.contains("switch to Write")
         ));
     }
@@ -954,7 +954,7 @@ mod tests {
         ];
         assert_eq!(
             describe_impact(
-                Dialect::Postgres,
+                &kuery_core::sql::POSTGRES,
                 "update orders set a = 1; select 1",
                 &impacts
             ),
@@ -965,7 +965,7 @@ mod tests {
         );
         // When the analysis does not line up, statements are numbered.
         assert_eq!(
-            describe_impact(Dialect::Postgres, "updat t", &impacts[..1]),
+            describe_impact(&kuery_core::sql::POSTGRES, "updat t", &impacts[..1]),
             ["Statement 1: 1,204 rows would change"]
         );
     }

@@ -67,8 +67,9 @@ impl SearchableListItem for DriverItem {
 
 /// Every driver, grouped by family in the order families first appear.
 fn driver_groups() -> SearchableVec<SearchableGroup<DriverItem>> {
+    let infos: Vec<&'static DriverInfo> = drivers::all().into_iter().map(|d| d.info()).collect();
     let mut families: Vec<Family> = Vec::new();
-    for info in driver::ALL {
+    for info in &infos {
         if !families.contains(&info.family) {
             families.push(info.family);
         }
@@ -78,7 +79,7 @@ fn driver_groups() -> SearchableVec<SearchableGroup<DriverItem>> {
             .into_iter()
             .map(|family| {
                 SearchableGroup::new(family.label()).items(
-                    driver::ALL
+                    infos
                         .iter()
                         .filter(|info| info.family == family)
                         .map(|info| DriverItem(info)),
@@ -139,7 +140,7 @@ impl ConnectionEditor {
         let info = spec
             .as_ref()
             .and_then(ConnectionSpec::driver_info)
-            .unwrap_or(&driver::POSTGRES);
+            .unwrap_or(&kuery_pg::DRIVER.info);
         let text = |value: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>| {
             let (value, placeholder) = (value.to_string(), placeholder.to_string());
             cx.new(|cx| {
@@ -250,8 +251,8 @@ impl ConnectionEditor {
                 let SelectEvent::Confirm(Some(id)) = event else {
                     return;
                 };
-                if let Some(info) = driver::find(id) {
-                    this.set_driver(info, window, cx);
+                if let Some(driver) = drivers::find(id) {
+                    this.set_driver(driver.info(), window, cx);
                 }
             },
         )

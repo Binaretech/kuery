@@ -88,7 +88,7 @@ pub struct Browse {
     pub sort: Vec<Sort>,
     pub page_size: u64,
     pub page: u64,
-    pub dialect: Dialect,
+    pub dialect: &'static Dialect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,12 +127,12 @@ impl Browse {
             sort: Vec::new(),
             page_size: 100,
             page: 0,
-            dialect: Dialect::Postgres,
+            dialect: &crate::sql::POSTGRES,
         }
     }
 
     /// The same, in another database's SQL.
-    pub fn in_dialect(mut self, dialect: Dialect) -> Self {
+    pub fn in_dialect(mut self, dialect: &'static Dialect) -> Self {
         self.dialect = dialect;
         self
     }
@@ -294,7 +294,7 @@ mod tests {
             TableRef::new("shop", "orders"),
             vec!["id".into(), "status".into()],
         )
-        .in_dialect(Dialect::Mysql);
+        .in_dialect(&crate::sql::MYSQL);
         browse.filters = vec![filter("status", FilterOp::Contains, "pa")];
         browse.sort = vec![Sort {
             column: "id".into(),
@@ -305,7 +305,7 @@ mod tests {
             "select * from `shop`.`orders` where cast(`status` as char) like '%pa%' escape _utf8mb4 x'5c' \
              order by `id` is null, `id` desc limit 100 offset 0"
         );
-        browse.dialect = Dialect::Sqlite;
+        browse.dialect = &crate::sql::SQLITE;
         assert_eq!(
             browse.count_sql().unwrap(),
             "select count(*) from \"shop\".\"orders\" where cast(\"status\" as text) like '%pa%' escape '\\'"

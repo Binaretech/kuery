@@ -3,40 +3,28 @@
 //! indexes, checks, triggers, functions and procedures.
 
 use kuery_core::catalog::{
-    CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, ForeignKeyRef, FunctionInfo,
-    IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef, TriggerInfo,
-    TriggerRef,
+    CatalogColumn, CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, ForeignKeyRef,
+    FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef,
+    TriggerInfo, TriggerRef,
 };
-use kuery_core::completion;
-use kuery_core::diagram::{self, Diagram, OnDelete};
-use kuery_core::result_set::ResultSet;
+use kuery_core::diagram::OnDelete;
 use kuery_core::session::QueryError;
-use kuery_core::sql::Dialect;
 
-use crate::Session;
+use kuery_core::adapter::fetch;
+
+use crate::Mysql;
 
 /// MySQL's and MariaDB's own databases.
 const SYSTEM: &str = "('mysql', 'information_schema', 'performance_schema', 'sys')";
 
 fn literal(value: &str) -> Result<String, QueryError> {
-    Dialect::Mysql
+    kuery_core::sql::MYSQL
         .quote_literal(value)
         .map_err(|error| QueryError::Unsupported(error.to_string()))
 }
 
 fn ident(value: &str) -> String {
-    Dialect::Mysql.quote_ident(value)
-}
-
-/// Each row's cells, `None` for NULL.
-fn rows(set: &ResultSet) -> Vec<Vec<Option<String>>> {
-    (0..set.rows())
-        .map(|row| {
-            (0..set.columns().len())
-                .map(|column| set.cell(row, column).flatten().map(str::to_string))
-                .collect()
-        })
-        .collect()
+    kuery_core::sql::MYSQL.quote_ident(value)
 }
 
 fn text(cell: &Option<String>) -> String {
@@ -56,15 +44,16 @@ struct Column {
     comment: String,
 }
 
-async fn columns(session: &Session, filter: &str) -> Result<Vec<Column>, QueryError> {
+fn columns(adapter: &mut Mysql, filter: &str) -> Result<Vec<Column>, QueryError> {
     let sql = format!(
         "select table_schema, table_name, column_name, column_type, is_nullable, \
          column_default, column_key, extra, column_comment \
          from information_schema.columns where {filter} \
          order by table_schema, table_name, ordinal_position"
     );
-    let set = session.fetch_trusted(sql).await?;
-    Ok(rows(&set)
+    let set = fetch(adapter, &sql)?;
+    Ok(set
+        .rows
         .iter()
         .map(|row| Column {
             schema: text(&row[0]),
@@ -92,7 +81,7 @@ struct ForeignKey {
     on_update: String,
 }
 
-async fn foreign_keys(session: &Session, filter: &str) -> Result<Vec<ForeignKey>, QueryError> {
+fn foreign_keys(adapter: &mut Mysql, filter: &str) -> Result<Vec<ForeignKey>, QueryError> {
     let sql = format!(
         "select k.table_name, k.constraint_name, k.column_name, k.referenced_table_schema, \
          k.referenced_table_name, k.referenced_column_name, r.delete_rule, r.update_rule \
@@ -104,8 +93,9 @@ async fn foreign_keys(session: &Session, filter: &str) -> Result<Vec<ForeignKey>
          where k.referenced_table_name is not null and {filter} \
          order by k.table_name, k.constraint_name, k.ordinal_position"
     );
-    let set = session.fetch_trusted(sql).await?;
-    Ok(rows(&set)
+    let set = fetch(adapter, &sql)?;
+    Ok(set
+        .rows
         .iter()
         .map(|row| ForeignKey {
             table: text(&row[0]),
@@ -143,23 +133,26 @@ fn kind(table_type: &str) -> TableKind {
 }
 
 /// Databases with their tables, views, functions, procedures and triggers.
-pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
-    let schemas = session
-        .fetch_trusted(format!(
+pub(crate) fn overview(adapter: &mut Mysql) -> Result<CatalogOverview, QueryError> {
+    let schemas = fetch(
+        adapter,
+        &format!(
             "select schema_name from information_schema.schemata \
              where schema_name not in {SYSTEM} order by 1"
-        ))
-        .await?;
-    let tables = session
-        .fetch_trusted(format!(
+        ),
+    )?;
+    let tables = fetch(
+        adapter,
+        &format!(
             "select table_schema, table_name, table_type, table_rows, table_comment \
              from information_schema.tables \
              where table_schema not in {SYSTEM} and table_type in ('BASE TABLE', 'VIEW') \
              order by 1, 2"
-        ))
-        .await?;
-    let routines = session
-        .fetch_trusted(format!(
+        ),
+    )?;
+    let routines = fetch(
+        adapter,
+        &format!(
             "select r.routine_schema, r.routine_name, r.routine_type, \
              coalesce(r.dtd_identifier, ''), \
              coalesce((select group_concat(concat_ws(' ', p.parameter_mode, p.parameter_name, p.dtd_identifier) \
@@ -169,18 +162,20 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
                          and p.specific_name = r.specific_name and p.ordinal_position > 0), '') \
              from information_schema.routines r \
              where r.routine_schema not in {SYSTEM} order by 1, 2"
-        ))
-        .await?;
-    let triggers = session
-        .fetch_trusted(format!(
+        ),
+    )?;
+    let triggers = fetch(
+        adapter,
+        &format!(
             "select trigger_schema, event_object_table, trigger_name \
              from information_schema.triggers where trigger_schema not in {SYSTEM} \
              order by 1, 2, 3"
-        ))
-        .await?;
+        ),
+    )?;
     Ok(CatalogOverview {
-        schemas: rows(&schemas).iter().map(|row| text(&row[0])).collect(),
-        tables: rows(&tables)
+        schemas: schemas.rows.iter().map(|row| text(&row[0])).collect(),
+        tables: tables
+            .rows
             .iter()
             .map(|row| TableInfo {
                 table: TableRef::new(text(&row[0]), text(&row[1])),
@@ -189,7 +184,8 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
                 comment: row[4].clone().filter(|c| !c.is_empty()),
             })
             .collect(),
-        functions: rows(&routines)
+        functions: routines
+            .rows
             .iter()
             .map(|row| FunctionInfo {
                 schema: text(&row[0]),
@@ -206,7 +202,8 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
             })
             .collect(),
         enums: Vec::new(),
-        triggers: rows(&triggers)
+        triggers: triggers
+            .rows
             .iter()
             .map(|row| TriggerRef {
                 table: TableRef::new(text(&row[0]), text(&row[1])),
@@ -217,22 +214,23 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
 }
 
 /// `CREATE FUNCTION …` or `CREATE PROCEDURE …`, as the server shows it.
-pub async fn function_definition(
-    session: Session,
-    function: FunctionInfo,
+pub(crate) fn function_definition(
+    adapter: &mut Mysql,
+    function: &FunctionInfo,
 ) -> Result<String, QueryError> {
     let what = match function.kind {
         RoutineKind::Procedure => "procedure",
         _ => "function",
     };
-    let set = session
-        .fetch_trusted(format!(
+    let set = fetch(
+        adapter,
+        &format!(
             "show create {what} {}.{}",
             ident(&function.schema),
             ident(&function.name)
-        ))
-        .await?;
-    match set.cell(0, 2).flatten() {
+        ),
+    )?;
+    match set.get(0, 2) {
         Some(definition) => Ok(format!("{definition};\n")),
         None => Ok(format!(
             "-- The server shows the body of {}.{} only to its owner or with SELECT on mysql.proc.\n",
@@ -241,7 +239,10 @@ pub async fn function_definition(
     }
 }
 
-pub async fn definition(session: Session, table: TableRef) -> Result<TableDefinition, QueryError> {
+pub(crate) fn definition(
+    adapter: &mut Mysql,
+    table: &TableRef,
+) -> Result<TableDefinition, QueryError> {
     let filter = format!(
         "table_schema = {} and table_name = {}",
         literal(&table.schema)?,
@@ -252,10 +253,10 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
         literal(&table.schema)?,
         literal(&table.name)?
     );
-    let keys = foreign_keys(&session, &key_filter).await?;
+    let keys = foreign_keys(adapter, &key_filter)?;
     let groups = grouped(&keys);
     let mut definition = TableDefinition::default();
-    for column in columns(&session, &filter).await? {
+    for column in columns(adapter, &filter)? {
         let foreign_key = keys
             .iter()
             .find(|k| k.column == column.name)
@@ -275,17 +276,18 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
         });
     }
 
-    let indexes = session
-        .fetch_trusted(format!(
+    let indexes = fetch(
+        adapter,
+        &format!(
             "select index_name, non_unique, \
              group_concat(coalesce(column_name, '(expression)') order by seq_in_index separator ', '), \
              index_type \
              from information_schema.statistics where {filter} \
              group by index_name, non_unique, index_type \
              order by index_name = 'PRIMARY' desc, index_name"
-        ))
-        .await?;
-    for row in rows(&indexes) {
+        ),
+    )?;
+    for row in indexes.rows {
         let name = text(&row[0]);
         let unique = text(&row[1]) == "0";
         let primary = name == "PRIMARY";
@@ -331,7 +333,8 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
                 .map(|k| ident(&k.column))
                 .collect::<Vec<_>>()
                 .join(", "),
-            Dialect::Mysql.quote_qualified(&first.referenced_schema, &first.referenced_table),
+            kuery_core::sql::MYSQL
+                .quote_qualified(&first.referenced_schema, &first.referenced_table),
             group
                 .iter()
                 .map(|k| ident(&k.referenced_column))
@@ -351,8 +354,9 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
     }
 
     // CHECK constraints (MySQL 8.0.16+, MariaDB); older servers have none.
-    let checks = session
-        .fetch_trusted(format!(
+    let checks = fetch(
+        adapter,
+        &format!(
             "select c.constraint_name, c.check_clause \
              from information_schema.check_constraints c \
              join information_schema.table_constraints t \
@@ -362,10 +366,10 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
              order by 1",
             literal(&table.schema)?,
             literal(&table.name)?
-        ))
-        .await;
+        ),
+    );
     if let Ok(checks) = checks {
-        for row in rows(&checks) {
+        for row in checks.rows {
             definition.constraints.push(ConstraintInfo {
                 name: text(&row[0]),
                 kind: ConstraintKind::Check,
@@ -374,16 +378,18 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
         }
     }
 
-    let triggers = session
-        .fetch_trusted(format!(
+    let triggers = fetch(
+        adapter,
+        &format!(
             "select trigger_name, action_timing, event_manipulation, action_statement \
              from information_schema.triggers \
              where event_object_schema = {} and event_object_table = {} order by 1",
             literal(&table.schema)?,
             literal(&table.name)?
-        ))
-        .await?;
-    definition.triggers = rows(&triggers)
+        ),
+    )?;
+    definition.triggers = triggers
+        .rows
         .iter()
         .map(|row| TriggerInfo {
             name: text(&row[0]),
@@ -401,112 +407,56 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
     Ok(definition)
 }
 
-pub async fn completion_catalog(session: Session) -> Result<completion::Catalog, QueryError> {
-    let current = session
-        .fetch_trusted("select database()".into())
-        .await?
-        .cell(0, 0)
-        .flatten()
-        .map(str::to_string);
-    let tables = session
-        .fetch_trusted(format!(
-            "select table_schema, table_name, table_type from information_schema.tables \
-             where table_schema not in {SYSTEM} and table_type in ('BASE TABLE', 'VIEW')"
-        ))
-        .await?;
-    let kinds: Vec<(TableRef, TableKind)> = rows(&tables)
-        .iter()
-        .map(|row| {
-            (
-                TableRef::new(text(&row[0]), text(&row[1])),
-                kind(&text(&row[2])),
-            )
-        })
-        .collect();
-    let mut catalog = completion::Catalog {
-        search_path: current.into_iter().collect(),
-        schemas: Vec::new(),
-        tables: Vec::new(),
+/// Every column of the tables and views in `schema`, or in every schema.
+pub(crate) fn catalog_columns(
+    adapter: &mut Mysql,
+    schema: Option<&str>,
+) -> Result<Vec<CatalogColumn>, QueryError> {
+    let filter = match schema {
+        Some(schema) => format!("table_schema = {}", literal(schema)?),
+        None => format!("table_schema not in {SYSTEM}"),
     };
-    for column in columns(&session, &format!("table_schema not in {SYSTEM}")).await? {
-        let table = TableRef::new(column.schema.clone(), column.table.clone());
-        if !catalog.schemas.contains(&column.schema) {
-            catalog.schemas.push(column.schema.clone());
-        }
-        let entry = match catalog.tables.iter_mut().position(|t| t.table == table) {
-            Some(index) => &mut catalog.tables[index],
-            None => {
-                let kind = kinds
-                    .iter()
-                    .find(|(t, _)| *t == table)
-                    .map_or(TableKind::Table, |(_, kind)| *kind);
-                catalog.tables.push(completion::Table {
-                    table,
-                    kind,
-                    columns: Vec::new(),
-                });
-                catalog.tables.last_mut().expect("just pushed")
-            }
-        };
-        entry.columns.push(completion::Column {
-            name: column.name,
-            data_type: column.column_type,
-        });
-    }
-    Ok(catalog)
+    Ok(columns(adapter, &filter)?
+        .into_iter()
+        .map(|c| CatalogColumn {
+            table: TableRef::new(c.schema, c.table),
+            name: c.name,
+            data_type: c.column_type,
+            nullable: c.nullable,
+            primary_key: c.primary_key,
+        })
+        .collect())
 }
 
-pub async fn diagram(session: Session, schema: String) -> Result<Diagram, QueryError> {
-    let schema_literal = literal(&schema)?;
-    let tables = session
-        .fetch_trusted(format!(
-            "select table_name, table_rows from information_schema.tables \
-             where table_schema = {schema_literal} and table_type = 'BASE TABLE' order by 1"
-        ))
-        .await?;
-    let columns = columns(&session, &format!("table_schema = {schema_literal}")).await?;
-    let keys = foreign_keys(&session, &format!("k.table_schema = {schema_literal}")).await?;
-    let mut diagram = Diagram {
-        schema: schema.clone(),
-        tables: Vec::new(),
-        relations: Vec::new(),
-    };
-    for row in rows(&tables) {
-        let name = text(&row[0]);
-        diagram.tables.push(diagram::Table {
-            table: TableRef::new(schema.clone(), name.clone()),
-            rows: row[1].as_deref().and_then(|n| n.parse().ok()),
-            columns: columns
-                .iter()
-                .filter(|c| c.table == name)
-                .map(|c| diagram::Column {
-                    name: c.name.clone(),
-                    data_type: c.column_type.clone(),
-                    nullable: c.nullable,
-                    primary_key: c.primary_key,
-                    foreign_key: keys.iter().any(|k| k.table == name && k.column == c.name),
-                })
-                .collect(),
-        });
-    }
-    for group in grouped(&keys) {
-        let first = group[0];
-        let from_columns: Vec<String> = group.iter().map(|k| k.column.clone()).collect();
-        let optional = columns
-            .iter()
-            .any(|c| c.table == first.table && c.nullable && from_columns.contains(&c.name));
-        diagram.relations.push(diagram::Relation {
-            name: first.name.clone(),
-            from: TableRef::new(schema.clone(), first.table.clone()),
-            from_columns,
-            to: TableRef::new(
-                first.referenced_schema.clone(),
-                first.referenced_table.clone(),
-            ),
-            to_columns: group.iter().map(|k| k.referenced_column.clone()).collect(),
-            optional,
-            on_delete: OnDelete::from_rule(&first.on_delete),
-        });
-    }
-    Ok(diagram)
+/// The foreign keys of the tables in `schema`.
+pub(crate) fn catalog_foreign_keys(
+    adapter: &mut Mysql,
+    schema: &str,
+) -> Result<Vec<kuery_core::catalog::ForeignKey>, QueryError> {
+    let keys = foreign_keys(adapter, &format!("k.table_schema = {}", literal(schema)?))?;
+    Ok(grouped(&keys)
+        .into_iter()
+        .map(|group| {
+            let first = group[0];
+            kuery_core::catalog::ForeignKey {
+                name: first.name.clone(),
+                from: TableRef::new(schema, first.table.clone()),
+                from_columns: group.iter().map(|k| k.column.clone()).collect(),
+                to: TableRef::new(
+                    first.referenced_schema.clone(),
+                    first.referenced_table.clone(),
+                ),
+                to_columns: group.iter().map(|k| k.referenced_column.clone()).collect(),
+                on_delete: OnDelete::from_rule(&first.on_delete),
+            }
+        })
+        .collect())
+}
+
+/// The database queries start in.
+pub(crate) fn search_path(adapter: &mut Mysql) -> Result<Vec<String>, QueryError> {
+    Ok(fetch(adapter, "select database()")?
+        .get(0, 0)
+        .map(|database| vec![database.to_string()])
+        .unwrap_or_default())
 }

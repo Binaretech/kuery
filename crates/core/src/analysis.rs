@@ -94,11 +94,11 @@ impl Analysis {
 
 /// Analyses a PostgreSQL script of one or more statements.
 pub fn analyze(sql: &str) -> Result<Analysis, Rejection> {
-    analyze_in(Dialect::Postgres, sql)
+    analyze_in(&crate::sql::POSTGRES, sql)
 }
 
 /// The same, for a database speaking `dialect`.
-pub fn analyze_in(dialect: Dialect, sql: &str) -> Result<Analysis, Rejection> {
+pub fn analyze_in(dialect: &Dialect, sql: &str) -> Result<Analysis, Rejection> {
     let statements = Parser::parse_sql(&*dialect.parser(), sql)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
     if statements.is_empty() {

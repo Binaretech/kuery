@@ -1146,7 +1146,7 @@ impl WorkspaceView {
                             )),
                     )
                     .child(div().child(db.target.clone()));
-                right = right.child(db.session.server_label());
+                right = right.child(db.session.server_label().to_string());
             }
             None => match &redis {
                 Some(redis) => {
@@ -1184,7 +1184,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(db.as_ref().map(|db| db.session.server_label()));
+                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
             }
             Some(Tab::Activity(activity)) => {
                 let tab = activity.read(cx);
@@ -1193,7 +1193,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(db.as_ref().map(|db| db.session.server_label()));
+                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
             }
             Some(Tab::RedisKey(key)) => {
                 let tab = key.read(cx);
@@ -1297,7 +1297,7 @@ impl WorkspaceView {
                         )
                     })
                     .child(tab.cursor_status(cx))
-                    .children(db.as_ref().map(|db| db.session.server_label()));
+                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
             }
             Some(Tab::Table(table)) => {
                 let tab = table.read(cx);
@@ -1308,7 +1308,7 @@ impl WorkspaceView {
                         .gap_4()
                         .flex_shrink_0()
                         .child(status)
-                        .children(db.as_ref().map(|db| db.session.server_label()));
+                        .children(db.as_ref().map(|db| db.session.server_label().to_string()));
                 }
             }
             None => {}

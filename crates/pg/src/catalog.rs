@@ -1,17 +1,16 @@
 //! PostgreSQL catalog: tables, columns, keys, indexes, constraints and
 //! triggers, read from `pg_catalog`.
 
+use kuery_core::adapter::{Rows, fetch};
 use kuery_core::catalog::{
-    CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, EnumInfo, ForeignKeyRef,
-    FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo, TableKind, TableRef,
-    TriggerInfo, TriggerRef,
+    CatalogColumn, CatalogOverview, ColumnInfo, ConstraintInfo, ConstraintKind, EnumInfo,
+    ForeignKey, ForeignKeyRef, FunctionInfo, IndexInfo, RoutineKind, TableDefinition, TableInfo,
+    TableKind, TableRef, TriggerInfo, TriggerRef,
 };
-use kuery_core::completion;
-use kuery_core::diagram::{self, Diagram, OnDelete};
-use kuery_core::result_set::ResultSet;
+use kuery_core::diagram::OnDelete;
 use kuery_core::sql::{quote_literal, quote_qualified};
 
-use crate::{QueryError, Session};
+use crate::{Postgres, QueryError};
 
 const TABLES_SQL: &str = r"
 select n.nspname,
@@ -71,44 +70,30 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace
 where not t.tgisinternal and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
 order by 1, 3";
 
-/// Every column of every table and view in a user schema, for completion.
+/// Every column of every table and view in the user schemas (or in one,
+/// `{schema}` being a filter on `n.nspname`), with whether it is in the
+/// primary key.
 const COLUMNS_SQL: &str = r"
 select n.nspname,
        c.relname,
-       c.relkind::text,
-       a.attname,
-       pg_catalog.format_type(a.atttypid, a.atttypmod)
-from pg_catalog.pg_class c
-join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-left join pg_catalog.pg_attribute a
-  on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-where c.relkind in ('r', 'p', 'v', 'm', 'f')
-  and not c.relispartition
-  and n.nspname not in ('pg_catalog', 'information_schema')
-  and n.nspname !~ '^pg_(toast|temp)'
-order by 1, 2, a.attnum";
-
-/// A schema's tables and columns, with which are primary or foreign keys,
-/// for a diagram. `{schema}` is a quoted literal.
-const DIAGRAM_COLUMNS_SQL: &str = r"
-select c.relname,
-       case when c.reltuples < 0 then null else c.reltuples::bigint end,
        a.attname,
        pg_catalog.format_type(a.atttypid, a.atttypmod),
        not a.attnotnull,
        exists (select 1 from pg_catalog.pg_constraint p
-               where p.conrelid = c.oid and p.contype = 'p' and a.attnum = any (p.conkey)),
-       exists (select 1 from pg_catalog.pg_constraint f
-               where f.conrelid = c.oid and f.contype = 'f' and a.attnum = any (f.conkey))
+               where p.conrelid = c.oid and p.contype = 'p' and a.attnum = any (p.conkey))
 from pg_catalog.pg_class c
 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
 join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-where n.nspname = {schema} and c.relkind in ('r', 'p') and not c.relispartition
-order by c.relname, a.attnum";
+where c.relkind in ('r', 'p', 'v', 'm', 'f')
+  and not c.relispartition
+  and n.nspname not in ('pg_catalog', 'information_schema')
+  and n.nspname !~ '^pg_(toast|temp)'
+  and {schema}
+order by 1, 2, a.attnum";
 
 /// A schema's foreign keys (not the copies partitions inherit): columns in
 /// order, joined with the unit separator.
-const DIAGRAM_KEYS_SQL: &str = r"
+const KEYS_SQL: &str = r"
 select con.conname,
        src.relname,
        tn.nspname,
@@ -119,10 +104,7 @@ select con.conname,
        (select string_agg(a.attname, E'\x1f' order by k.i)
           from unnest(con.confkey) with ordinality k(n, i)
           join pg_catalog.pg_attribute a on a.attrelid = con.confrelid and a.attnum = k.n),
-       con.confdeltype::text,
-       (select bool_or(not a.attnotnull)
-          from unnest(con.conkey) k(n)
-          join pg_catalog.pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n)
+       con.confdeltype::text
 from pg_catalog.pg_constraint con
 join pg_catalog.pg_class src on src.oid = con.conrelid
 join pg_catalog.pg_namespace sn on sn.oid = src.relnamespace
@@ -135,12 +117,20 @@ order by 2, 1";
 const SEARCH_PATH_SQL: &str = "select pg_catalog.unnest(pg_catalog.current_schemas(false))";
 
 /// Everything the explorer tree needs for one connection.
-pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
-    let schemas = session.fetch_trusted(SCHEMAS_SQL.into()).await?;
-    let tables = tables(session.clone()).await?;
-    let functions = session.fetch_trusted(FUNCTIONS_SQL.into()).await?;
-    let enums = session.fetch_trusted(ENUMS_SQL.into()).await?;
-    let triggers = session.fetch_trusted(TRIGGERS_SQL.into()).await?;
+pub(crate) fn overview(adapter: &mut Postgres) -> Result<CatalogOverview, QueryError> {
+    let schemas = fetch(adapter, SCHEMAS_SQL)?;
+    let tables = fetch(adapter, TABLES_SQL)?;
+    let tables = rows(&tables)
+        .map(|row| TableInfo {
+            table: TableRef::new(row.text(0), row.text(1)),
+            kind: table_kind(&row.text(2)),
+            estimated_rows: row.optional(3).and_then(|v| v.parse().ok()),
+            comment: row.optional(4),
+        })
+        .collect();
+    let functions = fetch(adapter, FUNCTIONS_SQL)?;
+    let enums = fetch(adapter, ENUMS_SQL)?;
+    let triggers = fetch(adapter, TRIGGERS_SQL)?;
     Ok(CatalogOverview {
         schemas: rows(&schemas).map(|row| row.text(0)).collect(),
         tables,
@@ -176,67 +166,11 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
     })
 }
 
-/// A schema's tables, columns and foreign keys, for its diagram.
-pub async fn diagram(session: Session, schema: String) -> Result<Diagram, QueryError> {
-    let literal = quote_literal(&schema).map_err(|error| QueryError::Database {
-        code: "22021".into(),
-        message: error.to_string(),
-    })?;
-    let columns = session
-        .fetch_trusted(DIAGRAM_COLUMNS_SQL.replace("{schema}", &literal))
-        .await?;
-    let keys = session
-        .fetch_trusted(DIAGRAM_KEYS_SQL.replace("{schema}", &literal))
-        .await?;
-    let mut tables: Vec<diagram::Table> = Vec::new();
-    for row in rows(&columns) {
-        let name = row.text(0);
-        if tables.last().is_none_or(|t| t.table.name != name) {
-            tables.push(diagram::Table {
-                table: TableRef::new(schema.clone(), name),
-                rows: row.optional(1).and_then(|r| r.parse().ok()),
-                columns: Vec::new(),
-            });
-        }
-        if let Some(table) = tables.last_mut() {
-            table.columns.push(diagram::Column {
-                name: row.text(2),
-                data_type: row.text(3),
-                nullable: row.flag(4),
-                primary_key: row.flag(5),
-                foreign_key: row.flag(6),
-            });
-        }
-    }
-    let split = |text: String| -> Vec<String> {
-        text.split('\u{1f}')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let relations = rows(&keys)
-        .map(|row| diagram::Relation {
-            name: row.text(0),
-            from: TableRef::new(schema.clone(), row.text(1)),
-            to: TableRef::new(row.text(2), row.text(3)),
-            from_columns: split(row.text(4)),
-            to_columns: split(row.text(5)),
-            on_delete: OnDelete::from_code(&row.text(6)),
-            optional: row.flag(7),
-        })
-        .collect();
-    Ok(Diagram {
-        schema,
-        tables,
-        relations,
-    })
-}
-
 /// `CREATE OR REPLACE FUNCTION …` for a function or procedure. Aggregates have
 /// no such definition, so they get a short description instead.
-pub async fn function_definition(
-    session: Session,
-    function: FunctionInfo,
+pub(crate) fn function_definition(
+    adapter: &mut Postgres,
+    function: &FunctionInfo,
 ) -> Result<String, QueryError> {
     if function.kind == RoutineKind::Aggregate {
         return Ok(format!(
@@ -244,56 +178,11 @@ pub async fn function_definition(
             function.schema, function.name, function.arguments
         ));
     }
-    let set = session
-        .fetch_trusted(format!(
-            "select pg_catalog.pg_get_functiondef({})",
-            function.oid
-        ))
-        .await?;
-    Ok(set.cell(0, 0).flatten().unwrap_or_default().to_owned())
-}
-
-/// Tables and views from every user schema.
-pub async fn tables(session: Session) -> Result<Vec<TableInfo>, QueryError> {
-    let set = session.fetch_trusted(TABLES_SQL.into()).await?;
-    Ok(rows(&set)
-        .map(|row| TableInfo {
-            table: TableRef::new(row.text(0), row.text(1)),
-            kind: table_kind(&row.text(2)),
-            estimated_rows: row.optional(3).and_then(|v| v.parse().ok()),
-            comment: row.optional(4),
-        })
-        .collect())
-}
-
-/// Schemas, tables and columns for the SQL editor's completion.
-pub async fn completion_catalog(session: Session) -> Result<completion::Catalog, QueryError> {
-    let search_path = session.fetch_trusted(SEARCH_PATH_SQL.into()).await?;
-    let schemas = session.fetch_trusted(SCHEMAS_SQL.into()).await?;
-    let columns = session.fetch_trusted(COLUMNS_SQL.into()).await?;
-    let mut tables: Vec<completion::Table> = Vec::new();
-    for row in rows(&columns) {
-        let table = TableRef::new(row.text(0), row.text(1));
-        if tables.last().is_none_or(|last| last.table != table) {
-            tables.push(completion::Table {
-                table,
-                kind: table_kind(&row.text(2)),
-                columns: Vec::new(),
-            });
-        }
-        // A table without columns comes with a NULL one.
-        if let (Some(name), Some(last)) = (row.optional(3), tables.last_mut()) {
-            last.columns.push(completion::Column {
-                name,
-                data_type: row.text(4),
-            });
-        }
-    }
-    Ok(completion::Catalog {
-        search_path: rows(&search_path).map(|row| row.text(0)).collect(),
-        schemas: rows(&schemas).map(|row| row.text(0)).collect(),
-        tables,
-    })
+    let set = fetch(
+        adapter,
+        &format!("select pg_catalog.pg_get_functiondef({})", function.oid),
+    )?;
+    Ok(set.text(0, 0))
 }
 
 /// `pg_class.relkind` of a table or view.
@@ -308,7 +197,10 @@ fn table_kind(relkind: &str) -> TableKind {
 }
 
 /// A table's full definition.
-pub async fn definition(session: Session, table: TableRef) -> Result<TableDefinition, QueryError> {
+pub(crate) fn definition(
+    adapter: &mut Postgres,
+    table: &TableRef,
+) -> Result<TableDefinition, QueryError> {
     let relation =
         quote_literal(&quote_qualified(&table.schema, &table.name)).map_err(|error| {
             QueryError::Database {
@@ -318,10 +210,10 @@ pub async fn definition(session: Session, table: TableRef) -> Result<TableDefini
         })?;
     let relation = format!("{relation}::regclass");
 
-    let columns = session.fetch_trusted(columns_sql(&relation)).await?;
-    let indexes = session.fetch_trusted(indexes_sql(&relation)).await?;
-    let constraints = session.fetch_trusted(constraints_sql(&relation)).await?;
-    let triggers = session.fetch_trusted(triggers_sql(&relation)).await?;
+    let columns = fetch(adapter, &columns_sql(&relation))?;
+    let indexes = fetch(adapter, &indexes_sql(&relation))?;
+    let constraints = fetch(adapter, &constraints_sql(&relation))?;
+    let triggers = fetch(adapter, &triggers_sql(&relation))?;
 
     Ok(TableDefinition {
         columns: rows(&columns)
@@ -440,16 +332,13 @@ order by tgname"
 }
 
 pub(crate) struct Row<'a> {
-    set: &'a ResultSet,
+    set: &'a Rows,
     index: usize,
 }
 
 impl Row<'_> {
     pub(crate) fn optional(&self, column: usize) -> Option<String> {
-        self.set
-            .cell(self.index, column)
-            .flatten()
-            .map(str::to_owned)
+        self.set.get(self.index, column).map(str::to_owned)
     }
 
     pub(crate) fn text(&self, column: usize) -> String {
@@ -457,10 +346,68 @@ impl Row<'_> {
     }
 
     pub(crate) fn flag(&self, column: usize) -> bool {
-        self.set.cell(self.index, column).flatten() == Some("t")
+        self.set.get(self.index, column) == Some("t")
     }
 }
 
-pub(crate) fn rows(set: &ResultSet) -> impl Iterator<Item = Row<'_>> {
-    (0..set.rows()).map(move |index| Row { set, index })
+pub(crate) fn rows(set: &Rows) -> impl Iterator<Item = Row<'_>> {
+    (0..set.rows.len()).map(move |index| Row { set, index })
+}
+
+fn literal(value: &str) -> Result<String, QueryError> {
+    quote_literal(value).map_err(|error| QueryError::Database {
+        code: "22021".into(),
+        message: error.to_string(),
+    })
+}
+
+/// Every column of the tables and views in `schema`, or in every user schema.
+pub(crate) fn catalog_columns(
+    adapter: &mut Postgres,
+    schema: Option<&str>,
+) -> Result<Vec<CatalogColumn>, QueryError> {
+    let filter = match schema {
+        Some(schema) => format!("n.nspname = {}", literal(schema)?),
+        None => "true".into(),
+    };
+    let set = fetch(adapter, &COLUMNS_SQL.replace("{schema}", &filter))?;
+    Ok(rows(&set)
+        .map(|row| CatalogColumn {
+            table: TableRef::new(row.text(0), row.text(1)),
+            name: row.text(2),
+            data_type: row.text(3),
+            nullable: row.flag(4),
+            primary_key: row.flag(5),
+        })
+        .collect())
+}
+
+/// A schema's foreign keys (not the copies partitions inherit).
+pub(crate) fn catalog_foreign_keys(
+    adapter: &mut Postgres,
+    schema: &str,
+) -> Result<Vec<ForeignKey>, QueryError> {
+    let set = fetch(adapter, &KEYS_SQL.replace("{schema}", &literal(schema)?))?;
+    let split = |text: String| -> Vec<String> {
+        text.split('\u{1f}')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    Ok(rows(&set)
+        .map(|row| ForeignKey {
+            name: row.text(0),
+            from: TableRef::new(schema, row.text(1)),
+            to: TableRef::new(row.text(2), row.text(3)),
+            from_columns: split(row.text(4)),
+            to_columns: split(row.text(5)),
+            on_delete: OnDelete::from_code(&row.text(6)),
+        })
+        .collect())
+}
+
+/// The schemas in `search_path` that exist, in order.
+pub(crate) fn search_path(adapter: &mut Postgres) -> Result<Vec<String>, QueryError> {
+    let set = fetch(adapter, SEARCH_PATH_SQL)?;
+    Ok(rows(&set).map(|row| row.text(0)).collect())
 }
