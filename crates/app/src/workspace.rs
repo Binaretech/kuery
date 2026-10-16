@@ -1115,7 +1115,7 @@ impl WorkspaceView {
             }
             Some(Tab::Query(query)) => {
                 let tab = query.read(cx);
-                let writing = tab.mode_status() != "Read-only";
+                let writing = tab.is_writing();
                 left = left.child(
                     h_flex()
                         .gap(px(5.))

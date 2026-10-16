@@ -1169,7 +1169,20 @@ impl QueryTab {
                        label: &'static str,
                        target: Option<WriteKind>,
                        cx: &mut Context<Self>| {
+            let tooltip = match target {
+                None => "Read-only: statements that write are refused before they reach the server",
+                Some(WriteKind::Transactional) => {
+                    "Write: changes stay in a transaction until you Commit or Roll Back"
+                }
+                Some(WriteKind::Full) => {
+                    "Full write: each script is kept as soon as it finishes, all of it or \
+                     nothing. There is no Roll Back"
+                }
+            };
             chrome::segment(id, icon, label, mode == target)
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                })
                 .on_click(cx.listener(move |this, _, window, cx| this.set_mode(target, window, cx)))
         };
 
@@ -1351,25 +1364,35 @@ impl QueryTab {
         )
     }
 
-    /// What the status bar says about this tab's mode.
+    /// Whether the tab is in one of the write modes.
+    pub fn is_writing(&self) -> bool {
+        matches!(self.write, WriteState::On(_) | WriteState::Connecting)
+    }
+
+    /// What the status bar says about this tab's mode: what the mode does
+    /// with changes, then what the environment asks before them.
     pub fn mode_status(&self) -> String {
         let hint = write_mode::policy_hint(self.db.environment.write_policy());
         match &self.write {
-            WriteState::Off => "Read-only".into(),
+            WriteState::Off => "Read-only · statements that write are refused".into(),
             WriteState::Connecting => "Opening a write connection…".into(),
             WriteState::Failed(error) => format!("Write mode failed: {error}"),
             WriteState::On(write) => match write.kind {
-                WriteKind::Full => format!("Full write · {hint}"),
+                WriteKind::Full => {
+                    format!(
+                        "Full write · each script is kept when it finishes, no Roll Back · {hint}"
+                    )
+                }
                 WriteKind::Transactional => match write.opened {
                     Some(opened) if write.session.in_transaction() => {
                         let open = opened.elapsed().as_secs();
                         format!(
-                            "Write · transaction open {}:{:02} · {hint}",
+                            "Write · transaction open {}:{:02}, Commit or Roll Back · {hint}",
                             open / 60,
                             open % 60
                         )
                     }
-                    _ => format!("Write · {hint}"),
+                    _ => format!("Write · changes wait in a transaction for Commit · {hint}"),
                 },
             },
         }
