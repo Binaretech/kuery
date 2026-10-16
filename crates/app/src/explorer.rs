@@ -1,5 +1,6 @@
 //! Sidebar: the project's connections as a tree (connection → schema →
-//! tables, views, functions, triggers and enums), its saved queries, and the
+//! tables, views, functions, triggers and enums for Postgres; connection →
+//! database → keys for Redis, see [`redis_keys`]), its saved queries, and the
 //! query history.
 //!
 //! The sidebar owns the open connections: it opens each one when it is first
@@ -7,9 +8,12 @@
 //! system keychain, and hands an open [`Db`] to the tabs it asks the
 //! workspace to open. The connection list follows the project model.
 
-use std::collections::HashSet;
+mod redis_keys;
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -28,10 +32,10 @@ use kuery_pg::catalog;
 
 use crate::app;
 use crate::assets::AppIcon;
-use crate::connection::{Db, Reconnect};
+use crate::connection::{Db, Reconnect, RedisDb};
 use crate::context_menus::{copy, item, item_icon, reveal};
 use crate::history::{self, HistoryEntry};
-use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
+use crate::project::{ConnectionSpec, Driver, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
@@ -55,12 +59,30 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
+    /// A Redis connection finished opening.
+    RedisConnected(RedisDb),
+    OpenRedisKey {
+        db: RedisDb,
+        database: i64,
+        key: String,
+    },
+    OpenRedisConsole {
+        db: RedisDb,
+        database: i64,
+    },
 }
 
 enum ConnectionState {
     Idle,
     Connecting,
-    Ready { db: Db, catalog: CatalogState },
+    Ready {
+        db: Db,
+        catalog: CatalogState,
+    },
+    RedisReady {
+        db: RedisDb,
+        keyspace: redis_keys::Keyspace,
+    },
     Failed(String),
 }
 
@@ -199,6 +221,10 @@ pub struct Explorer {
     /// never overwrites a newer one. Holds the last number written.
     history_saved: Arc<Mutex<u64>>,
     history_saves: u64,
+    /// Keys read so far per (connection, Redis database).
+    redis_keys: HashMap<(usize, i64), redis_keys::KeyBrowser>,
+    /// Bumped on every edit of the filter, so only the last one rescans.
+    filter_edits: u64,
 }
 
 impl EventEmitter<ExplorerEvent> for Explorer {}
@@ -206,9 +232,9 @@ impl EventEmitter<ExplorerEvent> for Explorer {}
 impl Explorer {
     pub fn new(model: Entity<ProjectModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter objects"));
-        cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+        cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                cx.notify();
+                this.filter_changed(cx);
             }
         })
         .detach();
@@ -238,6 +264,8 @@ impl Explorer {
             history: history::load(&project.root),
             history_saved: Arc::new(Mutex::new(0)),
             history_saves: 0,
+            redis_keys: HashMap::new(),
+            filter_edits: 0,
         };
         if !explorer.connections.is_empty() {
             explorer.expanded.insert("0".into());
@@ -270,10 +298,40 @@ impl Explorer {
     /// Reloads the catalog of every open connection.
     fn refresh_catalogs(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.connections.len() {
-            if matches!(self.connections[index].state, ConnectionState::Ready { .. }) {
-                self.load_catalog(index, cx);
+            match self.connections[index].state {
+                ConnectionState::Ready { .. } => self.load_catalog(index, cx),
+                ConnectionState::RedisReady { .. } => self.load_keyspace(index, cx),
+                _ => {}
             }
         }
+    }
+
+    /// Reloads one connection's catalog, or its databases for Redis.
+    fn refresh(&mut self, index: usize, cx: &mut Context<Self>) {
+        match self.connections.get(index).map(|node| &node.state) {
+            Some(ConnectionState::RedisReady { .. }) => self.load_keyspace(index, cx),
+            _ => self.load_catalog(index, cx),
+        }
+    }
+
+    /// The filter filters Postgres objects as typed; Redis key lists are
+    /// read again with it as a `SCAN` pattern once typing pauses.
+    fn filter_changed(&mut self, cx: &mut Context<Self>) {
+        self.filter_edits += 1;
+        let edit = self.filter_edits;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.filter_edits == edit {
+                    this.rescan_redis(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn current_db(&self) -> Option<Db> {
@@ -376,7 +434,9 @@ impl Explorer {
         };
         if matches!(
             node.state,
-            ConnectionState::Connecting | ConnectionState::Ready { .. }
+            ConnectionState::Connecting
+                | ConnectionState::Ready { .. }
+                | ConnectionState::RedisReady { .. }
         ) {
             return;
         }
@@ -387,6 +447,10 @@ impl Explorer {
         // The keychain may ask the user for permission: read it off the UI thread.
         let id = spec.id.clone();
         let password = cx.background_spawn(async move { secrets.get(&id) });
+        if spec.driver == Driver::Redis {
+            self.connect_redis(spec, password, cx);
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = match password.await {
                 Ok(password) => {
@@ -463,6 +527,13 @@ impl Explorer {
             self.selected = None;
         }
         self.queries = project.queries();
+        let connections = &self.connections;
+        self.redis_keys.retain(|(index, _), _| {
+            matches!(
+                connections.get(*index).map(|node| &node.state),
+                Some(ConnectionState::RedisReady { .. })
+            )
+        });
         cx.notify();
     }
 
@@ -625,6 +696,7 @@ impl Explorer {
         if let Some(node) = self.connections.get_mut(index) {
             node.state = ConnectionState::Idle;
             self.expanded.remove(&index.to_string());
+            self.redis_keys.retain(|(i, _), _| *i != index);
             cx.notify();
         }
     }
@@ -717,7 +789,11 @@ impl Explorer {
         for (index, node) in self.connections.iter().enumerate() {
             let key = index.to_string();
             let expanded = self.expanded.contains(&key)
-                || (searching && matches!(node.state, ConnectionState::Ready { .. }));
+                || (searching
+                    && matches!(
+                        node.state,
+                        ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
+                    ));
             rows.push(self.connection_row(index, node, expanded, cx));
             if !expanded {
                 continue;
@@ -744,6 +820,9 @@ impl Explorer {
                             }))
                             .into_any_element(),
                     );
+                }
+                ConnectionState::RedisReady { db, keyspace } => {
+                    self.redis_rows(index, db, keyspace, &mut rows, cx)
                 }
                 ConnectionState::Ready { catalog, .. } => match catalog {
                     CatalogState::Loading => {
@@ -775,11 +854,15 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let environment = node.spec.environment();
-        let ready = matches!(node.state, ConnectionState::Ready { .. });
+        let redis = node.spec.driver == Driver::Redis;
+        let ready = matches!(
+            node.state,
+            ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
+        );
         // The environment's color: filled once connected, an outline before;
         // amber while connecting, red when it failed.
         let dot = match &node.state {
-            ConnectionState::Ready { .. } => div()
+            ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. } => div()
                 .size(px(6.))
                 .rounded_full()
                 .bg(color(environment.color())),
@@ -802,13 +885,17 @@ impl Explorer {
         )
         .group(group.clone())
         .child(
-            Icon::new(AppIcon::Database)
-                .size(px(15.))
-                .text_color(color(if ready {
-                    theme::TEXT_SECONDARY
-                } else {
-                    theme::TEXT_QUIET
-                })),
+            Icon::new(if redis {
+                Icon::from(IconName::MemoryStick)
+            } else {
+                Icon::from(AppIcon::Database)
+            })
+            .size(px(15.))
+            .text_color(color(if ready {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_QUIET
+            })),
         )
         .child(
             div()
@@ -857,7 +944,7 @@ impl Explorer {
                     .child(Icon::new(AppIcon::Reload).size(px(11.)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.load_catalog(index, cx);
+                        this.refresh(index, cx);
                     })),
             )
         })
@@ -875,7 +962,23 @@ impl Explorer {
             let id = node.spec.id.clone();
             let target = node.spec.target();
             move |menu, _, _| {
-                let menu = if ready {
+                let menu = if ready && redis {
+                    menu.item(item_icon(
+                        "Open Console",
+                        AppIcon::Code,
+                        &this,
+                        move |this, _, cx| this.open_default_console(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Refresh Databases",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.load_keyspace(index, cx),
+                    ))
+                    .item(item("Disconnect", &this, move |this, _, cx| {
+                        this.disconnect(index, cx)
+                    }))
+                } else if ready {
                     menu.item(item_icon(
                         "New Query",
                         IconName::Plus,

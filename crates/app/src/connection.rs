@@ -223,6 +223,17 @@ impl Db {
     }
 }
 
+/// An open Redis connection, shared by the sidebar and the tabs opened from
+/// it. Redis tabs only read for now, so there is nothing to allow.
+#[derive(Clone)]
+pub struct RedisDb {
+    pub name: SharedString,
+    pub environment: Environment,
+    pub session: kuery_redis::Session,
+    /// `host:port/database`, without credentials.
+    pub target: SharedString,
+}
+
 /// Whether `kind` may run, given what the connection session allows.
 fn allows(policy: WritePolicy, writes: bool, full_writes: bool, kind: WriteKind) -> bool {
     if policy != WritePolicy::SessionUnlock {

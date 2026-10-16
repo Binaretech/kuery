@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 kuery-core = { path = "crates/core" }
 kuery-pg = { path = "crates/pg" }
+kuery-redis = { path = "crates/redis" }
 
 anyhow = "1"
 arrow-array = "60"
@@ -16,6 +17,8 @@ async-channel = "2"
 futures = "0.3"
 keyring = "4"
 serde = { version = "1", features = ["derive"] }
+# Pretty-printing JSON values in Redis keys, keeping their key order.
+serde_json = { version = "1", features = ["preserve_order"] }
 sqlformat = "0.5"
 sqlparser = { version = "0.63", features = ["visitor"] }
 thiserror = "2"
@@ -26,6 +29,8 @@ tokio-postgres = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 tokio-postgres-rustls = "0.14"
+# Async, reconnecting connections; TLS through the same rustls (and `ring`) as Postgres.
+redis = { version = "1.7", default-features = false, features = ["acl", "streams", "tokio-comp", "tokio-rustls-comp", "connection-manager"] }
 
 # gpui-kit pins its own gpui version; upgrade it on purpose, never by accident.
 gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql"] }

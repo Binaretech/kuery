@@ -1,4 +1,4 @@
-# Local Postgres for development and for the technical test.
+# Local Postgres and Redis for development and for the technical test.
 # Development-only credentials; see .env.example at the repo root.
 services:
   postgres:
@@ -15,3 +15,19 @@ services:
     volumes:
       - ./seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./seed-analytics.sql:/docker-entrypoint-initdb.d/20-analytics.sql:ro
+
+  redis:
+    image: redis:7-alpine
+    # No persistence: the example data is loaded again on every start.
+    command:
+      - sh
+      - -c
+      - >-
+        redis-server --save '' --appendonly no &
+        until redis-cli ping > /dev/null 2>&1; do sleep 0.2; done;
+        sh /seed/seed-redis.sh;
+        wait
+    ports:
+      - "63799:6379"
+    volumes:
+      - ./seed-redis.sh:/seed/seed-redis.sh:ro

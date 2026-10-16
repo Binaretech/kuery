@@ -8,6 +8,8 @@ query tabs that run read-only with streamed results (or, in write mode,
 inside a transaction you commit), and table tabs
 with server-side filtering, sorting and paging, the table definition, and
 row editing through staged changes (never on production connections).
+Redis connections get a key browser, key tabs and a read-only console (see
+[Redis](#redis)).
 
 ## Layout
 
@@ -15,6 +17,7 @@ row editing through staged changes (never on production connections).
 |---|---|
 | `crates/core` | Read-only policy and write-mode statement analysis (`sqlparser`), columnar results (Arrow), the catalog model, and escaped SQL for browsing and editing tables. No UI. |
 | `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, transactional row changes, and write transactions with a savepoint per run. |
+| `crates/redis` | Redis driver (`redis-rs`) on its own tokio runtime: a reconnecting connection per database, the keyspace, `SCAN` pages, key details, value pages per type, and console commands. TLS with the same rustls as Postgres. |
 | `crates/app` | The gpui app (`gpui-kit`, pinned version). Custom fonts and icons in `crates/app/assets`. |
 
 ## Interface
@@ -36,10 +39,11 @@ change when you click Preview Impact.
 ## Development
 
 ```bash
-docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database
+docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, and a seeded Redis
 cargo run -p kuery -- .                                 # the app, on this repo's project
 cargo test --workspace                                    # tests without a database
 cargo test -p kuery-pg -- --ignored                     # tests against the dev Postgres
+cargo test -p kuery-redis -- --ignored                  # tests against the dev Redis
 cargo run --release -p kuery-pg --example stream_bench  # streaming without a UI
 ```
 
@@ -75,6 +79,41 @@ Linux) under the connection's id, never into `project.toml`. A connection's
 `environment` (development, staging or production) is detected from the host
 if not set; production connections open read-only (the session also sets
 `default_transaction_read_only`) and the explorer offers no row editing.
+
+## Redis
+
+A connection's driver is PostgreSQL or Redis, picked at the top of the
+connection dialog (`driver = "redis"` in `project.toml`; connections without
+it are Postgres). For Redis the database is the index the console starts on,
+the user an optional ACL user, and TLS is on or off (with the server's
+certificate checked against the system's roots). Standalone servers only, for
+now.
+
+In the sidebar a Redis connection lists its databases with their key
+counts (empty ones are left out, except the default). Expanding one reads its
+keys with `SCAN`, a thousand at a time ("Load more keys" reads on; `KEYS`,
+which blocks the server, is never used), grouped into folders by `:`. The
+sidebar's filter becomes the `SCAN` pattern: `user` looks for `*user*`, and
+anything with `*`, `?` or `[` is used as typed.
+
+A key opens in a tab with its type, time to live, length, memory and
+encoding. Strings show as text, JSON indented (Pretty / Raw), up to the first
+MB. Hashes, lists, sets, sorted sets and streams fill the results grid 500
+entries at a time; stream fields become columns.
+
+The console (from a database's hover icon or menu, or a connection's menu)
+runs commands one per line, as `redis-cli` reads them, with command-name
+completion: `secondary-enter` runs the line under the cursor or the selected
+lines, `secondary-alt-enter` every line. The last reply fills the grid; the
+Output tab logs each reply the way `redis-cli` prints it. For now the console
+only reads: commands that write are refused, as are those that would change
+or hold the connection (`SELECT`, `SUBSCRIBE`, `MONITOR`, blocking pops,
+`MULTI`); pick the database in its toolbar instead. `KEYS` runs on
+development connections only.
+
+The dev compose starts a Redis on port 63799 with every key type, keys that
+expire, 1,500 products to page through and a second database; the repo's
+project has a `local-cache` connection to it.
 
 ## Write mode
 

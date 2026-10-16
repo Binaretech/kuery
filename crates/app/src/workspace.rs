@@ -25,7 +25,7 @@ use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
     OpenKeymapFile, OpenProject, PreviousTab, ToggleSidebar,
 };
-use crate::connection::{Db, Environment, WriteKind};
+use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
@@ -34,6 +34,8 @@ use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
 use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab};
 use crate::recent::{self, RecentProject};
+use crate::redis_console::ConsoleTab;
+use crate::redis_key_tab::KeyTab;
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
 use crate::ui::placeholder;
@@ -41,6 +43,8 @@ use crate::ui::placeholder;
 enum Tab {
     Query(Entity<QueryTab>),
     Table(Entity<TableTab>),
+    RedisKey(Entity<KeyTab>),
+    RedisConsole(Entity<ConsoleTab>),
 }
 
 impl Tab {
@@ -48,6 +52,17 @@ impl Tab {
         match self {
             Tab::Query(query) => query.entity_id(),
             Tab::Table(table) => table.entity_id(),
+            Tab::RedisKey(key) => key.entity_id(),
+            Tab::RedisConsole(console) => console.entity_id(),
+        }
+    }
+
+    /// The Redis connection of a Redis tab.
+    fn redis(&self, cx: &App) -> Option<RedisDb> {
+        match self {
+            Tab::RedisKey(key) => Some(key.read(cx).db().clone()),
+            Tab::RedisConsole(console) => Some(console.read(cx).db().clone()),
+            Tab::Query(_) | Tab::Table(_) => None,
         }
     }
 
@@ -57,6 +72,7 @@ impl Tab {
         match self {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
+            Tab::RedisKey(_) | Tab::RedisConsole(_) => false,
         }
     }
 
@@ -64,6 +80,7 @@ impl Tab {
         match self {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
+            Tab::RedisKey(_) | Tab::RedisConsole(_) => None,
         }
     }
 
@@ -75,6 +92,13 @@ impl Tab {
             Tab::Table(table) => {
                 let handle = table.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
+            }
+            Tab::RedisKey(key) => {
+                let handle = key.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            Tab::RedisConsole(console) => {
+                console.update(cx, |console, cx| console.focus_editor(window, cx))
             }
         }
     }
@@ -153,6 +177,19 @@ impl WorkspaceView {
                     window,
                     cx,
                 ),
+                ExplorerEvent::RedisConnected(db) => {
+                    // The first connection to open gets a console to start with.
+                    if this.tabs.is_empty() {
+                        this.open_redis_console(db.clone(), db.session.default_db(), window, cx);
+                    }
+                    cx.notify();
+                }
+                ExplorerEvent::OpenRedisKey { db, database, key } => {
+                    this.open_redis_key(db.clone(), *database, key.clone(), window, cx)
+                }
+                ExplorerEvent::OpenRedisConsole { db, database } => {
+                    this.open_redis_console(db.clone(), *database, window, cx)
+                }
             },
         )
         .detach();
@@ -196,10 +233,7 @@ impl WorkspaceView {
     /// Whether closing the window now would lose work: a query with unsaved
     /// edits or an open transaction, or a table with pending row changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
-        self.tabs.iter().any(|tab| match tab {
-            Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
-            Tab::Table(table) => table.read(cx).has_pending(),
-        })
+        self.tabs.iter().any(|tab| tab.needs_attention(cx))
     }
 
     fn open_query(
@@ -341,6 +375,43 @@ impl WorkspaceView {
                 self.tabs.len() - 1
             }
         };
+        self.activate(index, window, cx);
+    }
+
+    /// Opens a key in a tab, or shows the tab it is already open in.
+    fn open_redis_key(
+        &mut self,
+        db: RedisDb,
+        database: i64,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.tabs.iter().position(|tab| match tab {
+            Tab::RedisKey(tab) => {
+                let tab = tab.read(cx);
+                tab.db().name == db.name && tab.database() == database && tab.key() == key
+            }
+            _ => false,
+        });
+        let index = existing.unwrap_or_else(|| {
+            let tab = cx.new(|cx| KeyTab::new(db, database, key, window, cx));
+            self.tabs.push(Tab::RedisKey(tab));
+            self.tabs.len() - 1
+        });
+        self.activate(index, window, cx);
+    }
+
+    fn open_redis_console(
+        &mut self,
+        db: RedisDb,
+        database: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = cx.new(|cx| ConsoleTab::new(db, database, window, cx));
+        self.tabs.push(Tab::RedisConsole(tab));
+        let index = self.tabs.len() - 1;
         self.activate(index, window, cx);
     }
 
@@ -927,7 +998,12 @@ impl WorkspaceView {
     /// The bottom bar: the active connection and mode on the left, the last
     /// run and the cursor on the right.
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let db = self.active_db(cx);
+        let redis = self.tabs.get(self.active).and_then(|tab| tab.redis(cx));
+        let db = if redis.is_some() {
+            None
+        } else {
+            self.active_db(cx)
+        };
         let mut left = h_flex().gap_4().min_w_0();
         let mut right = h_flex().gap_4().flex_shrink_0();
         match &db {
@@ -951,9 +1027,62 @@ impl WorkspaceView {
                     .child(div().child(db.target.clone()));
                 right = right.child(format!("PostgreSQL {}", db.session.server_version()));
             }
-            None => left = left.child("No open connection"),
+            None => match &redis {
+                Some(redis) => {
+                    left = left
+                        .child(
+                            h_flex()
+                                .gap(px(6.))
+                                .text_color(color(
+                                    if redis.environment == Environment::Production {
+                                        0xffcf7f
+                                    } else {
+                                        0xc7c7cc
+                                    },
+                                ))
+                                .child(chrome::dot(redis.environment.color()))
+                                .child(format!(
+                                    "{} · {}",
+                                    redis.name,
+                                    redis.environment.label().to_lowercase()
+                                )),
+                        )
+                        .child(div().child(redis.target.clone()));
+                }
+                None => left = left.child("No open connection"),
+            },
         }
+        let redis_version = redis
+            .as_ref()
+            .map(|redis| format!("Redis {}", redis.session.server().version));
         match self.tabs.get(self.active) {
+            Some(Tab::RedisKey(key)) => {
+                let tab = key.read(cx);
+                left = left.child(div().truncate().child(format!(
+                    "db{} · {}",
+                    tab.database(),
+                    tab.key()
+                )));
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .children(tab.status())
+                    .children(redis_version);
+            }
+            Some(Tab::RedisConsole(console)) => {
+                let tab = console.read(cx);
+                left = left.child(
+                    h_flex()
+                        .gap(px(5.))
+                        .child(Icon::new(AppIcon::Lock).size(px(11.)))
+                        .child("Read-only"),
+                );
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .child(div().max_w(px(420.)).truncate().child(tab.status()))
+                    .children(redis_version);
+            }
             Some(Tab::Query(query)) => {
                 let tab = query.read(cx);
                 let writing = tab.mode_status() != "Read-only";
@@ -1066,10 +1195,17 @@ impl WorkspaceView {
                         table.has_pending(),
                     )
                 }
+                Tab::RedisKey(key) => (
+                    AppIcon::Key,
+                    SharedString::from(key.read(cx).key().to_string()),
+                    false,
+                ),
+                Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
             };
-            let tooltip: SharedString = match tab.db(cx) {
-                Some(db) => format!("{title} · {}", db.name).into(),
-                None => title.clone(),
+            let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {
+                (Some(db), _) => format!("{title} · {}", db.name).into(),
+                (None, Some(redis)) => format!("{title} · {}", redis.name).into(),
+                (None, None) => title.clone(),
             };
             let group = SharedString::from(format!("tab-{index}"));
             strip = strip.child(
@@ -1133,14 +1269,14 @@ impl WorkspaceView {
                         let count = self.tabs.len();
                         let file = match tab {
                             Tab::Query(query) => query.read(cx).file().map(PathBuf::from),
-                            Tab::Table(_) => None,
+                            _ => None,
                         };
                         let table = match tab {
                             Tab::Table(table) => {
                                 let table = &table.read(cx).info().table;
                                 Some(quote_qualified(&table.schema, &table.name))
                             }
-                            Tab::Query(_) => None,
+                            _ => None,
                         };
                         move |menu, _, _| {
                             let mut menu = menu
@@ -1203,6 +1339,8 @@ impl WorkspaceView {
         match self.tabs.get(self.active) {
             Some(Tab::Query(query)) => query.clone().into_any_element(),
             Some(Tab::Table(table)) => table.clone().into_any_element(),
+            Some(Tab::RedisKey(key)) => key.clone().into_any_element(),
+            Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
             None => placeholder(
                 "Open a table or saved query from the sidebar, or add a connection with +",
             ),
@@ -1253,8 +1391,12 @@ impl Render for WorkspaceView {
             .child(self.render_title_bar(cx))
             // Production is marked by a thin line under the title bar.
             .when(
-                self.active_db(cx)
-                    .is_some_and(|db| db.environment == Environment::Production),
+                match self.tabs.get(self.active).and_then(|tab| tab.redis(cx)) {
+                    Some(redis) => redis.environment == Environment::Production,
+                    None => self
+                        .active_db(cx)
+                        .is_some_and(|db| db.environment == Environment::Production),
+                },
                 |root| root.child(div().h(px(2.)).flex_shrink_0().bg(color(theme::AMBER))),
             )
             .child(

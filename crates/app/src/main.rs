@@ -29,6 +29,8 @@ mod profile_view;
 mod project;
 mod query_tab;
 mod recent;
+mod redis_console;
+mod redis_key_tab;
 mod results;
 mod secrets;
 mod table_tab;
@@ -46,6 +48,7 @@ use kuery_pg::Engine;
 fn main() {
     paths::migrate_legacy_config_dir();
     let engine = Arc::new(Engine::new().expect("start the Postgres runtime"));
+    let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
     let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
@@ -55,7 +58,12 @@ fn main() {
             app_icon::init();
             assets::load_fonts(cx).expect("register the embedded fonts");
             theme::apply(cx);
-            app::init(engine.clone(), Arc::new(secrets::Keyring), cx);
+            app::init(
+                engine.clone(),
+                redis.clone(),
+                Arc::new(secrets::Keyring),
+                cx,
+            );
             menus::init(cx);
             audit::init(cx);
             // After gpui_kit::init, so the keymap can keep its bindings.

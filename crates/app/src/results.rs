@@ -10,7 +10,7 @@ use gpui_kit::{
     AnyElement, App, Context, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
-use kuery_core::result_set::{Batch, ColumnKind, ResultSet};
+use kuery_core::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
 
 use crate::context_menus::{Cell, copy_cell_items};
 use crate::theme;
@@ -47,6 +47,22 @@ impl ResultsDelegate {
             })
             .collect();
         self.set = ResultSet::new(names);
+    }
+
+    /// Shows `rows` under `columns` at once, for results that arrive whole
+    /// (Redis replies and key values).
+    pub fn show(&mut self, columns: Vec<String>, rows: &[Vec<Option<String>>]) {
+        self.start();
+        let width = columns.len();
+        self.set_columns(columns);
+        let mut builder = BatchBuilder::new(width, rows.len());
+        for row in rows {
+            builder.push_row(|index| row.get(index).and_then(|value| value.as_deref()));
+        }
+        if builder.rows() > 0 {
+            self.push(builder.finish());
+        }
+        self.finish();
     }
 
     pub fn set_kinds(&mut self, kinds: Vec<ColumnKind>) {

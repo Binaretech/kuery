@@ -1,7 +1,7 @@
 # Kuery project.
 # Connection passwords are kept in the system keychain, not in this file.
-# These point at the dev Postgres in dev/compose.yaml, which trusts local
-# connections, so no password is needed.
+# These point at the dev Postgres and Redis in dev/compose.yaml, which need
+# no password.
 
 [project]
 name = "Checkout v2"
@@ -33,3 +33,12 @@ port = 54329
 database = "kuery"
 user = "kuery"
 environment = "production"
+
+[[connections]]
+id = "local-cache"
+name = "local-cache"
+driver = "redis"
+host = "localhost"
+port = 63799
+database = "0"
+environment = "development"

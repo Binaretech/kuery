@@ -18,6 +18,7 @@ use crate::workspace::WorkspaceView;
 
 pub struct AppState {
     pub engine: Arc<Engine>,
+    pub redis: Arc<kuery_redis::Engine>,
     pub secrets: Arc<dyn SecretStore>,
     /// Open project windows, so opening a project twice focuses it.
     windows: Vec<ProjectWindowEntry>,
@@ -69,9 +70,15 @@ impl Render for ProjectWindow {
     }
 }
 
-pub fn init(engine: Arc<Engine>, secrets: Arc<dyn SecretStore>, cx: &mut App) {
+pub fn init(
+    engine: Arc<Engine>,
+    redis: Arc<kuery_redis::Engine>,
+    secrets: Arc<dyn SecretStore>,
+    cx: &mut App,
+) {
     cx.set_global(AppState {
         engine,
+        redis,
         secrets,
         windows: Vec::new(),
         welcome: None,

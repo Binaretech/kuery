@@ -1,6 +1,7 @@
 //! SQL completion in query tabs: the editor asks [`SqlCompletions`] on every
 //! edit and on Ctrl+Space, and it answers from [`kuery_core::completion`]
-//! with the catalog the tab keeps for its connection.
+//! with the catalog the tab keeps for its connection. The Redis console
+//! completes command names with [`RedisCompletions`].
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -75,6 +76,58 @@ impl CompletionProvider for SqlCompletions {
 
     /// Every edit asks: the engine decides from the context, and an empty
     /// answer closes the menu (after `,` or `)`, say).
+    fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
+        true
+    }
+}
+
+/// Completes the command name at the start of a console line.
+pub struct RedisCompletions;
+
+impl CompletionProvider for RedisCompletions {
+    fn completions(
+        &self,
+        rope: &Rope,
+        offset: usize,
+        trigger: CompletionContext,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Task<Result<CompletionResponse>> {
+        let text = rope.to_string();
+        let offset = offset.min(text.len());
+        let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let typed = text[line_start..offset].trim_start();
+        let invoked = trigger.trigger_kind == CompletionTriggerKind::INVOKED;
+        let in_name = !typed.contains(char::is_whitespace) && !typed.starts_with('#');
+        if !in_name || (typed.is_empty() && !invoked) {
+            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+        }
+        let range = lsp_types::Range {
+            start: rope.offset_to_position(offset - typed.len()),
+            end: rope.offset_to_position(offset),
+        };
+        let items = kuery_core::redis::known_commands()
+            .into_iter()
+            .filter(|name| {
+                name.len() > typed.len()
+                    && name
+                        .get(..typed.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(typed))
+            })
+            .map(|name| CompletionItem {
+                kind: Some(CompletionItemKind::FUNCTION),
+                filter_text: Some(name[..typed.len()].to_string()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: format!("{name} "),
+                })),
+                label: name.to_string(),
+                ..CompletionItem::default()
+            })
+            .collect();
+        Task::ready(Ok(CompletionResponse::Array(items)))
+    }
+
     fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
         true
     }

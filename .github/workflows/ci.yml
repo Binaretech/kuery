@@ -107,3 +107,32 @@ jobs:
 
       - name: Ignored kuery-pg tests
         run: cargo test -p kuery-pg --locked -- --ignored
+
+  redis:
+    name: kuery-redis tests against Redis
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 63799:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sample data
+        run: |
+          docker run --rm --network host -e REDIS_PORT=63799 \
+            -v "$PWD/dev:/seed:ro" redis:7-alpine sh /seed/seed-redis.sh
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ignored kuery-redis tests
+        run: cargo test -p kuery-redis --locked -- --ignored

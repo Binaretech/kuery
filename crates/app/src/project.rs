@@ -32,17 +32,58 @@ pub struct Project {
     pub connections: Vec<ConnectionSpec>,
 }
 
+/// The kind of server a connection talks to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Driver {
+    #[default]
+    Postgres,
+    Redis,
+}
+
+impl Driver {
+    pub const ALL: [Driver; 2] = [Driver::Postgres, Driver::Redis];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Driver::Postgres => "PostgreSQL",
+            Driver::Redis => "Redis",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Driver::Postgres => 5432,
+            Driver::Redis => 6379,
+        }
+    }
+
+    fn is_postgres(&self) -> bool {
+        *self == Driver::Postgres
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionSpec {
     /// Stable id: the keychain entry and saved queries refer to it.
     pub id: String,
     pub name: String,
+    /// Left out of the file for Postgres, which projects had before there
+    /// was a choice.
+    #[serde(default, skip_serializing_if = "Driver::is_postgres")]
+    pub driver: Driver,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Postgres: the database name. Redis: the database index the console
+    /// starts on (empty is 0).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub database: String,
+    /// Postgres: the role. Redis: an ACL user, empty for the default one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user: String,
-    /// libpq `sslmode`; empty uses the driver's default.
+    /// Postgres: libpq `sslmode`, empty for the driver's default. Redis:
+    /// anything but `disable` turns TLS on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sslmode: Option<String>,
     /// `development`, `staging` or `production`; detected from the host if
@@ -65,7 +106,31 @@ impl ConnectionSpec {
 
     /// `host:port/database`, for display.
     pub fn target(&self) -> String {
-        format!("{}:{}/{}", self.host, self.port, self.database)
+        match self.driver {
+            Driver::Postgres => format!("{}:{}/{}", self.host, self.port, self.database),
+            Driver::Redis => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
+        }
+    }
+
+    /// The Redis database index the console starts on.
+    pub fn redis_db(&self) -> i64 {
+        self.database.trim().parse().unwrap_or(0)
+    }
+
+    /// Where and how to connect to Redis. The password is only ever added
+    /// here, in memory.
+    pub fn redis_target(&self, password: Option<&str>) -> kuery_redis::Target {
+        kuery_redis::Target {
+            host: self.host.clone(),
+            port: self.port,
+            db: self.redis_db(),
+            username: Some(self.user.trim().to_string()).filter(|user| !user.is_empty()),
+            password: password.filter(|p| !p.is_empty()).map(str::to_string),
+            tls: self
+                .sslmode
+                .as_deref()
+                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+        }
     }
 
     /// libpq `key=value` connection string. The password is only ever added
@@ -370,12 +435,47 @@ mod tests {
             id: new_id(),
             name: name.into(),
             host: "localhost".into(),
+            driver: Driver::Postgres,
             port: 54329,
             database: "kuery".into(),
             user: "kuery".into(),
             sslmode: None,
             environment: None,
         }
+    }
+
+    #[test]
+    fn keeps_postgres_files_as_they_were_and_reads_redis_ones() {
+        let postgres = toml::to_string(&spec("local-dev")).unwrap();
+        assert!(!postgres.contains("driver"));
+        let redis: ConnectionSpec = toml::from_str(
+            "id = \"r\"\nname = \"cache\"\ndriver = \"redis\"\nhost = \"localhost\"\nport = 63799\n",
+        )
+        .unwrap();
+        assert_eq!(redis.driver, Driver::Redis);
+        assert_eq!(
+            (redis.redis_db(), redis.target()),
+            (0, "localhost:63799/0".to_string())
+        );
+        let target = redis.redis_target(Some(""));
+        assert_eq!(
+            (target.username, target.password, target.tls),
+            (None, None, false)
+        );
+        let tls = ConnectionSpec {
+            sslmode: Some("require".into()),
+            database: "2".into(),
+            user: "reader".into(),
+            ..redis
+        };
+        let target = tls.redis_target(Some("pw"));
+        assert_eq!((target.db, target.tls), (2, true));
+        assert_eq!(target.username.as_deref(), Some("reader"));
+        assert!(
+            toml::to_string(&tls)
+                .unwrap()
+                .contains("driver = \"redis\"")
+        );
     }
 
     #[test]

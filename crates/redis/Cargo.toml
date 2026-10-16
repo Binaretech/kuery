@@ -1,0 +1,9 @@
+[package]
+name = "kuery-redis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+redis.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
