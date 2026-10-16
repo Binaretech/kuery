@@ -1249,6 +1249,54 @@ mod tests {
 
     #[test]
     #[ignore = "needs the dev Postgres"]
+    fn reads_a_schema_for_its_diagram() {
+        use kuery_core::catalog::TableRef;
+        use kuery_core::diagram::OnDelete;
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let session = session(&engine).await;
+            let diagram = catalog::diagram(session, "public".into()).await.unwrap();
+            let orders = diagram
+                .tables
+                .iter()
+                .find(|t| t.table.name == "orders")
+                .unwrap();
+            let id = orders.columns.iter().find(|c| c.name == "id").unwrap();
+            assert!(id.primary_key && !id.nullable);
+            let customer = orders
+                .columns
+                .iter()
+                .find(|c| c.name == "customer_id")
+                .unwrap();
+            assert!(customer.foreign_key && !customer.primary_key);
+            assert!(orders.rows.is_some_and(|rows| rows > 0));
+            let to_customers = diagram
+                .relations
+                .iter()
+                .find(|r| r.name == "orders_customer_id_fkey")
+                .unwrap();
+            assert_eq!(to_customers.to, TableRef::new("public", "customers"));
+            assert_eq!(to_customers.from_columns, ["customer_id"]);
+            assert_eq!(to_customers.to_columns, ["id"]);
+            assert!(!to_customers.optional);
+            let profiles = diagram
+                .relations
+                .iter()
+                .find(|r| r.from.name == "profiles")
+                .unwrap();
+            assert_eq!(profiles.on_delete, OnDelete::Cascade);
+            // Views have no card.
+            assert!(
+                !diagram
+                    .tables
+                    .iter()
+                    .any(|t| t.table.name == "v_daily_sales")
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
     fn reads_tables_and_their_definition_from_the_catalog() {
         use kuery_core::catalog::{ConstraintKind, TableKind, TableRef};
         let engine = Engine::new().unwrap();

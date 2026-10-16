@@ -17,6 +17,7 @@ mod connection;
 mod connection_editor;
 mod context_menus;
 mod definition;
+mod diagram_tab;
 mod drivers;
 mod explorer;
 mod grid;

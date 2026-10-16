@@ -33,6 +33,7 @@ actions!(
         OpenProject,
         ClearRecentProjects,
         NewConnection,
+        OpenSchemaDiagram,
     ]
 );
 
@@ -83,6 +84,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Clear Recent Projects",
         category: "Project",
         action: action!(ClearRecentProjects),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "diagram.open",
+        title: "Open Schema Diagram",
+        category: "Project",
+        action: action!(OpenSchemaDiagram),
         defaults: &[],
         context: None,
     },

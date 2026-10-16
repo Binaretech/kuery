@@ -7,6 +7,7 @@ use kuery_core::catalog::{
     TriggerInfo, TriggerRef,
 };
 use kuery_core::completion;
+use kuery_core::diagram::{self, Diagram, OnDelete};
 use kuery_core::result_set::ResultSet;
 use kuery_core::sql::{quote_literal, quote_qualified};
 
@@ -87,6 +88,50 @@ where c.relkind in ('r', 'p', 'v', 'm', 'f')
   and n.nspname !~ '^pg_(toast|temp)'
 order by 1, 2, a.attnum";
 
+/// A schema's tables and columns, with which are primary or foreign keys,
+/// for a diagram. `{schema}` is a quoted literal.
+const DIAGRAM_COLUMNS_SQL: &str = r"
+select c.relname,
+       case when c.reltuples < 0 then null else c.reltuples::bigint end,
+       a.attname,
+       pg_catalog.format_type(a.atttypid, a.atttypmod),
+       not a.attnotnull,
+       exists (select 1 from pg_catalog.pg_constraint p
+               where p.conrelid = c.oid and p.contype = 'p' and a.attnum = any (p.conkey)),
+       exists (select 1 from pg_catalog.pg_constraint f
+               where f.conrelid = c.oid and f.contype = 'f' and a.attnum = any (f.conkey))
+from pg_catalog.pg_class c
+join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+where n.nspname = {schema} and c.relkind in ('r', 'p') and not c.relispartition
+order by c.relname, a.attnum";
+
+/// A schema's foreign keys (not the copies partitions inherit): columns in
+/// order, joined with the unit separator.
+const DIAGRAM_KEYS_SQL: &str = r"
+select con.conname,
+       src.relname,
+       tn.nspname,
+       tgt.relname,
+       (select string_agg(a.attname, E'\x1f' order by k.i)
+          from unnest(con.conkey) with ordinality k(n, i)
+          join pg_catalog.pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n),
+       (select string_agg(a.attname, E'\x1f' order by k.i)
+          from unnest(con.confkey) with ordinality k(n, i)
+          join pg_catalog.pg_attribute a on a.attrelid = con.confrelid and a.attnum = k.n),
+       con.confdeltype::text,
+       (select bool_or(not a.attnotnull)
+          from unnest(con.conkey) k(n)
+          join pg_catalog.pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n)
+from pg_catalog.pg_constraint con
+join pg_catalog.pg_class src on src.oid = con.conrelid
+join pg_catalog.pg_namespace sn on sn.oid = src.relnamespace
+join pg_catalog.pg_class tgt on tgt.oid = con.confrelid
+join pg_catalog.pg_namespace tn on tn.oid = tgt.relnamespace
+where con.contype = 'f' and con.conparentid = 0 and not src.relispartition
+  and sn.nspname = {schema}
+order by 2, 1";
+
 const SEARCH_PATH_SQL: &str = "select pg_catalog.unnest(pg_catalog.current_schemas(false))";
 
 /// Everything the explorer tree needs for one connection.
@@ -128,6 +173,62 @@ pub async fn overview(session: Session) -> Result<CatalogOverview, QueryError> {
                 name: row.text(2),
             })
             .collect(),
+    })
+}
+
+/// A schema's tables, columns and foreign keys, for its diagram.
+pub async fn diagram(session: Session, schema: String) -> Result<Diagram, QueryError> {
+    let literal = quote_literal(&schema).map_err(|error| QueryError::Database {
+        code: "22021".into(),
+        message: error.to_string(),
+    })?;
+    let columns = session
+        .fetch_trusted(DIAGRAM_COLUMNS_SQL.replace("{schema}", &literal))
+        .await?;
+    let keys = session
+        .fetch_trusted(DIAGRAM_KEYS_SQL.replace("{schema}", &literal))
+        .await?;
+    let mut tables: Vec<diagram::Table> = Vec::new();
+    for row in rows(&columns) {
+        let name = row.text(0);
+        if tables.last().is_none_or(|t| t.table.name != name) {
+            tables.push(diagram::Table {
+                table: TableRef::new(schema.clone(), name),
+                rows: row.optional(1).and_then(|r| r.parse().ok()),
+                columns: Vec::new(),
+            });
+        }
+        if let Some(table) = tables.last_mut() {
+            table.columns.push(diagram::Column {
+                name: row.text(2),
+                data_type: row.text(3),
+                nullable: row.flag(4),
+                primary_key: row.flag(5),
+                foreign_key: row.flag(6),
+            });
+        }
+    }
+    let split = |text: String| -> Vec<String> {
+        text.split('\u{1f}')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let relations = rows(&keys)
+        .map(|row| diagram::Relation {
+            name: row.text(0),
+            from: TableRef::new(schema.clone(), row.text(1)),
+            to: TableRef::new(row.text(2), row.text(3)),
+            from_columns: split(row.text(4)),
+            to_columns: split(row.text(5)),
+            on_delete: OnDelete::from_code(&row.text(6)),
+            optional: row.flag(7),
+        })
+        .collect();
+    Ok(Diagram {
+        schema,
+        tables,
+        relations,
     })
 }
 

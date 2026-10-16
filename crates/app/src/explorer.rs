@@ -61,6 +61,11 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
+    /// A schema's diagram.
+    OpenDiagram {
+        db: Db,
+        schema: String,
+    },
     /// A Redis connection finished opening.
     RedisConnected(RedisDb),
     OpenRedisKey {
@@ -701,6 +706,12 @@ impl Explorer {
         }
     }
 
+    fn open_diagram(&mut self, index: usize, schema: String, cx: &mut Context<Self>) {
+        if let Some(db) = self.db(index) {
+            cx.emit(ExplorerEvent::OpenDiagram { db, schema });
+        }
+    }
+
     fn new_query(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(db) = self.db(index) {
             cx.emit(ExplorerEvent::NewQuery(db));
@@ -1058,11 +1069,18 @@ impl Explorer {
                 let this = cx.entity().downgrade();
                 let name = schema.to_owned();
                 move |menu, _, _| {
+                    let schema = name.clone();
                     menu.item(item_icon(
                         "New Query",
                         IconName::Plus,
                         &this,
                         move |this, _, cx| this.new_query(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Open Diagram",
+                        IconName::Network,
+                        &this,
+                        move |this, _, cx| this.open_diagram(index, schema.clone(), cx),
                     ))
                     .item(item_icon(
                         "Refresh Catalog",

@@ -23,11 +23,12 @@ use crate::audit::OpenAuditLog;
 use crate::chrome;
 use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenKeymapFile, OpenProject, PreviousTab, ToggleSidebar,
+    OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, ToggleSidebar,
 };
 use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
+use crate::diagram_tab::{DiagramEvent, DiagramTab};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
@@ -45,6 +46,7 @@ enum Tab {
     Table(Entity<TableTab>),
     RedisKey(Entity<KeyTab>),
     RedisConsole(Entity<ConsoleTab>),
+    Diagram(Entity<DiagramTab>),
 }
 
 impl Tab {
@@ -54,6 +56,7 @@ impl Tab {
             Tab::Table(table) => table.entity_id(),
             Tab::RedisKey(key) => key.entity_id(),
             Tab::RedisConsole(console) => console.entity_id(),
+            Tab::Diagram(diagram) => diagram.entity_id(),
         }
     }
 
@@ -62,7 +65,7 @@ impl Tab {
         match self {
             Tab::RedisKey(key) => Some(key.read(cx).db().clone()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().clone()),
-            Tab::Query(_) | Tab::Table(_) => None,
+            Tab::Query(_) | Tab::Table(_) | Tab::Diagram(_) => None,
         }
     }
 
@@ -73,7 +76,7 @@ impl Tab {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
-            Tab::RedisConsole(_) => false,
+            Tab::RedisConsole(_) | Tab::Diagram(_) => false,
         }
     }
 
@@ -81,6 +84,7 @@ impl Tab {
         match self {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
+            Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
             Tab::RedisKey(_) | Tab::RedisConsole(_) => None,
         }
     }
@@ -100,6 +104,10 @@ impl Tab {
             }
             Tab::RedisConsole(console) => {
                 console.update(cx, |console, cx| console.focus_editor(window, cx))
+            }
+            Tab::Diagram(diagram) => {
+                let handle = diagram.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
             }
         }
     }
@@ -178,6 +186,9 @@ impl WorkspaceView {
                     window,
                     cx,
                 ),
+                ExplorerEvent::OpenDiagram { db, schema } => {
+                    this.open_diagram(db.clone(), schema.clone(), window, cx)
+                }
                 ExplorerEvent::RedisConnected(db) => {
                     // The first connection to open gets a console to start with.
                     if this.tabs.is_empty() {
@@ -377,6 +388,59 @@ impl WorkspaceView {
             }
         };
         self.activate(index, window, cx);
+    }
+
+    /// Opens a schema's diagram, or shows the tab it is already open in.
+    fn open_diagram(
+        &mut self,
+        db: Db,
+        schema: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.tabs.iter().position(|tab| match tab {
+            Tab::Diagram(tab) => {
+                let tab = tab.read(cx);
+                tab.db().name == db.name && tab.schema() == schema
+            }
+            _ => false,
+        });
+        let index = existing.unwrap_or_else(|| {
+            let project = self.model.read(cx).project.root.clone();
+            let tab = cx.new(|cx| DiagramTab::new(db.clone(), schema, project, cx));
+            cx.subscribe_in(
+                &tab,
+                window,
+                move |this, _, event: &DiagramEvent, window, cx| match event {
+                    DiagramEvent::OpenTable(info) => {
+                        this.open_table(db.clone(), info.clone(), TableView::Data, window, cx)
+                    }
+                },
+            )
+            .detach();
+            self.tabs.push(Tab::Diagram(tab));
+            self.tabs.len() - 1
+        });
+        self.activate(index, window, cx);
+    }
+
+    /// The palette's Open Schema Diagram: the schema of the table in view,
+    /// else `public`, on the active connection.
+    fn open_schema_diagram(
+        &mut self,
+        _: &OpenSchemaDiagram,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.active_db(cx) else {
+            return;
+        };
+        let schema = match self.tabs.get(self.active) {
+            Some(Tab::Table(table)) => table.read(cx).info().table.schema.clone(),
+            Some(Tab::Diagram(diagram)) => diagram.read(cx).schema().to_string(),
+            _ => "public".to_string(),
+        };
+        self.open_diagram(db, schema, window, cx);
     }
 
     /// Opens a key in a tab, or shows the tab it is already open in.
@@ -1062,6 +1126,18 @@ impl WorkspaceView {
             .as_ref()
             .map(|redis| format!("Redis {}", redis.session.server().version));
         match self.tabs.get(self.active) {
+            Some(Tab::Diagram(diagram)) => {
+                let tab = diagram.read(cx);
+                left = left.child(format!("Diagram of {}", tab.schema()));
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .children(tab.status())
+                    .children(
+                        db.as_ref()
+                            .map(|db| format!("PostgreSQL {}", db.session.server_version())),
+                    );
+            }
             Some(Tab::RedisKey(key)) => {
                 let tab = key.read(cx);
                 left = left.child(div().truncate().child(format!(
@@ -1234,6 +1310,7 @@ impl WorkspaceView {
                     )
                 }
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
+                Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
             };
             let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {
                 (Some(db), _) => format!("{title} · {}", db.name).into(),
@@ -1374,6 +1451,7 @@ impl WorkspaceView {
             Some(Tab::Table(table)) => table.clone().into_any_element(),
             Some(Tab::RedisKey(key)) => key.clone().into_any_element(),
             Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
+            Some(Tab::Diagram(diagram)) => diagram.clone().into_any_element(),
             None => placeholder(
                 "Open a table or saved query from the sidebar, or add a connection with +",
             ),
@@ -1417,6 +1495,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::open_schema_diagram))
             .on_action(cx.listener(Self::close_window))
             .bg(color(theme::GROUND))
             .text_color(color(theme::TEXT))

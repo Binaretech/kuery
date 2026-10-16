@@ -209,6 +209,26 @@ expire, 1,500 products to page through and a second database; the repo's
 project has a `local-cache` connection to it, and `prod-cache`, the same
 server marked as production, to try the production rules.
 
+## Diagrams
+
+A schema's diagram opens from its menu in the sidebar ("Open Diagram") or
+with "Open Schema Diagram" in the command palette (the schema of the table in
+view, else `public`). Each table is a card with its columns (the primary
+key's in amber, foreign keys' in blue, types in their short form, `?` when
+nullable), or only its keys with "Keys only".
+
+Foreign keys are lines in crow's foot notation, from the referencing column
+(three prongs: many) to the key it refers to (two bars: one); a dashed line
+with a ring is an optional relation (the column may be NULL). The layout
+reads one way: tables others refer to sit on the left and the tables that
+depend on them to their right, each layer ordered to keep lines from
+crossing; tables without relations are set apart on the right.
+
+Clicking a table highlights it, its relations and its neighbors, and the
+footer says what it refers to (with its delete rule when it cascades or sets
+NULL) and what refers to it; double-clicking opens it. The diagram zooms in
+steps (click the percentage for 100%) and exports to SVG.
+
 ## Write mode
 
 Each query tab has three modes, chosen in the toolbar's Read / Write / Full
