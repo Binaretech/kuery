@@ -13,8 +13,9 @@ use gpui_kit::{Action, actions};
 use crate::audit::OpenAuditLog;
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
-    CancelQuery, CommitTransaction, ExportResults, FormatSql, PreviewImpact, RollbackTransaction,
-    RunAll, RunQuery, SaveQuery, SaveQueryAs, ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
+    CancelQuery, CommitTransaction, ExplainAnalyze, ExplainQuery, ExportResults, FormatSql,
+    PreviewImpact, RollbackTransaction, RunAll, RunQuery, SaveQuery, SaveQueryAs, ToggleResults,
+    UseFullWrite, UseReadOnly, UseWrite,
 };
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 
@@ -187,6 +188,22 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ToggleResults),
         defaults: &["secondary-j"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.explain",
+        title: "Explain Plan",
+        category: "Query",
+        action: action!(ExplainQuery),
+        defaults: &["secondary-e"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.explain_analyze",
+        title: "Explain Analyze (Run and Measure)",
+        category: "Query",
+        action: action!(ExplainAnalyze),
+        defaults: &["secondary-alt-e"],
         context: Some("QueryTab"),
     },
     Command {

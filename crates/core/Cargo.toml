@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 arrow-array.workspace = true
+serde_json.workspace = true
 sqlformat.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true

@@ -236,6 +236,7 @@ fn command_icon(id: &str) -> Icon {
         "query.toggle_results" => Icon::new(IconName::PanelBottom),
         "query.export" => Icon::new(AppIcon::Download),
         "query.preview" => Icon::new(IconName::Eye),
+        "query.explain" | "query.explain_analyze" => Icon::new(AppIcon::Plan),
         "audit.open" => Icon::new(AppIcon::Audit),
         "query.read_only" => Icon::new(AppIcon::Lock),
         "query.write" => Icon::new(AppIcon::Pencil),

@@ -265,9 +265,37 @@ tab loads the catalog when it opens and again after DDL runs or a commit.
 
 In a query tab the editor and the bottom panel are split by a divider you can
 drag (double-click it to reset). The panel has a Results tab with the grid, a
-Profile tab and an Output tab that logs each run (SQL, rows and time, or the
-error); it collapses to its tab strip with `secondary-j`, its button or a
-double-click on the strip, and running a query brings it back.
+Profile tab, a Plan tab and an Output tab that logs each run (SQL, rows and
+time, or the error); it collapses to its tab strip with `secondary-j`, its
+button or a double-click on the strip, and running a query brings it back.
+
+Plan shows how PostgreSQL runs the statement under the cursor (or the
+selection), made readable:
+
+- Explain (`secondary-e`, or the plan button) asks for the estimated plan
+  without running anything, so it is safe for any statement, writes
+  included.
+- Explain Analyze (`secondary-alt-e`, or alt-click the plan button) runs the
+  query and measures every step, with buffers. Reads run read-only. A
+  statement that writes needs Write or Full write and a yes: it runs for real
+  and is rolled back (the data stays as it was, but triggers fire and
+  sequences advance), and it is logged to the audit log.
+- An `EXPLAIN` typed in the editor also lands in Plan: as a tree when it
+  asked for `FORMAT JSON`, as text otherwise (with buttons to explain it
+  again as a tree).
+
+The tab starts with a summary (measured or estimated, execution and planning
+time, rows, cost, and how much data came from the cache or was read), then
+insights in plain words: a full scan that throws most rows away (an index
+would help), an estimate off by 10× or more (fresh statistics: `ANALYZE`), a
+sort or hash that spilled to disk (`work_mem`), an inner step repeated
+thousands of times, and the step that takes most of the time. Below is the
+plan as a tree: each step says what it does ("Read all of orders", "Join
+through a hash table") with an icon for its kind, estimated against actual
+rows (flagged when far off), its time (or cost) and a bar with the share it
+takes by itself. Clicking a step opens its conditions, keys, loops,
+discarded rows and buffers; the hottest step starts open. The JSON can be
+copied.
 
 Profile computes nothing until asked. The list on the left shows every
 column's name and kind ("Profile all" adds nulls, distinct values and a small

@@ -25,6 +25,7 @@ mod keymap;
 mod menus;
 mod palette;
 mod paths;
+mod plan_view;
 mod profile_charts;
 mod profile_view;
 mod project;

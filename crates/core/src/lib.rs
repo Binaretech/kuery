@@ -1,7 +1,8 @@
 //! Kuery core, with no UI dependencies: read-only policy, statement
 //! analysis for write mode, columnar results and their export, the catalog
 //! model, generated SQL for browsing and editing tables, statistics over
-//! results, Redis command and key-name helpers, and the drivers' descriptors.
+//! results, readable query plans, Redis command and key-name helpers, and the
+//! drivers' descriptors.
 
 pub mod analysis;
 pub mod browse;
@@ -13,6 +14,7 @@ pub mod edit;
 pub mod export;
 pub mod format;
 pub mod fuzzy;
+pub mod plan;
 pub mod read_only;
 pub mod redis;
 pub mod result_set;

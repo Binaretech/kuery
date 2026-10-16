@@ -3623,6 +3623,7 @@ name = "kuery-core"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "serde_json",
  "sqlformat",
  "sqlparser",
  "thiserror 2.0.21",

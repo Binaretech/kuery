@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use futures::{TryStreamExt as _, pin_mut};
 use kuery_core::edit::WriteStatement;
+use kuery_core::plan;
 use kuery_core::read_only::{self, Rejection};
 use kuery_core::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
 use tokio::runtime::Runtime;
@@ -239,6 +240,8 @@ pub enum QueryError {
     WritesDisabled,
     #[error("A transaction is open: commit it or roll it back first")]
     TransactionOpen,
+    #[error("{0}")]
+    Explain(String),
     #[error(
         "Expected to change {expected} row but {actual} changed: the row no longer exists or someone modified it. No changes were applied."
     )]
@@ -412,6 +415,50 @@ impl Session {
             .inner
             .handle
             .spawn(async move { preview_and_undo(&inner, &sql, &options).await });
+        async move {
+            task.await
+                .unwrap_or_else(|error| Err(QueryError::Connection(error.to_string())))
+        }
+    }
+
+    /// The plan of `statement` as PostgreSQL's JSON, run read-only:
+    /// estimated, or with `analyze` measured by running the statement,
+    /// which only statements that read may do here (for the others, see
+    /// [`Session::explain_and_undo`]). An estimate of any statement is
+    /// safe: EXPLAIN without ANALYZE does not run it.
+    pub fn explain(
+        &self,
+        statement: String,
+        analyze: bool,
+        options: RunOptions,
+    ) -> impl Future<Output = Result<String, QueryError>> + use<> {
+        let inner = self.inner.clone();
+        let task = self.inner.handle.spawn(async move {
+            let sql = plan::explain_sql(&statement, analyze).map_err(QueryError::Explain)?;
+            if analyze {
+                read_only::check(&statement).map_err(QueryError::Rejected)?;
+            }
+            explain_read_only(&inner, &sql, &options).await
+        });
+        async move {
+            task.await
+                .unwrap_or_else(|error| Err(QueryError::Connection(error.to_string())))
+        }
+    }
+
+    /// The measured plan of a statement that may write: run with EXPLAIN
+    /// ANALYZE and undone, like [`Session::preview`]. Needs a read-write
+    /// session.
+    pub fn explain_and_undo(
+        &self,
+        statement: String,
+        options: RunOptions,
+    ) -> impl Future<Output = Result<String, QueryError>> + use<> {
+        let inner = self.inner.clone();
+        let task = self.inner.handle.spawn(async move {
+            let sql = plan::explain_sql(&statement, true).map_err(QueryError::Explain)?;
+            explain_and_undo(&inner, &sql, &options).await
+        });
         async move {
             task.await
                 .unwrap_or_else(|error| Err(QueryError::Connection(error.to_string())))
@@ -620,6 +667,92 @@ async fn preview_and_undo(
     let impacts = outcome?;
     undone?;
     Ok(impacts)
+}
+
+/// Runs an EXPLAIN inside a `READ ONLY` transaction (or under a savepoint
+/// of the open one) and returns its plan.
+async fn explain_read_only(
+    inner: &Inner,
+    sql: &str,
+    options: &RunOptions,
+) -> Result<String, QueryError> {
+    let _busy = inner.busy.lock().await;
+    let client = &inner.client;
+    let timeout = options.statement_timeout.as_millis();
+    let in_transaction = inner.in_transaction.load(Ordering::SeqCst);
+    let (open, close) = if in_transaction {
+        (
+            format!("savepoint kuery_explain; set local statement_timeout = {timeout}"),
+            "rollback to savepoint kuery_explain; release savepoint kuery_explain",
+        )
+    } else {
+        (
+            format!("begin transaction read only; set local statement_timeout = {timeout}"),
+            "rollback",
+        )
+    };
+    client.batch_execute(&open).await?;
+    let outcome = first_value(client, sql).await;
+    let closed = client.batch_execute(close).await;
+    if closed.is_err() && in_transaction {
+        inner.in_transaction.store(false, Ordering::SeqCst);
+    }
+    let plan = outcome?;
+    closed?;
+    Ok(plan)
+}
+
+/// Runs an EXPLAIN ANALYZE of something that may write, and undoes it.
+async fn explain_and_undo(
+    inner: &Inner,
+    sql: &str,
+    options: &RunOptions,
+) -> Result<String, QueryError> {
+    if inner.access != Access::ReadWrite {
+        return Err(QueryError::WritesDisabled);
+    }
+    let _busy = inner.busy.lock().await;
+    let client = &inner.client;
+    let in_transaction = inner.in_transaction.load(Ordering::SeqCst);
+    let timeouts = format!(
+        "set local statement_timeout = {}; set local lock_timeout = {}",
+        options.statement_timeout.as_millis(),
+        options.lock_timeout.as_millis()
+    );
+    let (open, undo) = if in_transaction {
+        (
+            format!("savepoint kuery_explain; {timeouts}"),
+            "rollback to savepoint kuery_explain; release savepoint kuery_explain",
+        )
+    } else {
+        (
+            format!("begin transaction read write; {timeouts}"),
+            "rollback",
+        )
+    };
+    client.batch_execute(&open).await?;
+    let outcome = first_value(client, sql).await;
+    // Undo whatever happened, even if it failed halfway.
+    let undone = client.batch_execute(undo).await;
+    if undone.is_err() && in_transaction {
+        inner.in_transaction.store(false, Ordering::SeqCst);
+    }
+    let plan = outcome?;
+    undone?;
+    Ok(plan)
+}
+
+/// The first column of the first row `sql` returns.
+async fn first_value(client: &Client, sql: &str) -> Result<String, QueryError> {
+    client
+        .simple_query(sql)
+        .await?
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .ok_or_else(|| QueryError::Explain("The server returned no plan".into()))
 }
 
 /// Runs `sql` and counts each statement's rows, discarding returned rows.
@@ -1523,6 +1656,79 @@ mod tests {
             finish(writer.run_autocommit(format!("drop table {table}"), options))
                 .await
                 .unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn explains_with_estimates_and_measurements() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let reader = session(&engine).await;
+            let options = RunOptions::default();
+            let estimate = reader
+                .explain(
+                    "select * from orders where status = 'paid'".into(),
+                    false,
+                    options.clone(),
+                )
+                .await
+                .unwrap();
+            let plan = plan::parse(&estimate).unwrap();
+            assert!(!plan.analyzed);
+            assert!(
+                plan.root
+                    .walk()
+                    .iter()
+                    .any(|n| n.relation.as_deref() == Some("orders"))
+            );
+
+            let measured = reader
+                .explain("select count(*) from orders".into(), true, options.clone())
+                .await
+                .unwrap();
+            let plan = plan::parse(&measured).unwrap();
+            assert!(plan.analyzed && plan.execution_ms.is_some());
+
+            // An estimate of a write is safe, even read-only; measuring it is not.
+            let before = order_count(&reader).await;
+            reader
+                .explain("delete from orders".into(), false, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(order_count(&reader).await, before);
+            let refused = reader
+                .explain("delete from orders".into(), true, options.clone())
+                .await;
+            assert!(matches!(refused, Err(QueryError::Rejected(_))));
+            assert!(matches!(
+                reader
+                    .explain("select 1; select 2".into(), false, options)
+                    .await,
+                Err(QueryError::Explain(_))
+            ));
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the dev Postgres"]
+    fn measures_writes_and_undoes_them() {
+        let engine = Engine::new().unwrap();
+        engine.runtime.block_on(async {
+            let writer = write_session(&engine).await;
+            let before = order_count(&writer).await;
+            let measured = writer
+                .explain_and_undo(
+                    "delete from orders where id in (select id from orders limit 5)".into(),
+                    RunOptions::default(),
+                )
+                .await
+                .unwrap();
+            let plan = plan::parse(&measured).unwrap();
+            assert_eq!(plan.root.node_type, "ModifyTable");
+            assert_eq!(plan.root.title, "Delete from orders");
+            assert!(!writer.in_transaction());
+            assert_eq!(order_count(&writer).await, before);
         });
     }
 

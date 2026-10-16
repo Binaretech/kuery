@@ -28,7 +28,7 @@ use gpui_kit::{
 };
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::export::{self, Format};
-use kuery_core::{format, script};
+use kuery_core::{format, plan, script};
 use kuery_pg::{Access, Event, QueryError, RunOptions, Session, StatementImpact, catalog};
 
 use crate::assets::AppIcon;
@@ -37,6 +37,7 @@ use crate::chrome;
 use crate::completion::{SharedCatalog, SqlCompletions};
 use crate::connection::{Db, WriteKind};
 use crate::history::HistoryEntry;
+use crate::plan_view::{PlanEvent, PlanPanel};
 use crate::profile_charts;
 use crate::profile_view::ProfilePanel;
 use crate::project::with_connection_header;
@@ -62,6 +63,8 @@ actions!(
         PreviewImpact,
         CommitTransaction,
         RollbackTransaction,
+        ExplainQuery,
+        ExplainAnalyze,
     ]
 );
 
@@ -134,6 +137,7 @@ const MIN_PANEL_HEIGHT: Pixels = px(110.);
 enum PanelTab {
     Results,
     Profile,
+    Plan,
     Output,
 }
 
@@ -206,6 +210,8 @@ pub struct QueryTab {
     output: Vec<OutputEntry>,
     write: WriteState,
     profile: Entity<ProfilePanel>,
+    plan: Entity<PlanPanel>,
+    plan_task: Option<Task<()>>,
     /// Whether the run in progress goes into the write transaction.
     run_writes: bool,
     /// Checks the open transaction for idleness while write mode is on.
@@ -249,6 +255,15 @@ impl QueryTab {
         })
         .detach();
         let table = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
+        let plan = cx.new(|_| PlanPanel::default());
+        cx.subscribe_in(
+            &plan,
+            window,
+            |this, _, event: &PlanEvent, window, cx| match event {
+                PlanEvent::Explain { analyze } => this.explain(*analyze, window, cx),
+            },
+        )
+        .detach();
         let title = match &file {
             Some(path) => file_title(path),
             None => title.into(),
@@ -272,6 +287,8 @@ impl QueryTab {
             output: Vec::new(),
             write: WriteState::Off,
             profile: cx.new(|_| ProfilePanel::default()),
+            plan,
+            plan_task: None,
             run_writes: false,
             idle_watch: None,
             completion_catalog,
@@ -662,6 +679,7 @@ impl QueryTab {
                 if self.panel_tab == PanelTab::Profile {
                     self.compute_profile(cx);
                 }
+                self.show_typed_plan(cx);
             }
             Event::Failed(error) => {
                 self.finish_table(cx);
@@ -688,6 +706,123 @@ impl QueryTab {
             }
         }
         cx.notify();
+    }
+
+    fn explain_query(&mut self, _: &ExplainQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.explain(false, window, cx);
+    }
+
+    fn explain_analyze(&mut self, _: &ExplainAnalyze, window: &mut Window, cx: &mut Context<Self>) {
+        self.explain(true, window, cx);
+    }
+
+    /// Shows the plan of the statement under the cursor (or the selection)
+    /// in the Plan tab: estimated, or with `analyze` measured by running it.
+    /// Measuring a statement that writes needs write mode, and a yes: it
+    /// runs for real and is rolled back.
+    fn explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plan_task.is_some() || self.is_running() {
+            return;
+        }
+        let statement = self.sql_to_run(cx);
+        self.select_panel_tab(PanelTab::Plan, cx);
+        if let Err(error) = plan::explain_sql(&statement, analyze) {
+            self.plan.update(cx, |plan, cx| plan.fail(error, cx));
+            return;
+        }
+        let writes = analyze && analysis::analyze(&statement).map_or(true, |a| a.writes());
+        let options = RunOptions {
+            statement_timeout: Duration::from_secs(60),
+            ..RunOptions::default()
+        };
+        if !writes {
+            let explain = self.db.session.explain(statement, analyze, options);
+            self.run_explain(analyze, explain, cx);
+            return;
+        }
+        let WriteState::On(write) = &self.write else {
+            self.plan.update(cx, |plan, cx| {
+                plan.fail(
+                    "Explain Analyze runs the statement, and this one changes data. Switch \
+                     to Write to measure it: Kuery rolls it back afterwards."
+                        .into(),
+                    cx,
+                )
+            });
+            return;
+        };
+        let session = write.session.clone();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Run this statement to measure it?",
+            Some(
+                "Explain Analyze runs it for real, then rolls it back: the data stays as it \
+                 was, but triggers fire and sequences advance.",
+            ),
+            &["Run and Roll Back", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                let sql = statement.clone();
+                let explain = session.explain_and_undo(statement, options);
+                this.audit(
+                    AuditAction::Preview,
+                    &format!("EXPLAIN ANALYZE {sql}"),
+                    "measured and rolled back",
+                    None,
+                    false,
+                    cx,
+                );
+                this.run_explain(true, explain, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_explain(
+        &mut self,
+        analyze: bool,
+        explain: impl Future<Output = Result<String, QueryError>> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.plan.update(cx, |plan, cx| plan.loading(analyze, cx));
+        self.plan_task = Some(cx.spawn(async move |this, cx| {
+            let result = explain.await;
+            this.update(cx, |this, cx| {
+                this.plan_task = None;
+                this.plan.update(cx, |plan, cx| match result {
+                    Ok(output) => plan.show(output, cx),
+                    Err(error) => plan.fail(describe_error(error), cx),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// After an EXPLAIN typed in the editor runs, shows its plan in the
+    /// Plan tab too (as a tree when it was in JSON).
+    fn show_typed_plan(&mut self, cx: &mut Context<Self>) {
+        if !plan::is_explain(&self.last_sql) {
+            return;
+        }
+        let set = self.table.read(cx).delegate().results();
+        if set.columns().len() != 1 || !set.columns()[0].eq_ignore_ascii_case("query plan") {
+            return;
+        }
+        let lines: Vec<String> = set
+            .column_values(0)
+            .map(|value| value.unwrap_or_default().to_string())
+            .collect();
+        let output = lines.join("\n");
+        self.plan.update(cx, |plan, cx| plan.show(output, cx));
+        self.panel_tab = PanelTab::Plan;
     }
 
     /// Appends a write-mode event to the audit log, off the UI thread.
@@ -1252,6 +1387,26 @@ impl QueryTab {
             )
             .child(
                 chrome::icon_button(
+                    "explain-plan",
+                    AppIcon::Plan,
+                    if mac {
+                        "Explain Plan  ⌘E · Explain Analyze  ⌥⌘E"
+                    } else {
+                        "Explain Plan  Ctrl+E · Explain Analyze  Ctrl+Alt+E"
+                    },
+                    !running,
+                )
+                .when(!running, |b| {
+                    b.on_click(
+                        cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
+                            // Alt-click measures it.
+                            this.explain(event.modifiers().alt, window, cx)
+                        }),
+                    )
+                }),
+            )
+            .child(
+                chrome::icon_button(
                     "format-sql",
                     AppIcon::Format,
                     if mac {
@@ -1599,6 +1754,14 @@ impl QueryTab {
                 cx,
             ))
             .child(tab(
+                "panel-plan",
+                AppIcon::Plan,
+                "Plan",
+                None,
+                PanelTab::Plan,
+                cx,
+            ))
+            .child(tab(
                 "panel-output",
                 AppIcon::History,
                 "Output",
@@ -1822,6 +1985,8 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::format_sql))
             .on_action(cx.listener(Self::commit))
+            .on_action(cx.listener(Self::explain_query))
+            .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::rollback))
             .child(self.render_toolbar(cx))
             .child(
@@ -1875,6 +2040,7 @@ impl Render for QueryTab {
                                     .into_any_element(),
                                 PanelTab::Output => self.render_output(mono).into_any_element(),
                                 PanelTab::Profile => self.render_profile(cx),
+                                PanelTab::Plan => self.plan.clone().into_any_element(),
                             }),
                         )
                     }),
