@@ -563,8 +563,10 @@ impl Session {
                         Page::Offset(offset) => offset,
                         _ => 0,
                     };
-                    let stop = offset + limit as u64 - 1;
-                    let table = if kind == KeyKind::List {
+                    // One entry more than the page, to know whether another
+                    // page follows; it is not shown.
+                    let stop = offset + limit as u64;
+                    let mut table = if kind == KeyKind::List {
                         let items: Vec<Vec<u8>> = redis::cmd("LRANGE")
                             .arg(&key)
                             .arg(offset)
@@ -607,10 +609,11 @@ impl Session {
                                 .collect(),
                         }
                     };
-                    let full = table.rows.len() == limit;
+                    let more = table.rows.len() > limit;
+                    table.rows.truncate(limit);
                     ValuePage {
                         content: Content::Rows(table),
-                        next: full.then_some(Page::Offset(offset + limit as u64)),
+                        next: more.then_some(Page::Offset(offset + limit as u64)),
                     }
                 }
                 KeyKind::Stream => {
@@ -623,14 +626,20 @@ impl Session {
                         .arg(start)
                         .arg("+")
                         .arg("COUNT")
-                        .arg(limit)
+                        // One more than the page, to know whether another follows.
+                        .arg(limit + 1)
                         .query_async(&mut connection)
                         .await?;
-                    let (table, last) = reply::stream_table(&entries);
-                    let full = table.rows.len() == limit;
+                    let (mut table, _) = reply::stream_table(&entries);
+                    let more = table.rows.len() > limit;
+                    table.rows.truncate(limit);
+                    let last = table
+                        .rows
+                        .last()
+                        .and_then(|row| row.first().cloned().flatten());
                     ValuePage {
                         content: Content::Rows(table),
-                        next: last.filter(|_| full).map(Page::After),
+                        next: last.filter(|_| more).map(Page::After),
                     }
                 }
                 KeyKind::Missing => ValuePage {
@@ -946,6 +955,14 @@ mod tests {
             panic!("rows");
         };
         assert_eq!(items.rows[0][0].as_deref(), Some("200"));
+        // 300 items in pages of 100: the third page is the last one.
+        assert_eq!((items.rows.len(), last.next.clone()), (100, None));
+        let ranks = read("leaderboard", KeyKind::ZSet, Page::Offset(100), 100);
+        assert_eq!(ranks.next, None);
+        assert_eq!(
+            read("leaderboard", KeyKind::ZSet, Page::Start, 100).next,
+            Some(Page::Offset(100))
+        );
 
         let Content::Rows(top) = read("leaderboard", KeyKind::ZSet, Page::Start, 5).content else {
             panic!("rows");
@@ -969,6 +986,12 @@ mod tests {
             panic!("rows");
         };
         assert_eq!((rest_entries.rows.len(), rest.next), (300, None));
+        // 500 entries in one page of 500: nothing more to load.
+        let whole = read("events:orders", KeyKind::Stream, Page::Start, 500);
+        let Content::Rows(all) = &whole.content else {
+            panic!("rows");
+        };
+        assert_eq!((all.rows.len(), whole.next.clone()), (500, None));
 
         let mut members = 0;
         let mut page = Page::Start;
