@@ -297,6 +297,21 @@ takes by itself. Clicking a step opens its conditions, keys, loops,
 discarded rows and buffers; the hottest step starts open. The JSON can be
 copied.
 
+Tree / Graph switches the plan to a graph: a box per step, root at the top,
+joined by lines that thicken with the rows flowing through them. Each box
+shows the step's title, its rows and its share, coloured like the tree's
+bars; clicking one shows its details and insights beside the graph.
+
+The tab keeps the previous plan. Once there is one, "Compare with previous"
+puts the two side by side, for the "before and after creating an index"
+workflow: total time and cost before → after (how many times faster), the
+steps that changed ("Read all of orders" → "Fetch the matching rows of
+orders", with the step types), the ones that are new or gone, the time spent
+on each table (or estimated cost, when either plan is an estimate), and the
+insights that went away, appeared or are still there. Steps are paired by
+table, index and step type, from the strictest match to the loosest.
+Clicking a changed step shows it in the plan.
+
 Profile computes nothing until asked. The list on the left shows every
 column's name and kind ("Profile all" adds nulls, distinct values and a small
 chart to each). Above the result, a builder picks a column (click it, or the

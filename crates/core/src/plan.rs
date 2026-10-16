@@ -152,9 +152,29 @@ pub enum Severity {
     Info,
 }
 
+/// What an insight is about, so the insights of two plans can be matched
+/// although their numbers differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InsightKind {
+    /// A full scan that throws most of what it reads away.
+    DiscardedRows,
+    /// Row estimate off by 10× or more.
+    Misestimate,
+    SortOnDisk,
+    HashOnDisk,
+    /// The inner side of a nested loop, run thousands of times.
+    RepeatedInner,
+    TempFiles,
+    /// The step taking the largest share.
+    Hottest,
+    /// The plan is estimated, not measured.
+    Estimated,
+}
+
 /// Something worth knowing about a plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insight {
+    pub kind: InsightKind,
     pub severity: Severity,
     /// The step it is about.
     pub node: Option<usize>,
@@ -192,6 +212,16 @@ impl Plan {
         self.root.buffers
     }
 
+    /// The step with this id.
+    pub fn node(&self, id: usize) -> Option<&Node> {
+        self.root.walk().into_iter().find(|node| node.id == id)
+    }
+
+    /// How long it took to run, when measured.
+    pub fn total_ms(&self) -> Option<f64> {
+        self.execution_ms.or(self.root.inclusive_ms)
+    }
+
     /// The step that takes the largest share by itself.
     pub fn hottest(&self) -> &Node {
         self.root
@@ -214,7 +244,7 @@ pub fn parse(json: &str) -> Result<Plan, String> {
     .ok_or("The plan is empty")?;
     let plan = top.get("Plan").ok_or("The JSON has no \"Plan\"")?;
     let mut next = 0;
-    let root = node(plan, &mut next);
+    let root = node(plan, 1.0, &mut next);
     let analyzed = root.actual.is_some();
     let mut plan = Plan {
         root,
@@ -254,7 +284,10 @@ fn blocks(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-fn node(value: &Value, next: &mut usize) -> Node {
+/// Reads a step. `processes` is how many processes run it side by side: 1,
+/// or under a `Gather` the workers and the leader, whose loops PostgreSQL
+/// adds up although they run at the same time.
+fn node(value: &Value, processes: f64, next: &mut usize) -> Node {
     let id = *next;
     *next += 1;
     let node_type = text(value, "Node Type").unwrap_or_else(|| "Step".into());
@@ -283,17 +316,33 @@ fn node(value: &Value, next: &mut usize) -> Node {
         }),
         _ => None,
     };
+    let gathers = node_type.starts_with("Gather");
     let children: Vec<Node> = value
         .get("Plans")
         .and_then(Value::as_array)
-        .map(|plans| plans.iter().map(|plan| node(plan, next)).collect())
+        .map(|plans| {
+            plans
+                .iter()
+                .map(|plan| {
+                    // Each process runs the step under a Gather once, so its
+                    // loops count the processes (with or without the leader).
+                    let processes = if gathers {
+                        number(plan, "Actual Loops").unwrap_or(1.0).max(1.0)
+                    } else {
+                        processes
+                    };
+                    node(plan, processes, next)
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let total_cost = number(value, "Total Cost").unwrap_or(0.0);
     let children_cost: f64 = children.iter().map(|c| c.total_cost).sum();
+    // Wall-clock time: parallel processes share the loops between them.
     let inclusive_ms = actual
         .filter(|a| a.total_ms_per_loop > 0.0 || a.loops == 0.0)
-        .map(|a| a.total_ms_per_loop * a.loops);
+        .map(|a| a.total_ms_per_loop * a.loops / processes);
     let self_ms = inclusive_ms.map(|inclusive| {
         let children_ms: f64 = children.iter().filter_map(|c| c.inclusive_ms).sum();
         (inclusive - children_ms).max(0.0)
@@ -514,6 +563,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
                 .find(|(label, _)| label == "Filter")
                 .map(|(_, value)| value.clone());
             found.push(Insight {
+                kind: InsightKind::DiscardedRows,
                 severity: Severity::Warning,
                 node: Some(node.id),
                 title: format!(
@@ -540,6 +590,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
             let direction = if ratio >= 1.0 { "more" } else { "fewer" };
             let factor = if ratio >= 1.0 { ratio } else { 1.0 / ratio };
             found.push(Insight {
+                kind: InsightKind::Misestimate,
                 severity: Severity::Warning,
                 node: Some(node.id),
                 title: format!(
@@ -567,6 +618,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
                 .any(|(label, value)| label == "Sort method" && value.contains("external"));
         if sort_on_disk {
             found.push(Insight {
+                kind: InsightKind::SortOnDisk,
                 severity: Severity::Warning,
                 node: Some(node.id),
                 title: "The sort did not fit in memory and used disk".into(),
@@ -582,6 +634,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
             && batches.parse::<u64>().is_ok_and(|b| b > 1)
         {
             found.push(Insight {
+                kind: InsightKind::HashOnDisk,
                 severity: Severity::Warning,
                 node: Some(node.id),
                 title: format!("The hash table was split in {batches} batches on disk"),
@@ -595,6 +648,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
             && actual.loops >= MANY_LOOPS
         {
             found.push(Insight {
+                kind: InsightKind::RepeatedInner,
                 severity: Severity::Info,
                 node: Some(inner.id),
                 title: format!(
@@ -610,6 +664,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
     }
     if plan.root.buffers.temp_written > 0 && !found.iter().any(|i| i.title.contains("disk")) {
         found.push(Insight {
+            kind: InsightKind::TempFiles,
             severity: Severity::Warning,
             node: None,
             title: format!(
@@ -623,6 +678,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
     let share = plan.share(hottest);
     if share >= HOT_SHARE && (hottest.id != plan.root.id || plan.root.children.is_empty()) {
         found.push(Insight {
+            kind: InsightKind::Hottest,
             severity: Severity::Info,
             node: Some(hottest.id),
             title: format!(
@@ -640,6 +696,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
     }
     if !plan.analyzed {
         found.push(Insight {
+            kind: InsightKind::Estimated,
             severity: Severity::Info,
             node: None,
             title: "These are estimates".into(),
@@ -648,6 +705,256 @@ fn insights(plan: &Plan) -> Vec<Insight> {
     }
     found.sort_by_key(|insight| insight.severity);
     found
+}
+
+/// How a step of one plan relates to a step of the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The same kind of step, on the same table and index.
+    Same,
+    /// The same job done another way: `Seq Scan` → `Index Scan` on the
+    /// same table, `Hash Join` → `Nested Loop`.
+    Retyped,
+    /// Only in the earlier plan.
+    Removed,
+    /// Only in the later plan.
+    Added,
+}
+
+/// A step of the earlier plan and its counterpart in the later one, by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepPair {
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+    pub change: Change,
+}
+
+/// The time (or cost) spent on one table in each plan; `None` when the
+/// plan does not touch it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationDelta {
+    pub relation: String,
+    pub before: Option<f64>,
+    pub after: Option<f64>,
+}
+
+impl RelationDelta {
+    pub fn delta(&self) -> f64 {
+        self.after.unwrap_or(0.0) - self.before.unwrap_or(0.0)
+    }
+}
+
+/// Two plans of a query side by side, typically before and after creating
+/// an index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    /// Whether both plans were measured: step figures are then milliseconds,
+    /// otherwise estimated cost.
+    pub measured: bool,
+    pub time_ms: (Option<f64>, Option<f64>),
+    pub cost: (f64, f64),
+    /// Every step of both plans: the later plan's in tree order, then the
+    /// ones that went away.
+    pub steps: Vec<StepPair>,
+    /// Largest change first.
+    pub relations: Vec<RelationDelta>,
+    /// Insights of the earlier plan that the later one no longer has.
+    pub gone: Vec<Insight>,
+    /// Insights only the later plan has.
+    pub appeared: Vec<Insight>,
+    /// Insights both have (as the later plan words them).
+    pub kept: Vec<Insight>,
+}
+
+impl Comparison {
+    /// The figure steps and tables are compared by: time by itself when
+    /// both plans were measured, cost by itself otherwise.
+    pub fn measure(&self, node: &Node) -> f64 {
+        measure(node, self.measured)
+    }
+}
+
+fn measure(node: &Node, measured: bool) -> f64 {
+    if measured {
+        node.self_ms.unwrap_or(0.0)
+    } else {
+        node.self_cost
+    }
+}
+
+/// Compares two plans of (usually) the same query. Steps are paired from
+/// the strictest match to the loosest, in tree order within each pass: same
+/// table, index and step type; then same table (a scan done another way);
+/// then the same step type away from tables; then joins, aggregates and
+/// sorts done another way.
+pub fn compare(before: &Plan, after: &Plan) -> Comparison {
+    let measured = before.analyzed && after.analyzed;
+    let old = before.root.walk();
+    let new = after.root.walk();
+    let mut old_match: Vec<Option<usize>> = vec![None; old.len()];
+    let mut new_match: Vec<Option<usize>> = vec![None; new.len()];
+    let passes: [fn(&Node, &Node) -> bool; 4] = [
+        |x, y| {
+            x.relation.is_some()
+                && x.relation == y.relation
+                && x.index == y.index
+                && x.node_type == y.node_type
+        },
+        |x, y| x.relation.is_some() && x.relation == y.relation,
+        |x, y| {
+            x.relation.is_none()
+                && y.relation.is_none()
+                && x.node_type == y.node_type
+                && x.index == y.index
+        },
+        |x, y| {
+            x.relation.is_none()
+                && y.relation.is_none()
+                && x.category == y.category
+                && matches!(
+                    x.category,
+                    Category::Join | Category::Aggregate | Category::Sort
+                )
+                && x.node_type != "Hash"
+                && y.node_type != "Hash"
+        },
+    ];
+    for matches in passes {
+        for (i, x) in old.iter().enumerate() {
+            if old_match[i].is_some() {
+                continue;
+            }
+            if let Some(j) = (0..new.len()).find(|&j| new_match[j].is_none() && matches(x, new[j]))
+            {
+                old_match[i] = Some(j);
+                new_match[j] = Some(i);
+            }
+        }
+    }
+    let mut steps: Vec<StepPair> = new
+        .iter()
+        .zip(&new_match)
+        .map(|(y, found)| match found {
+            Some(i) => {
+                let x = old[*i];
+                StepPair {
+                    before: Some(x.id),
+                    after: Some(y.id),
+                    change: if x.node_type == y.node_type && x.index == y.index {
+                        Change::Same
+                    } else {
+                        Change::Retyped
+                    },
+                }
+            }
+            None => StepPair {
+                before: None,
+                after: Some(y.id),
+                change: Change::Added,
+            },
+        })
+        .collect();
+    steps.extend(
+        old.iter()
+            .zip(&old_match)
+            .filter(|(_, found)| found.is_none())
+            .map(|(x, _)| StepPair {
+                before: Some(x.id),
+                after: None,
+                change: Change::Removed,
+            }),
+    );
+
+    let old_tables = relation_totals(before, measured);
+    let new_tables = relation_totals(after, measured);
+    let mut relations: Vec<RelationDelta> = Vec::new();
+    for (relation, _) in old_tables.iter().chain(&new_tables) {
+        if relations.iter().any(|r| &r.relation == relation) {
+            continue;
+        }
+        let find = |tables: &[(String, f64)]| {
+            tables
+                .iter()
+                .find(|(name, _)| name == relation)
+                .map(|(_, value)| *value)
+        };
+        relations.push(RelationDelta {
+            relation: relation.clone(),
+            before: find(&old_tables),
+            after: find(&new_tables),
+        });
+    }
+    relations.sort_by(|a, b| b.delta().abs().total_cmp(&a.delta().abs()));
+
+    let old_keys: Vec<_> = before
+        .insights
+        .iter()
+        .map(|i| insight_key(before, i))
+        .collect();
+    let new_keys: Vec<_> = after
+        .insights
+        .iter()
+        .map(|i| insight_key(after, i))
+        .collect();
+    let (kept, appeared) = after
+        .insights
+        .iter()
+        .zip(&new_keys)
+        .partition::<Vec<_>, _>(|(_, key)| old_keys.contains(key));
+    Comparison {
+        measured,
+        time_ms: (before.total_ms(), after.total_ms()),
+        cost: (before.root.total_cost, after.root.total_cost),
+        steps,
+        relations,
+        gone: before
+            .insights
+            .iter()
+            .zip(&old_keys)
+            .filter(|(_, key)| !new_keys.contains(key))
+            .map(|(insight, _)| insight.clone())
+            .collect(),
+        appeared: appeared.into_iter().map(|(i, _)| i.clone()).collect(),
+        kept: kept.into_iter().map(|(i, _)| i.clone()).collect(),
+    }
+}
+
+/// An insight's kind and what it is about (its step's table, or title),
+/// which stay the same across plans while the numbers change.
+fn insight_key(plan: &Plan, insight: &Insight) -> (InsightKind, String) {
+    let subject = insight
+        .node
+        .and_then(|id| plan.node(id))
+        .map(|node| node.relation.clone().unwrap_or_else(|| node.title.clone()))
+        .unwrap_or_default();
+    (insight.kind, subject)
+}
+
+/// Time (or cost) by itself of the steps on each table, in the order the
+/// tables first appear. Bitmap steps under a table's scan count for that
+/// table.
+fn relation_totals(plan: &Plan, measured: bool) -> Vec<(String, f64)> {
+    fn visit(node: &Node, owner: Option<&str>, measured: bool, totals: &mut Vec<(String, f64)>) {
+        let relation = node.relation.as_deref().or_else(|| {
+            node.node_type
+                .starts_with("Bitmap")
+                .then_some(owner)
+                .flatten()
+        });
+        if let Some(relation) = relation {
+            let value = measure(node, measured);
+            match totals.iter_mut().find(|(name, _)| name == relation) {
+                Some((_, total)) => *total += value,
+                None => totals.push((relation.to_string(), value)),
+            }
+        }
+        for child in &node.children {
+            visit(child, relation, measured, totals);
+        }
+    }
+    let mut totals = Vec::new();
+    visit(&plan.root, None, measured, &mut totals);
+    totals
 }
 
 /// `1234567` → `1,234,567`.
@@ -819,6 +1126,162 @@ mod tests {
         );
         assert!(parse("not json").is_err());
         assert!(parse("[]").is_err());
+    }
+
+    /// The same join measured on the dev database before and after
+    /// `CREATE INDEX orders_total_idx ON orders (total)`.
+    const BEFORE_INDEX: &str = include_str!("../fixtures/plans/orders_before_index.json");
+    const AFTER_INDEX: &str = include_str!("../fixtures/plans/orders_after_index.json");
+
+    fn titles(insights: &[Insight]) -> Vec<&str> {
+        insights.iter().map(|i| i.title.as_str()).collect()
+    }
+
+    #[test]
+    fn compares_the_plans_before_and_after_an_index() {
+        let (before, after) = (parse(BEFORE_INDEX).unwrap(), parse(AFTER_INDEX).unwrap());
+        let diff = compare(&before, &after);
+        assert!(diff.measured);
+        assert_eq!(diff.time_ms, (Some(43.143), Some(10.341)));
+        assert!(diff.cost.1 < diff.cost.0);
+
+        let types = |pair: &StepPair| {
+            (
+                pair.before
+                    .map(|id| before.node(id).unwrap().node_type.as_str()),
+                pair.after
+                    .map(|id| after.node(id).unwrap().node_type.as_str()),
+            )
+        };
+        let changed: Vec<_> = diff
+            .steps
+            .iter()
+            .filter(|pair| pair.change != Change::Same)
+            .map(|pair| (pair.change, types(pair)))
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                (
+                    Change::Retyped,
+                    (Some("Seq Scan"), Some("Bitmap Heap Scan"))
+                ),
+                (Change::Added, (None, Some("Bitmap Index Scan"))),
+                (Change::Removed, (Some("Gather Merge"), None)),
+            ]
+        );
+        // Every step of both plans appears once.
+        assert_eq!(
+            diff.steps.iter().filter(|p| p.after.is_some()).count(),
+            after.root.walk().len()
+        );
+        assert_eq!(
+            diff.steps.iter().filter(|p| p.before.is_some()).count(),
+            before.root.walk().len()
+        );
+
+        // The parallel scan of orders counts its time once, not once per
+        // process.
+        assert!((diff.relations[0].before.unwrap() - 31.325).abs() < 1e-9);
+        let tables: Vec<&str> = diff.relations.iter().map(|r| r.relation.as_str()).collect();
+        assert_eq!(tables, ["orders", "customers"]);
+        let orders = &diff.relations[0];
+        assert!(orders.delta() < 0.0, "{orders:?}");
+        // The bitmap lookup counts for orders.
+        let bitmap_ms = after.root.walk()[3].self_ms.unwrap();
+        let heap_ms = after.root.walk()[2].self_ms.unwrap();
+        assert!((orders.after.unwrap() - (bitmap_ms + heap_ms)).abs() < 1e-9);
+
+        let gone = titles(&diff.gone);
+        assert!(
+            gone.iter()
+                .any(|t| t.starts_with("Reads ") && t.contains("rows of orders to keep 3,300")),
+            "{gone:?}"
+        );
+        assert!(
+            !titles(&diff.appeared)
+                .iter()
+                .any(|t| t.starts_with("Reads ")),
+        );
+        assert_eq!(
+            diff.gone.len() + diff.kept.len(),
+            before.insights.len(),
+            "{diff:#?}"
+        );
+        assert_eq!(diff.appeared.len() + diff.kept.len(), after.insights.len());
+    }
+
+    #[test]
+    fn counts_parallel_steps_once() {
+        let plan = parse(BEFORE_INDEX).unwrap();
+        let nodes = plan.root.walk();
+        // Gather Merge over three processes (two workers and the leader):
+        // the scan under it took 31.3 ms in each, at the same time.
+        assert_eq!(nodes[3].node_type, "Seq Scan");
+        assert_eq!(nodes[3].actual.unwrap().loops, 3.0);
+        assert!((nodes[3].inclusive_ms.unwrap() - 31.325).abs() < 1e-9);
+        assert!((nodes[1].inclusive_ms.unwrap() - 37.462).abs() < 1e-9);
+        // Rows still add up over the processes.
+        assert_eq!(nodes[3].actual_rows(), Some(3300.0));
+        // Self times add up to the whole, so no share is clamped.
+        let whole = plan.root.inclusive_ms.unwrap();
+        let parts: f64 = nodes.iter().filter_map(|n| n.self_ms).sum();
+        assert!((parts - whole).abs() < 1e-6, "{parts} vs {whole}");
+        assert!(plan.share(nodes[3]) < 0.75);
+        assert_eq!(plan.hottest().id, 3);
+    }
+
+    #[test]
+    fn pairs_joins_done_another_way_and_compares_estimates_by_cost() {
+        let before = parse(
+            r#"[{"Plan": {"Node Type": "Hash Join", "Join Type": "Inner", "Total Cost": 100,
+            "Plan Rows": 10, "Plans": [
+              {"Node Type": "Seq Scan", "Relation Name": "orders", "Total Cost": 60, "Plan Rows": 10},
+              {"Node Type": "Hash", "Total Cost": 30, "Plan Rows": 5, "Plans": [
+                {"Node Type": "Seq Scan", "Relation Name": "customers", "Total Cost": 30, "Plan Rows": 5}]}]}}]"#,
+        )
+        .unwrap();
+        let after = parse(
+            r#"[{"Plan": {"Node Type": "Nested Loop", "Join Type": "Inner", "Total Cost": 20,
+            "Plan Rows": 10, "Plans": [
+              {"Node Type": "Index Scan", "Relation Name": "orders", "Index Name": "orders_total_idx",
+               "Total Cost": 8, "Plan Rows": 10},
+              {"Node Type": "Index Scan", "Relation Name": "customers", "Index Name": "customers_pkey",
+               "Total Cost": 10, "Plan Rows": 1}]}}]"#,
+        )
+        .unwrap();
+        let diff = compare(&before, &after);
+        assert!(!diff.measured);
+        assert_eq!(diff.time_ms, (None, None));
+        assert_eq!(diff.cost, (100.0, 20.0));
+        let summary: Vec<_> = diff
+            .steps
+            .iter()
+            .map(|p| (p.before, p.after, p.change))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Some(0), Some(0), Change::Retyped),
+                (Some(1), Some(1), Change::Retyped),
+                (Some(3), Some(2), Change::Retyped),
+                (Some(2), None, Change::Removed),
+            ]
+        );
+        // By cost: orders 60 → 8, customers 30 → 10.
+        assert_eq!(diff.relations[0].relation, "orders");
+        assert_eq!(
+            (diff.relations[0].before, diff.relations[0].after),
+            (Some(60.0), Some(8.0))
+        );
+        assert_eq!(diff.measure(&after.root), 2.0);
+        // Both are estimates: that insight stays; the hottest step moved.
+        assert!(titles(&diff.kept).contains(&"These are estimates"));
+        assert!(
+            titles(&diff.gone)
+                .iter()
+                .any(|t| t.contains("Read all of orders"))
+        );
     }
 
     #[test]
