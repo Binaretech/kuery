@@ -204,9 +204,12 @@ fn cancels_over_tls() {
         let (_, _, _, last) = collect(rx).await;
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(
-            matches!(&last, Event::Failed(QueryError::Database { code, .. }) if code == "57014"),
+            matches!(&last, Event::Failed(QueryError::Cancelled)),
             "{last:?}"
         );
+        // Cancelling over TLS leaves the connection usable, just as without TLS.
+        assert_eq!(scalar(&session, "select 1").await, "1");
+        assert!(started.elapsed() < Duration::from_secs(5));
     });
 }
 
