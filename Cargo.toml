@@ -12,6 +12,10 @@ kuery-pg = { path = "crates/pg" }
 kuery-redis = { path = "crates/redis" }
 kuery-sqlite = { path = "crates/sqlite" }
 kuery-mysql = { path = "crates/mysql" }
+kuery-files = { path = "crates/files" }
+
+# Local file analytics; keep Polars behind kuery-files, separate from core's Arrow.
+polars = { version = "=0.55.2", default-features = false, features = ["lazy", "csv", "json", "parquet", "temporal", "timezones", "dtype-date", "dtype-datetime", "dtype-duration", "dtype-time", "dtype-decimal", "dtype-struct", "dtype-array", "dtype-i8", "dtype-i16", "dtype-u8", "dtype-u16"] }
 
 anyhow = "1"
 arrow-array = "60"

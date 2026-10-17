@@ -1,0 +1,16 @@
+[package]
+name = "kuery-files"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kuery-core.workspace = true
+polars.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Already used by Polars; format temporal cells in a form Profile can parse.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

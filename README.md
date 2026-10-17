@@ -56,7 +56,72 @@ grouped by family. See [Drivers](#drivers).
 | `crates/core` | Read-only policy and write-mode statement analysis (`sqlparser`), columnar results (Arrow), the catalog model, and escaped SQL for browsing and editing tables. No UI. |
 | `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, transactional row changes, and write transactions with a savepoint per run. |
 | `crates/redis` | Redis driver (`redis-rs`) on its own tokio runtime: a reconnecting connection per database, the keyspace, `SCAN` pages, key details, value pages per type, and console commands. TLS with the same rustls as Postgres. |
+| `crates/files` | Local CSV/TSV, JSON, JSONL/NDJSON and Parquet previews with Polars, native schema metadata, and conversion to the same results as SQL. No UI. |
 | `crates/app` | The gpui app (`gpui-kit`, pinned version). Custom fonts and icons in `crates/app/assets`. |
+
+## Local data file reader (library)
+
+`kuery-files` reads local CSV/TSV, JSON arrays of objects, JSONL/NDJSON and
+Parquet with Polars 0.55.2. This is the file-reader foundation; opening data
+files in the desktop UI is a subsequent integration step. It returns the
+existing `ResultSet` consumed by the results grid, Profile and charts, with
+native schema metadata and an explicit complete/prefix-limited scope.
+
+```rust,ignore
+use kuery_files::{FileDataset, FileSource, PreviewRequest};
+
+let dataset = FileDataset::open(FileSource::new("orders.parquet")?)?;
+let preview = dataset.preview(PreviewRequest::default())?;
+// preview.results: Kuery ResultSet; preview.schema: original/inferred types.
+// preview.scope: Complete or PrefixLimited, never an estimated total count.
+```
+
+Run synchronous reads on a background worker. Defaults: first 10,000 rows
+(maximum 100,000), with a 64 MiB budget for the resulting Arrow text arrays.
+Readers request one extra row to distinguish a complete file from a prefix.
+The byte budget counts actual Arrow allocations, including buffer capacity;
+it does not bound Polars/parser memory, temporary conversions or process RSS.
+CSV and Parquet/NDJSON use limited lazy reads; Polars may parse beyond the
+requested prefix internally. No full-file count is requested.
+
+CSV options include comma/semicolon/tab delimiters, headers, empty-field NULL
+handling and a custom NULL literal. Unquoted empty fields are NULL by default;
+quoted empty strings remain empty. CSV types are inferred from up to 1,000
+prefix records. A second text-only pass preserves numeric source text, even
+when inference promotes a large integer to floating point. Late conflicts
+inside the parsed data are errors rather than skipped rows.
+
+JSON must contain an array of objects; JSONL has one object per nonblank line.
+Conventional JSON is parsed eagerly with a 32 MiB input limit, then only its
+prefix is materialized in Polars. JSONL is scanned lazily; validation passes
+visit one prefix record at a time, with a 32 MiB per-record limit. Missing fields
+are NULL. Validation rejects silent coercions, dropped fields and integer
+precision loss, including nested values. Floating-point values use f64.
+Integer literals outside the signed/unsigned 64-bit range are rejected before
+JSON parsing; encode those as strings to keep
+their exact value. Records outside the preview are not validated
+(conventional JSON syntax/container shape and integer ranges are checked in full).
+
+Parquet preserves native schema; nested cells display compact JSON and binary
+cells display `0x` hexadecimal. Zoned timestamps use RFC 3339 offsets understood
+by Profile, with the original timezone retained in schema metadata; decimal and
+integer text is not routed through f64. Invalid calendar values return errors.
+Profile's existing f64 calculations and timestamp-hour interpretation still
+apply. A file whose size or modification time changes must be reopened; this
+check detects changes but does not provide an atomic filesystem snapshot.
+Sources are read-only and are never added to SQL history or project settings.
+
+To inspect a reader result without showing cell values:
+
+```bash
+CARGO_TARGET_DIR=/private/tmp/kuery-polars-target cargo run -p kuery-files --example preview_bench -- /path/to/orders.parquet 10000
+CARGO_TARGET_DIR=/private/tmp/kuery-polars-target cargo test -p kuery-files --locked
+```
+
+`preview_bench` reports elapsed time, result bytes, scope and schema. For peak
+RSS on macOS, run the built example with `/usr/bin/time -l`; result bytes alone
+are not a measure of total memory use. The target directory above keeps build
+artifacts on the internal disk when the checkout is on an external disk.
 
 ## Interface
 
