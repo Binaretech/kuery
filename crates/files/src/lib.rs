@@ -7,6 +7,8 @@ mod convert;
 mod preview;
 mod reader;
 mod source;
+mod sql;
+pub use sql::{SqlFile, SqlResult, query_files};
 
 use std::path::PathBuf;
 
@@ -20,6 +22,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Sql(String),
     #[error("Unsupported data file format: {0}")]
     UnsupportedFormat(PathBuf),
     #[error("Invalid read options: {0}")]

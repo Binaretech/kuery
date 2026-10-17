@@ -124,9 +124,13 @@ pub fn bindings() -> Vec<KeyBinding> {
                 secondary: false,
                 shift: true,
             },
-            Some("QueryTab > Input"),
+            Some("(QueryTab || FileQueryTab) > Input"),
         ),
-        KeyBinding::new("ctrl-space", ShowCompletions, Some("QueryTab > Input")),
+        KeyBinding::new(
+            "ctrl-space",
+            ShowCompletions,
+            Some("(QueryTab || FileQueryTab) > Input"),
+        ),
     ]
 }
 

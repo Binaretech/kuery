@@ -35,6 +35,9 @@ actions!(
         NewConnection,
         OpenSchemaDiagram,
         ShowServerActivity,
+        OpenDataFile,
+        QueryDataFiles,
+        ReloadDataFile,
     ]
 );
 
@@ -64,6 +67,30 @@ macro_rules! action {
 }
 
 pub const COMMANDS: &[Command] = &[
+    Command {
+        id: "file.query",
+        title: "Query Open Data Files",
+        category: "File",
+        action: action!(QueryDataFiles),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "file.open_data",
+        title: "Open Data File…",
+        category: "File",
+        action: action!(OpenDataFile),
+        defaults: &["secondary-shift-o"],
+        context: None,
+    },
+    Command {
+        id: "file.reload_data",
+        title: "Reload Data File",
+        category: "File",
+        action: action!(ReloadDataFile),
+        defaults: &["secondary-r"],
+        context: Some("FileTab"),
+    },
     Command {
         id: "palette.open",
         title: "Command Palette",
@@ -158,7 +185,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(RunQuery),
         defaults: &["secondary-enter"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || FileQueryTab"),
     },
     Command {
         id: "query.run_all",
@@ -174,7 +201,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(FormatSql),
         defaults: &["secondary-shift-f"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || FileQueryTab"),
     },
     Command {
         id: "query.save",
@@ -198,7 +225,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(CancelQuery),
         defaults: &["secondary-."],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || FileQueryTab"),
     },
     Command {
         id: "query.toggle_results",

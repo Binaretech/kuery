@@ -7,7 +7,8 @@ use gpui_kit::{App, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
 use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenKeymapFile, OpenProject, OpenRecentProject, PreviousTab, ReloadKeymap, ToggleSidebar,
+    OpenDataFile, OpenKeymapFile, OpenProject, OpenRecentProject, PreviousTab, QueryDataFiles,
+    ReloadDataFile, ReloadKeymap, ToggleSidebar,
 };
 use crate::query_tab::{SaveQuery, SaveQueryAs};
 
@@ -56,6 +57,9 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Quit Kuery", Quit),
         ]),
         Menu::new("File").items([
+            MenuItem::action("Open Data File…", OpenDataFile),
+            MenuItem::action("Query Open Data Files", QueryDataFiles),
+            MenuItem::action("Reload Data File", ReloadDataFile),
             MenuItem::action("Open Project…", OpenProject),
             MenuItem::submenu(Menu::new("Open Recent").items(recent)),
             MenuItem::separator(),

@@ -132,6 +132,7 @@ fn command_bindings(
 /// binding a shortcut would do nothing while typing in the SQL editor.
 fn binding_contexts(context: Option<&str>) -> [Option<String>; 2] {
     let input = match context {
+        Some(context) if context.contains("||") => format!("({context}) > Input"),
         Some(context) => format!("{context} > Input"),
         None => "Input".to_string(),
     };
@@ -423,6 +424,10 @@ mod tests {
 
     /// What a keystroke runs with the focus in the SQL editor of a query tab.
     fn action_in_query_editor(keys: &str) -> Option<String> {
+        action_in_editor(keys, "QueryTab")
+    }
+
+    fn action_in_editor(keys: &str, tab: &str) -> Option<String> {
         use gpui_kit::component::input::Enter;
         use gpui_kit::{KeyContext, Keymap, Keystroke};
 
@@ -439,7 +444,7 @@ mod tests {
         bindings.extend(command_bindings(&resolved).0);
         bindings.extend(crate::query_tab::bindings());
         let keymap = Keymap::new(bindings);
-        let stack = ["Workspace", "QueryTab", "Input mode=editor"]
+        let stack = ["Workspace", tab, "Input mode=editor"]
             .map(|context| KeyContext::parse(context).unwrap());
         let keys = keys.replace("secondary", if IS_MAC { "cmd" } else { "ctrl" });
         let (matched, _) = keymap.bindings_for_input(&[Keystroke::parse(&keys).unwrap()], &stack);
@@ -458,6 +463,21 @@ mod tests {
             action_in_query_editor("secondary-shift-enter").as_deref(),
             Some("input::Enter")
         );
+    }
+
+    #[test]
+    fn file_sql_editor_reuses_run_format_cancel_and_newline_bindings() {
+        for (keys, action) in [
+            ("secondary-enter", "kuery::RunQuery"),
+            ("secondary-shift-enter", "input::Enter"),
+            ("secondary-shift-f", "kuery::FormatSql"),
+            ("secondary-.", "kuery::CancelQuery"),
+        ] {
+            assert_eq!(
+                action_in_editor(keys, "FileQueryTab").as_deref(),
+                Some(action)
+            );
+        }
     }
 
     #[test]

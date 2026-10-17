@@ -47,63 +47,93 @@ impl FileDataset {
     pub fn preview(&self, request: PreviewRequest) -> Result<PreviewResult> {
         request.validate()?;
         self.check_unchanged()?;
-        let result = self.read(request).and_then(|frame| {
-            // Preserve original CSV numeric lexemes: mixed integer/float
-            // inference may promote an integer above 2^53 to Float64.
-            let display = if self.source.format == FileFormat::Csv {
-                let display = csv_plan(&self.source, request.row_limit + 1, 0)
-                    .and_then(|lf| lf.limit((request.row_limit + 1) as IdxSize).collect())
-                    .map_err(|e| self.source.parse_error(e.to_string()))?;
-                if display.shape() != frame.shape()
-                    || display.get_column_names() != frame.get_column_names()
-                {
-                    return Err(Error::FileChanged(self.source.path.clone()));
-                }
-                Some(display)
-            } else {
-                None
-            };
-            convert::preview(
-                &frame,
-                display.as_ref(),
-                &self.source,
-                request,
-                self.fingerprint.clone(),
-            )
-        });
+        let result = self
+            .read_rows(Some(request.row_limit + 1))
+            .and_then(|frame| {
+                // Preserve original CSV numeric lexemes: mixed integer/float
+                // inference may promote an integer above 2^53 to Float64.
+                let display = if self.source.format == FileFormat::Csv {
+                    let display = csv_plan(&self.source, request.row_limit + 1, 0)
+                        .and_then(|lf| lf.limit((request.row_limit + 1) as IdxSize).collect())
+                        .map_err(|e| self.source.parse_error(e.to_string()))?;
+                    if display.shape() != frame.shape()
+                        || display.get_column_names() != frame.get_column_names()
+                    {
+                        return Err(Error::FileChanged(self.source.path.clone()));
+                    }
+                    Some(display)
+                } else {
+                    None
+                };
+                convert::preview(
+                    &frame,
+                    display.as_ref(),
+                    &self.source,
+                    request,
+                    self.fingerprint.clone(),
+                )
+            });
         // Prefer the change error even when parsing failed during replacement.
         self.check_unchanged()?;
         result
     }
 
-    fn check_unchanged(&self) -> Result<()> {
+    /// Full-source plans for SQL. JSON inputs are validated in full before SQL
+    /// so their deserializer cannot silently turn incompatible values into NULL.
+    pub(crate) fn sql_plan(&self) -> Result<LazyFrame> {
+        self.check_unchanged()?;
+        match self.source.format {
+            FileFormat::Csv => {
+                let mut plan = csv_plan(&self.source, usize::MAX, 1_000)
+                    .map_err(|e| self.source.parse_error(e.to_string()))?;
+                validate_csv_float_integers(&self.source, &mut plan)?;
+                Ok(plan)
+            }
+            FileFormat::Parquet => {
+                let file = File::open(&self.source.path).map_err(|e| self.source.io_error(e))?;
+                LazyFrame::scan_parquet_sources(
+                    ScanSources::Files(vec![file].into()),
+                    ScanArgsParquet {
+                        glob: false,
+                        hive_options: polars::io::HiveOptions::new_disabled(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| self.source.parse_error(e.to_string()))
+            }
+            FileFormat::Json | FileFormat::NdJson => self.read_rows(None).map(DataFrame::lazy),
+        }
+    }
+
+    pub(crate) fn check_unchanged(&self) -> Result<()> {
         if fingerprint(&self.source)? != self.fingerprint {
             return Err(Error::FileChanged(self.source.path.clone()));
         }
         Ok(())
     }
 
-    fn read(&self, request: PreviewRequest) -> Result<DataFrame> {
+    fn read_rows(&self, limit: Option<usize>) -> Result<DataFrame> {
         let source = &self.source;
-        let count = request.row_limit + 1;
+        let count = limit.unwrap_or(usize::MAX);
         // Canonical local paths cannot become cloud URLs. Disable glob expansion
         // so filenames containing brackets are read literally.
         let file = File::open(&source.path).map_err(|e| source.io_error(e))?;
         let sources = ScanSources::Files(vec![file].into());
         let frame = match source.format {
-            FileFormat::Csv => csv_plan(source, count, 1_000.min(count))
-                .and_then(|lf| lf.limit(count as IdxSize).collect()),
+            FileFormat::Csv => {
+                csv_plan(source, count, 1_000.min(count)).and_then(|lf| lf.collect())
+            }
             FileFormat::Parquet => LazyFrame::scan_parquet_sources(
                 sources,
                 ScanArgsParquet {
-                    n_rows: Some(count),
+                    n_rows: limit,
                     glob: false,
                     // Single opened files have no partition directory context.
                     hive_options: polars::io::HiveOptions::new_disabled(),
                     ..Default::default()
                 },
             )
-            .and_then(|lf| lf.limit(count as IdxSize).collect()),
+            .and_then(|lf| lf.collect()),
             FileFormat::NdJson => {
                 // Polars' JSON deserializer can silently null incompatible
                 // values. Validate the loaded prefix against the original rows.
@@ -121,11 +151,11 @@ impl FileDataset {
                     return Ok(DataFrame::empty_with_height(records));
                 }
                 let frame = LazyJsonLineReader::new_with_sources(sources)
-                    .with_n_rows(Some(count))
+                    .with_n_rows(limit)
                     .with_infer_schema_length(NonZeroUsize::new(1_000.min(count)))
                     .with_ignore_errors(false)
                     .finish()
-                    .and_then(|lf| lf.limit(count as IdxSize).collect())
+                    .and_then(|lf| lf.collect())
                     .map_err(|e| source.parse_error(e.to_string()))?;
                 if frame.height() != records {
                     return Err(source
@@ -197,7 +227,7 @@ fn csv_plan(source: &FileSource, count: usize, infer_rows: usize) -> PolarsResul
                 .map(|s| NullValues::AllColumnsSingle(s.as_str().into())),
         )
         .with_infer_schema_length(Some(infer_rows))
-        .with_n_rows(Some(count))
+        .with_n_rows((count != usize::MAX).then_some(count))
         .with_ignore_errors(false)
         .with_raise_if_empty(false)
         .finish()
@@ -387,4 +417,39 @@ fn validate_integer_literals(source: &FileSource, bytes: &[u8]) -> Result<()> {
         index += 1;
     }
     Ok(())
+}
+
+/// CSV inference can promote mixed integer/float columns to f64. Inspect the
+/// original integer lexemes in batches before SQL can group/join rounded IDs.
+fn validate_csv_float_integers(source: &FileSource, plan: &mut LazyFrame) -> Result<()> {
+    let schema = plan
+        .collect_schema()
+        .map_err(|e| source.parse_error(e.to_string()))?;
+    let columns: Vec<_> = schema
+        .iter()
+        .filter(|(_, dtype)| dtype.is_float())
+        .map(|(name, _)| col(name.clone()))
+        .collect();
+    if columns.is_empty() {
+        return Ok(());
+    }
+    csv_plan(source, usize::MAX, 0)
+        .and_then(|lf| lf.select(columns).sink_batches(
+            PlanCallback::new(|batch: DataFrame| {
+                for column in batch.columns() {
+                    for text in column.str()?.iter().flatten() {
+                        let digits = text.trim().trim_start_matches(['-', '+']);
+                        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) { continue; }
+                        let exact = digits.parse::<u128>().ok().is_some_and(|n| {
+                            let shift = (128u32 - n.leading_zeros()).saturating_sub(53);
+                            n & ((1u128 << shift) - 1) == 0
+                        });
+                        polars_ensure!(exact, ComputeError: "Column {} mixes floating-point values with an integer that cannot be represented exactly; store the column as text or use an exact Parquet type", column.name());
+                    }
+                }
+                Ok(false)
+            }), false, NonZeroUsize::new(4096),
+        )?.collect_with_engine(Engine::Streaming))
+        .map(|_| ())
+        .map_err(|e| source.parse_error(e.to_string()))
 }

@@ -3963,6 +3963,7 @@ dependencies = [
  "image",
  "keyring",
  "kuery-core",
+ "kuery-files",
  "kuery-mysql",
  "kuery-pg",
  "kuery-redis",
@@ -3997,7 +3998,9 @@ dependencies = [
  "chrono-tz",
  "kuery-core",
  "polars",
+ "polars-sql",
  "serde_json",
+ "sqlparser 0.62.0",
  "tempfile",
  "thiserror 2.0.21",
 ]

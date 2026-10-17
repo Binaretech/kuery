@@ -87,6 +87,9 @@ pub struct ProfilePanel {
     compare_options: CompareOptions,
     shown: Option<Shown>,
     task: Option<Task<()>>,
+    scope: Option<String>,
+    generation: u64,
+    analysis_version: u64,
     /// Timelines drawn as bars instead of a line.
     bars_over_time: bool,
 }
@@ -94,6 +97,8 @@ pub struct ProfilePanel {
 impl ProfilePanel {
     /// Forgets the results (a new run started).
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.scope = None;
         self.set = None;
         self.overviews = Overviews::None;
         self.shown = None;
@@ -108,6 +113,8 @@ impl ProfilePanel {
     /// Takes new results. Only the kinds are worked out (from a sample of
     /// values when the server did not report them); nothing is analyzed.
     pub fn load(&mut self, mut set: ResultSet, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.scope = None;
         let kinds = stats::kinds(&set);
         set.set_kinds(kinds.iter().map(|(kind, _)| *kind).collect());
         self.inferred = kinds.iter().map(|(_, inferred)| *inferred).collect();
@@ -122,6 +129,22 @@ impl ProfilePanel {
         self.overviews = Overviews::None;
         self.shown = None;
         self.task = None;
+        cx.notify();
+    }
+
+    /// The same analyses/charts, with the file's scope and schema provenance.
+    pub fn load_scoped(
+        &mut self,
+        set: ResultSet,
+        scope: String,
+        inferred: Vec<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        self.load(set, cx);
+        self.scope = Some(scope);
+        if inferred.len() == self.columns().len() {
+            self.inferred = inferred;
+        }
         cx.notify();
     }
 
@@ -221,6 +244,9 @@ impl ProfilePanel {
                 ..
             } => Job::Pair(*comparison, *options),
         };
+        self.analysis_version += 1;
+        let version = self.analysis_version;
+        let generation = self.generation;
         self.task = Some(cx.spawn(async move |this, cx| {
             let data = cx
                 .background_spawn(async move {
@@ -235,6 +261,9 @@ impl ProfilePanel {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.generation != generation || this.analysis_version != version {
+                    return;
+                }
                 this.shown = Some(Shown { request, data });
                 this.task = None;
                 cx.notify();
@@ -246,14 +275,21 @@ impl ProfilePanel {
 
     /// Summarizes every column for the list.
     fn profile_all(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overviews, Overviews::Computing(_)) {
+            return;
+        }
         let Some(set) = self.set.clone() else {
             return;
         };
+        let generation = self.generation;
         let task = cx.spawn(async move |this, cx| {
             let overviews = cx
                 .background_spawn(async move { stats::overview(&set) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.overviews = Overviews::Ready(overviews);
                 cx.notify();
             })
@@ -1184,11 +1220,25 @@ impl Render for ProfilePanel {
         if self.columns().is_empty() {
             return message("No columns to profile").into_any_element();
         }
-        h_flex()
+        v_flex()
             .size_full()
-            .items_start()
-            .child(self.render_list(mono.clone(), cx))
-            .child(self.render_detail(mono, cx))
+            .children(self.scope.clone().map(|scope| {
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(12.))
+                    .text_color(color(theme::TEXT_SECONDARY))
+                    .child(format!("Profile · {scope}"))
+            }))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .items_start()
+                    .child(self.render_list(mono.clone(), cx))
+                    .child(self.render_detail(mono, cx)),
+            )
             .into_any_element()
     }
 }

@@ -1,0 +1,390 @@
+//! SQL over a named set of local files, using the shared SQL editor and grid.
+use crate::{
+    completion::{SharedCatalog, SqlCompletions},
+    file_jobs,
+    profile_view::ProfilePanel,
+    query_tab::{CancelQuery, FormatSql, RunQuery},
+    results::ResultsDelegate,
+    theme::{self, color},
+    ui::{format_duration, thousands},
+};
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Editor, EditorState},
+    table::{DataTable, TableState},
+    v_flex,
+};
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Task, Window, div, px,
+};
+use kuery_core::{
+    catalog::{TableKind, TableRef},
+    completion::{Catalog, Column, Table},
+    format, script,
+};
+use kuery_files::{ColumnSchema, PreviewRequest, PreviewScope, SqlFile};
+use std::{rc::Rc, time::Instant};
+
+#[derive(Clone)]
+pub struct Source {
+    pub file: SqlFile,
+    pub columns: Vec<ColumnSchema>,
+}
+
+/// Names are independent of SQL syntax/filenames, and collisions are explicit.
+pub fn name_sources(
+    sources: Vec<(
+        kuery_files::FileSource,
+        kuery_files::FileFingerprint,
+        Vec<ColumnSchema>,
+    )>,
+) -> Vec<Source> {
+    let mut used = std::collections::HashSet::new();
+    sources
+        .into_iter()
+        .map(|(source, fingerprint, columns)| {
+            let stem = source
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let mut base: String = stem
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if base.is_empty() {
+                base = "file".into();
+            }
+            if base.as_bytes()[0].is_ascii_digit() {
+                base = format!("file_{base}");
+            }
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while !used.insert(name.clone()) {
+                name = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            Source {
+                file: SqlFile {
+                    name,
+                    source,
+                    fingerprint,
+                },
+                columns,
+            }
+        })
+        .collect()
+}
+
+pub struct FileQueryTab {
+    sources: Vec<Source>,
+    editor: Entity<EditorState>,
+    table: Entity<TableState<ResultsDelegate>>,
+    profile: Entity<ProfilePanel>,
+    show_profile: bool,
+    status: String,
+    error: Option<String>,
+    running: bool,
+    generation: u64,
+    task: Option<Task<()>>,
+    focus: FocusHandle,
+}
+impl FileQueryTab {
+    pub fn new(sources: Vec<Source>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let sql = format!(
+            "-- Queries read entire files; the grid shows up to 10,000 result rows.\nSELECT * FROM \"{}\" LIMIT 100;\n",
+            sources[0].file.name
+        );
+        let catalog: SharedCatalog = Rc::new(std::cell::RefCell::new(Catalog {
+            search_path: vec![String::new()],
+            tables: sources
+                .iter()
+                .map(|s| Table {
+                    table: TableRef {
+                        schema: String::new(),
+                        name: s.file.name.clone(),
+                    },
+                    kind: TableKind::Table,
+                    columns: s
+                        .columns
+                        .iter()
+                        .map(|c| Column {
+                            name: c.name.clone(),
+                            data_type: c.native_type.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        let editor = cx.new(|cx| {
+            let mut editor = EditorState::new(window, cx)
+                .language("sql")
+                .line_number(true)
+                .default_value(sql);
+            editor.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(catalog)));
+            editor
+        });
+        Self {
+            sources,
+            editor,
+            table: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
+            profile: cx.new(|_| ProfilePanel::default()),
+            show_profile: false,
+            status: "Ready · full file inputs · read only".into(),
+            error: None,
+            running: false,
+            generation: 0,
+            task: None,
+            focus: cx.focus_handle(),
+        }
+    }
+    pub fn title(&self) -> SharedString {
+        "File SQL".into()
+    }
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+    fn run(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let editor = self.editor.read(cx);
+        let selected = editor.selected_text().to_string();
+        let text = editor.text().to_string();
+        let sql = if !selected.trim().is_empty() {
+            selected
+        } else {
+            script::statement_at(&text, editor.cursor())
+                .map(|r| text[r].to_owned())
+                .unwrap_or(text)
+        };
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.generation += 1;
+        let generation = self.generation;
+        self.running = true;
+        self.error = None;
+        self.status = "Running · full file inputs…".into();
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().start();
+            table.clear_selection(cx);
+            table.refresh(cx);
+        });
+        self.profile.update(cx, |p, cx| p.clear(cx));
+        let files = self
+            .sources
+            .iter()
+            .map(|s| s.file.clone())
+            .collect::<Vec<_>>();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let permit = file_jobs::limiter().acquire().await;
+            if !this
+                .update(cx, |this, _| this.generation == generation && this.running)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let started = Instant::now();
+            let result = cx
+                .background_spawn(async move {
+                    let _permit = permit;
+                    kuery_files::query_files(&files, &sql, PreviewRequest::default())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.running = false;
+                this.task = None;
+                match result {
+                    Ok(result) => {
+                        let prefix = !matches!(result.scope, PreviewScope::Complete);
+                        this.status = format!(
+                            "{}{} result rows · {} · full file inputs",
+                            if prefix { "First " } else { "" },
+                            thousands(result.results.rows() as u64),
+                            format_duration(started.elapsed())
+                        );
+                        this.profile.update(cx, |p, cx| {
+                            p.load_scoped(result.results.clone(), this.status.clone(), vec![], cx)
+                        });
+                        this.table.update(cx, |table, cx| {
+                            let has_columns = !result.results.columns().is_empty();
+                            table.delegate_mut().load(result.results);
+                            table.refresh(cx);
+                            if table.delegate().rows() > 0 {
+                                table.scroll_to_row(0, cx);
+                            }
+                            if has_columns {
+                                table.scroll_to_col(0, cx);
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        this.table.update(cx, |t, cx| {
+                            t.delegate_mut().finish();
+                            cx.notify();
+                        });
+                        this.status = "Query failed".into();
+                        this.error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+    fn cancel(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.running {
+            return;
+        }
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().finish();
+            cx.notify();
+        });
+        self.generation += 1;
+        // Keep the task alive until its worker ends. Its permit remains held.
+        self.running = false;
+        self.status = "Cancelled · a running Polars worker may finish in the background".into();
+        cx.notify();
+    }
+    fn format(&mut self, _: &FormatSql, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let selected = editor.selected_text().to_string();
+            if selected.trim().is_empty() {
+                editor.replace_all(format::format_sql(&editor.text().to_string()), window, cx);
+            } else {
+                editor.replace(format::format_sql(&selected), window, cx);
+            }
+        });
+    }
+}
+impl Focusable for FileQueryTab {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+impl Render for FileQueryTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .key_context("FileQueryTab")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::run))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::format))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(color(theme::HAIRLINE))
+                    .child(
+                        Button::new("file-sql-run")
+                            .label("Run SQL")
+                            .disabled(self.running)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run(&RunQuery, window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("file-sql-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(!self.running)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&CancelQuery, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("file-sql-format")
+                            .ghost()
+                            .label("Format")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.format(&FormatSql, window, cx)
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child("Polars SQL · read only"),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(color(theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "Tables: {} · sources/options fixed when this SQL tab opens",
+                        self.sources
+                            .iter()
+                            .map(|s| format!(
+                                "\"{}\" = {}",
+                                s.file.name,
+                                s.file.source.path.display()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(240.))
+                    .flex_shrink_0()
+                    .child(Editor::new(&self.editor).h_full().bordered(false)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_y_1()
+                    .border_color(color(theme::HAIRLINE))
+                    .child(
+                        Button::new("file-sql-results")
+                            .ghost()
+                            .label("Results")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_profile = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("file-sql-profile")
+                            .ghost()
+                            .label("Profile")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_profile = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.status.clone()),
+            )
+            .children(
+                self.error
+                    .clone()
+                    .map(|e| div().p_3().text_color(color(theme::AMBER)).child(e)),
+            )
+            .child(div().flex_1().min_h_0().child(if self.show_profile {
+                self.profile.clone().into_any_element()
+            } else {
+                DataTable::new(&self.table)
+                    .stripe(true)
+                    .bordered(false)
+                    .into_any_element()
+            }))
+    }
+}

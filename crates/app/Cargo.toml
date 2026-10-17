@@ -9,6 +9,7 @@ kuery-pg.workspace = true
 kuery-redis.workspace = true
 kuery-sqlite.workspace = true
 kuery-mysql.workspace = true
+kuery-files.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 futures.workspace = true

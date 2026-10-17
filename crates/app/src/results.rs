@@ -31,6 +31,13 @@ pub struct ResultsDelegate {
 }
 
 impl ResultsDelegate {
+    /// Replace a complete preview while retaining the shared grid renderer.
+    pub fn load(&mut self, set: ResultSet) {
+        self.start();
+        self.set_columns(set.columns().to_vec());
+        self.set = set;
+        self.finish();
+    }
     /// Prepares a new query: clears the table and marks it as running.
     pub fn start(&mut self) {
         *self = Self {
@@ -212,5 +219,32 @@ impl TableDelegate for ResultsDelegate {
             Some(Some(text)) => text.to_owned(),
             _ => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reloaded_preview_replaces_old_columns_rows_and_types() {
+        let mut delegate = ResultsDelegate::default();
+        delegate.show(
+            vec!["old".into(), "removed".into()],
+            &[vec![Some("stale".into()), None]],
+        );
+        let mut set = ResultSet::new(vec!["amount".into()]);
+        set.set_kinds(vec![ColumnKind::Number]);
+        let mut batch = BatchBuilder::new(1, 2);
+        batch.push_row(|_| Some("12.50"));
+        batch.push_row(|_| None);
+        set.push(batch.finish());
+        delegate.load(set);
+        assert_eq!(delegate.results().columns(), ["amount"]);
+        assert_eq!(delegate.results().kinds(), [ColumnKind::Number]);
+        assert_eq!(delegate.rows(), 2);
+        assert_eq!(delegate.results().cell(0, 0), Some(Some("12.50")));
+        assert_eq!(delegate.results().cell(1, 0), Some(None));
+        assert!(!delegate.running);
     }
 }

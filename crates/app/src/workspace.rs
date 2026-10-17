@@ -23,13 +23,16 @@ use crate::audit::OpenAuditLog;
 use crate::chrome;
 use crate::commands::{
     ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, ShowServerActivity, ToggleSidebar,
+    OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, QueryDataFiles,
+    ShowServerActivity, ToggleSidebar,
 };
 use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
+use crate::file_query_tab::{self, FileQueryTab};
+use crate::file_tab::FileTab;
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
@@ -39,7 +42,6 @@ use crate::redis_console::ConsoleTab;
 use crate::redis_key_tab::KeyTab;
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
-use crate::ui::placeholder;
 
 enum Tab {
     Query(Entity<QueryTab>),
@@ -48,6 +50,8 @@ enum Tab {
     RedisConsole(Entity<ConsoleTab>),
     Diagram(Entity<DiagramTab>),
     Activity(Entity<ActivityTab>),
+    File(Entity<FileTab>),
+    FileQuery(Entity<FileQueryTab>),
 }
 
 impl Tab {
@@ -59,6 +63,8 @@ impl Tab {
             Tab::RedisConsole(console) => console.entity_id(),
             Tab::Diagram(diagram) => diagram.entity_id(),
             Tab::Activity(activity) => activity.entity_id(),
+            Tab::File(file) => file.entity_id(),
+            Tab::FileQuery(query) => query.entity_id(),
         }
     }
 
@@ -67,7 +73,12 @@ impl Tab {
         match self {
             Tab::RedisKey(key) => Some(key.read(cx).db().clone()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().clone()),
-            Tab::Query(_) | Tab::Table(_) | Tab::Diagram(_) | Tab::Activity(_) => None,
+            Tab::Query(_)
+            | Tab::Table(_)
+            | Tab::Diagram(_)
+            | Tab::Activity(_)
+            | Tab::File(_)
+            | Tab::FileQuery(_) => None,
         }
     }
 
@@ -78,7 +89,11 @@ impl Tab {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
-            Tab::RedisConsole(_) | Tab::Diagram(_) | Tab::Activity(_) => false,
+            Tab::RedisConsole(_)
+            | Tab::Diagram(_)
+            | Tab::Activity(_)
+            | Tab::File(_)
+            | Tab::FileQuery(_) => false,
         }
     }
 
@@ -88,7 +103,7 @@ impl Tab {
             Tab::Table(table) => Some(table.read(cx).db().clone()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
             Tab::Activity(activity) => Some(activity.read(cx).db().clone()),
-            Tab::RedisKey(_) | Tab::RedisConsole(_) => None,
+            Tab::RedisKey(_) | Tab::RedisConsole(_) | Tab::File(_) | Tab::FileQuery(_) => None,
         }
     }
 
@@ -116,6 +131,8 @@ impl Tab {
                 let handle = activity.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
             }
+            Tab::File(file) => window.focus(&file.read(cx).focus_handle(cx), cx),
+            Tab::FileQuery(query) => window.focus(&query.read(cx).focus_handle(cx), cx),
         }
     }
 }
@@ -254,6 +271,92 @@ impl WorkspaceView {
     /// edits or an open transaction, or a table with pending row changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         self.tabs.iter().any(|tab| tab.needs_attention(cx))
+    }
+
+    fn query_data_files(
+        &mut self,
+        _: &QueryDataFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sources = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::File(file) => file.read(cx).sql_source(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            drop(window.prompt(
+                PromptLevel::Info,
+                "Open a data file first",
+                Some("Wait for a file preview to finish, then choose Query files."),
+                &["OK"],
+                cx,
+            ));
+            return;
+        }
+        if let Some(Tab::File(active)) = self.tabs.get(self.active)
+            && let Some(index) = sources
+                .iter()
+                .position(|(source, _, _)| source.path == active.read(cx).path())
+        {
+            sources.rotate_left(index);
+        }
+        let sources = file_query_tab::name_sources(sources);
+        let query = cx.new(|cx| FileQueryTab::new(sources, window, cx));
+        cx.observe(&query, |_, _, cx| cx.notify()).detach();
+        self.tabs.push(Tab::FileQuery(query));
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn open_data_file(&mut self, _: &OpenDataFile, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open data file".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let source = cx
+                .background_spawn(async move {
+                    let mut source =
+                        kuery_files::FileSource::new(path).map_err(|e| e.to_string())?;
+                    source.path = source.path.canonicalize().map_err(|e| e.to_string())?;
+                    Ok::<_, String>(source)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| match source {
+                Ok(source) => {
+                    let existing = this.tabs.iter().position(
+                        |tab| matches!(tab, Tab::File(file) if file.read(cx).matches(&source)),
+                    );
+                    let index = existing.unwrap_or_else(|| {
+                        let file = cx.new(|cx| FileTab::new(source, window, cx));
+                        cx.observe(&file, |_, _, cx| cx.notify()).detach();
+                        this.tabs.push(Tab::File(file));
+                        this.tabs.len() - 1
+                    });
+                    this.activate(index, window, cx);
+                }
+                Err(error) => drop(window.prompt(
+                    PromptLevel::Critical,
+                    "Could not open data file",
+                    Some(&error),
+                    &["OK"],
+                    cx,
+                )),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_query(
@@ -839,6 +942,12 @@ impl WorkspaceView {
 
     /// The connection of the active tab, or the sidebar's.
     fn active_db(&self, cx: &App) -> Option<Db> {
+        if matches!(
+            self.tabs.get(self.active),
+            Some(Tab::File(_) | Tab::FileQuery(_))
+        ) {
+            return None;
+        }
         self.tabs
             .get(self.active)
             .and_then(|tab| tab.db(cx))
@@ -1177,6 +1286,18 @@ impl WorkspaceView {
             .as_ref()
             .map(|redis| format!("Redis {}", redis.session.server().version));
         match self.tabs.get(self.active) {
+            Some(Tab::FileQuery(query)) => {
+                left = h_flex().gap_4().min_w_0().child("Polars SQL · read only");
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .child(query.read(cx).status().to_owned());
+            }
+            Some(Tab::File(file)) => {
+                let file = file.read(cx);
+                left = h_flex().gap_4().min_w_0().child("Local file · read only");
+                right = h_flex().gap_4().flex_shrink_0().child(file.status());
+            }
             Some(Tab::Diagram(diagram)) => {
                 let tab = diagram.read(cx);
                 left = left.child(format!("Diagram of {}", tab.schema()));
@@ -1367,11 +1488,17 @@ impl WorkspaceView {
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
                 Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
                 Tab::Activity(activity) => (AppIcon::Activity, activity.read(cx).title(), false),
+                Tab::File(file) => (AppIcon::Table, file.read(cx).title(), false),
+                Tab::FileQuery(query) => (AppIcon::Code, query.read(cx).title(), false),
             };
             let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {
                 (Some(db), _) => format!("{title} · {}", db.name).into(),
                 (None, Some(redis)) => format!("{title} · {}", redis.name).into(),
                 (None, None) => title.clone(),
+            };
+            let tooltip = match tab {
+                Tab::File(file) => file.read(cx).path().display().to_string().into(),
+                _ => tooltip,
             };
             let group = SharedString::from(format!("tab-{index}"));
             strip = strip.child(
@@ -1435,6 +1562,7 @@ impl WorkspaceView {
                         let count = self.tabs.len();
                         let file = match tab {
                             Tab::Query(query) => query.read(cx).file().map(PathBuf::from),
+                            Tab::File(file) => Some(file.read(cx).path().to_path_buf()),
                             _ => None,
                         };
                         let table = match tab {
@@ -1507,7 +1635,7 @@ impl WorkspaceView {
         )
     }
 
-    fn render_content(&self) -> AnyElement {
+    fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.tabs.get(self.active) {
             Some(Tab::Query(query)) => query.clone().into_any_element(),
             Some(Tab::Table(table)) => table.clone().into_any_element(),
@@ -1515,9 +1643,22 @@ impl WorkspaceView {
             Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
             Some(Tab::Diagram(diagram)) => diagram.clone().into_any_element(),
             Some(Tab::Activity(activity)) => activity.clone().into_any_element(),
-            None => placeholder(
-                "Open a table or saved query from the sidebar, or add a connection with +",
-            ),
+            Some(Tab::File(file)) => file.clone().into_any_element(),
+            Some(Tab::FileQuery(query)) => query.clone().into_any_element(),
+            None => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child("Explore a data file, or open a table or saved query from the sidebar")
+                .child(
+                    Button::new("empty-open-file")
+                        .label("Open Data File…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_data_file(&OpenDataFile, window, cx)
+                        })),
+                )
+                .into_any_element(),
         }
     }
 }
@@ -1560,6 +1701,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::open_schema_diagram))
             .on_action(cx.listener(Self::show_server_activity))
+            .on_action(cx.listener(Self::open_data_file))
+            .on_action(cx.listener(Self::query_data_files))
             .on_action(cx.listener(Self::close_window))
             .bg(color(theme::GROUND))
             .text_color(color(theme::TEXT))
@@ -1588,7 +1731,7 @@ impl Render for WorkspaceView {
                             .h_full()
                             .min_w_0()
                             .child(self.render_tab_strip(cx))
-                            .child(div().flex_1().min_h_0().child(self.render_content())),
+                            .child(div().flex_1().min_h_0().child(self.render_content(cx))),
                     ),
             )
             .child(self.render_status_bar(cx))
