@@ -272,6 +272,19 @@ Linux, with additional database integration jobs. The
 [release workflow](.github/workflows/release.yml) packages Linux x86_64,
 macOS Apple Silicon/Intel and Windows x86_64 builds for tagged releases.
 
+The macOS app is signed with a Developer ID certificate, notarized and stapled
+when these repository secrets are set; without them it gets an ad-hoc signature
+and macOS blocks it until it is allowed in System Settings → Privacy & Security
+→ Open Anyway:
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERTIFICATE` | The "Developer ID Application" certificate and its private key exported as `.p12`, base64-encoded (`base64 -i cert.p12`) |
+| `MACOS_CERTIFICATE_PASSWORD` | The password chosen when exporting the `.p12` |
+| `APPLE_API_KEY` | An App Store Connect API key (`AuthKey_XXXX.p8`, "Developer" access), base64-encoded |
+| `APPLE_API_KEY_ID` | That key's ID |
+| `APPLE_API_ISSUER_ID` | The issuer ID shown above the keys in App Store Connect → Users and Access → Integrations |
+
 When reporting a bug, include the platform, build/commit, steps to reproduce
 and a small synthetic dataset or query where possible. Remove credentials and
 private data from screenshots and sample files.
