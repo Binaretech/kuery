@@ -146,19 +146,26 @@ jobs:
           codesign --verify --strict --verbose=2 "$app"
 
           echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          auth=(--key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
           ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Kuery-notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/Kuery-notarize.zip" \
-            --key "$RUNNER_TEMP/AuthKey.p8" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID" \
-            --wait --timeout 30m --output-format json | tee "$RUNNER_TEMP/notarization.json"
-          status="$(jq -r .status "$RUNNER_TEMP/notarization.json")"
+
+          # Submit first and wait separately, so the submission ID is known
+          # even when Apple is slow (a new team's first submissions can take
+          # hours; later ones usually take minutes).
+          id="$(xcrun notarytool submit "$RUNNER_TEMP/Kuery-notarize.zip" "${auth[@]}" --output-format json | jq -r .id)"
+          if [[ -z "$id" || "$id" == null ]]; then
+            echo "::error::notarytool did not return a submission ID."
+            exit 1
+          fi
+          echo "Notarization submission: $id"
+          if ! xcrun notarytool wait "$id" "${auth[@]}" --timeout 2h; then
+            echo "::error::Notarization submission $id did not finish within 2 hours; check it with 'xcrun notarytool info $id'."
+            exit 1
+          fi
+          status="$(xcrun notarytool info "$id" "${auth[@]}" --output-format json | jq -r .status)"
           if [[ "$status" != Accepted ]]; then
-            xcrun notarytool log "$(jq -r .id "$RUNNER_TEMP/notarization.json")" \
-              --key "$RUNNER_TEMP/AuthKey.p8" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER_ID" || true
-            echo "::error::Notarization finished with status $status."
+            xcrun notarytool log "$id" "${auth[@]}" || true
+            echo "::error::Notarization submission $id finished with status $status."
             exit 1
           fi
           rm "$RUNNER_TEMP/AuthKey.p8"
