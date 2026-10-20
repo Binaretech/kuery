@@ -158,11 +158,22 @@ jobs:
             exit 1
           fi
           echo "Notarization submission: $id"
-          if ! xcrun notarytool wait "$id" "${auth[@]}" --timeout 2h; then
+          # Poll instead of `notarytool wait`, which gives up on the first
+          # network error; a failed check is simply retried.
+          status=""
+          deadline=$((SECONDS + 2 * 60 * 60))
+          while (( SECONDS < deadline )); do
+            status="$(xcrun notarytool info "$id" "${auth[@]}" --output-format json 2>/dev/null | jq -r '.status // empty' || true)"
+            if [[ -n "$status" && "$status" != "In Progress" ]]; then
+              break
+            fi
+            echo "$(date -u +%H:%M:%S) status: ${status:-unavailable, retrying}"
+            sleep 30
+          done
+          if [[ -z "$status" || "$status" == "In Progress" ]]; then
             echo "::error::Notarization submission $id did not finish within 2 hours; check it with 'xcrun notarytool info $id'."
             exit 1
           fi
-          status="$(xcrun notarytool info "$id" "${auth[@]}" --output-format json | jq -r .status)"
           if [[ "$status" != Accepted ]]; then
             xcrun notarytool log "$id" "${auth[@]}" || true
             echo "::error::Notarization submission $id finished with status $status."
