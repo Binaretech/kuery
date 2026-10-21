@@ -31,6 +31,15 @@ pub static SQL: [&SqlDriver; 4] = [
     &kuery_sqlite::DRIVER,
 ];
 
+/// Makes `ring` the process's rustls provider, before any connection.
+///
+/// Redis and MySQL build their TLS configs with rustls' process-wide
+/// default, which rustls cannot choose by itself when a dependency compiles
+/// in a second provider. Installing twice is harmless.
+pub fn install_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// The background runtimes drivers outside the SQL family run on.
 #[derive(Clone)]
 pub struct Engines {
@@ -204,6 +213,17 @@ fn through(spec: &ConnectionSpec) -> String {
 mod tests {
     use super::*;
     use crate::project::SshSpec;
+
+    /// Redis and MySQL build their rustls configs with the process-wide
+    /// default provider, which rustls cannot pick when more than one is
+    /// compiled in.
+    #[test]
+    fn rustls_configs_build_with_the_default_provider() {
+        install_tls_provider();
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
 
     #[test]
     fn every_driver_is_found_by_its_id_once() {
