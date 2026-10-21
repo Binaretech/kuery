@@ -233,6 +233,16 @@ PostgreSQL and are new work for this driver.
 3. **Authentication: SQL Server logins only.** NTLM/`DOMAIN\user` moves to
    non-goals (the earlier call to add it is withdrawn).
 
+4. **Read-only without `VIEW SERVER PERFORMANCE STATE` (asked after the
+   spike): undo and warn.** At connect the adapter probes the write-detection
+   query. With the permission, writes that slip into read mode are refused
+   with an error (as designed). Without it (error 300), reads still run in the
+   always-rolled-back transaction, so nothing is kept, but the refusal cannot
+   be reported; the connection shows a warning saying read-only is enforced by
+   Kuery's checks and automatic undo only, and recommending either granting
+   `VIEW SERVER PERFORMANCE STATE` (`VIEW SERVER STATE` before 2022) or a
+   `db_datareader`-only login.
+
 ## Suggested order
 
 1. Spike: cancel (attention vs KILL) and read-only second layer against the
