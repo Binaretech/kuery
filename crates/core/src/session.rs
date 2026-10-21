@@ -3,7 +3,7 @@
 //! drives any driver's [`Adapter`] by the same rules.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -178,6 +178,8 @@ struct State {
     in_transaction: AtomicBool,
     /// A statement runs: cancelling keeps at it until this goes false.
     running: AtomicBool,
+    /// Which run it is, so a cancel's retries never reach the next one.
+    run: AtomicU64,
     /// A cancel came: some databases let a stopped statement end as if
     /// nothing happened, so the run checks this too.
     cancelled: AtomicBool,
@@ -436,12 +438,15 @@ impl Session {
             return;
         }
         state.cancelled.store(true, Ordering::SeqCst);
+        let run = state.run.load(Ordering::SeqCst);
         let canceller = self.shared.canceller.clone();
         let _ = std::thread::Builder::new()
             .name("kuery-cancel".into())
             .spawn(move || {
                 for _ in 0..40 {
-                    if !state.running.load(Ordering::SeqCst) {
+                    if !state.running.load(Ordering::SeqCst)
+                        || state.run.load(Ordering::SeqCst) != run
+                    {
                         break;
                     }
                     canceller();
@@ -557,6 +562,7 @@ impl Worker {
 
     /// A statement is running, for [`Session::cancel`].
     fn begin_run(&mut self) {
+        self.state.run.fetch_add(1, Ordering::SeqCst);
         self.state.cancelled.store(false, Ordering::SeqCst);
         self.state.running.store(true, Ordering::SeqCst);
     }

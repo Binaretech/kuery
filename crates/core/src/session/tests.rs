@@ -412,6 +412,23 @@ fn a_cancelled_statement_counts_as_cancelled_even_if_it_ends_well() {
 }
 
 #[test]
+fn a_cancel_does_not_reach_the_next_run() {
+    let (session, _) = open(Access::ReadOnly);
+    let rx = session.run_read_only("select slow".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(50));
+    session.cancel();
+    assert!(matches!(drain(rx).1, Err(QueryError::Cancelled)));
+    // Started while the cancel's retries could still be waiting.
+    let next = session.run_read_only("select slow".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(400));
+    let finished = std::iter::from_fn(|| next.try_recv().ok())
+        .any(|event| matches!(event, Event::Finished(_) | Event::Failed(_)));
+    assert!(!finished, "the next run was stopped by the earlier cancel");
+    session.cancel();
+    assert!(matches!(drain(next).1, Err(QueryError::Cancelled)));
+}
+
+#[test]
 fn composes_completion_and_diagrams_from_the_catalog() {
     let (session, log) = open(Access::ReadOnly);
     let catalog = block_on(session.completion_catalog()).unwrap();
