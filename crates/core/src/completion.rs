@@ -20,8 +20,9 @@ pub struct Catalog {
     pub search_path: Vec<String>,
     pub schemas: Vec<String>,
     pub tables: Vec<Table>,
-    /// What quotes identifiers that need it (`"`, or `` ` `` in MySQL).
-    pub quote: char,
+    /// What opens and closes an identifier that needs quoting (`"`, `` ` ``
+    /// or `[` and `]`).
+    pub quotes: (char, char),
 }
 
 impl Default for Catalog {
@@ -30,7 +31,7 @@ impl Default for Catalog {
             search_path: Vec::new(),
             schemas: Vec::new(),
             tables: Vec::new(),
-            quote: '"',
+            quotes: ('"', '"'),
         }
     }
 }
@@ -64,7 +65,7 @@ impl Catalog {
             search_path,
             schemas: overview.schemas.clone(),
             tables,
-            quote: dialect.ident_quote,
+            quotes: dialect.ident_quotes,
         }
     }
 }
@@ -176,7 +177,7 @@ pub fn complete(sql: &str, offset: usize, catalog: &Catalog, invoked: bool) -> C
 
     let mut builder = Builder {
         prefix: &prefix,
-        quote: catalog.quote,
+        quotes: catalog.quotes,
         quoted,
         suggestions: Vec::new(),
     };
@@ -725,8 +726,8 @@ fn qualified_table<'a>(
 
 struct Builder<'a> {
     prefix: &'a str,
-    /// What quotes identifiers.
-    quote: char,
+    /// What opens and closes an identifier.
+    quotes: (char, char),
     /// The word started with `"`: identifiers are inserted quoted.
     quoted: bool,
     suggestions: Vec<Suggestion>,
@@ -750,10 +751,10 @@ impl Builder<'_> {
 
     fn identifier(&self, name: &str) -> String {
         if self.quoted || needs_quotes(name) {
-            let quote = self.quote;
+            let (open, close) = self.quotes;
             format!(
-                "{quote}{}{quote}",
-                name.replace(quote, &format!("{quote}{quote}"))
+                "{open}{}{close}",
+                name.replace(close, &format!("{close}{close}"))
             )
         } else {
             name.to_owned()
@@ -1174,7 +1175,7 @@ mod tests {
                 ),
                 table("sales", "invoices", TableKind::Table, &[("number", "text")]),
             ],
-            quote: '"',
+            quotes: ('"', '"'),
         }
     }
 

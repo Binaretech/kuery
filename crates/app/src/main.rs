@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 fn main() {
     paths::migrate_legacy_config_dir();
+    drivers::install_tls_provider();
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
     let folder = std::env::args_os().nth(1).map(PathBuf::from);
 

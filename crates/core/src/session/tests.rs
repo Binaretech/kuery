@@ -2,6 +2,9 @@
 //! to run: `select N` returns N rows, `update N` changes N rows,
 //! `select fail` and `update fail` fail, `select slow` runs until cancelled
 //! and then ends as if nothing happened (like MySQL's killed `SLEEP`).
+//! `select deadlock` fails the way a deadlock victim does on SQL Server (the
+//! server rolls back the whole transaction, so the next `rollback to` fails),
+//! and `select lost` the way a dropped connection does.
 
 use std::sync::Mutex;
 
@@ -26,6 +29,8 @@ struct Fake {
     dialect: &'static Dialect,
     log: Log,
     stop: Arc<AtomicBool>,
+    /// Why the next `rollback to` fails: the transaction is gone.
+    gone: Option<QueryError>,
 }
 
 impl Adapter for Fake {
@@ -41,6 +46,27 @@ impl Adapter for Fake {
         self.log.0.lock().unwrap().push(sql.to_string());
         let words: Vec<&str> = sql.split_whitespace().collect();
         match words.as_slice() {
+            ["rollback", "to", ..] if self.gone.is_some() => Err(self.gone.clone().unwrap()),
+            ["rollback"] => {
+                self.gone = None;
+                Ok(0)
+            }
+            ["select", "deadlock"] => {
+                let victim = QueryError::Database {
+                    code: "1205".into(),
+                    message: "chosen as the deadlock victim".into(),
+                };
+                self.gone = Some(QueryError::Database {
+                    code: "3903".into(),
+                    message: "no corresponding begin transaction".into(),
+                });
+                Err(victim)
+            }
+            ["select", "lost"] => {
+                let lost = QueryError::Connection("reset by peer".into());
+                self.gone = Some(lost.clone());
+                Err(lost)
+            }
             [_, "fail"] => Err(QueryError::Database {
                 code: "42000".into(),
                 message: "failed on purpose".into(),
@@ -138,6 +164,7 @@ fn open_with(dialect: &'static Dialect, access: Access) -> (Session, Log) {
             dialect,
             log: opener_log.clone(),
             stop: Arc::new(AtomicBool::new(false)),
+            gone: None,
         }))
     });
     (block_on(Session::open(opener, access)).unwrap(), log)
@@ -385,6 +412,23 @@ fn a_cancelled_statement_counts_as_cancelled_even_if_it_ends_well() {
 }
 
 #[test]
+fn a_cancel_does_not_reach_the_next_run() {
+    let (session, _) = open(Access::ReadOnly);
+    let rx = session.run_read_only("select slow".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(50));
+    session.cancel();
+    assert!(matches!(drain(rx).1, Err(QueryError::Cancelled)));
+    // Started while the cancel's retries could still be waiting.
+    let next = session.run_read_only("select slow".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(400));
+    let finished = std::iter::from_fn(|| next.try_recv().ok())
+        .any(|event| matches!(event, Event::Finished(_) | Event::Failed(_)));
+    assert!(!finished, "the next run was stopped by the earlier cancel");
+    session.cancel();
+    assert!(matches!(drain(next).1, Err(QueryError::Cancelled)));
+}
+
+#[test]
 fn composes_completion_and_diagrams_from_the_catalog() {
     let (session, log) = open(Access::ReadOnly);
     let catalog = block_on(session.completion_catalog()).unwrap();
@@ -430,4 +474,44 @@ fn reopens_another_session_alike() {
     assert!(session.has_plans() && !session.has_activity());
     let (_, refused) = drain(other.run_autocommit("update 1".into(), RunOptions::default()));
     assert!(matches!(refused, Err(QueryError::WritesDisabled)));
+}
+
+#[test]
+fn a_read_that_ends_the_write_transaction_forgets_it() {
+    let (session, log) = open(Access::ReadWrite);
+    let write = |sql: &str| drain(session.run_in_transaction(sql.into(), RunOptions::default()));
+    let read = |sql: &str| drain(session.run_read_only(sql.into(), RunOptions::default())).1;
+
+    // A read that fails on its own leaves the transaction as it was.
+    write("update 1").1.unwrap();
+    assert!(matches!(
+        read("select fail"),
+        Err(QueryError::Database { .. })
+    ));
+    assert!(session.in_transaction());
+    log.take();
+
+    // The server rolled the transaction back: its savepoint is gone too.
+    assert!(
+        matches!(read("select deadlock"), Err(QueryError::Database { code, .. }) if code == "1205")
+    );
+    assert!(!session.in_transaction());
+    assert_eq!(
+        log.take(),
+        [
+            "savepoint kuery_read",
+            "select deadlock",
+            "rollback to savepoint kuery_read",
+            "release savepoint kuery_read",
+            "rollback"
+        ]
+    );
+
+    // A dropped connection takes it with it.
+    write("update 1").1.unwrap();
+    assert!(matches!(
+        read("select lost"),
+        Err(QueryError::Connection(_))
+    ));
+    assert!(!session.in_transaction());
 }

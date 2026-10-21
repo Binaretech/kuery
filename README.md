@@ -18,7 +18,7 @@
 </p>
 
 Kuery brings database administration and file analytics into one desktop app.
-Work with PostgreSQL, MySQL, MariaDB, SQLite and Redis, or open CSV, JSON and
+Work with PostgreSQL, MySQL, MariaDB, SQL Server, SQLite and Redis, or open CSV, JSON and
 Parquet files without a database connection. The same results grid and Profile
 views help you move from a query to an explanation of the data.
 
@@ -94,6 +94,7 @@ For additional views, see the [query plan](docs/screenshots/plan-tree.png),
 | --- | --- | --- | --- |
 | **PostgreSQL** | Schemas, tables, views, routines, triggers, enums and definitions | SQL editor, read-only reads, explicit write modes | Streaming results, plan inspection, TLS and SSH. |
 | **MySQL / MariaDB** | Databases presented as schemas, tables, views and routines | SQL editor, read-only reads, explicit write modes | DDL that commits implicitly is refused wherever rollback is promised. |
+| **SQL Server** | Databases, schemas, tables, views and routines | SQL editor with `GO` batches, read-only reads, explicit write modes | Query plans and server activity. SQL Server logins only; see the guide for the read-only guarantee. |
 | **SQLite** | Local database files, tables, views and definitions | SQL editor, query-only reads, explicit write modes | Existing files only; missing paths do not create an empty database. |
 | **Redis** | Standalone databases and keys, including streams | Dedicated command console | Read-only by default. Redis writes apply immediately and cannot be rolled back. |
 | **CSV / TSV** | File preview, inferred schema and Profile | Polars SQL | Comma, semicolon or tab; header and NULL options. |
@@ -189,7 +190,7 @@ my-project/
 
 The sample database stack is optional. The
 [development guide](docs/guide.md#development) covers the seeded PostgreSQL,
-MySQL, Redis, SQLite and SSH examples.
+MySQL, SQL Server, Redis, SQLite and SSH examples.
 
 ## Shortcuts
 
@@ -248,6 +249,7 @@ Profile.
 | [`kuery-core`](crates/core) | Arrow-backed results, SQL analysis, session policies, catalog models, statistics and comparisons. |
 | [`kuery-pg`](crates/pg) | PostgreSQL adapter, catalog, TLS, streaming and cancellation. |
 | [`kuery-mysql`](crates/mysql) | MySQL/MariaDB adapter and database-specific behavior. |
+| [`kuery-mssql`](crates/mssql) | SQL Server adapter and database-specific behavior. |
 | [`kuery-sqlite`](crates/sqlite) | SQLite adapter and local database access. |
 | [`kuery-redis`](crates/redis) | Redis runtime, key browsing, value handling and console commands. |
 | [`kuery-files`](crates/files) | Polars readers, schema metadata, bounded previews and read-only file SQL. |

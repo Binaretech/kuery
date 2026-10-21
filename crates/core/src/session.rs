@@ -3,7 +3,7 @@
 //! drives any driver's [`Adapter`] by the same rules.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -164,6 +164,7 @@ struct Shared {
     server: String,
     access: Access,
     has_activity: bool,
+    notice: Option<String>,
     canceller: Canceller,
     state: Arc<State>,
     opener: Opener,
@@ -177,6 +178,8 @@ struct State {
     in_transaction: AtomicBool,
     /// A statement runs: cancelling keeps at it until this goes false.
     running: AtomicBool,
+    /// Which run it is, so a cancel's retries never reach the next one.
+    run: AtomicU64,
     /// A cancel came: some databases let a stopped statement end as if
     /// nothing happened, so the run checks this too.
     cancelled: AtomicBool,
@@ -217,6 +220,7 @@ impl Session {
                         server: adapter.server(),
                         access,
                         has_activity: adapter.has_activity(),
+                        notice: adapter.notice(),
                         canceller: canceller.clone(),
                         state: state.clone(),
                         opener: opener.clone(),
@@ -275,6 +279,12 @@ impl Session {
     /// Whether the server's sessions can be watched (Server Activity).
     pub fn has_activity(&self) -> bool {
         self.shared.has_activity
+    }
+
+    /// What the driver said the user should know about this connection
+    /// (see [`Adapter::notice`]).
+    pub fn notice(&self) -> Option<&str> {
+        self.shared.notice.as_deref()
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -428,12 +438,15 @@ impl Session {
             return;
         }
         state.cancelled.store(true, Ordering::SeqCst);
+        let run = state.run.load(Ordering::SeqCst);
         let canceller = self.shared.canceller.clone();
         let _ = std::thread::Builder::new()
             .name("kuery-cancel".into())
             .spawn(move || {
                 for _ in 0..40 {
-                    if !state.running.load(Ordering::SeqCst) {
+                    if !state.running.load(Ordering::SeqCst)
+                        || state.run.load(Ordering::SeqCst) != run
+                    {
                         break;
                     }
                     canceller();
@@ -527,6 +540,15 @@ impl Worker {
         self.adapter.execute(sql, &mut Discard).map(|_| ())
     }
 
+    /// Frees a savepoint where the database can; elsewhere it stays until the
+    /// transaction ends.
+    fn release(&mut self, name: &str) -> Result<(), QueryError> {
+        match self.dialect().release(name) {
+            Some(sql) => self.exec(&sql),
+            None => Ok(()),
+        }
+    }
+
     fn exec_all(&mut self, statements: &[&str]) -> Result<(), QueryError> {
         statements.iter().try_for_each(|sql| self.exec(sql))
     }
@@ -540,6 +562,7 @@ impl Worker {
 
     /// A statement is running, for [`Session::cancel`].
     fn begin_run(&mut self) {
+        self.state.run.fetch_add(1, Ordering::SeqCst);
         self.state.cancelled.store(false, Ordering::SeqCst);
         self.state.running.store(true, Ordering::SeqCst);
     }
@@ -594,8 +617,15 @@ impl Worker {
         if self.state.in_transaction.load(Ordering::SeqCst) {
             self.exec(&self.dialect().savepoint(READ))?;
             let outcome = job(self);
-            let _ = self.exec(&self.dialect().rollback_to(READ));
-            let _ = self.exec(&self.dialect().release(READ));
+            let undone = self.exec(&self.dialect().rollback_to(READ));
+            let _ = self.release(READ);
+            // A dropped connection takes the write transaction with it, and
+            // a savepoint that cannot be rolled back to is gone with its
+            // transaction (SQL Server rolls it all back for a deadlock
+            // victim or a snapshot conflict).
+            if matches!(outcome, Err(QueryError::Connection(_))) || undone.is_err() {
+                self.lose_transaction();
+            }
             return outcome;
         }
         self.exec_all(transactions.begin_read_only)?;
@@ -653,10 +683,10 @@ impl Worker {
         // Cancelled: undone, like any failure.
         let outcome = self.end_run(outcome);
         let closed = if outcome.is_ok() {
-            self.exec(&dialect.release(RUN))
+            self.release(RUN)
         } else {
             self.exec(&dialect.rollback_to(RUN))
-                .and_then(|()| self.exec(&dialect.release(RUN)))
+                .and_then(|()| self.release(RUN))
         };
         if let Err(error) = closed {
             // The savepoint is gone only if the transaction is (the script
@@ -727,7 +757,7 @@ impl Worker {
         // Even halfway.
         let undone = if in_transaction {
             self.exec(&dialect.rollback_to(PREVIEW))
-                .and_then(|()| self.exec(&dialect.release(PREVIEW)))
+                .and_then(|()| self.release(PREVIEW))
         } else {
             self.exec("rollback")
         };

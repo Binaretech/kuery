@@ -11,6 +11,7 @@ conformance = []
 arrow-array.workspace = true
 async-channel.workspace = true
 futures.workspace = true
+roxmltree.workspace = true
 serde_json.workspace = true
 sqlformat.workspace = true
 sqlparser.workspace = true

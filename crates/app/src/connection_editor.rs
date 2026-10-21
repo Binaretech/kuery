@@ -627,6 +627,7 @@ impl Render for ConnectionEditor {
                     .child(field("Name", Input::new(&self.name)))
                     .when(!info.file, |form| {
                         form.child(field("Host", Input::new(&self.host)))
+                            .children(info.host_help.map(|help| field("", muted(help))))
                             .child(field("Port", Input::new(&self.port)))
                     })
                     .child(field(info.database.label, Input::new(&self.database)))

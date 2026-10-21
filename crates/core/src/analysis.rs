@@ -97,30 +97,43 @@ pub fn analyze(sql: &str) -> Result<Analysis, Rejection> {
     analyze_in(&crate::sql::POSTGRES, sql)
 }
 
-/// The same, for a database speaking `dialect`.
+/// The same, for a database speaking `dialect`. With a batch separator
+/// (T-SQL's `GO`) each batch is parsed on its own, and what only touches the
+/// session (variables, `#temp` tables, session options) counts as a read.
 pub fn analyze_in(dialect: &Dialect, sql: &str) -> Result<Analysis, Rejection> {
-    let statements = Parser::parse_sql(&*dialect.parser(), sql)
-        .map_err(|error| Rejection::Parse(error.to_string()))?;
+    let session_local = dialect.batch_separator.is_some();
+    let batches = match session_local {
+        true => crate::script::statements_in(dialect, sql)
+            .ok_or_else(|| Rejection::Parse("unterminated string, comment or identifier".into()))?
+            .into_iter()
+            .map(|range| &sql[range])
+            .collect(),
+        false => vec![sql],
+    };
+    let mut statements = Vec::new();
+    for batch in batches {
+        let parsed = Parser::parse_sql(&*dialect.parser(), batch)
+            .map_err(|error| Rejection::Parse(error.to_string()))?;
+        statements.extend(parsed.iter().map(|s| describe(s, session_local)));
+    }
     if statements.is_empty() {
         return Err(Rejection::Empty);
     }
-    Ok(Analysis {
-        statements: statements.iter().map(describe).collect(),
-    })
+    Ok(Analysis { statements })
 }
 
-fn describe(statement: &Statement) -> StatementInfo {
+fn describe(statement: &Statement, session_local: bool) -> StatementInfo {
     let mut dangers = DangerVisitor::default();
     let _ = statement.visit(&mut dangers);
     StatementInfo {
-        kind: kind(statement),
+        kind: kind(statement, session_local),
         summary: summary(statement),
         dangers: dangers.found,
     }
 }
 
-fn kind(statement: &Statement) -> StatementKind {
-    if read_only::check_statement(statement).is_ok() {
+fn kind(statement: &Statement, session_local: bool) -> StatementKind {
+    if read_only::check_statement_in(statement, session_local).is_ok() {
         return StatementKind::Read;
     }
     match statement {
@@ -361,6 +374,53 @@ mod tests {
                 .transaction_control()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn t_sql_scripts_are_analysed_batch_by_batch() {
+        use crate::sql::{MSSQL, MYSQL};
+        use StatementKind::*;
+        let kinds_in = |dialect, sql| -> Vec<StatementKind> {
+            analyze_in(dialect, sql)
+                .unwrap()
+                .statements
+                .iter()
+                .map(|s| s.kind)
+                .collect()
+        };
+        let script = "create table dbo.t (id int)\nGO\ninsert into dbo.t values (1)\nGO\nselect * from dbo.t";
+        assert_eq!(kinds_in(&MSSQL, script), [Schema, Data, Read]);
+        // What only touches the session (variables, #temp tables) is not a
+        // write.
+        let local = analyze_in(
+            &MSSQL,
+            "declare @x int; set @x = 1; select @x;\ncreate table #t (id int); insert into #t values (@x)",
+        )
+        .unwrap();
+        assert!(!local.writes(), "{local:?}");
+        assert!(
+            analyze_in(&MSSQL, "update dbo.t set id = 2 where id = 1")
+                .unwrap()
+                .writes()
+        );
+        assert!(
+            analyze_in(&MSSQL, "select 1\nGO\nupdate dbo.t set id = 2 where id = 1")
+                .unwrap()
+                .writes()
+        );
+        assert_eq!(
+            analyze_in(&MSSQL, "select 1\nGO\ndrop table dbo.t")
+                .unwrap()
+                .dangers()
+                .count(),
+            1
+        );
+        assert_eq!(
+            analyze_in(&MSSQL, "-- nothing\nGO\n"),
+            Err(Rejection::Empty)
+        );
+        // Other dialects: unchanged, a session variable is no read.
+        assert_eq!(kinds_in(&MYSQL, "set @x = 1; select @x"), [Other, Read]);
     }
 
     #[test]

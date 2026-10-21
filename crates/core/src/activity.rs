@@ -31,6 +31,18 @@ impl State {
         }
     }
 
+    /// From `sys.dm_exec_sessions.status` and the session's open
+    /// transactions.
+    pub fn from_mssql(status: &str, open_transactions: i32) -> Self {
+        match status.trim().to_ascii_lowercase().as_str() {
+            "running" | "runnable" | "suspended" => State::Active,
+            "sleeping" if open_transactions > 0 => State::IdleInTransaction,
+            "sleeping" => State::Idle,
+            "background" => State::Background,
+            other => State::Other(other.to_string()),
+        }
+    }
+
     pub fn label(&self) -> &str {
         match self {
             State::Active => "active",
@@ -397,6 +409,20 @@ mod tests {
         assert_eq!(concern(40), Some(Concern::LongQuery));
         assert_eq!(concern(50), None);
         assert_eq!(activity.backend(10).unwrap().seconds(), Some(300.));
+    }
+
+    #[test]
+    fn reads_sql_server_session_states() {
+        assert_eq!(State::from_mssql("running", 0), State::Active);
+        assert_eq!(State::from_mssql("runnable", 1), State::Active);
+        assert_eq!(State::from_mssql("suspended", 0), State::Active);
+        assert_eq!(State::from_mssql("sleeping", 2), State::IdleInTransaction);
+        assert_eq!(State::from_mssql("sleeping", 0), State::Idle);
+        assert_eq!(State::from_mssql("background", 0), State::Background);
+        assert_eq!(
+            State::from_mssql("dormant", 0),
+            State::Other("dormant".into())
+        );
     }
 
     #[test]

@@ -99,6 +99,8 @@ pub struct DriverInfo {
     /// The database is a file: the form asks for its path (in the database
     /// field), not for a server, a user or TLS.
     pub file: bool,
+    /// A line under the host field, for hosts that take more than a name.
+    pub host_help: Option<&'static str>,
 }
 
 impl DriverInfo {
@@ -204,6 +206,7 @@ pub const REDIS: DriverInfo = DriverInfo {
     tls: Tls::Toggle,
     production_note: "Production connections only write once writes are allowed for the session.",
     file: false,
+    host_help: None,
 };
 
 #[cfg(test)]
@@ -233,6 +236,7 @@ mod tests {
         tls: Tls::Modes(&["disable", "prefer", "require"]),
         production_note: "",
         file: false,
+        host_help: None,
     };
 
     /// A database file, like SQLite.

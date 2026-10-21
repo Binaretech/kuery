@@ -12,6 +12,7 @@ kuery-pg = { path = "crates/pg" }
 kuery-redis = { path = "crates/redis" }
 kuery-sqlite = { path = "crates/sqlite" }
 kuery-mysql = { path = "crates/mysql" }
+kuery-mssql = { path = "crates/mssql" }
 kuery-files = { path = "crates/files" }
 
 # Local file analytics; keep Polars behind kuery-files, separate from core's Arrow.
@@ -22,6 +23,8 @@ arrow-array = "60"
 async-channel = "2"
 futures = "0.3"
 keyring = "4"
+# SQL Server's showplan XML, read into plans.
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 # Pretty-printing JSON values in Redis keys, keeping their key order.
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -35,7 +38,14 @@ tokio-postgres = "0.7"
 # MySQL and MariaDB over rustls with `ring`, like the rest.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks", "column_decltype"] }
-# TLS with rustls and the `ring` provider (no aws-lc, which needs cmake and NASM on Windows).
+# SQL Server (TDS) over rustls; named instances through the SQL Browser service.
+# Its tokio-rustls brings aws-lc-rs as a second rustls provider (native-tls hangs
+# in the handshake on macOS), so the app installs `ring` as the default at startup.
+# aws-lc-sys builds with the C compiler alone on the release targets (pregenerated
+# bindings, prebuilt NASM objects); other targets would need cmake.
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "sql-browser-tokio"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+# TLS with rustls and the `ring` provider, the one every connection uses.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 tokio-postgres-rustls = "0.14"

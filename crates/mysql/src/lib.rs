@@ -95,6 +95,7 @@ pub static DRIVER: SqlDriver = SqlDriver {
         tls: Tls::Toggle,
         production_note: "Production connections always open read-only and cannot edit rows.",
         file: false,
+        host_help: None,
     },
     dialect: &MYSQL,
     open: |options, access| open(&Target::from(options), access),

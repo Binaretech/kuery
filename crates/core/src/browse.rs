@@ -171,10 +171,11 @@ impl Browse {
         }
 
         let page_size = self.page_size.max(1);
-        sql.push_str(&format!(
-            " limit {page_size} offset {}",
-            self.page * page_size
-        ));
+        sql.push_str(
+            &self
+                .dialect
+                .page(!order.is_empty(), page_size, self.page * page_size),
+        );
         Ok(sql)
     }
 
@@ -309,6 +310,27 @@ mod tests {
         assert_eq!(
             browse.count_sql().unwrap(),
             "select count(*) from \"shop\".\"orders\" where cast(\"status\" as text) like '%pa%' escape '\\'"
+        );
+    }
+
+    #[test]
+    fn pages_with_offset_fetch_in_t_sql() {
+        let mut browse = Browse::new(
+            TableRef::new("dbo", "orders"),
+            vec!["id".into(), "total".into()],
+        )
+        .in_dialect(&crate::sql::MSSQL);
+        assert_eq!(
+            browse.page_sql(&[]).unwrap(),
+            "select * from [dbo].[orders] order by (select null) offset 0 rows fetch next 100 rows only"
+        );
+        browse.sort = vec![Sort {
+            column: "total".into(),
+            direction: Direction::Descending,
+        }];
+        assert_eq!(
+            browse.page_sql(&[]).unwrap(),
+            "select * from [dbo].[orders] order by case when [total] is null then 1 else 0 end, [total] desc offset 0 rows fetch next 100 rows only"
         );
     }
 

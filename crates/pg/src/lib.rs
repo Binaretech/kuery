@@ -130,6 +130,7 @@ pub static DRIVER: SqlDriver = SqlDriver {
         tls: Tls::Modes(&["disable", "prefer", "require", "verify-ca", "verify-full"]),
         production_note: "Production connections always open read-only and cannot edit rows.",
         file: false,
+        host_help: None,
     },
     dialect: &POSTGRES,
     open: |options, access| open(&conninfo(options), access),

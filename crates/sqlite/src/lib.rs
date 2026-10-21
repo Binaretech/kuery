@@ -51,6 +51,7 @@ pub static DRIVER: SqlDriver = SqlDriver {
         tls: Tls::Toggle,
         production_note: "Production connections open the file read-only and cannot edit rows.",
         file: true,
+        host_help: None,
     },
     dialect: &SQLITE,
     open: |options, access| open(Path::new(&options.database), access),
