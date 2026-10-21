@@ -274,9 +274,7 @@ with the code in `crates/mssql/examples/spike.rs`
   `kuery-files`); it adds no new native requirement. With the workspace's
   `ring` feature also on, rustls still negotiates without anyone installing a
   default provider (verified, TLS connects). No need for `native-tls`.
-- `Config`: `trust_cert()` + `EncryptionLevel::Required` connected and
-  `sys.dm_exec_connections.encrypt_option` was `TRUE`.
-  `@@version` reads fine at connect.
+- TLS mode mapping: see "TLS modes" below. `@@version` reads fine at connect.
 - `sqlparser` 0.63 `MsSqlDialect` **parses `waitfor delay '00:00:20'`** (to
   `Statement::WaitFor`), alone and followed by `; select 1`. So no
   substitute slow statement is needed for tests (a cross join over
@@ -336,7 +334,51 @@ where transaction_id = (select transaction_id from sys.dm_tran_current_transacti
 Temp-table work (tempdb, `database_id = 2`) is invisible to it, so `#t`,
 `declare` and `select … into #t` stay allowed without special cases; real
 writes, DDL included, are visible right after the statement. The value is
-`bigint` (`I64`). Writes are detectable; the layer is feasible.
+`bigint` (`I64`).
+
+**Permission finding (important): the above was run as `sa`, and it does not
+work for an ordinary login.** Tried on the dev server (SQL Server 2022) with
+logins created by `spike -- logins`: `kuery_reader` (user in `shop` with only
+`db_datareader`) and `kuery_writer` (`db_datareader` + `db_datawriter`, the
+realistic read-only-mode login that can write):
+
+- `sys.dm_tran_database_transactions`, `sys.dm_tran_session_transactions`,
+  `sys.dm_tran_current_transaction`, `sys.dm_tran_active_transactions`,
+  `sys.dm_exec_connections`, `sys.dm_db_session_space_usage` and
+  `sys.dm_tran_locks` all fail for both logins with error 300: `VIEW SERVER
+  PERFORMANCE STATE permission was denied on object 'server', database
+  'master'.` (`has_perms_by_name(null, null, 'VIEW SERVER STATE')` = 0). On
+  SQL Server 2019 and earlier the permission is `VIEW SERVER STATE`.
+- What does work without any permission is unreliable: `@@trancount` /
+  `xact_state()` only say a transaction is open; `sys.dm_exec_sessions.writes`
+  (own row) stayed `0` for `kuery_writer` after an insert, and moved for
+  `kuery_reader` after plain selects (page writes by the engine, not log
+  records); `sys.dm_exec_requests.writes` was `0`.
+- Partial fallbacks that need no permission, verified as `kuery_writer`
+  (with `db_ddladmin` added to allow DDL; `db_datawriter` alone gets error 262
+  `CREATE TABLE permission denied`): the rows-affected count tiberius returns
+  for an `insert` (`[2]`), and `select max(modify_date) from sys.objects`
+  changing after `create table`. They miss writes made inside a procedure or
+  trigger with `set nocount on`, updates that touch zero rows through
+  triggers, and other side effects, so they are **not** a proof.
+- **With the permission granted it works for the writer login:**
+  `use master; grant VIEW SERVER PERFORMANCE STATE to kuery_writer` (also
+  `VIEW SERVER STATE`, which is what 2012 to 2019 need and which 2022 accepts)
+  gave, as `kuery_writer` (`spike -- grants`): after select `0`, after insert
+  of 2 rows `3`, after `create table` `22`. Note the grant is server-scope and
+  must be run in `master`.
+
+Conclusion for the read-only second layer: **feasible, but only for a login
+with `VIEW SERVER STATE` (`VIEW SERVER PERFORMANCE STATE` on 2022+).** For a
+login without it there is no reliable detector, so the adapter must probe at
+connect (run the detection query once in a throwaway transaction; error 300 =
+unavailable) and then say so honestly: the connection's read-only protection
+is Kuery's analyser plus the rollback, without server-side detection. The
+form/docs must tell users that a writer login needs the grant for read-only
+mode to be enforced, and that a `db_datareader`-only login is the safe
+choice because the server itself then refuses every write. Read-only mode
+with a login that is both able to write and lacks the grant cannot satisfy
+`refuses_writes_twice_when_reading` and should be shown as "not enforced".
 
 ### `as_text` and value text
 
@@ -368,22 +410,28 @@ columns the edit check should be skipped or key-only (a catalog column type is
 available there), and the filter on a binary column is not offered.
 
 Rendering rule per tiberius `ColumnData` variant so that the adapter's text is
-byte for byte what style 126 gives (checked against the server for each row
-below, including `NULL` giving `None`):
+byte for byte what style 126 gives. The rules are implemented as `render()` in
+`crates/mssql/examples/spike.rs` and compared with the server's `as_text`
+expression by `spike -- render` for 117 values (types above, edge values such
+as `0001-01-01`, `9999-12-31 23:59:59.9999999`, offsets `+14:00` / `-12:00`
+and a midnight crossing, datetime 1/300 s rounding, 38-digit decimals, float
+extremes, empty strings, an emoji, `NULL` of each type): 115 equal and 2 known
+differences (money beyond about 10^14, below). Binary is compared with
+`convert(nvarchar(max), x, 1)`.
 
 | SQL type | tiberius value | Text rule | Example |
 | --- | --- | --- | --- |
 | `tinyint` | `U8` | decimal | `7` |
 | `smallint` / `int` / `bigint` | `I16` / `I32` / `I64` | decimal | `-42` |
 | `bit` | `Bit` | `1` / `0` | `1` |
-| `decimal` / `numeric` | `Numeric` | `Display`, keeps scale (also `-0.05`, 38 digits) | `12345.60` |
-| `money` / `smallmoney` | `F64` | `format!("{:.4}")` (4 decimals; precision beyond f64 is lost above about 10^11, accepted) | `1234.5000` |
+| `decimal` / `numeric` | `Numeric` | `Display`, keeps scale (also `-0.05`, 38 digits); scale 0 uses the integer value only (`Display` writes `5.0`, the server `5`) | `12345.60`, `5` |
+| `money` / `smallmoney` | `F64` | `format!("{:.4}")` (4 decimals). **Known difference:** `money` arrives as f64, so values beyond about 10^14 lose the last digits (`922337203685477.5807` renders `…477.6250`); `99999999999.9999` is still exact. Accepted, documented | `1234.5000` |
 | `float` | `F64` | `{:.15e}`, exponent as sign plus 3 digits | `1.000000000000000e-001` |
 | `real` | `F32` | `{:.7e}` of the f32, exponent as sign plus 3 digits | `1.0000000e-001` |
 | `date` | `Date(days)` | days since 0001-01-01 to `YYYY-MM-DD` | `2026-10-21` |
-| `time(n)` | `Time{increments, scale}` | `increments` is in 10^-scale s; `HH:MM:SS`, plus `.` and exactly `scale` digits when `scale > 0` | `13:45:09.1234567`, `13:45:09.120` (scale 3), `13:45:09` (scale 0) |
+| `time(n)` | `Time{increments, scale}` | `increments` is in 10^-scale s; `HH:MM:SS`, plus `.` and exactly `scale` digits only when the fraction is not zero (whole seconds print no fraction at all) | `13:45:09.1234567`, `13:45:09.120` (scale 3), `13:45:09` (scale 0, or scale 7 with zero fraction) |
 | `smalldatetime` | `SmallDateTime{days, minutes}` | days since 1900-01-01; `minutes` since midnight; seconds are always `:00` | `2026-10-21T13:45:00` |
-| `datetime` | `DateTime{days, seconds_fragments}` | days since 1900-01-01; fragments are 1/300 s; seconds = fragments / 300, milliseconds = round((fragments % 300) * 10 / 3); always 3 ms digits | `2026-10-21T13:45:09.123`, `.007` |
+| `datetime` | `DateTime{days, seconds_fragments}` | days since 1900-01-01; fragments are 1/300 s; seconds = fragments / 300, milliseconds = round((fragments % 300) * 10 / 3); 3 ms digits, but none when the fraction is zero | `2026-10-21T13:45:09.123`, `.007`, `1900-01-01T00:00:00` |
 | `datetime2(n)` | `DateTime2{date, time}` | `date` + `T` + time rule (scale digits) | `2026-10-21T13:45:09.1234567`, scale 0: `…:09` |
 | `datetimeoffset(n)` | `DateTimeOffset{datetime2, offset}` | the stored time is **UTC**; add `offset` minutes to get local, then datetime2 rule, then `+HH:MM` / `-HH:MM` (`+00:00` for zero) | `2026-10-21T13:45:09.1234567+05:30`, `…T03:15:09.5-08:00` |
 | `uniqueidentifier` | `Guid` | hyphenated **uppercase** (`uuid` prints lowercase) | `6F9619FF-8B86-D011-B42D-00C04FC964FF` |
@@ -391,8 +439,46 @@ below, including `NULL` giving `None`):
 | `binary` / `varbinary` / `image` | `Binary` | `0x` + uppercase hex; not comparable with `as_text` (see above) | `0x00FF10` |
 | `xml` | `Xml(XmlData{data, ..})` | `data` as is | `<a x="1"><b/></a>` |
 
-The `float` / `real` / `money` rules are the fragile ones: they only agree
-with the server when Rust and SQL Server round the last digit the same way
-(true for every value tried: `0.1`, `1.5e20`, `0.1234567890123456…`). Task 2
-or 3 should add a test with the values above and a few random floats against
-the Docker server, as the design already requires for each type.
+The `float` / `real` rules agree with the server for every value tried
+(`0`, `0.1`, `1e15`, `1e16`, `-1.5e-300`, `1.7976931348623157e308`,
+`2.2250738585072014e-308`, `123456789.123456789`, `3.4e38`, `16777216`); Task 3
+should keep a test with these values (and a few random floats) against the
+Docker server.
+
+### TLS modes
+
+`EncryptionLevel` and `trust_cert()` for each mode, run against the dev server
+(self-signed certificate) by `spike -- tlsmodes`; `encrypt_option` read from
+`sys.dm_exec_connections`:
+
+| Kuery mode | tiberius | Result on the dev server |
+| --- | --- | --- |
+| `disable` | `NotSupported`, no trust | connects, `encrypt_option` FALSE, no TLS handshake at all |
+| default (none chosen: encrypt if the server offers it, check the certificate) | `On`, no trust | **fails** on the self-signed certificate (error below) |
+| `require` | `Required`, no trust | **fails** with the same error |
+| `trust server certificate` | `Required` + `trust_cert()` | connects, `encrypt_option` TRUE (certificate and host name not checked) |
+| (not offered) | `On` + `trust_cert()` | connects, TRUE |
+| (not offered) | `Off` + `trust_cert()` | connects, `encrypt_option` FALSE (only the login is encrypted) |
+
+`Off` without trust fails too: SQL Server always runs the TLS handshake for the
+login, so only `NotSupported` avoids certificate checking. Do not use `Off`.
+Mapping decision: `disable` = `NotSupported`; default = `On`; `require` =
+`Required`; `trust server certificate` = `Required` + `trust_cert()`.
+
+Error text for an untrusted self-signed certificate (default and `require`):
+
+> Error forming TLS connection: the server's certificate was rejected during
+> the TLS handshake: Other(OtherError(UnsupportedCertVersion)). The SQL Server
+> presented a certificate rustls considers too old (an outdated X.509 version),
+> which frequently happens with the self-signed certificate SQL Server
+> auto-generates. To connect anyway you can: (1) trust a specific CA
+> certificate with `Config::trust_cert_ca(path)` … (3) skip certificate
+> validation entirely with `Config::trust_cert()` … (4) build tiberius with
+> the `native-tls` backend, which is more lenient toward legacy certificates.
+
+Kuery should recognise this error (a TLS handshake error from tiberius) and
+replace it with its own message pointing to the "trust server certificate"
+option. Note that the cause here is `UnsupportedCertVersion`: rustls rejects
+the old X.509 certificate that SQL Server generates, so even a certificate the
+user installs as trusted may fail on such servers; that is what the
+`native-tls` fallback in "Answers from the owner" (2) is for.
