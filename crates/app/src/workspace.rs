@@ -1257,7 +1257,9 @@ impl WorkspaceView {
                     .child(div().child(db.target.clone()));
                 right = right
                     .children(db.session.notice().map(|notice| {
-                        div().text_color(color(theme::AMBER)).child(notice.to_string())
+                        div()
+                            .text_color(color(theme::AMBER))
+                            .child(notice.to_string())
                     }))
                     .child(db.session.server_label().to_string());
             }
