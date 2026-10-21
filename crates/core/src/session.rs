@@ -613,10 +613,11 @@ impl Worker {
             let outcome = job(self);
             let undone = self.exec(&self.dialect().rollback_to(READ));
             let _ = self.release(READ);
-            // A dropped connection takes the write transaction with it.
-            if matches!(outcome, Err(QueryError::Connection(_)))
-                || matches!(undone, Err(QueryError::Connection(_)))
-            {
+            // A dropped connection takes the write transaction with it, and
+            // a savepoint that cannot be rolled back to is gone with its
+            // transaction (SQL Server rolls it all back for a deadlock
+            // victim or a snapshot conflict).
+            if matches!(outcome, Err(QueryError::Connection(_))) || undone.is_err() {
                 self.lose_transaction();
             }
             return outcome;
