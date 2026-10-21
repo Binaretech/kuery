@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use futures::executor::block_on;
 use kuery_core::adapter::{Discard, fetch};
+use kuery_core::diagram::OnDelete;
 use kuery_core::session::{Opener, Session};
 
 use super::*;
@@ -671,4 +672,209 @@ fn drain_all(rx: async_channel::Receiver<kuery_core::session::Event>) -> Result<
         }
         Err(QueryError::Cancelled)
     })
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn reads_the_catalog() {
+    use kuery_core::catalog::{ConstraintKind, RoutineKind, TableKind};
+    let reader = session(target(), Access::ReadOnly);
+    let overview = block_on(reader.overview()).unwrap();
+    assert!(overview.schemas.contains(&"dbo".to_string()));
+    assert!(overview.schemas.contains(&"sales".to_string()));
+    for hidden in ["sys", "INFORMATION_SCHEMA", "guest", "db_owner"] {
+        assert!(!overview.schemas.contains(&hidden.to_string()), "{hidden}");
+    }
+    let dbo: Vec<(&str, TableKind)> = overview
+        .tables
+        .iter()
+        .filter(|t| {
+            t.table.schema == "dbo"
+                && !t.table.name.starts_with("scratch")
+                && !t.table.name.starts_with("kuery_")
+        })
+        .map(|t| (t.table.name.as_str(), t.kind))
+        .collect();
+    assert_eq!(
+        dbo,
+        [
+            ("customers", TableKind::Table),
+            ("order_lines", TableKind::Table),
+            ("orders", TableKind::Table),
+            ("paid_orders", TableKind::View),
+            ("products", TableKind::Table)
+        ]
+    );
+    let customers = overview
+        .tables
+        .iter()
+        .find(|t| t.table.name == "customers")
+        .unwrap();
+    assert_eq!(customers.comment.as_deref(), Some("People who buy"));
+    assert_eq!(customers.estimated_rows, Some(2000));
+
+    let in_sales = |name: &str| {
+        overview
+            .functions
+            .iter()
+            .find(|f| f.schema == "sales" && f.name == name)
+            .unwrap()
+    };
+    assert_eq!(in_sales("raise_quota").kind, RoutineKind::Procedure);
+    assert!(
+        in_sales("raise_quota")
+            .arguments
+            .contains("@by decimal(12,2)")
+    );
+    let reached = in_sales("quota_reached");
+    assert_eq!(reached.kind, RoutineKind::Function);
+    assert_eq!(reached.result, "bit");
+    assert_eq!(reached.arguments, "@country char(2)");
+    let source = block_on(reader.routine_source(reached.clone())).unwrap();
+    assert!(source.contains("create function"), "{source}");
+    assert!(
+        overview
+            .tables
+            .iter()
+            .any(|t| t.table.schema == "sales" && t.kind == TableKind::View)
+    );
+    assert!(
+        overview
+            .triggers
+            .iter()
+            .any(|t| t.table == TableRef::new("sales", "quotas") && t.name == "quotas_changed")
+    );
+    let money = overview
+        .enums
+        .iter()
+        .find(|e| e.name == "money_amount")
+        .unwrap();
+    assert_eq!(
+        (money.schema.as_str(), money.values.as_slice()),
+        ("sales", ["decimal(12,2) not null".to_string()].as_slice())
+    );
+
+    let orders = block_on(reader.definition(TableRef::new("dbo", "orders"))).unwrap();
+    assert_eq!(orders.primary_key(), ["id"]);
+    let customer = orders.column("customer_id").unwrap();
+    assert_eq!(
+        customer.foreign_key.as_ref().unwrap().table.name,
+        "customers"
+    );
+    assert_eq!(
+        orders.column("shipping").unwrap().data_type,
+        "nvarchar(max)"
+    );
+    assert!(orders.column("shipping").unwrap().nullable);
+    assert_eq!(orders.column("total").unwrap().data_type, "decimal(10,2)");
+    assert!(orders.constraints.iter().any(
+        |c| c.kind == ConstraintKind::ForeignKey && c.definition.contains("ON DELETE CASCADE")
+    ));
+    assert!(
+        orders
+            .constraints
+            .iter()
+            .any(|c| c.kind == ConstraintKind::Check)
+    );
+    assert!(orders.indexes.iter().any(|i| i.name == "orders_by_created"));
+    let customers = block_on(reader.definition(TableRef::new("dbo", "customers"))).unwrap();
+    assert_eq!(customers.column("email").unwrap().data_type, "varchar(120)");
+    assert_eq!(
+        customers.column("full_name").unwrap().data_type,
+        "nvarchar(120)"
+    );
+    assert!(
+        customers
+            .constraints
+            .iter()
+            .any(|c| c.kind == ConstraintKind::Unique)
+    );
+    let lines = block_on(reader.definition(TableRef::new("dbo", "order_lines"))).unwrap();
+    assert_eq!(lines.primary_key(), ["order_id", "line"]);
+    assert_eq!(lines.triggers[0].name, "order_lines_total");
+    assert!(lines.triggers[0].definition.contains("create trigger"));
+    assert!(lines.triggers[0].enabled);
+    let quotas = block_on(reader.definition(TableRef::new("sales", "quotas"))).unwrap();
+    assert_eq!(
+        quotas.column("amount").unwrap().data_type,
+        "sales.money_amount"
+    );
+
+    let diagram = block_on(reader.diagram("dbo".into())).unwrap();
+    let to_orders = diagram
+        .relations
+        .iter()
+        .find(|r| r.name == "lines_order")
+        .unwrap();
+    assert_eq!(to_orders.on_delete, OnDelete::Cascade);
+
+    let completion = block_on(reader.completion_catalog()).unwrap();
+    assert_eq!(completion.search_path, ["dbo"]);
+    assert!(
+        completion
+            .tables
+            .iter()
+            .any(|t| t.table.name == "paid_orders" && t.kind == TableKind::View)
+    );
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_column_named_with_a_bracket_round_trips_through_edits() {
+    use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange};
+    let table = format!("scratch_bracket_{}", std::process::id());
+    let mut sa = adapter();
+    run(
+        sa.as_mut(),
+        &format!(
+            "create table dbo.{table} (id int primary key, [a]]b] nvarchar(20)); \
+             insert into dbo.{table} values (1, N'before')"
+        ),
+    );
+    let writer = session(target(), Access::ReadWrite);
+    let definition = block_on(writer.definition(TableRef::new("dbo", table.clone()))).unwrap();
+    let names: Vec<&str> = definition.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "a]b"]);
+    let edit_target = EditTarget {
+        table: TableRef::new("dbo", table.clone()),
+        columns: names.iter().map(|n| n.to_string()).collect(),
+        primary_key: definition.primary_key(),
+        dialect: &MSSQL,
+    };
+    let change = edit::build(
+        &edit_target,
+        &RowChange::Update {
+            key: vec![KeyValue {
+                column: "id".into(),
+                value: "1".into(),
+            }],
+            cells: vec![CellChange {
+                column: "a]b".into(),
+                old: Some("before".into()),
+                new: Some("after".into()),
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(block_on(writer.apply(vec![change])), Ok(1));
+    assert_eq!(
+        scalar(
+            sa.as_mut(),
+            &format!("select [a]]b] from dbo.{table} where id = 1")
+        )
+        .as_deref(),
+        Some("after")
+    );
+    drop(writer);
+    run(sa.as_mut(), &format!("drop table dbo.{table}"));
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn works_like_the_other_drivers() {
+    kuery_core::conformance::run(&kuery_core::conformance::Fixture {
+        opener: Arc::new(|access| open(&target(), access)),
+        schema: "dbo".into(),
+        slow_query: "waitfor delay '00:00:20'; select 1".into(),
+    });
 }

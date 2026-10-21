@@ -14,6 +14,7 @@
 //! That look needs `VIEW SERVER PERFORMANCE STATE`; without it the rollback
 //! at the end still undoes everything, and [`Adapter::notice`] says so.
 
+mod catalog;
 mod value;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,9 @@ use std::time::Duration;
 
 use futures::TryStreamExt as _;
 use kuery_core::adapter::{Adapter, Canceller, RowSink};
-use kuery_core::catalog::{CatalogColumn, CatalogOverview, ForeignKey, TableDefinition, TableRef};
+use kuery_core::catalog::{
+    CatalogColumn, CatalogOverview, ForeignKey, FunctionInfo, TableDefinition, TableRef,
+};
 use kuery_core::driver::{ConnectOptions, DriverInfo, Family, Field, SqlDriver, Tls};
 use kuery_core::result_set::ColumnKind;
 use kuery_core::session::{Access, QueryError, RunOptions};
@@ -625,28 +628,28 @@ impl Adapter for Mssql {
     }
 
     fn overview(&mut self) -> Result<CatalogOverview, QueryError> {
-        Err(not_yet())
+        catalog::overview(self)
     }
 
-    fn definition(&mut self, _: &TableRef) -> Result<TableDefinition, QueryError> {
-        Err(not_yet())
+    fn definition(&mut self, table: &TableRef) -> Result<TableDefinition, QueryError> {
+        catalog::definition(self, table)
     }
 
-    fn columns(&mut self, _: Option<&str>) -> Result<Vec<CatalogColumn>, QueryError> {
-        Err(not_yet())
+    fn columns(&mut self, schema: Option<&str>) -> Result<Vec<CatalogColumn>, QueryError> {
+        catalog::catalog_columns(self, schema)
     }
 
-    fn foreign_keys(&mut self, _: &str) -> Result<Vec<ForeignKey>, QueryError> {
-        Err(not_yet())
+    fn foreign_keys(&mut self, schema: &str) -> Result<Vec<ForeignKey>, QueryError> {
+        catalog::catalog_foreign_keys(self, schema)
     }
 
     fn search_path(&mut self) -> Result<Vec<String>, QueryError> {
-        Err(not_yet())
+        catalog::search_path(self)
     }
-}
 
-fn not_yet() -> QueryError {
-    QueryError::Unsupported("Kuery cannot read the SQL Server catalog yet".into())
+    fn routine_source(&mut self, routine: &FunctionInfo) -> Result<String, QueryError> {
+        catalog::function_definition(self, routine)
+    }
 }
 
 #[cfg(test)]

@@ -136,3 +136,38 @@ jobs:
 
       - name: Ignored kuery-redis tests
         run: cargo test -p kuery-redis --locked -- --ignored
+
+  mssql:
+    name: kuery-mssql tests against SQL Server
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Kuery_dev_2026!
+        ports:
+          - 14339:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Kuery_dev_2026!' -Q 'select 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sample data
+        run: |
+          docker run --rm --network host -v "$PWD/dev:/seed:ro" \
+            mcr.microsoft.com/mssql/server:2022-latest \
+            /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost,14339 -U sa -P 'Kuery_dev_2026!' \
+            -i /seed/seed-mssql.sql
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ignored kuery-mssql tests
+        run: cargo test -p kuery-mssql --locked -- --ignored

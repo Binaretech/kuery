@@ -15,6 +15,11 @@ go
 create database shop;
 go
 
+-- Readers see the last committed rows instead of waiting for writers' locks
+-- (how Azure SQL Database behaves, and what the conformance suite expects).
+alter database shop set read_committed_snapshot on with rollback immediate;
+go
+
 use shop;
 go
 
