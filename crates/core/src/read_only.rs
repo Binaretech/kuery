@@ -8,10 +8,12 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, Expr, FromTable, ObjectName, ObjectType, Query, SessionParamStatsTopic, SetExpr,
-    SetSessionParamKind, Statement, TableFactor, TableObject, Visit, Visitor,
+    Delete, Expr, FromTable, ObjectName, ObjectType, OutputClause, Query, SessionParamStatsTopic,
+    SetExpr, SetSessionParamKind, Statement, TableFactor, TableObject, TableWithJoins,
+    UpdateTableFromKind, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use crate::sql::Dialect;
 
@@ -159,6 +161,7 @@ fn check_batch(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
         [batch] => &sql[batch.clone()],
         many => return Err(Rejection::MultipleStatements(many.len())),
     };
+    refuse_next_value_for(dialect, batch)?;
     let statements = Parser::parse_sql(&*dialect.parser(), batch)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
     if statements.is_empty() {
@@ -172,6 +175,41 @@ fn check_batch(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
             ControlFlow::Break(rejection) => Err(rejection),
         }
     })
+}
+
+/// `NEXT VALUE FOR seq` advances the sequence. Looked for in the tokens, so
+/// it is refused whatever the parser makes of it.
+fn refuse_next_value_for(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
+    let tokens = Tokenizer::new(&*dialect.parser(), sql)
+        .tokenize()
+        .map_err(|error| Rejection::Parse(error.to_string()))?;
+    let words: Vec<Option<String>> = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                token,
+                Token::Whitespace(
+                    Whitespace::SingleLineComment { .. }
+                        | Whitespace::MultiLineComment(_)
+                        | Whitespace::Space
+                        | Whitespace::Newline
+                        | Whitespace::Tab
+                )
+            )
+        })
+        .map(|token| match token {
+            Token::Word(word) if word.quote_style.is_none() => Some(word.value.to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let is = |word: &Option<String>, expected: &str| word.as_deref() == Some(expected);
+    if words
+        .windows(3)
+        .any(|w| is(&w[0], "next") && is(&w[1], "value") && is(&w[2], "for"))
+    {
+        return Err(Rejection::Function("next value for".into()));
+    }
+    Ok(())
 }
 
 /// Checks that one parsed statement only reads data.
@@ -223,6 +261,16 @@ impl Visitor for ReadOnlyVisitor {
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Rejection> {
         if !query.locks.is_empty() {
             return ControlFlow::Break(Rejection::LockingClause);
+        }
+        // `with #c as (select * from dbo.orders) update #c …` writes the real
+        // table behind the CTE, whatever the CTE is called.
+        if self.session_local
+            && query.with.is_some()
+            && let SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement) = &*query.body
+        {
+            return ControlFlow::Break(Rejection::Statement(statement_kind(statement)));
         }
         if creates_table(&query.body, self.session_local) {
             return ControlFlow::Break(Rejection::SelectInto);
@@ -291,6 +339,33 @@ fn is_session_local_table(factor: &TableFactor) -> bool {
     matches!(factor, TableFactor::Table { name, .. } if is_session_local_name(name))
 }
 
+/// Every table in the list, joined ones too, is itself a `#`/`@` name. An
+/// alias does not count: `from dbo.orders as #o` is the real table.
+fn all_session_local(tables: &[TableWithJoins]) -> bool {
+    tables.iter().all(|table| {
+        is_session_local_table(&table.relation)
+            && table
+                .joins
+                .iter()
+                .all(|join| is_session_local_table(&join.relation))
+    })
+}
+
+/// No `OUTPUT … INTO` a table that outlives the session.
+fn output_stays_local(output: &Option<OutputClause>) -> bool {
+    match output {
+        None => true,
+        Some(OutputClause::Output { into_table, .. }) => into_table.as_ref().is_none_or(|into| {
+            !into.targets.is_empty()
+                && into.targets.iter().all(|target| {
+                    matches!(target, Expr::Identifier(ident)
+                        if is_temp_table(&ident.value) || ident.value.starts_with('@'))
+                })
+        }),
+        Some(_) => false,
+    }
+}
+
 /// T-SQL statements that cannot change anything outside this session. Their
 /// expressions are still visited, so a subquery or function in them is
 /// checked like any other.
@@ -341,8 +416,19 @@ fn is_session_local(statement: &Statement) -> bool {
         } => names.iter().all(is_session_local_name),
         Statement::Insert(insert) => {
             matches!(&insert.table, TableObject::TableName(name) if is_session_local_name(name))
+                && output_stays_local(&insert.output)
         }
-        Statement::Update(update) => is_session_local_table(&update.table.relation),
+        Statement::Update(update) => {
+            let from = match &update.from {
+                None => &[][..],
+                Some(
+                    UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from),
+                ) => from.as_slice(),
+            };
+            all_session_local(std::slice::from_ref(&update.table))
+                && all_session_local(from)
+                && output_stays_local(&update.output)
+        }
         Statement::Delete(delete) => deletes_only_session_local(delete),
         _ => false,
     }
@@ -376,9 +462,8 @@ fn deletes_only_session_local(delete: &Delete) -> bool {
     delete.using.is_none()
         && delete.tables.iter().all(is_session_local_name)
         && !from.is_empty()
-        && from
-            .iter()
-            .all(|table| is_session_local_table(&table.relation))
+        && all_session_local(from)
+        && output_stays_local(&delete.output)
 }
 
 /// Short statement name for the error message, e.g. `DELETE`.
@@ -571,6 +656,24 @@ mod tests {
         no("set identity_insert dbo.orders on");
         no("waitfor delay '00:00:01'; delete from dbo.orders");
         no("exec ('delete from dbo.orders')");
+        // OUTPUT … INTO a real table writes it.
+        no("delete from #t output deleted.* into dbo.archive");
+        no("insert into #t output inserted.id into dbo.log values (1)");
+        no("update #t set id = 2 output inserted.id into dbo.log");
+        ok("update #t set id = 2 output inserted.id into #log");
+        // A `#` alias of a real table is not a temp table.
+        no("update #o set total = 0 from dbo.orders as #o");
+        no("update #o set total = 0 from #t join dbo.orders #o on 1 = 1");
+        no("delete #o from #t join dbo.orders #o on 1 = 1");
+        no("delete from #t from #t join dbo.orders o on 1 = 1");
+        // A `#` CTE can stand for a real table.
+        no("with #c as (select * from dbo.orders) update #c set total = 0");
+        no("with #c as (select * from dbo.orders) delete from #c");
+        no("with #c as (select * from dbo.orders) insert into #c select 1");
+        // Sequences advance when read, however the parser sees them.
+        no("select next value for dbo.seq");
+        no("select next /* x */ value\nfor dbo.seq");
+        no("insert into #t select next value for dbo.seq");
         no("exec dbo.sp_help 'x'");
         no("set @n = (select count(*) from openquery(srv, 'select 1'))");
         assert_eq!(
