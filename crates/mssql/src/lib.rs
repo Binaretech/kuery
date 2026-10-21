@@ -191,6 +191,22 @@ const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count
      where transaction_id = (select transaction_id from sys.dm_tran_current_transaction) \
        and database_id <> 2 and database_transaction_log_record_count > 0)";
 
+/// Whether the login may change the current database: a permission that
+/// writes or runs code there, from a fixed role (`db_datawriter`, `db_owner`,
+/// `db_ddladmin`) or granted to it or one of its roles on the database, a
+/// schema or an object. 1 or 0.
+const MAY_WRITE: &str = "select case when has_perms_by_name(db_name(), 'DATABASE', 'INSERT') = 1 \
+       or has_perms_by_name(db_name(), 'DATABASE', 'UPDATE') = 1 \
+       or has_perms_by_name(db_name(), 'DATABASE', 'DELETE') = 1 \
+       or has_perms_by_name(db_name(), 'DATABASE', 'ALTER') = 1 \
+       or has_perms_by_name(db_name(), 'DATABASE', 'EXECUTE') = 1 \
+       or exists (select 1 from sys.database_permissions p \
+                  join sys.database_principals d on d.principal_id = p.grantee_principal_id \
+                  where p.state in ('G', 'W') \
+                    and p.permission_name in ('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'EXECUTE', 'CONTROL', 'TAKE OWNERSHIP') \
+                    and (d.name = user_name() or is_member(d.name) = 1)) \
+     then 1 else 0 end";
+
 /// Why the writes check cannot run, as the connection's notice.
 const UNDETECTED: &str = "Read-only is enforced by Kuery's checks and automatic undo only: grant VIEW SERVER PERFORMANCE STATE to this login, or use a login with only db_datareader, for writes to be refused.";
 
@@ -210,6 +226,9 @@ pub struct Mssql {
     server: String,
     /// Whether the writes check can run (see [`UNDETECTED`]).
     detects_writes: bool,
+    /// Whether the login may write in the database it opened in; without the
+    /// writes check, only such a login gets the notice.
+    may_write: bool,
     /// The session's read-only transaction is open.
     reading: bool,
     /// The database allows snapshot isolation: reads use it, so they do not
@@ -281,6 +300,15 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
                 .await
                 .map(|_| ()),
         )?;
+        let may_write = match detects_writes {
+            true => true,
+            false => {
+                let row = first_row(&mut connection, MAY_WRITE)
+                    .await
+                    .map_err(|error| format!("Could not check for writes: {error}"))?;
+                row.first().cloned().flatten().as_deref() != Some("0")
+            }
+        };
         let snapshot = snapshot_allowed(&mut connection).await?;
         Ok(Box::new(Mssql {
             connection: Some(connection),
@@ -300,6 +328,7 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
                     .as_str(),
             ),
             detects_writes,
+            may_write,
             reading: false,
             snapshot,
             transactions: 0,
@@ -363,10 +392,10 @@ fn probe_verdict(probe: Result<(), tiberius::error::Error>) -> Result<bool, Stri
     }
 }
 
-/// SQL Server errors 300, 297 and 262: the login may not read what the
-/// writes check reads.
+/// SQL Server errors 300, 297, 262 and 229: the login may not read what
+/// the writes check reads.
 fn lacks_permission(code: u32) -> bool {
-    matches!(code, 300 | 297 | 262)
+    matches!(code, 300 | 297 | 262 | 229)
 }
 
 fn connect_error(error: tiberius::error::Error, tls: TlsMode) -> String {
@@ -723,7 +752,7 @@ impl Adapter for Mssql {
     }
 
     fn notice(&self) -> Option<String> {
-        (!self.detects_writes).then(|| UNDETECTED.to_string())
+        (!self.detects_writes && self.may_write).then(|| UNDETECTED.to_string())
     }
 
     /// One call may hold several `GO`-separated batches (the plan text

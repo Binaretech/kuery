@@ -393,6 +393,23 @@ fn notices_when_writes_cannot_be_detected() {
         "{notice:?}"
     );
     assert_eq!(session(target(), Access::ReadOnly).notice(), None);
+    // A login that can only read has nothing to detect.
+    for sql in [
+        "if suser_id('kuery_reader') is null \
+         create login kuery_reader with password = 'Kuery_reader_2026!', check_policy = off",
+        "use master; revoke view server state from kuery_reader; \
+         revoke view server performance state from kuery_reader",
+        "use shop; if user_id('kuery_reader') is null create user kuery_reader for login kuery_reader; \
+         alter role db_datareader add member kuery_reader",
+    ] {
+        run(sa.as_mut(), sql);
+    }
+    let reader = Target {
+        user: "kuery_reader".into(),
+        password: Some("Kuery_reader_2026!".into()),
+        ..target()
+    };
+    assert_eq!(session(reader, Access::ReadOnly).notice(), None);
 
     // Undetected, the write is still undone with the read-only transaction.
     let mut adapter = open(&writer, Access::ReadWrite).unwrap();
@@ -615,7 +632,7 @@ fn statement_timeout_stops_reads_but_not_write_transactions() {
 
 #[test]
 fn only_a_missing_permission_downgrades_the_writes_check() {
-    assert!([300, 297, 262].into_iter().all(lacks_permission));
+    assert!([300, 297, 262, 229].into_iter().all(lacks_permission));
     assert!(![208, 1222, 18456].into_iter().any(lacks_permission));
     assert_eq!(probe_verdict(Ok(())), Ok(true));
     let broken = tiberius::error::Error::Protocol("cut short".into());
