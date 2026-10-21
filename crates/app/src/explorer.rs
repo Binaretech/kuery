@@ -18,15 +18,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel, Render, ScrollStrategy,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle,
-    Window, div, px, uniform_list,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel, Render,
+    ScrollStrategy, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
@@ -184,6 +184,26 @@ pub struct Explorer {
     rows_query: String,
     rows_stale: bool,
     scroll: UniformListScrollHandle,
+    /// The sidebar itself, focused by a click anywhere in it, so its own
+    /// shortcuts (Find in Sidebar) apply there and nowhere else.
+    focus_handle: FocusHandle,
+}
+
+/// What Esc does in the filter field.
+#[derive(Debug, PartialEq, Eq)]
+enum FilterEscape {
+    /// Empty the field and stay in it.
+    Clear,
+    /// Hand the focus back to the sidebar.
+    Leave,
+}
+
+fn filter_escape(text: &str) -> FilterEscape {
+    if text.is_empty() {
+        FilterEscape::Leave
+    } else {
+        FilterEscape::Clear
+    }
 }
 
 impl EventEmitter<ExplorerEvent> for Explorer {}
@@ -232,6 +252,7 @@ impl Explorer {
             rows_query: String::new(),
             rows_stale: true,
             scroll: UniformListScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
         };
         if !explorer.connections.is_empty() {
             explorer.expanded.insert("0".into());
@@ -253,6 +274,28 @@ impl Explorer {
             self.refresh_queries(cx);
         }
         cx.notify();
+    }
+
+    /// Moves the focus to the filter field with its text selected, so typing
+    /// replaces it. The tree is shown first if the sidebar was on another view.
+    pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Explorer {
+            self.set_mode(Mode::Explorer, cx);
+        }
+        self.search.update(cx, |search, cx| {
+            search.focus(window, cx);
+            search.select_all(window, cx);
+        });
+    }
+
+    /// Esc in the filter field empties it, or leaves it once it is empty.
+    fn filter_escaped(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        match filter_escape(&self.search.read(cx).value()) {
+            FilterEscape::Clear => self
+                .search
+                .update(cx, |search, cx| search.clean(window, cx)),
+            FilterEscape::Leave => window.focus(&self.focus_handle, cx),
+        }
     }
 
     /// Collapses every expanded node.
@@ -1722,6 +1765,12 @@ fn compact(n: u64) -> String {
     }
 }
 
+impl Focusable for Explorer {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for Explorer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.mode {
@@ -1798,19 +1847,20 @@ impl Render for Explorer {
             }),
         };
 
+        // The workspace sizes the sidebar and draws its right edge, which
+        // is also the handle that resizes it.
         v_flex()
-            .w(px(256.))
-            .h_full()
-            .flex_shrink_0()
+            .key_context("Explorer")
+            .track_focus(&self.focus_handle)
+            .size_full()
             .bg(color(theme::SIDEBAR))
-            .border_r_1()
-            .border_color(color(theme::HAIRLINE))
             .child(header)
             .when(self.mode == Mode::Explorer, |col| {
                 col.child(
                     div()
                         .px(px(10.))
                         .pb_2()
+                        .on_action(cx.listener(Self::filter_escaped))
                         .child(Input::new(&self.search).small().cleanable(true)),
                 )
             })
@@ -1840,6 +1890,13 @@ mod tests {
         assert_eq!(compact(86), "86");
         assert_eq!(compact(18_204), "18.2k");
         assert_eq!(compact(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn esc_in_the_filter_clears_it_then_leaves_it() {
+        assert_eq!(filter_escape("orders"), FilterEscape::Clear);
+        assert_eq!(filter_escape(" "), FilterEscape::Clear);
+        assert_eq!(filter_escape(""), FilterEscape::Leave);
     }
 
     #[test]

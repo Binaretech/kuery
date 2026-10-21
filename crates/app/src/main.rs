@@ -41,6 +41,7 @@ mod redis_key_tab;
 mod redis_write;
 mod results;
 mod secrets;
+mod settings;
 mod table_tab;
 mod theme;
 mod tunnel;
