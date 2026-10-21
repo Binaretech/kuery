@@ -1184,8 +1184,27 @@ fn reads_do_not_wait_for_uncommitted_rows_where_snapshots_are_allowed() {
     }
     assert_eq!(isolation_level(direct.as_mut()).as_deref(), Some("2"));
 
+    // Moving to another database (`use` in Full write) checks it again.
+    let mut moving = open(&target(), Access::ReadWrite).unwrap();
+    let read_level = |adapter: &mut dyn Adapter| {
+        for statement in MSSQL.transactions.begin_read_only {
+            run(adapter, statement);
+        }
+        let level = isolation_level(adapter);
+        for statement in MSSQL.transactions.end_read_only {
+            run(adapter, statement);
+        }
+        level
+    };
+    assert_eq!(read_level(moving.as_mut()).as_deref(), Some("2"));
+    run(moving.as_mut(), &format!("use {SNAPSHOT_DB}"));
+    assert_eq!(read_level(moving.as_mut()).as_deref(), Some("5"));
+    assert_eq!(isolation_level(moving.as_mut()).as_deref(), Some("2"));
+    run(moving.as_mut(), "use shop");
+    assert_eq!(read_level(moving.as_mut()).as_deref(), Some("2"));
+
     run(writer.as_mut(), "rollback");
-    drop((writer, reader, direct));
+    drop((writer, reader, direct, moving));
     drop_snapshot_db();
 }
 

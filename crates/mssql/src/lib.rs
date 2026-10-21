@@ -234,6 +234,12 @@ pub struct Mssql {
     /// The database allows snapshot isolation: reads use it, so they do not
     /// wait for other sessions' uncommitted rows.
     snapshot: bool,
+    /// The database (`db_id()`) `snapshot` is about; a batch that moves to
+    /// another (`use`) has it read again.
+    database: i64,
+    /// The open read transaction runs at snapshot isolation, to be set back
+    /// when it ends.
+    snapshot_read: bool,
     /// `@@trancount` after the last batch.
     transactions: i64,
     /// A `set showplan_xml on` (or the like) is in force: batches return
@@ -309,7 +315,7 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
                 row.first().cloned().flatten().as_deref() != Some("0")
             }
         };
-        let snapshot = snapshot_allowed(&mut connection).await?;
+        let (database, snapshot) = database_state(&mut connection).await?;
         Ok(Box::new(Mssql {
             connection: Some(connection),
             target: target.clone(),
@@ -331,6 +337,8 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
             may_write,
             reading: false,
             snapshot,
+            database,
+            snapshot_read: false,
             transactions: 0,
             plans_only: false,
             lock_timeout: None,
@@ -369,16 +377,23 @@ async fn connect(target: &Target, lock_timeout: Option<u128>) -> Result<Connecti
     Ok(connection)
 }
 
-/// Whether the current database allows snapshot isolation (`allow_snapshot_isolation
-/// on`; the database's default level is not touched).
-async fn snapshot_allowed(connection: &mut Connection) -> Result<bool, String> {
+/// The current database's `db_id()`, and whether it allows snapshot
+/// isolation (`allow_snapshot_isolation on`; the database's default level is
+/// not touched).
+async fn database_state(connection: &mut Connection) -> Result<(i64, bool), String> {
     let row = first_row(
         connection,
-        "select snapshot_isolation_state from sys.databases where database_id = db_id()",
+        "select db_id(), snapshot_isolation_state from sys.databases where database_id = db_id()",
     )
     .await
     .map_err(|error| error.to_string())?;
-    Ok(row.first().cloned().flatten().as_deref() == Some("1"))
+    let id = row
+        .first()
+        .cloned()
+        .flatten()
+        .and_then(|id| id.parse().ok())
+        .unwrap_or(0);
+    Ok((id, row.get(1).cloned().flatten().as_deref() == Some("1")))
 }
 
 /// Whether the writes check can run, from the probe's result: a login
@@ -494,17 +509,19 @@ async fn stream(
 }
 
 /// What a batch left behind: rows changed by its last statement,
-/// `@@trancount`, and the log records written when asked.
+/// `@@trancount`, the database it ended in, and the log records written
+/// when asked.
 struct After {
     changed: u64,
     transactions: i64,
+    database: i64,
     writes: Option<i64>,
 }
 
 async fn after_batch(connection: &mut Connection, check_writes: bool) -> Result<After, QueryError> {
     let sql = match check_writes {
-        true => format!("select @@rowcount, @@trancount, {WRITES}"),
-        false => "select @@rowcount, @@trancount".into(),
+        true => format!("select @@rowcount, @@trancount, db_id(), {WRITES}"),
+        false => "select @@rowcount, @@trancount, db_id()".into(),
     };
     let row = first_row(connection, &sql).await.map_err(query_error)?;
     let number = |index: usize| -> i64 {
@@ -517,7 +534,8 @@ async fn after_batch(connection: &mut Connection, check_writes: bool) -> Result<
     Ok(After {
         changed: number(0).max(0) as u64,
         transactions: number(1),
-        writes: check_writes.then(|| number(2)),
+        database: number(2),
+        writes: check_writes.then(|| number(3)),
     })
 }
 
@@ -544,15 +562,16 @@ impl Mssql {
         self.reading = false;
         self.transactions = 0;
         self.plans_only = false;
-        let (connection, snapshot) = runtime()
+        self.snapshot_read = false;
+        let (connection, (database, snapshot)) = runtime()
             .block_on(async {
                 let mut connection = connect(&self.target, self.lock_timeout).await?;
-                let snapshot = snapshot_allowed(&mut connection).await?;
-                Ok::<_, String>((connection, snapshot))
+                let state = database_state(&mut connection).await?;
+                Ok::<_, String>((connection, state))
             })
             .map_err(QueryError::Connection)?;
         self.connection = Some(connection);
-        self.snapshot = snapshot;
+        (self.database, self.snapshot) = (database, snapshot);
         Ok(())
     }
 
@@ -581,6 +600,7 @@ impl Mssql {
         let unchanged = After {
             changed: 0,
             transactions: self.transactions,
+            database: self.database,
             writes: None,
         };
         // The read transaction starts at snapshot isolation when the
@@ -671,12 +691,20 @@ impl Mssql {
         self.transactions = after.transactions;
         if begins_reading {
             self.reading = true;
+            self.snapshot_read = self.snapshot;
         }
         // Any rollback ends the read-only transaction.
         if after.transactions == 0 {
             self.reading = false;
         }
-        if was_reading && !self.reading && self.snapshot {
+        if after.database != self.database {
+            let connection = self.connection()?;
+            (self.database, self.snapshot) = runtime()
+                .block_on(database_state(connection))
+                .map_err(QueryError::Connection)?;
+        }
+        if was_reading && !self.reading && self.snapshot_read {
+            self.snapshot_read = false;
             let connection = self.connection()?;
             runtime()
                 .block_on(async {
