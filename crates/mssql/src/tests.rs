@@ -45,7 +45,22 @@ fn run(adapter: &mut dyn Adapter, sql: &str) {
     adapter.execute(sql, &mut Discard).unwrap();
 }
 
-/// A table of its own for a test that writes; `drop_scratch` drops it.
+/// Tests that create or drop things in `shop` (scratch tables, users) run
+/// together, but never while `reads_the_catalog` reads it: the catalog
+/// queries and that DDL can deadlock (1205).
+static SHOP: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn changing_shop() -> std::sync::RwLockReadGuard<'static, ()> {
+    SHOP.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn reading_shop_alone() -> std::sync::RwLockWriteGuard<'static, ()> {
+    SHOP.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A table of its own for a test that writes (holding [`changing_shop`]);
+/// `drop_scratch` drops it.
 fn scratch(name: &str) -> String {
     let table = format!("dbo.scratch_{name}_{}", std::process::id());
     run(
@@ -176,6 +191,7 @@ fn streams_every_result_set() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn counts_rows_changed() {
+    let _shop = changing_shop();
     let table = scratch("count");
     let mut adapter = adapter();
     let changed = adapter.execute(&format!("update {table} set qty = qty + 1"), &mut Discard);
@@ -365,6 +381,7 @@ fn renders_values_like_as_text() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn notices_when_writes_cannot_be_detected() {
+    let _shop = changing_shop();
     let table = scratch("notice");
     let mut sa = adapter();
     for sql in [
@@ -431,6 +448,7 @@ fn notices_when_writes_cannot_be_detected() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn refuses_writes_that_slip_into_read_mode() {
+    let _shop = changing_shop();
     let table = scratch("readonly");
     let mut adapter = adapter();
     let begin = |adapter: &mut dyn Adapter| {
@@ -518,6 +536,7 @@ fn cancels_and_keeps_working() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn cancel_inside_a_write_transaction_says_what_was_lost() {
+    let _shop = changing_shop();
     let table = scratch("lost");
     let mut adapter = adapter();
     run(adapter.as_mut(), "begin transaction");
@@ -567,6 +586,7 @@ fn untrusted_certificate_points_to_the_option() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn lock_timeout_is_reported() {
+    let _shop = changing_shop();
     let table = scratch("lock");
     let mut holder = adapter();
     run(holder.as_mut(), "begin transaction");
@@ -643,6 +663,7 @@ fn only_a_missing_permission_downgrades_the_writes_check() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn a_dropped_connection_ends_the_session_transaction_inside_a_read() {
+    let _shop = changing_shop();
     let table = scratch("dropped");
     let writer = session(target(), Access::ReadWrite);
     drain_all(writer.run_in_transaction(
@@ -694,6 +715,7 @@ fn drain_all(rx: async_channel::Receiver<kuery_core::session::Event>) -> Result<
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn reads_the_catalog() {
+    let _shop = reading_shop_alone();
     use kuery_core::catalog::{ConstraintKind, RoutineKind, TableKind};
     let reader = session(target(), Access::ReadOnly);
     let overview = block_on(reader.overview()).unwrap();
@@ -838,6 +860,7 @@ fn reads_the_catalog() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn a_column_named_with_a_bracket_round_trips_through_edits() {
+    let _shop = changing_shop();
     use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange};
     let table = format!("scratch_bracket_{}", std::process::id());
     let mut sa = adapter();
@@ -889,6 +912,7 @@ fn a_column_named_with_a_bracket_round_trips_through_edits() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn works_like_the_other_drivers() {
+    let _shop = changing_shop();
     kuery_core::conformance::run(&kuery_core::conformance::Fixture {
         opener: Arc::new(|access| open(&target(), access)),
         schema: "dbo".into(),
@@ -993,6 +1017,7 @@ impl Blocking {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn sees_a_blocker() {
+    let _shop = changing_shop();
     let blocking = Blocking::start("blocker");
     let (waiter, update) = blocking.blocked();
     let mut monitor = adapter();
@@ -1297,6 +1322,7 @@ fn a_trailing_go_is_not_sent_to_the_server() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn go_text_cannot_write_inside_the_read_only_transaction() {
+    let _shop = changing_shop();
     let table = scratch("goreadonly");
     let write = format!("update {table} set qty = 0");
     let texts = [
@@ -1324,6 +1350,7 @@ fn go_text_cannot_write_inside_the_read_only_transaction() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn measured_plans_of_writes_are_refused_or_undone() {
+    let _shop = changing_shop();
     let table = scratch("explainwrite");
     let update = format!("update {table} set qty = 0");
     let reader = session(target(), Access::ReadOnly);
@@ -1347,6 +1374,7 @@ fn measured_plans_of_writes_are_refused_or_undone() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn a_refused_batch_does_not_leave_plan_mode_on() {
+    let _shop = changing_shop();
     let table = scratch("planmode");
     let mut adapter = adapter();
     for statement in MSSQL.transactions.begin_read_only {
@@ -1393,6 +1421,7 @@ const ENDLESS: &str = "select a.object_id, b.name from sys.all_objects a \
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn a_dropped_reader_stops_the_statement() {
+    let _shop = changing_shop();
     // Through a session, as the app drops a run's receiver.
     let reader = session(target(), Access::ReadOnly);
     let events = reader.run_read_only(
@@ -1452,6 +1481,7 @@ fn a_dropped_reader_stops_the_statement() {
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn a_plan_inside_a_read_keeps_the_writes_check() {
+    let _shop = changing_shop();
     let table = scratch("planread");
     let mut adapter = adapter();
     for statement in MSSQL.transactions.begin_read_only {
