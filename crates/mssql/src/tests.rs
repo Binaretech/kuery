@@ -1006,10 +1006,9 @@ fn sees_a_blocker() {
     assert_eq!(holder.state, kuery_core::activity::State::IdleInTransaction);
     assert!(holder.transaction_seconds.is_some());
     let activity = monitor.activity().unwrap();
-    assert_eq!(
-        activity.blockers().first().map(|b| b.pid),
-        Some(blocking.holder_pid)
-    );
+    // Other tests of the suite may block each other meanwhile.
+    let roots: Vec<i32> = activity.blockers().iter().map(|b| b.pid).collect();
+    assert!(roots.contains(&blocking.holder_pid), "{roots:?}");
     assert!(
         activity
             .backends
@@ -1194,4 +1193,91 @@ fn reads_keep_the_default_level_where_snapshots_are_not_allowed() {
     for statement in MSSQL.transactions.end_read_only {
         run(direct.as_mut(), statement);
     }
+}
+
+/// How many result sets `sql` streams on `adapter`.
+fn result_sets(adapter: &mut dyn Adapter, sql: &str) -> usize {
+    let mut seen = Seen::default();
+    adapter.execute(sql, &mut seen).unwrap();
+    seen.0.len()
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_trailing_go_is_not_sent_to_the_server() {
+    let mut adapter = adapter();
+    assert_eq!(result_sets(adapter.as_mut(), "select 1\nGO"), 1);
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn go_text_cannot_write_inside_the_read_only_transaction() {
+    let table = scratch("goreadonly");
+    let write = format!("update {table} set qty = 0");
+    let texts = [
+        format!("{write}\nGO\nselect 1\nGO\nselect 2"),
+        format!("select 1\nGO\n{write}\nGO\nselect 2"),
+        format!("select 1\nGO\nselect 2\nGO\n{write}"),
+    ];
+    let mut adapter = adapter();
+    for text in &texts {
+        for statement in MSSQL.transactions.begin_read_only {
+            run(adapter.as_mut(), statement);
+        }
+        let blocked = adapter.execute(text, &mut Discard);
+        assert_eq!(blocked, Err(QueryError::WritesDisabled), "{text}");
+        for statement in MSSQL.transactions.end_read_only {
+            run(adapter.as_mut(), statement);
+        }
+        let sum = scalar(adapter.as_mut(), &format!("select sum(qty) from {table}"));
+        assert_eq!(sum.as_deref(), Some("6"), "{text}");
+    }
+    drop(adapter);
+    drop_scratch(&table);
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn measured_plans_of_writes_are_refused_or_undone() {
+    let table = scratch("explainwrite");
+    let update = format!("update {table} set qty = 0");
+    let reader = session(target(), Access::ReadOnly);
+    let refused = block_on(reader.explain(update.clone(), true, RunOptions::default()));
+    assert!(
+        matches!(refused, Err(QueryError::Rejected(_))),
+        "{refused:?}"
+    );
+
+    let writer = session(target(), Access::ReadWrite);
+    let xml = block_on(writer.explain_and_undo(update, RunOptions::default())).unwrap();
+    let plan = kuery_core::plan::parse(&xml).unwrap();
+    assert!(plan.analyzed);
+    let mut sa = adapter();
+    let sum = scalar(sa.as_mut(), &format!("select sum(qty) from {table}"));
+    assert_eq!(sum.as_deref(), Some("6"));
+    drop(writer);
+    drop_scratch(&table);
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_refused_batch_does_not_leave_plan_mode_on() {
+    let table = scratch("planmode");
+    let mut adapter = adapter();
+    for statement in MSSQL.transactions.begin_read_only {
+        run(adapter.as_mut(), statement);
+    }
+    let blocked = adapter.execute(
+        &format!(
+            "set statistics xml on\nGO\nupdate {table} set qty = 0\nGO\nset statistics xml off"
+        ),
+        &mut Discard,
+    );
+    assert_eq!(blocked, Err(QueryError::WritesDisabled));
+    assert_eq!(result_sets(adapter.as_mut(), "select 1"), 1);
+    for statement in MSSQL.transactions.end_read_only {
+        run(adapter.as_mut(), statement);
+    }
+    drop(adapter);
+    drop_scratch(&table);
 }

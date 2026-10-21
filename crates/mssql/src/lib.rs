@@ -673,21 +673,27 @@ impl Adapter for Mssql {
     /// does); they run in order on this connection, and the last one's
     /// outcome is the call's.
     fn execute(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
-        let batches = match script::statements_in(&MSSQL, sql) {
-            Some(ranges) if ranges.len() > 1 => ranges,
-            _ => return self.run_batch(sql, rows),
+        let ranges = script::statements_in(&MSSQL, sql).unwrap_or_default();
+        let texts: Vec<&str> = match ranges.len() {
+            0 => return self.run_batch(sql, rows),
+            _ => ranges.iter().map(|range| &sql[range.clone()]).collect(),
         };
-        let texts: Vec<&str> = batches.iter().map(|range| &sql[range.clone()]).collect();
         let mut outcome = Ok(0);
         for (index, text) in texts.iter().enumerate() {
             outcome = self.run_batch(text, rows);
-            if matches!(outcome, Err(QueryError::Database { .. })) {
-                // A failed batch must not leave `set showplan_xml on` behind.
-                if let Some(last) = texts[index + 1..].last().filter(|text| turns_off(text)) {
+            if outcome.is_err() {
+                // A failed batch must not leave a mode on (`set showplan_xml
+                // on`) that a closing `set ... off` batch was to end; a lost
+                // or stopped connection starts over without it anyway.
+                let reconnected = matches!(
+                    outcome,
+                    Err(QueryError::Cancelled | QueryError::Connection(_))
+                );
+                if let Some(last) = texts[index + 1..].last().filter(|t| turns_off(t))
+                    && !reconnected
+                {
                     let _ = self.run_batch(last, &mut kuery_core::adapter::Discard);
                 }
-            }
-            if outcome.is_err() {
                 break;
             }
         }
