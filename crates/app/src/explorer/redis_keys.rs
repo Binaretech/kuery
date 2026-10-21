@@ -9,6 +9,7 @@ use gpui_kit::{AnyElement, Task};
 use kuery_core::redis::KeyTree;
 use kuery_redis::DbInfo;
 
+use super::rows::{Row, Tree, error_row, note};
 use super::*;
 use crate::ui::thousands;
 
@@ -217,245 +218,125 @@ impl Explorer {
         }
     }
 
-    pub(super) fn redis_rows(
-        &self,
-        index: usize,
-        db: &RedisDb,
-        keyspace: &Keyspace,
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        let databases = match keyspace {
-            Keyspace::Loading => {
-                rows.push(note_row(1, "Loading databases…", theme::TEXT_TERTIARY));
-                return;
-            }
-            Keyspace::Failed(error) => {
-                rows.push(note_row(1, error.clone(), theme::RED));
-                return;
-            }
-            Keyspace::Loaded(databases) => databases,
-        };
-        let default = db.session.default_db();
-        let shown: Vec<&DbInfo> = databases
-            .iter()
-            .filter(|info| info.keys > 0 || info.index == default)
-            .collect();
-        for info in &shown {
-            self.database_rows(index, info, rows, cx);
-        }
-        let empty = databases.len() - shown.len();
-        if empty > 0 {
-            rows.push(note_row(
-                1,
-                format!(
-                    "{empty} empty database{}",
-                    if empty == 1 { "" } else { "s" }
-                ),
-                theme::TEXT_QUIET,
-            ));
-        }
-    }
-
-    fn database_rows(
-        &self,
-        index: usize,
-        info: &DbInfo,
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        let database = info.index;
-        let expanded = self.expanded.contains(&database_key(index, database));
-        let group = SharedString::from(format!("redis-db-{index}-{database}"));
-        rows.push(
-            tree_row(
-                SharedString::from(format!("redis-db-row-{index}-{database}")),
-                1,
-                Some(expanded),
-                false,
-            )
-            .group(group.clone())
-            .child(
-                Icon::new(AppIcon::Database)
-                    .size(px(13.))
-                    .text_color(color(theme::TEXT_TERTIARY)),
-            )
-            .child(div().flex_1().truncate().child(format!("db{database}")))
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "redis-console-{index}-{database}"
-                    )))
-                    .px_1()
-                    .rounded(px(4.))
-                    .invisible()
-                    .group_hover(group, |s| s.visible())
-                    .text_color(color(theme::TEXT_TERTIARY))
-                    .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
-                    .child(Icon::new(AppIcon::Code).size(px(11.)))
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new("Open console").build(window, cx)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_console(index, database, cx);
-                    })),
-            )
-            .child(counter(compact(info.keys)))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_database(index, database, cx)))
-            .context_menu({
-                let this = cx.entity().downgrade();
-                move |menu, _, _| {
-                    menu.item(item_icon(
-                        "Open Console",
-                        AppIcon::Code,
-                        &this,
-                        move |this, _, cx| this.open_console(index, database, cx),
-                    ))
-                    .item(item_icon(
-                        "Refresh Keys",
-                        AppIcon::Reload,
-                        &this,
-                        move |this, _, cx| {
-                            this.expanded.insert(database_key(index, database));
-                            this.load_keys(index, database, false, cx)
-                        },
-                    ))
-                    .separator()
-                    .item(copy("Copy Name", format!("db{database}")))
-                }
-            })
-            .into_any_element(),
-        );
-        if !expanded {
-            return;
-        }
-        let Some(browser) = self.redis_keys.get(&(index, database)) else {
-            rows.push(note_row(2, "Loading keys…", theme::TEXT_TERTIARY));
-            return;
-        };
-        if let Some(error) = &browser.error {
-            rows.push(note_row(2, error.clone(), theme::RED));
-        }
-        if browser.cursor.is_none() {
-            if browser.loading.is_some() {
-                rows.push(note_row(2, "Loading keys…", theme::TEXT_TERTIARY));
-            }
-            return;
-        }
-        if browser.tree.is_empty() {
-            let text = if browser.pattern.is_some() {
-                "No keys match the filter"
-            } else {
-                "No keys"
-            };
-            rows.push(note_row(2, text, theme::TEXT_TERTIARY));
-        }
-        let auto_expand = browser.pattern.is_some() && browser.tree.count <= AUTO_EXPAND;
-        self.key_rows(
-            index,
-            database,
-            &browser.tree,
-            &mut Vec::new(),
-            2,
-            auto_expand,
-            rows,
-            cx,
-        );
-        if browser.loading.is_some() {
-            rows.push(note_row(2, "Loading more keys…", theme::TEXT_TERTIARY));
-        } else if browser.cursor != Some(0) {
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("redis-more-{index}-{database}")))
-                    .pl(px(26. + 2. * 14.))
-                    .py_1()
-                    .text_size(px(12.))
-                    .text_color(color(0x4da3ff))
-                    .hover(|s| s.text_color(color(0x80bdff)))
-                    .child(format!(
-                        "Load more keys · {} so far",
-                        thousands(browser.tree.count as u64)
-                    ))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.load_keys(index, database, true, cx)
-                        }),
-                    )
-                    .into_any_element(),
-            );
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn key_rows(
+    pub(super) fn database_row(
         &self,
         index: usize,
         database: i64,
-        node: &KeyTree,
-        path: &mut Vec<String>,
-        depth: usize,
-        auto_expand: bool,
-        rows: &mut Vec<AnyElement>,
+        keys: u64,
+        expanded: bool,
         cx: &mut Context<Self>,
-    ) {
-        let children = node.children();
-        for (position, (name, child)) in children.iter().enumerate() {
-            if position == MAX_CHILDREN {
-                rows.push(note_row(
-                    depth,
-                    format!(
-                        "{} more · filter to narrow",
-                        thousands((children.len() - MAX_CHILDREN) as u64)
-                    ),
-                    theme::TEXT_QUIET,
-                ));
-                break;
+    ) -> AnyElement {
+        let group = SharedString::from(format!("redis-db-{index}-{database}"));
+        tree_row(
+            SharedString::from(format!("redis-db-row-{index}-{database}")),
+            1,
+            Some(expanded),
+            false,
+        )
+        .group(group.clone())
+        .child(
+            Icon::new(AppIcon::Database)
+                .size(px(13.))
+                .text_color(color(theme::TEXT_TERTIARY)),
+        )
+        .child(div().flex_1().truncate().child(format!("db{database}")))
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "redis-console-{index}-{database}"
+                )))
+                .px_1()
+                .rounded(px(4.))
+                .invisible()
+                .group_hover(group, |s| s.visible())
+                .text_color(color(theme::TEXT_TERTIARY))
+                .hover(|s| s.bg(color(0x3a3a3e)).text_color(color(theme::TEXT)))
+                .child(Icon::new(AppIcon::Code).size(px(11.)))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("Open console").build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_console(index, database, cx);
+                })),
+        )
+        .child(counter(compact(keys)))
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_database(index, database, cx)))
+        .context_menu({
+            let this = cx.entity().downgrade();
+            move |menu, _, _| {
+                menu.item(item_icon(
+                    "Open Console",
+                    AppIcon::Code,
+                    &this,
+                    move |this, _, cx| this.open_console(index, database, cx),
+                ))
+                .item(item_icon(
+                    "Refresh Keys",
+                    AppIcon::Reload,
+                    &this,
+                    move |this, _, cx| {
+                        this.expanded.insert(database_key(index, database));
+                        this.load_keys(index, database, false, cx)
+                    },
+                ))
+                .separator()
+                .item(copy("Copy Name", format!("db{database}")))
             }
-            path.push(name.to_string());
-            if child.has_children() {
-                let key = folder_key(index, database, path);
-                let open = auto_expand || self.expanded.contains(&key);
-                rows.push(
-                    tree_row(
-                        SharedString::from(format!("redis-folder-{key}")),
-                        depth,
-                        Some(open),
-                        false,
-                    )
-                    .child(
-                        Icon::new(IconName::FolderClosed)
-                            .size(px(13.))
-                            .text_color(color(theme::ACCENT)),
-                    )
-                    .child(div().flex_1().truncate().child(display_segment(name)))
-                    .child(counter(compact(child.count as u64)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx)))
-                    .into_any_element(),
-                );
-                if open {
-                    if let Some(full) = &child.key {
-                        rows.push(self.key_row(index, database, full, full, depth + 1, cx));
-                    }
-                    self.key_rows(
-                        index,
-                        database,
-                        child,
-                        path,
-                        depth + 1,
-                        auto_expand,
-                        rows,
-                        cx,
-                    );
-                }
-            } else if let Some(full) = &child.key {
-                rows.push(self.key_row(index, database, name, full, depth, cx));
-            }
-            path.pop();
-        }
+        })
+        .into_any_element()
     }
 
-    fn key_row(
+    pub(super) fn folder_row(
+        &self,
+        key: &str,
+        name: &str,
+        count: usize,
+        depth: usize,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = key.to_string();
+        tree_row(
+            SharedString::from(format!("redis-folder-{key}")),
+            depth,
+            Some(open),
+            false,
+        )
+        .child(
+            Icon::new(IconName::FolderClosed)
+                .size(px(13.))
+                .text_color(color(theme::ACCENT)),
+        )
+        .child(div().flex_1().truncate().child(display_segment(name)))
+        .child(counter(compact(count as u64)))
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx)))
+        .into_any_element()
+    }
+
+    pub(super) fn more_row(
+        &self,
+        index: usize,
+        database: i64,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(SharedString::from(format!("redis-more-{index}-{database}")))
+            .h(px(28.))
+            .pl(px(26. + 2. * 14.))
+            .text_size(px(12.))
+            .text_color(color(0x4da3ff))
+            .hover(|s| s.text_color(color(0x80bdff)))
+            .child(format!(
+                "Load more keys · {} so far",
+                thousands(count as u64)
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| this.load_keys(index, database, true, cx)))
+            .into_any_element()
+    }
+
+    pub(super) fn key_row(
         &self,
         index: usize,
         database: i64,
@@ -496,6 +377,165 @@ impl Explorer {
     }
 }
 
+/// The rows under an open Redis connection: its databases (the empty ones
+/// counted on one line, but for the default one), and the keys of each
+/// expanded database.
+pub(super) fn redis_rows(
+    index: usize,
+    keyspace: &Keyspace,
+    default: i64,
+    tree: &Tree,
+    rows: &mut Vec<Row>,
+) {
+    let databases = match keyspace {
+        Keyspace::Loading => {
+            rows.push(note(1, "Loading databases…", theme::TEXT_TERTIARY));
+            return;
+        }
+        Keyspace::Failed(error) => {
+            rows.push(error_row(1, error));
+            return;
+        }
+        Keyspace::Loaded(databases) => databases,
+    };
+    let shown: Vec<&DbInfo> = databases
+        .iter()
+        .filter(|info| info.keys > 0 || info.index == default)
+        .collect();
+    for info in &shown {
+        database_rows(index, info, tree, rows);
+    }
+    let empty = databases.len() - shown.len();
+    if empty > 0 {
+        rows.push(note(
+            1,
+            format!(
+                "{empty} empty database{}",
+                if empty == 1 { "" } else { "s" }
+            ),
+            theme::TEXT_QUIET,
+        ));
+    }
+}
+
+fn database_rows(index: usize, info: &DbInfo, tree: &Tree, rows: &mut Vec<Row>) {
+    let database = info.index;
+    let expanded = tree.expanded.contains(&database_key(index, database));
+    rows.push(Row::RedisDatabase {
+        index,
+        database,
+        keys: info.keys,
+        expanded,
+    });
+    if !expanded {
+        return;
+    }
+    let Some(browser) = tree.redis_keys.get(&(index, database)) else {
+        rows.push(note(2, "Loading keys…", theme::TEXT_TERTIARY));
+        return;
+    };
+    if let Some(error) = &browser.error {
+        rows.push(error_row(2, error));
+    }
+    if browser.cursor.is_none() {
+        if browser.loading.is_some() {
+            rows.push(note(2, "Loading keys…", theme::TEXT_TERTIARY));
+        }
+        return;
+    }
+    if browser.tree.is_empty() {
+        let text = if browser.pattern.is_some() {
+            "No keys match the filter"
+        } else {
+            "No keys"
+        };
+        rows.push(note(2, text, theme::TEXT_TERTIARY));
+    }
+    let auto_expand = browser.pattern.is_some() && browser.tree.count <= AUTO_EXPAND;
+    let mut folders = Folders {
+        index,
+        database,
+        expanded: tree.expanded,
+        auto_expand,
+        path: Vec::new(),
+    };
+    folders.rows(&browser.tree, 2, rows);
+    if browser.loading.is_some() {
+        rows.push(note(2, "Loading more keys…", theme::TEXT_TERTIARY));
+    } else if browser.cursor != Some(0) {
+        rows.push(Row::RedisMore {
+            index,
+            database,
+            count: browser.tree.count,
+        });
+    }
+}
+
+/// Walks one database's key tree into rows.
+struct Folders<'a> {
+    index: usize,
+    database: i64,
+    expanded: &'a HashSet<String>,
+    auto_expand: bool,
+    /// The folder being walked, by segment.
+    path: Vec<String>,
+}
+
+impl Folders<'_> {
+    fn rows(&mut self, node: &KeyTree, depth: usize, rows: &mut Vec<Row>) {
+        let (index, database) = (self.index, self.database);
+        let children = node.children();
+        for (position, (name, child)) in children.iter().enumerate() {
+            if position == MAX_CHILDREN {
+                rows.push(note(
+                    depth,
+                    format!(
+                        "{} more · filter to narrow",
+                        thousands((children.len() - MAX_CHILDREN) as u64)
+                    ),
+                    theme::TEXT_QUIET,
+                ));
+                break;
+            }
+            self.path.push(name.to_string());
+            if child.has_children() {
+                let key = folder_key(index, database, &self.path);
+                let open = self.auto_expand || self.expanded.contains(&key);
+                rows.push(Row::RedisFolder {
+                    index,
+                    database,
+                    key,
+                    name: name.to_string(),
+                    count: child.count,
+                    depth,
+                    open,
+                });
+                if open {
+                    if let Some(full) = &child.key {
+                        rows.push(Row::RedisKey {
+                            index,
+                            database,
+                            label: full.clone(),
+                            key: full.clone(),
+                            depth: depth + 1,
+                        });
+                    }
+                    self.rows(child, depth + 1, rows);
+                }
+            } else if let Some(full) = &child.key {
+                rows.push(Row::RedisKey {
+                    index,
+                    database,
+                    label: name.to_string(),
+                    key: full.clone(),
+                    depth,
+                });
+            }
+            self.path.pop();
+        }
+    }
+}
+
 /// An empty segment (`a::b`) is shown so it can be told apart.
 fn display_segment(name: &str) -> String {
     if name.is_empty() {
@@ -508,6 +548,140 @@ fn display_segment(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn databases() -> Keyspace {
+        let info = |index, keys| DbInfo {
+            index,
+            keys,
+            expires: 0,
+        };
+        Keyspace::Loaded(vec![info(0, 0), info(1, 4), info(2, 0), info(3, 0)])
+    }
+
+    /// db1 with `session`, `user:1` (a key and a folder), `user:1:name` and
+    /// `user:2`, read with `pattern`; more pages to read.
+    fn browser(pattern: Option<&str>) -> KeyBrowser {
+        let mut browser = KeyBrowser {
+            cursor: Some(42),
+            pattern: pattern.map(str::to_string),
+            ..KeyBrowser::default()
+        };
+        for key in ["user:2", "session", "user:1:name", "user:1"] {
+            browser.tree.insert(key, DELIMITER);
+        }
+        browser
+    }
+
+    fn rows(expanded: &[&str], browser: Option<KeyBrowser>) -> Vec<Row> {
+        let expanded = expanded.iter().map(|key| key.to_string()).collect();
+        let redis_keys = browser.into_iter().map(|b| ((0, 1), b)).collect();
+        let tree = Tree {
+            expanded: &expanded,
+            redis_keys: &redis_keys,
+            query: "",
+        };
+        let mut rows = Vec::new();
+        redis_rows(0, &databases(), 0, &tree, &mut rows);
+        rows
+    }
+
+    fn database(database: i64, keys: u64, expanded: bool) -> Row {
+        Row::RedisDatabase {
+            index: 0,
+            database,
+            keys,
+            expanded,
+        }
+    }
+
+    /// `name` with `/` between segments.
+    fn folder(name: &str, count: usize, depth: usize, open: bool) -> Row {
+        Row::RedisFolder {
+            index: 0,
+            database: 1,
+            key: format!("0/db1/k:{}", name.replace('/', ":")),
+            name: name.rsplit('/').next().unwrap().into(),
+            count,
+            depth,
+            open,
+        }
+    }
+
+    fn key(label: &str, key: &str, depth: usize) -> Row {
+        Row::RedisKey {
+            index: 0,
+            database: 1,
+            label: label.into(),
+            key: key.into(),
+            depth,
+        }
+    }
+
+    #[test]
+    fn lists_databases_with_keys_and_the_default_one() {
+        assert_eq!(
+            rows(&[], None),
+            [
+                database(0, 0, false),
+                database(1, 4, false),
+                note(1, "2 empty databases", theme::TEXT_QUIET),
+            ]
+        );
+        let failed = Keyspace::Failed("NOAUTH".into());
+        let (expanded, redis_keys) = (HashSet::new(), HashMap::new());
+        let tree = Tree {
+            expanded: &expanded,
+            redis_keys: &redis_keys,
+            query: "",
+        };
+        let mut rows = Vec::new();
+        redis_rows(0, &failed, 0, &tree, &mut rows);
+        assert_eq!(rows, [error_row(1, "NOAUTH")]);
+    }
+
+    #[test]
+    fn an_expanded_database_lists_folders_then_keys() {
+        assert_eq!(
+            rows(&["0/db1"], None)[2],
+            note(2, "Loading keys…", theme::TEXT_TERTIARY)
+        );
+        let more = Row::RedisMore {
+            index: 0,
+            database: 1,
+            count: 4,
+        };
+        assert_eq!(
+            rows(&["0/db1"], Some(browser(None)))[1..],
+            [
+                database(1, 4, true),
+                key("session", "session", 2),
+                folder("user", 3, 2, false),
+                more.clone(),
+                note(1, "2 empty databases", theme::TEXT_QUIET),
+            ]
+        );
+        // `user:1` is both a key and a folder: the key comes first inside.
+        assert_eq!(
+            rows(
+                &["0/db1", "0/db1/k:user", "0/db1/k:user:1"],
+                Some(browser(None))
+            )[2..7],
+            [
+                key("session", "session", 2),
+                folder("user", 3, 2, true),
+                folder("user/1", 2, 3, true),
+                key("user:1", "user:1", 4),
+                key("name", "user:1:name", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_filtered_list_opens_its_folders() {
+        let rows = rows(&["0/db1"], Some(browser(Some("*user*"))));
+        assert!(rows.contains(&key("2", "user:2", 3)));
+        assert!(rows.contains(&key("name", "user:1:name", 4)));
+    }
 
     #[test]
     fn turns_the_filter_into_a_scan_pattern() {

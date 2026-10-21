@@ -139,21 +139,40 @@ fn explorer_frame_cost(cx: &mut TestAppContext) {
         })
     });
 
-    // Every frame renders the explorer again, as hovering a row does.
-    let mut total = Duration::ZERO;
+    // Every frame renders the explorer again, as hovering a row does; after
+    // a change (an expand, a catalog arriving) it also lists the rows again.
+    let (mut redraw, mut rebuild) = (Duration::ZERO, Duration::ZERO);
     cx.update_window(window, |_, window, cx| {
         window.draw(cx).clear(cx);
         for _ in 0..FRAMES {
             let start = Instant::now();
             window.refresh();
             window.draw(cx).clear(cx);
-            total += start.elapsed();
+            redraw += start.elapsed();
+        }
+        for _ in 0..FRAMES {
+            explorer.update(cx, |explorer, _| explorer.rows_stale = true);
+            let start = Instant::now();
+            window.refresh();
+            window.draw(cx).clear(cx);
+            rebuild += start.elapsed();
         }
     })
     .unwrap();
+    // The connection, the schema, two groups and their objects.
+    let rows = explorer.read_with(cx, |explorer, _| explorer.rows.len());
+    assert_eq!(rows, 4 + 2 * OBJECTS);
+    // The list fits the window and scrolls, rather than growing to its rows.
+    let sizes = explorer.read_with(cx, |explorer, _| explorer.scroll.0.borrow().last_item_size);
+    let sizes = sizes.expect("the list was laid out");
+    assert!(sizes.item.height > px(500.) && sizes.item.height < px(900.));
+    assert_eq!(sizes.contents.height, px(29.) * rows as f32);
+    let mean = |total: Duration| total.as_secs_f64() * 1000. / f64::from(FRAMES);
     println!(
-        "explorer frame, {OBJECTS} tables + {OBJECTS} functions open: {:.2} ms (mean of {FRAMES})",
-        total.as_secs_f64() * 1000. / f64::from(FRAMES),
+        "explorer frame, {OBJECTS} tables + {OBJECTS} functions open: {:.2} ms, \
+         {:.2} ms listing the rows again (mean of {FRAMES})",
+        mean(redraw),
+        mean(rebuild),
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
