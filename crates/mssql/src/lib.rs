@@ -555,8 +555,14 @@ impl Mssql {
             let run = async {
                 let streamed = stream(connection, sql, rows).await;
                 // Also after an error: a batch may have written before it.
+                // Rows nobody reads any more (the sink cancelled) are read
+                // and dropped first, by the next query, when reconnecting
+                // would lose a write transaction.
                 let after = match &streamed {
                     Err(QueryError::Database { .. }) | Ok(_) => {
+                        after_batch(connection, check_writes).await
+                    }
+                    Err(QueryError::Cancelled) if loses_writes => {
                         after_batch(connection, check_writes).await
                     }
                     Err(_) => Err(QueryError::Cancelled),
@@ -578,6 +584,15 @@ impl Mssql {
         stop.end();
 
         let (streamed, after) = match ended {
+            // The sink cancelled (its reader went away): stop the statement
+            // rather than let the server stream the rest, which the next
+            // query would have to read first.
+            Ended::Ran(Err(QueryError::Cancelled), _) if !loses_writes => {
+                self.reconnect().map_err(|error| {
+                    QueryError::Connection(format!("Stopped, and could not reconnect: {error}"))
+                })?;
+                return Err(QueryError::Cancelled);
+            }
             Ended::Ran(streamed, after) => (streamed, after),
             stopped => {
                 self.reconnect().map_err(|error| {

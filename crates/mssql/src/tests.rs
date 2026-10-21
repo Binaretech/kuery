@@ -1330,3 +1330,85 @@ fn a_refused_batch_does_not_leave_plan_mode_on() {
     drop(adapter);
     drop_scratch(&table);
 }
+
+/// A sink whose reader goes away after the first row.
+struct GoneAfterFirstRow(bool);
+
+impl RowSink for GoneAfterFirstRow {
+    fn wants_kinds(&self) -> bool {
+        false
+    }
+
+    fn columns(&mut self, _: Vec<String>, _: Option<Vec<ColumnKind>>) -> Result<(), QueryError> {
+        Ok(())
+    }
+
+    fn row(&mut self, _: &[Option<&str>]) -> Result<(), QueryError> {
+        match std::mem::replace(&mut self.0, true) {
+            true => Err(QueryError::Cancelled),
+            false => Ok(()),
+        }
+    }
+}
+
+const ENDLESS: &str = "select a.object_id, b.name from sys.all_objects a \
+                       cross join sys.all_objects b cross join sys.all_objects c";
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_dropped_reader_stops_the_statement() {
+    // Through a session, as the app drops a run's receiver.
+    let reader = session(target(), Access::ReadOnly);
+    let events = reader.run_read_only(
+        ENDLESS.into(),
+        RunOptions {
+            first_batch_rows: 100,
+            ..RunOptions::default()
+        },
+    );
+    loop {
+        match block_on(events.recv()).unwrap() {
+            kuery_core::session::Event::Batch(_) => break,
+            kuery_core::session::Event::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    drop(events);
+    let started = Instant::now();
+    let set = block_on(reader.fetch_all("select 1".into(), RunOptions::default())).unwrap();
+    assert_eq!(set.cell(0, 0), Some(Some("1")));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // In a write transaction the rest is read instead, keeping it.
+    let table = scratch("gone");
+    let mut writer = adapter();
+    run(writer.as_mut(), "begin transaction");
+    run(
+        writer.as_mut(),
+        &format!("update {table} set qty = 7 where id = 1"),
+    );
+    let gone = writer.execute(
+        &format!("select top 50000 a.object_id from {table} cross join sys.all_objects a cross join sys.all_objects b"),
+        &mut GoneAfterFirstRow(false),
+    );
+    assert_eq!(gone, Err(QueryError::Cancelled));
+    assert_eq!(
+        scalar(writer.as_mut(), "select @@trancount").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        scalar(
+            writer.as_mut(),
+            &format!("select qty from {table} where id = 1")
+        )
+        .as_deref(),
+        Some("7")
+    );
+    run(writer.as_mut(), "rollback");
+    drop(writer);
+    drop_scratch(&table);
+}
