@@ -171,11 +171,11 @@ impl Browse {
         }
 
         let page_size = self.page_size.max(1);
-        sql.push_str(&self.dialect.page(
-            !order.is_empty(),
-            page_size as u64,
-            (self.page * page_size) as u64,
-        ));
+        sql.push_str(
+            &self
+                .dialect
+                .page(!order.is_empty(), page_size, self.page * page_size),
+        );
         Ok(sql)
     }
 

@@ -40,18 +40,17 @@ pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> 
         if from < separator_end {
             continue;
         }
-        if let (Some(separator), Token::Word(word)) = (dialect.batch_separator, &token.token) {
-            if word.quote_style.is_none()
-                && word.value.eq_ignore_ascii_case(separator)
-                && let Some(line_end) = separator_line(sql, from, to)
-            {
-                if let (Some(start), true) = (start, has_code) {
-                    ranges.push(start..end);
-                }
-                (start, has_code) = (None, false);
-                separator_end = line_end;
-                continue;
+        if let (Some(separator), Token::Word(word)) = (dialect.batch_separator, &token.token)
+            && word.quote_style.is_none()
+            && word.value.eq_ignore_ascii_case(separator)
+            && let Some(line_end) = separator_line(sql, from, to)
+        {
+            if let (Some(start), true) = (start, has_code) {
+                ranges.push(start..end);
             }
+            (start, has_code) = (None, false);
+            separator_end = line_end;
+            continue;
         }
         match &token.token {
             Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab) => {}
