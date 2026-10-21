@@ -266,6 +266,7 @@ impl WorkspaceView {
                 .iter()
                 .any(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
             {
+                view.update(cx, |view, _| view.flush_sidebar_width());
                 return true;
             }
             window.defer(cx, move |window, cx| {
@@ -273,6 +274,13 @@ impl WorkspaceView {
             });
             false
         });
+
+        // Quitting drops the windows with any save still pending.
+        cx.on_app_quit(|this, _| {
+            this.flush_sidebar_width();
+            async {}
+        })
+        .detach();
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
@@ -762,6 +770,7 @@ impl WorkspaceView {
             .filter(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
             .count();
         if open == 0 {
+            self.flush_sidebar_width();
             window.remove_window();
             return;
         }
@@ -780,8 +789,9 @@ impl WorkspaceView {
             &["Roll Back and Close", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(0) = answer.await {
+                this.update(cx, |this, _| this.flush_sidebar_width()).ok();
                 cx.update(|window, _| window.remove_window()).ok();
             }
         })
@@ -930,6 +940,16 @@ impl WorkspaceView {
         self.explorer
             .update(cx, |explorer, cx| explorer.focus_filter(window, cx));
         cx.notify();
+    }
+
+    /// Writes the sidebar's width now if a save is still waiting, before the
+    /// window closes or the app quits and the waiting save is dropped.
+    fn flush_sidebar_width(&mut self) {
+        if self.sidebar_width_save.take().is_some()
+            && let Err(error) = settings::set_sidebar_width(f32::from(self.sidebar_width))
+        {
+            eprintln!("kuery: could not save the sidebar width: {error}");
+        }
     }
 
     /// Follows the sidebar's right edge while it is dragged.
