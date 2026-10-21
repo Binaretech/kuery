@@ -1,0 +1,13 @@
+[package]
+name = "kuery-mssql"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiberius.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+sqlparser.workspace = true
+futures.workspace = true

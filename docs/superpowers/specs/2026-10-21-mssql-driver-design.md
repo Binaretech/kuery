@@ -253,3 +253,146 @@ PostgreSQL and are new work for this driver.
 Exact SQL of catalog queries, type-to-text styles per type (within the rule
 above), crate/module layout inside `kuery-mssql`, how the showplan XML maps
 onto existing `Node` fields, test fixtures.
+
+## Spike results
+
+Run on 2026-10-21 against `mcr.microsoft.com/mssql/server:2022-latest`
+(16.0.4305.5, Developer, Linux, amd64 under emulation) on `localhost:14339`
+with the code in `crates/mssql/examples/spike.rs`
+(`cargo run -p kuery-mssql --example spike -- cancel|cancel2|socket|write|values|astext|tls|parse`).
+
+### Library and TLS
+
+- **`tiberius = 0.13.0`**, `default-features = false`, features
+  `tds73`, `rustls`, `sql-browser-tokio`; plus `tokio-util` with `compat`
+  (`TcpStream::compat_write()`). 0.12.3 was rejected: its `rustls` feature uses
+  rustls 0.21 (a second TLS stack) and it has no cancel call.
+- **TLS backend: rustls 0.23.** `cargo tree -p kuery-mssql -d | grep rustls`
+  shows no duplicate rustls; the whole workspace has one `rustls 0.23.46`.
+  tiberius' `tokio-rustls` keeps its default `aws_lc_rs` feature, so
+  `aws-lc-sys` is in the build graph, but it already was (polars via reqwest,
+  `kuery-files`); it adds no new native requirement. With the workspace's
+  `ring` feature also on, rustls still negotiates without anyone installing a
+  default provider (verified, TLS connects). No need for `native-tls`.
+- `Config`: `trust_cert()` + `EncryptionLevel::Required` connected and
+  `sys.dm_exec_connections.encrypt_option` was `TRUE`.
+  `@@version` reads fine at connect.
+- `sqlparser` 0.63 `MsSqlDialect` **parses `waitfor delay '00:00:20'`** (to
+  `Statement::WaitFor`), alone and followed by `; select 1`. So no
+  substitute slow statement is needed for tests (a cross join over
+  `sys.all_objects` also ran > 5 s and was stopped; see below).
+
+### Cancel: drop the socket and reconnect
+
+- **tiberius 0.13.0 has `Client::cancel_query()` (TDS attention), but it
+  cannot be used.** After the statement future is dropped (select on a
+  `Notify` at 300 ms), `cancel_query` sends the attention and the server does
+  stop the statement (no `WAITFOR` request left), yet `cancel_query` returns
+  `Err(Protocol("Never got a DONE token acknowledging the Attention
+  signal."))` in 1 to 20 ms, and the connection is left **one response behind**:
+  the next query returns zero result sets and every following query returns the
+  previous query's rows (`select 100`, `select 200`, `select 300` came back as
+  0 sets, `100`, `200`). A second `cancel_query` returns `Ok` but does not fix
+  it. Same for all four cases tried (waitfor; `select 1; waitfor`; slow
+  aggregate; slow select streaming rows, which took 851 ms to drain first).
+  A desynchronised connection that returns wrong rows is worse than a lost
+  one, so attention through tiberius is **rejected**.
+- **Chosen: drop the client and socket, then connect again.** The adapter
+  runs each statement under a `select!` against a cancel signal; on cancel it
+  drops the `Client` and opens a new one in place.
+  - The server session goes away by itself: 8 to 50 ms after the drop for
+    `waitfor`; 30 ms for a slow aggregate `select` that has sent no rows;
+    ~30 to 50 ms with an open write transaction. Checked from a second
+    connection with `select count(*) from sys.dm_exec_sessions where
+    session_id = <old spid>` returning `0`. No `KILL` and no
+    `ALTER ANY CONNECTION` needed.
+  - **The old connection is unusable; a fresh connect is needed.** Reconnect
+    (TCP + TLS + login) took **12 to 34 ms** on localhost (emulated server).
+    The new session has a new `@@spid`.
+  - An open write transaction is lost: after the drop, the table created
+    inside the transaction was not there (`0` in `sys.tables`) and its
+    session was gone. Session state (temp tables, `set` options, `use`) is
+    lost too; the adapter must replay its `set lock_timeout` after reconnect.
+
+### Write detection (read-only second layer)
+
+Query, run in the same connection and transaction:
+
+```sql
+select coalesce(sum(database_transaction_log_record_count), 0)
+from sys.dm_tran_database_transactions
+where transaction_id = (select transaction_id from sys.dm_tran_current_transaction)
+  and database_id <> 2
+```
+
+| Step in an open transaction | Result |
+| --- | --- |
+| `select * into #t from sys.objects` | `0` |
+| `create table dbo.spike (i int)` | `20` |
+| after `rollback`, `dbo.spike` exists? | no (DDL is transactional) |
+| `select count(*) from dbo.spike` | `0` |
+| `insert into dbo.spike values (1)` | `2` |
+
+Temp-table work (tempdb, `database_id = 2`) is invisible to it, so `#t`,
+`declare` and `select … into #t` stay allowed without special cases; real
+writes, DDL included, are visible right after the statement. The value is
+`bigint` (`I64`). Writes are detectable; the layer is feasible.
+
+### `as_text` and value text
+
+No single expression gives the right text for every type:
+
+- `convert(nvarchar(max), x, 126)` is right for all types except **xml**
+  (error 6358, style not valid) and **binary** (`varbinary`: reinterprets the
+  bytes as UTF-16 garbage, e.g. `0x00FF10` becomes `"\u{ff00}\u{10}"`). Style
+  121 is worse (float loses digits: `0.123457`; money gets thousands commas).
+- `sql_variant_property(cast(x as sql_variant), 'BaseType')` cannot be used to
+  pick a style: it errors for `nvarchar(max)`, `varbinary(max)`, `varchar(max)`
+  and `xml`.
+- `format()`, `concat()` and a plain `cast` fail or give non-ISO dates
+  (`Oct 21 2026  1:45PM`) or 6-digit floats.
+
+**Decision: `Dialect::as_text` for MSSQL is**
+
+```sql
+coalesce(try_convert(nvarchar(max), {expr}, 126), convert(nvarchar(max), {expr}))
+```
+
+`try_convert` turns the xml error into `NULL`, and the fallback then gives the
+xml text (`<a x="1"><b/></a>`). `NULL` stays `NULL`. This is correct for every
+type except binary. **Binary columns must not be compared through `as_text`**:
+the adapter shows them as `0x` plus uppercase hex (what style 1 gives), which
+`as_text` cannot produce without knowing the type. The staged-edit check
+(`edit.rs`) and the `like` filter (`browse.rs`) are the two users; for binary
+columns the edit check should be skipped or key-only (a catalog column type is
+available there), and the filter on a binary column is not offered.
+
+Rendering rule per tiberius `ColumnData` variant so that the adapter's text is
+byte for byte what style 126 gives (checked against the server for each row
+below, including `NULL` giving `None`):
+
+| SQL type | tiberius value | Text rule | Example |
+| --- | --- | --- | --- |
+| `tinyint` | `U8` | decimal | `7` |
+| `smallint` / `int` / `bigint` | `I16` / `I32` / `I64` | decimal | `-42` |
+| `bit` | `Bit` | `1` / `0` | `1` |
+| `decimal` / `numeric` | `Numeric` | `Display`, keeps scale (also `-0.05`, 38 digits) | `12345.60` |
+| `money` / `smallmoney` | `F64` | `format!("{:.4}")` (4 decimals; precision beyond f64 is lost above about 10^11, accepted) | `1234.5000` |
+| `float` | `F64` | `{:.15e}`, exponent as sign plus 3 digits | `1.000000000000000e-001` |
+| `real` | `F32` | `{:.7e}` of the f32, exponent as sign plus 3 digits | `1.0000000e-001` |
+| `date` | `Date(days)` | days since 0001-01-01 to `YYYY-MM-DD` | `2026-10-21` |
+| `time(n)` | `Time{increments, scale}` | `increments` is in 10^-scale s; `HH:MM:SS`, plus `.` and exactly `scale` digits when `scale > 0` | `13:45:09.1234567`, `13:45:09.120` (scale 3), `13:45:09` (scale 0) |
+| `smalldatetime` | `SmallDateTime{days, minutes}` | days since 1900-01-01; `minutes` since midnight; seconds are always `:00` | `2026-10-21T13:45:00` |
+| `datetime` | `DateTime{days, seconds_fragments}` | days since 1900-01-01; fragments are 1/300 s; seconds = fragments / 300, milliseconds = round((fragments % 300) * 10 / 3); always 3 ms digits | `2026-10-21T13:45:09.123`, `.007` |
+| `datetime2(n)` | `DateTime2{date, time}` | `date` + `T` + time rule (scale digits) | `2026-10-21T13:45:09.1234567`, scale 0: `…:09` |
+| `datetimeoffset(n)` | `DateTimeOffset{datetime2, offset}` | the stored time is **UTC**; add `offset` minutes to get local, then datetime2 rule, then `+HH:MM` / `-HH:MM` (`+00:00` for zero) | `2026-10-21T13:45:09.1234567+05:30`, `…T03:15:09.5-08:00` |
+| `uniqueidentifier` | `Guid` | hyphenated **uppercase** (`uuid` prints lowercase) | `6F9619FF-8B86-D011-B42D-00C04FC964FF` |
+| `char` / `varchar` / `nchar` / `nvarchar` / `text` | `String` | as is | `héllo` |
+| `binary` / `varbinary` / `image` | `Binary` | `0x` + uppercase hex; not comparable with `as_text` (see above) | `0x00FF10` |
+| `xml` | `Xml(XmlData{data, ..})` | `data` as is | `<a x="1"><b/></a>` |
+
+The `float` / `real` / `money` rules are the fragile ones: they only agree
+with the server when Rust and SQL Server round the last digit the same way
+(true for every value tried: `0.1`, `1.5e20`, `0.1234567890123456…`). Task 2
+or 3 should add a test with the values above and a few random floats against
+the Docker server, as the design already requires for each type.
