@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::script;
 
+mod showplan;
+
 /// PostgreSQL's block size, for turning buffer counts into bytes.
 pub const BLOCK_BYTES: u64 = 8 * 1024;
 
@@ -169,6 +171,10 @@ pub enum InsightKind {
     Hottest,
     /// The plan is estimated, not measured.
     Estimated,
+    /// SQL Server suggests an index that does not exist.
+    MissingIndex,
+    /// A warning the database put in the plan.
+    Warning,
 }
 
 /// Something worth knowing about a plan.
@@ -232,8 +238,12 @@ impl Plan {
     }
 }
 
-/// Reads PostgreSQL's `EXPLAIN (FORMAT JSON)` output: `[{"Plan": …}]`.
+/// Reads PostgreSQL's `EXPLAIN (FORMAT JSON)` output: `[{"Plan": …}]`, or
+/// SQL Server's showplan XML (what starts with `<`).
 pub fn parse(json: &str) -> Result<Plan, String> {
+    if json.trim_start().starts_with('<') {
+        return showplan::parse(json);
+    }
     let value: Value =
         serde_json::from_str(json.trim()).map_err(|error| format!("Not a JSON plan: {error}"))?;
     let top = match &value {
@@ -642,7 +652,7 @@ fn insights(plan: &Plan) -> Vec<Insight> {
                     .into(),
             });
         }
-        if node.node_type == "Nested Loop"
+        if matches!(node.node_type.as_str(), "Nested Loop" | "Nested Loops")
             && let Some(inner) = node.children.get(1)
             && let Some(actual) = inner.actual
             && actual.loops >= MANY_LOOPS

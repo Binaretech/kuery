@@ -4047,6 +4047,7 @@ dependencies = [
  "arrow-array",
  "async-channel",
  "futures",
+ "roxmltree 0.21.1",
  "serde_json",
  "sqlformat",
  "sqlparser 0.63.0",
