@@ -878,3 +878,112 @@ fn works_like_the_other_drivers() {
         slow_query: "waitfor delay '00:00:20'; select 1".into(),
     });
 }
+
+/// A scratch database that allows snapshot isolation but does not use it by
+/// default, with one row (id 1, qty 1) in `t`.
+const SNAPSHOT_DB: &str = "kuery_snapshot";
+
+fn create_snapshot_db() {
+    let mut sa = adapter();
+    drop_snapshot_db();
+    run(sa.as_mut(), &format!("create database {SNAPSHOT_DB}"));
+    run(
+        sa.as_mut(),
+        &format!(
+            "alter database {SNAPSHOT_DB} set allow_snapshot_isolation on; \
+             alter database {SNAPSHOT_DB} set read_committed_snapshot off with rollback immediate"
+        ),
+    );
+    let mut inside = open(
+        &Target {
+            database: SNAPSHOT_DB.into(),
+            ..target()
+        },
+        Access::ReadWrite,
+    )
+    .unwrap();
+    run(
+        inside.as_mut(),
+        "create table t (id int primary key, qty int); insert into t values (1, 1)",
+    );
+}
+
+fn drop_snapshot_db() {
+    run(
+        adapter().as_mut(),
+        &format!(
+            "if db_id('{SNAPSHOT_DB}') is not null begin \
+             alter database {SNAPSHOT_DB} set single_user with rollback immediate; \
+             drop database {SNAPSHOT_DB} end"
+        ),
+    );
+}
+
+fn isolation_level(adapter: &mut dyn Adapter) -> Option<String> {
+    scalar(
+        adapter,
+        "select transaction_isolation_level from sys.dm_exec_sessions where session_id = @@spid",
+    )
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn reads_do_not_wait_for_uncommitted_rows_where_snapshots_are_allowed() {
+    create_snapshot_db();
+    let inside = Target {
+        database: SNAPSHOT_DB.into(),
+        ..target()
+    };
+    let mut writer = open(&inside, Access::ReadWrite).unwrap();
+    run(writer.as_mut(), "begin transaction");
+    run(writer.as_mut(), "update t set qty = 2 where id = 1");
+
+    let reader = session(inside.clone(), Access::ReadOnly);
+    let options = RunOptions {
+        lock_timeout: Duration::from_secs(2),
+        ..RunOptions::default()
+    };
+    let started = Instant::now();
+    let rows = block_on(reader.fetch_all("select qty from t where id = 1".into(), options));
+    assert_eq!(rows.unwrap().cell(0, 0), Some(Some("1")));
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // Snapshot only while the read transaction is open.
+    let mut direct = open(&inside, Access::ReadOnly).unwrap();
+    assert_eq!(isolation_level(direct.as_mut()).as_deref(), Some("2"));
+    for statement in MSSQL.transactions.begin_read_only {
+        run(direct.as_mut(), statement);
+    }
+    assert_eq!(isolation_level(direct.as_mut()).as_deref(), Some("5"));
+    for statement in MSSQL.transactions.end_read_only {
+        run(direct.as_mut(), statement);
+    }
+    assert_eq!(isolation_level(direct.as_mut()).as_deref(), Some("2"));
+
+    run(writer.as_mut(), "rollback");
+    drop((writer, reader, direct));
+    drop_snapshot_db();
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn reads_keep_the_default_level_where_snapshots_are_not_allowed() {
+    // `shop` reads committed rows through row versions (RCSI), but does not
+    // allow snapshot isolation.
+    let mut direct = open(&target(), Access::ReadOnly).unwrap();
+    assert_eq!(
+        scalar(
+            direct.as_mut(),
+            "select snapshot_isolation_state from sys.databases where database_id = db_id()"
+        )
+        .as_deref(),
+        Some("0")
+    );
+    for statement in MSSQL.transactions.begin_read_only {
+        run(direct.as_mut(), statement);
+    }
+    assert_eq!(isolation_level(direct.as_mut()).as_deref(), Some("2"));
+    for statement in MSSQL.transactions.end_read_only {
+        run(direct.as_mut(), statement);
+    }
+}

@@ -184,6 +184,11 @@ const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count
 /// Why the writes check cannot run, as the connection's notice.
 const UNDETECTED: &str = "Read-only is enforced by Kuery's checks and automatic undo only: grant VIEW SERVER PERFORMANCE STATE to this login, or use a login with only db_datareader, for writes to be refused.";
 
+/// The isolation level of read transactions on a database that allows
+/// snapshots, and the one writes (and everything else) run at.
+const SNAPSHOT: &str = "set transaction isolation level snapshot";
+const READ_COMMITTED: &str = "set transaction isolation level read committed";
+
 /// What a dropped connection takes with it inside a write transaction.
 const LOST: &str = "the open transaction and its uncommitted changes were lost";
 
@@ -197,6 +202,9 @@ pub struct Mssql {
     detects_writes: bool,
     /// The session's read-only transaction is open.
     reading: bool,
+    /// The database allows snapshot isolation: reads use it, so they do not
+    /// wait for other sessions' uncommitted rows.
+    snapshot: bool,
     /// `@@trancount` after the last batch.
     transactions: i64,
     /// Replayed on every new connection.
@@ -260,6 +268,7 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
                 .await
                 .map(|_| ()),
         )?;
+        let snapshot = snapshot_allowed(&mut connection).await?;
         Ok(Box::new(Mssql {
             connection: Some(connection),
             target: target.clone(),
@@ -279,6 +288,7 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
             ),
             detects_writes,
             reading: false,
+            snapshot,
             transactions: 0,
             lock_timeout: None,
             statement_timeout: None,
@@ -314,6 +324,18 @@ async fn connect(target: &Target, lock_timeout: Option<u128>) -> Result<Connecti
         .await
         .map_err(|error| error.to_string())?;
     Ok(connection)
+}
+
+/// Whether the current database allows snapshot isolation (`allow_snapshot_isolation
+/// on`; the database's default level is not touched).
+async fn snapshot_allowed(connection: &mut Connection) -> Result<bool, String> {
+    let row = first_row(
+        connection,
+        "select snapshot_isolation_state from sys.databases where database_id = db_id()",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(row.first().cloned().flatten().as_deref() == Some("1"))
 }
 
 /// Whether the writes check can run, from the probe's result: a login
@@ -478,10 +500,15 @@ impl Mssql {
         self.connection = None;
         self.reading = false;
         self.transactions = 0;
-        let connection = runtime()
-            .block_on(connect(&self.target, self.lock_timeout))
+        let (connection, snapshot) = runtime()
+            .block_on(async {
+                let mut connection = connect(&self.target, self.lock_timeout).await?;
+                let snapshot = snapshot_allowed(&mut connection).await?;
+                Ok::<_, String>((connection, snapshot))
+            })
             .map_err(QueryError::Connection)?;
         self.connection = Some(connection);
+        self.snapshot = snapshot;
         Ok(())
     }
 
@@ -525,6 +552,14 @@ impl Adapter for Mssql {
         // Write transactions never time out: that would drop them.
         let timeout = self.statement_timeout.filter(|_| !loses_writes);
         let stop = self.stop.clone();
+        let was_reading = self.reading;
+        // The read transaction starts at snapshot isolation when the
+        // database allows it; the level lasts until the transaction ends.
+        let sql = match begins_reading && self.snapshot {
+            true => format!("{SNAPSHOT}; {sql}"),
+            false => sql.to_string(),
+        };
+        let sql = sql.as_str();
         let connection = self.connection()?;
 
         stop.start();
@@ -593,6 +628,18 @@ impl Adapter for Mssql {
         // Any rollback ends the read-only transaction.
         if after.transactions == 0 {
             self.reading = false;
+        }
+        if was_reading && !self.reading && self.snapshot {
+            let connection = self.connection()?;
+            runtime()
+                .block_on(async {
+                    connection
+                        .simple_query(READ_COMMITTED)
+                        .await?
+                        .into_results()
+                        .await
+                })
+                .map_err(query_error)?;
         }
         if after.writes.is_some_and(|writes| writes > 0) {
             let undo = format!(
