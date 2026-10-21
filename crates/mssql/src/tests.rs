@@ -1412,3 +1412,39 @@ fn a_dropped_reader_stops_the_statement() {
     drop(writer);
     drop_scratch(&table);
 }
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_plan_inside_a_read_keeps_the_writes_check() {
+    let table = scratch("planread");
+    let mut adapter = adapter();
+    for statement in MSSQL.transactions.begin_read_only {
+        run(adapter.as_mut(), statement);
+    }
+    let plan = (MSSQL.explain.unwrap())(&format!("select * from {table}"), false).unwrap();
+    let mut seen = Seen::default();
+    adapter.execute(&plan, &mut seen).unwrap();
+    assert!(seen.0.iter().any(|(_, rows)| {
+        rows.iter()
+            .flatten()
+            .flatten()
+            .any(|cell| cell.contains("ShowPlanXML"))
+    }));
+    // Still in the read-only transaction, still checked.
+    let blocked = adapter.execute(&format!("update {table} set qty = 0"), &mut Discard);
+    assert_eq!(blocked, Err(QueryError::WritesDisabled));
+    for statement in MSSQL.transactions.end_read_only {
+        run(adapter.as_mut(), statement);
+    }
+    drop(adapter);
+    drop_scratch(&table);
+}
+
+#[test]
+fn plan_modes_are_read_from_their_set_batches() {
+    assert_eq!(plan_mode("set showplan_xml on"), Some(true));
+    assert_eq!(plan_mode(" SET NOEXEC OFF; "), Some(false));
+    assert_eq!(plan_mode("set statistics xml on"), None);
+    assert_eq!(plan_mode("set showplan_xml on; select 1"), None);
+    assert_eq!(plan_mode("select 1"), None);
+}

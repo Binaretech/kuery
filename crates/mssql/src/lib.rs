@@ -217,6 +217,9 @@ pub struct Mssql {
     snapshot: bool,
     /// `@@trancount` after the last batch.
     transactions: i64,
+    /// A `set showplan_xml on` (or the like) is in force: batches return
+    /// plans instead of running, the after-batch check included.
+    plans_only: bool,
     /// Replayed on every new connection.
     lock_timeout: Option<u128>,
     statement_timeout: Option<Duration>,
@@ -300,6 +303,7 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
             reading: false,
             snapshot,
             transactions: 0,
+            plans_only: false,
             lock_timeout: None,
             statement_timeout: None,
             stop: Arc::default(),
@@ -510,6 +514,7 @@ impl Mssql {
         self.connection = None;
         self.reading = false;
         self.transactions = 0;
+        self.plans_only = false;
         let (connection, snapshot) = runtime()
             .block_on(async {
                 let mut connection = connect(&self.target, self.lock_timeout).await?;
@@ -541,6 +546,14 @@ impl Mssql {
         let timeout = self.statement_timeout.filter(|_| !loses_writes);
         let stop = self.stop.clone();
         let was_reading = self.reading;
+        // Under a plan mode the after-batch check would only return its
+        // plan; nothing ran, so nothing changed.
+        let plans_only = plan_mode(sql).unwrap_or(self.plans_only);
+        let unchanged = After {
+            changed: 0,
+            transactions: self.transactions,
+            writes: None,
+        };
         // The read transaction starts at snapshot isolation when the
         // database allows it; the level lasts until the transaction ends.
         let sql = match begins_reading && self.snapshot {
@@ -559,6 +572,7 @@ impl Mssql {
                 // and dropped first, by the next query, when reconnecting
                 // would lose a write transaction.
                 let after = match &streamed {
+                    Err(QueryError::Database { .. }) | Ok(_) if plans_only => Ok(unchanged),
                     Err(QueryError::Database { .. }) | Ok(_) => {
                         after_batch(connection, check_writes).await
                     }
@@ -624,6 +638,7 @@ impl Mssql {
             }
         };
 
+        self.plans_only = plans_only;
         self.transactions = after.transactions;
         if begins_reading {
             self.reading = true;
@@ -659,6 +674,26 @@ impl Mssql {
         // Rows changed, as `@@rowcount` tells for the last statement; none for
         // a batch that returns rows.
         streamed.map(|returned| if returned { 0 } else { after.changed })
+    }
+}
+
+/// The plan mode a batch turns on (`Some(true)`) or off: `set showplan_xml`,
+/// `showplan_all`, `showplan_text` or `noexec`, under which statements are
+/// compiled but not run.
+fn plan_mode(batch: &str) -> Option<bool> {
+    let batch = batch.trim().trim_end_matches(';').to_lowercase();
+    let words: Vec<&str> = batch.split_whitespace().collect();
+    match words.as_slice() {
+        [
+            "set",
+            "showplan_xml" | "showplan_all" | "showplan_text" | "noexec",
+            state,
+        ] => match *state {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
