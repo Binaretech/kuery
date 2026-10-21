@@ -445,6 +445,94 @@ fn notices_when_writes_cannot_be_detected() {
     drop_scratch(&table);
 }
 
+/// The notice a login without the writes check gets, after `setup` (run as
+/// `sa` in `shop`, with `{user}` for the user) on top of `db_datareader`;
+/// `cleanup` undoes what `setup` made before the user and login go.
+fn notice_for(login: &str, setup: &[&str], cleanup: &[&str]) -> Option<String> {
+    let mut sa = adapter();
+    let password = format!("{login}_Pw_2026!");
+    let drop_user = format!("use shop; if user_id('{login}') is not null drop user {login}");
+    let tidy = |sa: &mut dyn Adapter| {
+        for sql in cleanup {
+            let _ = sa.execute(
+                &format!("use shop; {}", sql.replace("{user}", login)),
+                &mut Discard,
+            );
+        }
+        run(sa, &drop_user);
+        drop_login(sa, login);
+    };
+    tidy(sa.as_mut());
+    run(
+        sa.as_mut(),
+        &format!("create login {login} with password = '{password}', check_policy = off"),
+    );
+    run(
+        sa.as_mut(),
+        &format!(
+            "use shop; create user {login} for login {login}; \
+             alter role db_datareader add member {login}"
+        ),
+    );
+    for sql in setup {
+        run(
+            sa.as_mut(),
+            &format!("use shop; {}", sql.replace("{user}", login)),
+        );
+    }
+    let limited = Target {
+        user: login.into(),
+        password: Some(password),
+        ..target()
+    };
+    let notice = open(&limited, Access::ReadOnly).unwrap().notice();
+    tidy(sa.as_mut());
+    notice
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn the_notice_shows_for_every_login_that_can_write() {
+    let _shop = changing_shop();
+    assert_eq!(notice_for("kuery_n_reader", &[], &[]), None);
+    let can_write: [(&str, &[&str], &[&str]); 5] = [
+        (
+            "kuery_n_ddl",
+            &["alter role db_ddladmin add member {user}"],
+            &[],
+        ),
+        (
+            "kuery_n_schema",
+            &["exec ('create schema kuery_n_owned authorization {user}')"],
+            &["if schema_id('kuery_n_owned') is not null drop schema kuery_n_owned"],
+        ),
+        (
+            "kuery_n_table",
+            &[
+                "create table dbo.kuery_n_owned (i int)",
+                "alter authorization on dbo.kuery_n_owned to {user}",
+            ],
+            &["drop table if exists dbo.kuery_n_owned"],
+        ),
+        (
+            "kuery_n_insert",
+            &["grant insert on dbo.customers to {user}"],
+            &[],
+        ),
+        (
+            "kuery_n_execute",
+            &["grant execute on schema::dbo to {user}"],
+            &[],
+        ),
+    ];
+    let silent: Vec<&str> = can_write
+        .into_iter()
+        .filter(|(login, setup, cleanup)| notice_for(login, setup, cleanup).is_none())
+        .map(|(login, _, _)| login)
+        .collect();
+    assert!(silent.is_empty(), "can write but got no notice: {silent:?}");
+}
+
 #[test]
 #[ignore = "needs the dev SQL Server"]
 fn refuses_writes_that_slip_into_read_mode() {

@@ -336,7 +336,11 @@ the guarantee has layers. Kuery's analyser refuses writes, and reads run in
 a transaction that is always rolled back. With `VIEW SERVER PERFORMANCE
 STATE` (`VIEW SERVER STATE` before SQL Server 2022) a write that slips
 through is detected and refused with an error; without it the write is
-undone silently, and the connection shows a warning in the status bar. A
+undone silently, and the connection shows a warning in the status bar,
+unless Kuery can tell the login only reads: its user's roles (nested ones
+included) are only `public` and `db_datareader`, it owns no schema or object,
+it has no write, DDL, `EXECUTE` or `IMPERSONATE` permission at any scope, and
+no server permission over every database. Any doubt shows the warning. A
 login with only `db_datareader` is the strongest guarantee. If the
 permission check fails for a reason other than missing permission, the
 connection does not open.

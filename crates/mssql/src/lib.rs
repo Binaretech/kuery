@@ -191,20 +191,48 @@ const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count
      where transaction_id = (select transaction_id from sys.dm_tran_current_transaction) \
        and database_id <> 2 and database_transaction_log_record_count > 0)";
 
-/// Whether the login may change the current database: a permission that
-/// writes or runs code there, from a fixed role (`db_datawriter`, `db_owner`,
-/// `db_ddladmin`) or granted to it or one of its roles on the database, a
-/// schema or an object. 1 or 0.
-const MAY_WRITE: &str = "select case when has_perms_by_name(db_name(), 'DATABASE', 'INSERT') = 1 \
-       or has_perms_by_name(db_name(), 'DATABASE', 'UPDATE') = 1 \
-       or has_perms_by_name(db_name(), 'DATABASE', 'DELETE') = 1 \
-       or has_perms_by_name(db_name(), 'DATABASE', 'ALTER') = 1 \
-       or has_perms_by_name(db_name(), 'DATABASE', 'EXECUTE') = 1 \
-       or exists (select 1 from sys.database_permissions p \
-                  join sys.database_principals d on d.principal_id = p.grantee_principal_id \
-                  where p.state in ('G', 'W') \
-                    and p.permission_name in ('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'EXECUTE', 'CONTROL', 'TAKE OWNERSHIP') \
-                    and (d.name = user_name() or is_member(d.name) = 1)) \
+/// 1 when the login can only read the current database, anything else when
+/// it may write (or Kuery cannot tell). Only read when the writes check
+/// cannot run, to decide whether the notice is worth showing; every doubt
+/// shows it. The login can only read when all hold for its user and every
+/// principal in its token (`sys.user_token`: roles, nested ones and Windows
+/// groups included, plus `public`):
+/// - it is not `dbo`, `db_owner` or `sysadmin`, and its roles are only
+///   `public` and `db_datareader`;
+/// - none owns a schema or an object (an owner may change it), but for the
+///   empty schema each fixed role owns (`db_datareader`'s own);
+/// - none was granted a permission that writes, changes schema or runs code
+///   (procedures write through ownership chains), at any scope;
+/// - the login has no server permission over every database.
+const READS_ONLY: &str = "with token as ( \
+         select principal_id from sys.user_token \
+         union select database_principal_id() union select 0) \
+     select case when user_name() <> 'dbo' \
+       and is_member('db_owner') = 0 \
+       and is_srvrolemember('sysadmin') = 0 \
+       and not exists (select 1 from sys.user_token t \
+                       where t.type = 'ROLE' and t.name not in ('public', 'db_datareader')) \
+       and not exists (select 1 from sys.database_role_members m \
+                       join sys.database_principals r on r.principal_id = m.role_principal_id \
+                       where m.member_principal_id in (select principal_id from token) \
+                         and r.name not in ('public', 'db_datareader')) \
+       and not exists (select 1 from sys.schemas s \
+                       where s.principal_id in (select principal_id from token) \
+                         and not (s.schema_id between 16384 and 16393 \
+                                  and not exists (select 1 from sys.objects o \
+                                                  where o.schema_id = s.schema_id))) \
+       and not exists (select 1 from sys.objects o \
+                       where o.principal_id in (select principal_id from token)) \
+       and not exists (select 1 from sys.database_permissions p \
+                       where p.grantee_principal_id in (select principal_id from token) \
+                         and p.state in ('G', 'W') \
+                         and (p.permission_name in ('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'CONTROL', \
+                                                    'TAKE OWNERSHIP', 'EXECUTE', 'IMPERSONATE') \
+                              or p.permission_name like 'CREATE %' \
+                              or p.permission_name like 'ALTER ANY %')) \
+       and not exists (select 1 from fn_my_permissions(null, 'SERVER') \
+                       where permission_name in ('CONTROL SERVER', 'ALTER ANY DATABASE', \
+                                                 'IMPERSONATE ANY LOGIN')) \
      then 1 else 0 end";
 
 /// Why the writes check cannot run, as the connection's notice.
@@ -226,8 +254,9 @@ pub struct Mssql {
     server: String,
     /// Whether the writes check can run (see [`UNDETECTED`]).
     detects_writes: bool,
-    /// Whether the login may write in the database it opened in; without the
-    /// writes check, only such a login gets the notice.
+    /// Whether the login may write in the database it opened in (see
+    /// [`READS_ONLY`]); without the writes check, only such a login gets the
+    /// notice.
     may_write: bool,
     /// The session's read-only transaction is open.
     reading: bool,
@@ -306,15 +335,13 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
                 .await
                 .map(|_| ()),
         )?;
-        let may_write = match detects_writes {
-            true => true,
-            false => {
-                let row = first_row(&mut connection, MAY_WRITE)
-                    .await
-                    .map_err(|error| format!("Could not check for writes: {error}"))?;
-                row.first().cloned().flatten().as_deref() != Some("0")
-            }
-        };
+        // Any error or doubt: it may write.
+        let may_write = detects_writes
+            || first_row(&mut connection, READS_ONLY)
+                .await
+                .map_or(true, |row| {
+                    row.first().cloned().flatten().as_deref() != Some("1")
+                });
         let (database, snapshot) = database_state(&mut connection).await?;
         Ok(Box::new(Mssql {
             connection: Some(connection),

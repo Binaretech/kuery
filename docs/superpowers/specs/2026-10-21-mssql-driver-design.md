@@ -246,6 +246,18 @@ PostgreSQL and are new work for this driver.
    Kuery's checks and automatic undo only, and recommending either granting
    `VIEW SERVER PERFORMANCE STATE` (`VIEW SERVER STATE` before 2022) or a
    `db_datareader`-only login.
+   **Amended (final review): the warning is hidden only for a login that can
+   only read**, failing open (an error or any doubt shows it). All must hold
+   for the user and every principal in its token (`sys.user_token`: nested
+   roles and Windows groups, plus `public`): not `dbo`, `db_owner` or
+   `sysadmin`; roles only `public` and `db_datareader`; owns no schema (but
+   the empty one each fixed role owns) and no object; no granted `INSERT`,
+   `UPDATE`, `DELETE`, `ALTER`, `CONTROL`, `TAKE OWNERSHIP`, `EXECUTE`
+   (procedures write through ownership chains), `IMPERSONATE`, `CREATE …` or
+   `ALTER ANY …` at any scope; and no `CONTROL SERVER`, `ALTER ANY DATABASE`
+   or `IMPERSONATE ANY LOGIN`. Tested with a `db_datareader`-only login (no
+   warning) and with `db_ddladmin`, a schema owner, a table owner,
+   `grant insert` on a table and `grant execute on schema::dbo` (warning).
 
 ## Suggested order
 
