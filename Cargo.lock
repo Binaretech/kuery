@@ -4027,6 +4027,7 @@ dependencies = [
  "keyring",
  "kuery-core",
  "kuery-files",
+ "kuery-mssql",
  "kuery-mysql",
  "kuery-pg",
  "kuery-redis",

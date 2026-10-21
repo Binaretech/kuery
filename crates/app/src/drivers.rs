@@ -24,9 +24,10 @@ use crate::tunnel::{self, Tunnel};
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// Every SQL driver, in the order the list shows them.
-pub static SQL: [&SqlDriver; 3] = [
+pub static SQL: [&SqlDriver; 4] = [
     &kuery_pg::DRIVER,
     &kuery_mysql::DRIVER,
+    &kuery_mssql::DRIVER,
     &kuery_sqlite::DRIVER,
 ];
 
@@ -207,7 +208,8 @@ mod tests {
     #[test]
     fn every_driver_is_found_by_its_id_once() {
         let ids: Vec<&str> = all().iter().map(|d| d.info().id).collect();
-        assert_eq!(ids, ["postgres", "mysql", "sqlite", "redis"]);
+        assert_eq!(ids, ["postgres", "mysql", "mssql", "sqlite", "redis"]);
+        assert!(find("mssql").unwrap().info().matches("sql server"));
         assert!(matches!(find("redis"), Some(Driver::Redis)));
         assert!(find("oracle").is_none());
         for sql in SQL {
@@ -215,7 +217,7 @@ mod tests {
         }
     }
 
-    /// Needs the dev Postgres, MySQL, Redis and bastion
+    /// Needs the dev Postgres, MySQL, SQL Server, Redis and bastion
     /// (`docker compose -f dev/compose.yaml up -d`).
     #[test]
     #[ignore]
@@ -241,10 +243,11 @@ mod tests {
             environment: None,
             ssh: ssh.clone(),
         };
-        let test = |spec: &ConnectionSpec| {
+        let test_with = |spec: &ConnectionSpec, password: Option<String>| {
             let driver = for_spec(spec).unwrap();
-            futures::executor::block_on(driver.test(spec, None, &engines)).unwrap()
+            futures::executor::block_on(driver.test(spec, password, &engines)).unwrap()
         };
+        let test = |spec: &ConnectionSpec| test_with(spec, None);
         let reached = test(&postgres);
         assert!(
             reached.starts_with("Connected through localhost · PostgreSQL 16"),
@@ -268,11 +271,25 @@ mod tests {
             host: "mysql".into(),
             port: 3306,
             database: "shop".into(),
-            ..postgres
+            ..postgres.clone()
         };
         let reached = test(&mysql);
         assert!(
             reached.starts_with("Connected through localhost · MySQL 8"),
+            "{reached}"
+        );
+        let mssql = ConnectionSpec {
+            driver: "mssql".into(),
+            host: "mssql".into(),
+            port: 1433,
+            database: "shop".into(),
+            user: "sa".into(),
+            sslmode: Some("trust server certificate".into()),
+            ..postgres
+        };
+        let reached = test_with(&mssql, Some("Kuery_dev_2026!".into()));
+        assert!(
+            reached.starts_with("Connected through localhost · SQL Server 2022"),
             "{reached}"
         );
     }

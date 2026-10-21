@@ -143,6 +143,9 @@ pub static DRIVER: SqlDriver = SqlDriver {
         tls: Tls::Modes(&["disable", "require", "trust server certificate"]),
         production_note: "Production connections open read-only. SQL Server cannot refuse writes by itself: Kuery blocks them and undoes any that slip through; for a guarantee, use a login with only db_datareader.",
         file: false,
+        host_help: Some(
+            "A named instance is HOST\\INSTANCE; it is found through the SQL Browser service (UDP 1434). Through an SSH tunnel, use the instance's fixed port instead.",
+        ),
     },
     dialect: &MSSQL,
     open: |options, access| open(&Target::from(options), access),

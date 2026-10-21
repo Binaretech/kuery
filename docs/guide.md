@@ -11,6 +11,7 @@ Detailed workflows, file-reader behavior, connection configuration and developme
 | `crates/core` | Read-only policy and write-mode statement analysis (`sqlparser`), columnar results (Arrow), the catalog model, and escaped SQL for browsing and editing tables. No UI. |
 | `crates/pg` | PostgreSQL driver on its own tokio runtime: batched streaming, `BEGIN TRANSACTION READ ONLY`, timeout, cancellation, TLS with rustls, catalog queries, transactional row changes, and write transactions with a savepoint per run. |
 | `crates/mysql` | MySQL and MariaDB adapter: catalog, streaming results, cancellation, TLS and the shared session/write policy. |
+| `crates/mssql` | SQL Server adapter (tiberius): catalog from the system views, `GO` batches, plans, server activity, cancellation and the detect-and-undo read-only guard. |
 | `crates/sqlite` | SQLite adapter: local database files, catalog, query-only reads, cancellation and transactional edits. |
 | `crates/redis` | Redis driver (`redis-rs`) on its own tokio runtime: a reconnecting connection per database, the keyspace, `SCAN` pages, key details, value pages per type, and console commands. TLS with the same rustls as Postgres. |
 | `crates/files` | Local CSV/TSV, JSON, JSONL/NDJSON and Parquet previews with Polars, native schema metadata, and conversion to the same results as SQL. No UI. |
@@ -164,13 +165,14 @@ For builds on a different disk, set `CARGO_TARGET_DIR` before invoking Cargo. On
 
 
 ```bash
-docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, a seeded Redis and an SSH bastion
+docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, SQL Server 2022 (`mssql` and `mssql-seed`; amd64, emulated on Apple silicon, port 14339, user `sa`, development-only password in `.env.example`), a seeded Redis and an SSH bastion
 cargo run -p kuery-sqlite --example seed                # dev/shop.sqlite, for the local-sqlite connection
 cargo run -p kuery -- .                                 # the app, on this repo's project
 cargo test --workspace --locked                         # tests without a database
 cargo test -p kuery-pg -- --ignored                     # tests against the dev Postgres
 cargo test -p kuery-redis -- --ignored                  # tests against the dev Redis
 cargo test -p kuery-mysql -- --ignored                  # tests against the dev MySQL
+cargo test -p kuery-mssql -- --ignored                  # tests against the dev SQL Server
 cargo test -p kuery -- --ignored                        # SSH tunnels through the dev bastion
 cargo run --release -p kuery-pg --example stream_bench  # streaming without a UI
 ```
@@ -262,7 +264,7 @@ and nothing else. Everything that must work the same lives once, in core:
 └─────────────────────────────────┬──────────────────────────────────┘
                      kuery_core::adapter::Adapter
         ┌──────────────┬──────────┴──────┬──────────────┐
-     kuery-pg      kuery-mysql     kuery-sqlite     kuery-<new>
+     kuery-pg   kuery-mysql  kuery-mssql  kuery-sqlite  kuery-<new>
 ```
 
 - **The adapter** (`kuery_core::adapter::Adapter`) is one blocking
@@ -276,7 +278,7 @@ and nothing else. Everything that must work the same lives once, in core:
   quotes, casts to text, matches without case, sorts NULLs, compares with
   NULL, opens read-only transactions and savepoints, whether schema changes
   commit by themselves (MySQL: refused wherever an undo is promised), and
-  how to EXPLAIN for the Plan tab. `POSTGRES`, `MYSQL` and `SQLITE` are
+  how to EXPLAIN for the Plan tab. `POSTGRES`, `MYSQL`, `MSSQL` and `SQLITE` are
   there; a new driver can bring its own.
 - **The registration** is one `DRIVER` (`kuery_core::driver::SqlDriver`)
   per crate: the descriptor the form follows (id, name and aliases, default
@@ -307,6 +309,56 @@ MySQL commits `CREATE`, `ALTER`, `DROP`, `TRUNCATE` and a few others by
 itself, so nothing can undo them: write mode refuses them inside its
 transaction and in previews, and runs them in Full write. Cancelling a query
 kills it on the server (`KILL QUERY`) from a side connection.
+
+### SQL Server
+
+A SQL Server connection asks for a host, a user and optionally the database
+to start in (empty is the login's default). SQL Server 2012 or later, with
+SQL Server logins only: no Windows (NTLM or Kerberos) authentication. The
+sidebar lists the databases the login can see, with schemas, tables, views
+and routines; the Plan tab shows the estimated plan, and Server Activity
+lists sessions.
+
+**Host and instances.** A named instance is written `HOST\INSTANCE`; Kuery
+finds its port through the SQL Browser service (UDP 1434). Through an SSH
+tunnel the lookup cannot happen, so use the instance's fixed port instead.
+
+**TLS.** Without a choice, Kuery encrypts if the server offers it. A
+self-signed certificate, which is what a local install has, needs "trust
+server certificate"; "require" checks the certificate; "disable" sends
+nothing encrypted.
+
+**Read-only.** SQL Server cannot refuse writes for a session by itself, so
+the guarantee has layers. Kuery's analyser refuses writes, and reads run in
+a transaction that is always rolled back. With `VIEW SERVER PERFORMANCE
+STATE` (`VIEW SERVER STATE` before SQL Server 2022) a write that slips
+through is detected and refused with an error; without it the write is
+undone silently, and the connection shows a warning in the status bar. A
+login with only `db_datareader` is the strongest guarantee. If the
+permission check fails for a reason other than missing permission, the
+connection does not open.
+
+**Locks.** On a default-configured server, reading rows another session is
+changing waits for its lock (as in SSMS) and fails with "Waited too long for
+a lock" after the lock timeout. That includes Kuery's own write-mode
+connection. Turning on `READ_COMMITTED_SNAPSHOT`, or allowing snapshot
+isolation (which Kuery then uses for reads), avoids it.
+
+**Cancelling.** Cancelling a query, or a statement timeout, ends the server
+session: an open write transaction and temp tables are lost, and Kuery says
+so. Inside write mode the statement timeout is off, so it never drops
+uncommitted work.
+
+**Scripts.** A script runs per `GO` batch; a trailing `GO` is not sent. A
+batch with several statements reports the row count of its last statement
+(0 when the batch returned rows).
+
+**Row edits.** Editing a row whose binary column has to be compared fails
+safely ("the row changed") instead of writing.
+
+**Server Activity.** Cancel and Terminate both end the session. Without
+`VIEW SERVER STATE` you see only your own sessions, without their query
+text.
 
 ### SQLite
 
