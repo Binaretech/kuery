@@ -41,8 +41,8 @@ pub struct Dialect {
     pub as_text: fn(&str) -> String,
     /// The case-insensitive `LIKE`.
     pub like_ignoring_case: &'static str,
-    /// Whether `NULLS LAST` exists; without it, sorting puts `x is null` first.
-    pub nulls_last: bool,
+    /// How sorting puts NULLs last.
+    pub nulls_last: NullsLast,
     /// `a` equals `b`, NULL equal to NULL.
     pub same: fn(&str, &str) -> String,
     /// A row with every column at its default; `{}` is the table.
@@ -69,6 +69,18 @@ pub struct Dialect {
 
 /// The EXPLAIN statement for a statement, estimated or (`true`) measured.
 pub type Explain = fn(&str, bool) -> Result<String, String>;
+
+/// How a database sorts NULLs after everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullsLast {
+    /// `x desc nulls last`.
+    Keyword,
+    /// `x is null, x desc`: a condition can be sorted on.
+    IsNullFirst,
+    /// `case when x is null then 1 else 0 end, x desc`, where a condition
+    /// cannot be sorted on.
+    Case,
+}
 
 /// How a database limits a query to a page of rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +155,12 @@ impl Dialect {
     /// Sorts by `expr` with NULLs last either way.
     pub fn order_nulls_last(&self, expr: &str, descending: bool) -> String {
         let direction = if descending { "desc" } else { "asc" };
-        if self.nulls_last {
-            format!("{expr} {direction} nulls last")
-        } else {
-            format!("{expr} is null, {expr} {direction}")
+        match self.nulls_last {
+            NullsLast::Keyword => format!("{expr} {direction} nulls last"),
+            NullsLast::IsNullFirst => format!("{expr} is null, {expr} {direction}"),
+            NullsLast::Case => {
+                format!("case when {expr} is null then 1 else 0 end, {expr} {direction}")
+            }
         }
     }
 
@@ -217,7 +231,7 @@ pub static POSTGRES: Dialect = Dialect {
     literal: quote_literal,
     as_text: |expr| format!("{expr}::text"),
     like_ignoring_case: "ilike",
-    nulls_last: true,
+    nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is not distinct from {b}"),
     insert_defaults: "insert into {} default values",
     parser: || Box::new(sqlparser::dialect::PostgreSqlDialect {}),
@@ -249,7 +263,7 @@ pub static SQLITE: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as text)"),
     like_ignoring_case: "like",
-    nulls_last: true,
+    nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is {b}"),
     insert_defaults: "insert into {} default values",
     parser: || Box::new(sqlparser::dialect::SQLiteDialect {}),
@@ -284,7 +298,7 @@ pub static MYSQL: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as char)"),
     like_ignoring_case: "like",
-    nulls_last: false,
+    nulls_last: NullsLast::IsNullFirst,
     same: |a, b| format!("{a} <=> {b}"),
     insert_defaults: "insert into {} () values ()",
     parser: || Box::new(sqlparser::dialect::MySqlDialect {}),
@@ -319,7 +333,7 @@ pub static MSSQL: Dialect = Dialect {
         format!("coalesce(try_convert(nvarchar(max), {expr}, 126), convert(nvarchar(max), {expr}))")
     },
     like_ignoring_case: "like",
-    nulls_last: false,
+    nulls_last: NullsLast::Case,
     same: |a, b| format!("({a} = {b} or ({a} is null and {b} is null))"),
     insert_defaults: "insert into {} default values",
     parser: || Box::new(sqlparser::dialect::MsSqlDialect {}),
@@ -466,7 +480,10 @@ mod tests {
         );
         assert_eq!(ms.join_script(&["a", "b"]), "a\nGO\nb");
         assert_eq!(MYSQL.join_script(&["a", "b"]), "a; b");
-        assert_eq!(ms.order_nulls_last("[n]", true), "[n] is null, [n] desc");
+        assert_eq!(
+            ms.order_nulls_last("[n]", true),
+            "case when [n] is null then 1 else 0 end, [n] desc"
+        );
         assert_eq!(
             ms.as_text("[n]"),
             "coalesce(try_convert(nvarchar(max), [n], 126), convert(nvarchar(max), [n]))"

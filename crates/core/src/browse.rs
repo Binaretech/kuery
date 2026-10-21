@@ -330,7 +330,7 @@ mod tests {
         }];
         assert_eq!(
             browse.page_sql(&[]).unwrap(),
-            "select * from [dbo].[orders] order by [total] is null, [total] desc offset 0 rows fetch next 100 rows only"
+            "select * from [dbo].[orders] order by case when [total] is null then 1 else 0 end, [total] desc offset 0 rows fetch next 100 rows only"
         );
     }
 
