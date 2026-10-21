@@ -180,6 +180,10 @@ PostgreSQL and are new work for this driver.
 - **Column kinds** mapped from TDS types: integers, decimal/money/float →
   Number, date → Date, datetime/datetime2/smalldatetime/datetimeoffset →
   Timestamp, bit → Boolean if `ColumnKind` has one, else Integer; rest Text.
+  **As built: `bit` → Integer, deliberately.** `ColumnKind` has a Boolean,
+  but a bit's text is `1`/`0` (what `as_text` gives), and the profile's
+  boolean split counts `t`/`true` and `f`/`false`: as Boolean a bit column
+  would profile as neither. As Integer it gets the categories `1` and `0`.
 - **Dev environment**: `dev/compose.yaml` gets a
   `mcr.microsoft.com/mssql/server:2022-latest` service (amd64; on Apple
   silicon it runs under Docker's Rosetta emulation) on port `14339`, with a
@@ -270,6 +274,9 @@ Run on 2026-10-21 against `mcr.microsoft.com/mssql/server:2022-latest`
 (16.0.4305.5, Developer, Linux, amd64 under emulation) on `localhost:14339`
 with the code in `crates/mssql/examples/spike.rs`
 (`cargo run -p kuery-mssql --example spike -- cancel|cancel2|socket|write|values|astext|tls|parse`).
+That example was removed in Task 5 (commit `8f97ace`), once the adapter and
+its tests covered what it showed; it is in git history (added in `74d1f11`).
+The `spike -- …` commands named below refer to it.
 
 ### Library and TLS
 
@@ -371,9 +378,12 @@ interval, and its first-ever setup in a database, in a system transaction
 nested in whatever transaction runs the first query of the interval. That
 logs the running transaction's `LOP_BEGIN_XACT` (108 bytes) and nothing else
 in it, so a plain `select` read `1` once per interval (reproduced with
-`interval_length_minutes = 1` and after `set query_store clear`). Every write
-logs that begin record plus at least one more (measured: insert, update
-including `set q = q`, delete `2`; `alter table add` `10`; `truncate` `11`;
+`interval_length_minutes = 1` and after `set query_store clear`). Every write the
+log shows logs that begin record plus at least one more (measured: insert,
+update, delete `2`; an update that sets a value it already has, `set q = q`,
+also reads `2` in `shop`, which uses row versioning (RCSI); without row
+versioning SQL Server may log nothing for it, and then it is no write the
+check can see, nor one that changed anything; `alter table add` `10`; `truncate` `11`;
 `grant` `5`; `create table` `20`; `select into` `49`), so the check counts
 `database_transaction_log_record_count - 1` for each database with records.
 Auto-created and auto-updated statistics, sequences, spools, schemabound

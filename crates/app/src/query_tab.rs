@@ -745,7 +745,7 @@ impl QueryTab {
         self.select_panel_tab(PanelTab::Plan, cx);
         if !self.db.session.has_plans() {
             let message = format!(
-                "Plans are drawn for PostgreSQL only. On {} run EXPLAIN as a query to see its own.",
+                "Kuery draws no plans for {}: run its own EXPLAIN as a query to see one.",
                 self.db.session.server_label()
             );
             self.plan.update(cx, |plan, cx| plan.fail(message, cx));

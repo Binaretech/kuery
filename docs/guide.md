@@ -317,9 +317,10 @@ kills it on the server (`KILL QUERY`) from a side connection.
 A SQL Server connection asks for a host, a user and optionally the database
 to start in (empty is the login's default). SQL Server 2012 or later, with
 SQL Server logins only: no Windows (NTLM or Kerberos) authentication. The
-sidebar lists the databases the login can see, with schemas, tables, views
-and routines; the Plan tab shows the estimated plan, and Server Activity
-lists sessions.
+sidebar lists the schemas of the connection's database (one database per
+connection), with tables, views and routines; the Plan tab shows the
+estimated plan (Explain) or the measured one (Explain Analyze), and Server
+Activity lists sessions.
 
 **Host and instances.** A named instance is written `HOST\INSTANCE`; Kuery
 finds its port through the SQL Browser service (UDP 1434). Through an SSH
