@@ -14,6 +14,7 @@
 //! That look needs `VIEW SERVER PERFORMANCE STATE`; without it the rollback
 //! at the end still undoes everything, and [`Adapter::notice`] says so.
 
+mod activity;
 mod catalog;
 mod value;
 
@@ -22,12 +23,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::TryStreamExt as _;
+use kuery_core::activity::{Activity, Signal};
 use kuery_core::adapter::{Adapter, Canceller, RowSink};
 use kuery_core::catalog::{
     CatalogColumn, CatalogOverview, ForeignKey, FunctionInfo, TableDefinition, TableRef,
 };
 use kuery_core::driver::{ConnectOptions, DriverInfo, Family, Field, SqlDriver, Tls};
 use kuery_core::result_set::ColumnKind;
+use kuery_core::script;
 use kuery_core::session::{Access, QueryError, RunOptions};
 use kuery_core::sql::{Dialect, MSSQL};
 use tiberius::{AuthMethod, Client, ColumnType, Config, EncryptionLevel, QueryItem, SqlBrowser};
@@ -517,31 +520,9 @@ impl Mssql {
     fn would_lose_writes(&self, sql: &str) -> bool {
         (self.transactions > 0 && !self.reading) || opens_transaction(sql)
     }
-}
 
-/// Whether a batch may begin a transaction of its own.
-fn opens_transaction(sql: &str) -> bool {
-    let sql = sql.to_lowercase();
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair[0] == "begin" && pair[1].starts_with("tran"))
-}
-
-impl Adapter for Mssql {
-    fn dialect(&self) -> &'static Dialect {
-        &MSSQL
-    }
-
-    fn server(&self) -> String {
-        self.server.clone()
-    }
-
-    fn notice(&self) -> Option<String> {
-        (!self.detects_writes).then(|| UNDETECTED.to_string())
-    }
-
-    fn execute(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
+    /// Runs one batch, watching for cancel, timeout and writes.
+    fn run_batch(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
         let begins_reading = MSSQL
             .transactions
             .begin_read_only
@@ -657,6 +638,61 @@ impl Adapter for Mssql {
         // a batch that returns rows.
         streamed.map(|returned| if returned { 0 } else { after.changed })
     }
+}
+
+/// Whether a batch is a `set … off`, which ends a mode the batches before it
+/// turned on (`set showplan_xml off`).
+fn turns_off(batch: &str) -> bool {
+    let batch = batch.trim().to_lowercase();
+    batch.starts_with("set ") && batch.ends_with(" off")
+}
+
+/// Whether a batch may begin a transaction of its own.
+fn opens_transaction(sql: &str) -> bool {
+    let sql = sql.to_lowercase();
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair[0] == "begin" && pair[1].starts_with("tran"))
+}
+
+impl Adapter for Mssql {
+    fn dialect(&self) -> &'static Dialect {
+        &MSSQL
+    }
+
+    fn server(&self) -> String {
+        self.server.clone()
+    }
+
+    fn notice(&self) -> Option<String> {
+        (!self.detects_writes).then(|| UNDETECTED.to_string())
+    }
+
+    /// One call may hold several `GO`-separated batches (the plan text
+    /// does); they run in order on this connection, and the last one's
+    /// outcome is the call's.
+    fn execute(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
+        let batches = match script::statements_in(&MSSQL, sql) {
+            Some(ranges) if ranges.len() > 1 => ranges,
+            _ => return self.run_batch(sql, rows),
+        };
+        let texts: Vec<&str> = batches.iter().map(|range| &sql[range.clone()]).collect();
+        let mut outcome = Ok(0);
+        for (index, text) in texts.iter().enumerate() {
+            outcome = self.run_batch(text, rows);
+            if matches!(outcome, Err(QueryError::Database { .. })) {
+                // A failed batch must not leave `set showplan_xml on` behind.
+                if let Some(last) = texts[index + 1..].last().filter(|text| turns_off(text)) {
+                    let _ = self.run_batch(last, &mut kuery_core::adapter::Discard);
+                }
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        outcome
+    }
 
     fn limit(&mut self, options: &RunOptions) -> Result<(), QueryError> {
         let millis = options.lock_timeout.as_millis();
@@ -692,6 +728,18 @@ impl Adapter for Mssql {
 
     fn search_path(&mut self) -> Result<Vec<String>, QueryError> {
         catalog::search_path(self)
+    }
+
+    fn has_activity(&self) -> bool {
+        true
+    }
+
+    fn activity(&mut self) -> Result<Activity, QueryError> {
+        activity::activity(self)
+    }
+
+    fn signal(&mut self, pid: i32, signal: Signal) -> Result<bool, QueryError> {
+        activity::signal(self, pid, signal)
     }
 
     fn routine_source(&mut self, routine: &FunctionInfo) -> Result<String, QueryError> {

@@ -208,12 +208,15 @@ impl ActivityTab {
         cx: &mut Context<Self>,
     ) {
         let weak = cx.entity().downgrade();
+        let cancel_note = self.db.session.dialect().cancel_note;
         let (title, ok, what) = match signal {
             Signal::Cancel => (
                 format!("Cancel the query of session {}?", backend.pid),
                 "Cancel Query",
-                "Stops the query it runs now. The session stays connected; if it is in a \
-                 transaction, the transaction fails and has to be rolled back.",
+                cancel_note.unwrap_or(
+                    "Stops the query it runs now. The session stays connected; if it is in a \
+                     transaction, the transaction fails and has to be rolled back.",
+                ),
             ),
             Signal::Terminate => (
                 format!("End session {}?", backend.pid),

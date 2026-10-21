@@ -879,6 +879,214 @@ fn works_like_the_other_drivers() {
     });
 }
 
+/// The plan of `statement` from a read-only session on `shop`.
+fn plan_of(statement: &str, analyze: bool) -> kuery_core::plan::Plan {
+    let reader = session(target(), Access::ReadOnly);
+    let xml = block_on(reader.explain(statement.into(), analyze, RunOptions::default())).unwrap();
+    kuery_core::plan::parse(&xml).unwrap_or_else(|error| panic!("{error}\n{xml}"))
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn explains_estimated_and_measured() {
+    let statement =
+        "select o.id, c.full_name from dbo.orders o join dbo.customers c on c.id = o.customer_id";
+    let estimated = plan_of(statement, false);
+    assert!(!estimated.analyzed);
+    assert!(estimated.root.actual.is_none());
+    let measured = plan_of(statement, true);
+    assert!(measured.analyzed);
+    assert!(measured.root.actual.is_some());
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn runs_go_separated_batches_in_order() {
+    let mut adapter = adapter();
+    let mut seen = Seen::default();
+    adapter
+        .execute("select 1 as a\nGO\nselect 2 as b", &mut seen)
+        .unwrap();
+    assert_eq!(seen.0.len(), 2);
+    assert_eq!(seen.0[1].0, ["b"]);
+    // A statement that fails to compile does not leave showplan on.
+    let failed = adapter.execute(
+        "set showplan_xml on\nGO\nselect * from dbo.no_such_table\nGO\nset showplan_xml off",
+        &mut Discard,
+    );
+    assert!(
+        matches!(failed, Err(QueryError::Database { .. })),
+        "{failed:?}"
+    );
+    let mut seen = Seen::default();
+    adapter.execute("select 7 as seven", &mut seen).unwrap();
+    assert_eq!(seen.0[0].1, [[Some("7".to_string())]]);
+}
+
+/// The sessions of two connections, for tests that need a blocker.
+struct Blocking {
+    table: String,
+    holder: Box<dyn Adapter>,
+    holder_pid: i32,
+}
+
+impl Blocking {
+    /// A holds an uncommitted update of row 1.
+    fn start(name: &str) -> Self {
+        let table = scratch(name);
+        let mut holder = adapter();
+        run(holder.as_mut(), "begin transaction");
+        run(
+            holder.as_mut(),
+            &format!("update {table} set qty = 10 where id = 1"),
+        );
+        let holder_pid = scalar(holder.as_mut(), "select @@spid")
+            .unwrap()
+            .parse()
+            .unwrap();
+        Blocking {
+            table,
+            holder,
+            holder_pid,
+        }
+    }
+
+    /// A second connection that updates the same row, waiting on the first;
+    /// returns its session id and the thread that finishes with it.
+    fn blocked(&self) -> (i32, std::thread::JoinHandle<Result<u64, QueryError>>) {
+        let mut waiter = adapter();
+        let pid = scalar(waiter.as_mut(), "select @@spid")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let update = format!("update {} set qty = 20 where id = 1", self.table);
+        (
+            pid,
+            std::thread::spawn(move || waiter.execute(&update, &mut Discard)),
+        )
+    }
+
+    fn finish(mut self) {
+        run(self.holder.as_mut(), "rollback");
+        drop(self.holder);
+        drop_scratch(&self.table);
+    }
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn sees_a_blocker() {
+    let blocking = Blocking::start("blocker");
+    let (waiter, update) = blocking.blocked();
+    let mut monitor = adapter();
+    assert!(monitor.has_activity());
+    let mut seen = None;
+    for _ in 0..50 {
+        let activity = monitor.activity().unwrap();
+        if let Some(backend) = activity.backend(waiter)
+            && !backend.blocked_by.is_empty()
+        {
+            seen = Some((
+                backend.clone(),
+                activity.backend(blocking.holder_pid).cloned(),
+            ));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (blocked, holder) = seen.expect("the waiting update shows as blocked");
+    assert_eq!(blocked.blocked_by, [blocking.holder_pid]);
+    assert!(blocked.is_client() && !blocked.own);
+    assert!(blocked.waiting_for.is_some(), "{blocked:?}");
+    assert!(
+        blocked.query.to_lowercase().contains("update"),
+        "{blocked:?}"
+    );
+    let holder = holder.unwrap();
+    assert_eq!(holder.state, kuery_core::activity::State::IdleInTransaction);
+    assert!(holder.transaction_seconds.is_some());
+    let activity = monitor.activity().unwrap();
+    assert_eq!(
+        activity.blockers().first().map(|b| b.pid),
+        Some(blocking.holder_pid)
+    );
+    assert!(
+        activity
+            .backends
+            .iter()
+            .any(|b| b.own && b.state == kuery_core::activity::State::Active)
+    );
+    assert!(activity.backends.iter().any(|b| !b.is_client()));
+    blocking.finish();
+    assert_eq!(update.join().unwrap(), Ok(1));
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn kills_a_session() {
+    let mut victim = adapter();
+    let pid: i32 = scalar(victim.as_mut(), "select @@spid")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut monitor = adapter();
+    assert_eq!(monitor.signal(pid, Signal::Terminate), Ok(true));
+    // The victim finds out on its next statement.
+    assert!(victim.execute("select 1", &mut Discard).is_err());
+    drop(victim);
+    // A session that does not exist: not the victim's number, which another
+    // connection may already have taken.
+    let backends = monitor.activity().unwrap().backends;
+    let missing = backends.iter().map(|b| b.pid).max().unwrap() + 1000;
+    assert_eq!(monitor.signal(missing, Signal::Terminate), Ok(false));
+}
+
+/// Drops `login` if it exists, after ending the sessions it still has.
+fn drop_login(adapter: &mut dyn Adapter, login: &str) {
+    let end_sessions = format!(
+        "declare @kill nvarchar(max) = N''; \
+         select @kill += N'kill ' + cast(session_id as nvarchar(10)) + N';' \
+         from sys.dm_exec_sessions where login_name = '{login}'; exec (@kill)"
+    );
+    for _ in 0..30 {
+        // A session may end by itself in between.
+        let _ = adapter.execute(&end_sessions, &mut Discard);
+        let dropped = adapter.execute(
+            &format!("if suser_id('{login}') is not null drop login {login}"),
+            &mut Discard,
+        );
+        if dropped.is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("could not drop the login {login}");
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn activity_without_view_server_state_shows_own_sessions() {
+    let mut sa = adapter();
+    drop_login(sa.as_mut(), "kuery_nomonitor");
+    run(
+        sa.as_mut(),
+        "create login kuery_nomonitor with password = 'Kuery_nomonitor_2026!', check_policy = off",
+    );
+    let limited = Target {
+        user: "kuery_nomonitor".into(),
+        password: Some("Kuery_nomonitor_2026!".into()),
+        database: "master".into(),
+        ..target()
+    };
+    let mut limited = open(&limited, Access::ReadOnly).unwrap();
+    let activity = limited.activity();
+    drop(limited);
+    drop_login(sa.as_mut(), "kuery_nomonitor");
+    let activity = activity.unwrap();
+    assert!(!activity.backends.is_empty());
+    assert!(activity.backends.iter().all(|b| b.own), "{activity:?}");
+}
+
 /// A scratch database that allows snapshot isolation but does not use it by
 /// default, with one row (id 1, qty 1) in `t`.
 const SNAPSHOT_DB: &str = "kuery_snapshot";

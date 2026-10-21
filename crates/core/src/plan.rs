@@ -20,6 +20,34 @@ pub const BLOCK_BYTES: u64 = 8 * 1024;
 /// with `analyze` measured by running it (with buffers). `statement` must
 /// be a single statement, not an `EXPLAIN` already.
 pub fn explain_sql(statement: &str, analyze: bool) -> Result<String, String> {
+    let statement = single_statement(statement)?;
+    let options = if analyze {
+        "ANALYZE, BUFFERS, VERBOSE, FORMAT JSON"
+    } else {
+        "VERBOSE, FORMAT JSON"
+    };
+    Ok(format!("EXPLAIN ({options}) {statement}"))
+}
+
+/// What SQL Server needs to return `statement`'s plan as showplan XML:
+/// estimated, or with `analyze` measured by running it (`statistics xml`,
+/// whose last result set is the plan). The `GO` lines make it three batches,
+/// as `set showplan_xml` must be alone in its batch.
+pub fn showplan_sql(statement: &str, analyze: bool) -> Result<String, String> {
+    let statement = single_statement(statement)?;
+    let option = if analyze {
+        "statistics xml"
+    } else {
+        "showplan_xml"
+    };
+    Ok(format!(
+        "set {option} on\nGO\n{statement}\nGO\nset {option} off"
+    ))
+}
+
+/// `statement` without its closing `;`, when it is one statement that is not
+/// an `EXPLAIN` already.
+fn single_statement(statement: &str) -> Result<&str, String> {
     let statement = statement.trim().trim_end_matches(';').trim();
     if statement.is_empty() {
         return Err("There is no statement to explain".into());
@@ -32,12 +60,7 @@ pub fn explain_sql(statement: &str, analyze: bool) -> Result<String, String> {
     if is_explain(statement) {
         return Err("This is an EXPLAIN already: run it to see its plan".into());
     }
-    let options = if analyze {
-        "ANALYZE, BUFFERS, VERBOSE, FORMAT JSON"
-    } else {
-        "VERBOSE, FORMAT JSON"
-    };
-    Ok(format!("EXPLAIN ({options}) {statement}"))
+    Ok(statement)
 }
 
 /// Whether `sql` starts with the `EXPLAIN` keyword (after comments).
@@ -1059,6 +1082,15 @@ mod tests {
         assert!(explain_sql("select 1; select 2", false).is_err());
         assert!(explain_sql("explain select 1", false).is_err());
         assert!(explain_sql("  ", false).is_err());
+        assert_eq!(
+            showplan_sql("select 1;", false).unwrap(),
+            "set showplan_xml on\nGO\nselect 1\nGO\nset showplan_xml off"
+        );
+        assert_eq!(
+            showplan_sql("select 1", true).unwrap(),
+            "set statistics xml on\nGO\nselect 1\nGO\nset statistics xml off"
+        );
+        assert!(showplan_sql("select 1; select 2", false).is_err());
         assert!(is_explain("-- why slow?\nEXPLAIN (ANALYZE) select 1"));
         assert!(is_explain("explain select 1"));
         assert!(!is_explain("explained_rows"));

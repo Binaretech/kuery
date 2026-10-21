@@ -65,6 +65,9 @@ pub struct Dialect {
     /// for an estimate or (`true`) a measured run; `None` where Kuery cannot
     /// draw this database's plans yet.
     pub explain: Option<Explain>,
+    /// What cancelling a session's query does when the server cannot stop
+    /// just the query; `None` when it can.
+    pub cancel_note: Option<&'static str>,
 }
 
 /// The EXPLAIN statement for a statement, estimated or (`true`) measured.
@@ -250,6 +253,7 @@ pub static POSTGRES: Dialect = Dialect {
     batch_separator: None,
     implicit_commits: false,
     explain: Some(crate::plan::explain_sql),
+    cancel_note: None,
 };
 
 pub static SQLITE: Dialect = Dialect {
@@ -281,6 +285,7 @@ pub static SQLITE: Dialect = Dialect {
     batch_separator: None,
     implicit_commits: false,
     explain: None,
+    cancel_note: None,
 };
 
 pub static MYSQL: Dialect = Dialect {
@@ -315,6 +320,7 @@ pub static MYSQL: Dialect = Dialect {
     batch_separator: None,
     implicit_commits: true,
     explain: None,
+    cancel_note: None,
 };
 
 pub static MSSQL: Dialect = Dialect {
@@ -350,7 +356,11 @@ pub static MSSQL: Dialect = Dialect {
     paging: Paging::OffsetFetch,
     batch_separator: Some("GO"),
     implicit_commits: false,
-    explain: None,
+    explain: Some(crate::plan::showplan_sql),
+    cancel_note: Some(
+        "SQL Server can only end the whole session: its open transaction rolls back, its \
+         locks are released and its application loses the connection.",
+    ),
 };
 
 /// `orders` → `"orders"`, `a"b` → `"a""b"`. Always quoted, so uppercase
