@@ -214,9 +214,16 @@ fn refuse_next_value_for(dialect: &Dialect, sql: &str) -> Result<(), Rejection> 
 
 /// Checks that one parsed statement only reads data.
 pub(crate) fn check_statement(statement: &Statement) -> Result<(), Rejection> {
-    match statement.visit(&mut ReadOnlyVisitor {
-        session_local: false,
-    }) {
+    check_statement_in(statement, false)
+}
+
+/// The same; with `session_local`, also allowing what only touches the
+/// session (T-SQL variables, `#temp` tables, session options).
+pub(crate) fn check_statement_in(
+    statement: &Statement,
+    session_local: bool,
+) -> Result<(), Rejection> {
+    match statement.visit(&mut ReadOnlyVisitor { session_local }) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(rejection) => Err(rejection),
     }
