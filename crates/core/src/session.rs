@@ -527,6 +527,15 @@ impl Worker {
         self.adapter.execute(sql, &mut Discard).map(|_| ())
     }
 
+    /// Frees a savepoint where the database can; elsewhere it stays until the
+    /// transaction ends.
+    fn release(&mut self, name: &str) -> Result<(), QueryError> {
+        match self.dialect().release(name) {
+            Some(sql) => self.exec(&sql),
+            None => Ok(()),
+        }
+    }
+
     fn exec_all(&mut self, statements: &[&str]) -> Result<(), QueryError> {
         statements.iter().try_for_each(|sql| self.exec(sql))
     }
@@ -595,7 +604,7 @@ impl Worker {
             self.exec(&self.dialect().savepoint(READ))?;
             let outcome = job(self);
             let _ = self.exec(&self.dialect().rollback_to(READ));
-            let _ = self.exec(&self.dialect().release(READ));
+            let _ = self.release(READ);
             return outcome;
         }
         self.exec_all(transactions.begin_read_only)?;
@@ -653,10 +662,10 @@ impl Worker {
         // Cancelled: undone, like any failure.
         let outcome = self.end_run(outcome);
         let closed = if outcome.is_ok() {
-            self.exec(&dialect.release(RUN))
+            self.release(RUN)
         } else {
             self.exec(&dialect.rollback_to(RUN))
-                .and_then(|()| self.exec(&dialect.release(RUN)))
+                .and_then(|()| self.release(RUN))
         };
         if let Err(error) = closed {
             // The savepoint is gone only if the transaction is (the script
@@ -727,7 +736,7 @@ impl Worker {
         // Even halfway.
         let undone = if in_transaction {
             self.exec(&dialect.rollback_to(PREVIEW))
-                .and_then(|()| self.exec(&dialect.release(PREVIEW)))
+                .and_then(|()| self.release(PREVIEW))
         } else {
             self.exec("rollback")
         };

@@ -1577,10 +1577,7 @@ impl Explorer {
 
 /// `select * from "schema"."table" limit 100;`, for a new query tab.
 fn select_sql(dialect: &Dialect, table: &TableRef) -> String {
-    format!(
-        "select *\nfrom {}\nlimit 100;\n",
-        dialect.quote_qualified(&table.schema, &table.name)
-    )
+    dialect.first_rows(&dialect.quote_qualified(&table.schema, &table.name), 100)
 }
 
 /// The sidebar's title row: what it shows, then its actions.

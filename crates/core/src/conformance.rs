@@ -90,7 +90,10 @@ impl Scratch {
 
     fn table(&self, fixture: &Fixture) -> TableRef {
         let unquoted = self.name.rsplit('.').next().unwrap_or_default();
-        TableRef::new(fixture.schema.clone(), unquoted.trim_matches(['"', '`']))
+        TableRef::new(
+            fixture.schema.clone(),
+            unquoted.trim_matches(['"', '`', '[', ']']),
+        )
     }
 
     fn sum(&self, session: &Session) -> Option<String> {

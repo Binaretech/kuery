@@ -32,8 +32,9 @@ impl std::error::Error for SqlError {}
 pub struct Dialect {
     /// For messages, such as `PostgreSQL`.
     pub name: &'static str,
-    /// What quotes identifiers (`"` or `` ` ``); doubled inside one.
-    pub ident_quote: char,
+    /// What opens and closes an identifier (`"`, `` ` `` or `[` and `]`); the
+    /// closing one is doubled inside.
+    pub ident_quotes: (char, char),
     /// A text literal.
     pub literal: fn(&str) -> Result<String, SqlError>,
     /// An expression as text, the way its values are shown.
@@ -51,6 +52,11 @@ pub struct Dialect {
     /// How the formatter reads it.
     pub formatter: sqlformat::Dialect,
     pub transactions: Transactions,
+    /// How a page of rows is asked for.
+    pub paging: Paging,
+    /// The line that separates batches in a script (`GO`); `None` where
+    /// statements are separated by `;`.
+    pub batch_separator: Option<&'static str>,
     /// Schema changes (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`…) commit by
     /// themselves: nothing can undo them, so they never run where Kuery
     /// promises an undo.
@@ -64,6 +70,15 @@ pub struct Dialect {
 /// The EXPLAIN statement for a statement, estimated or (`true`) measured.
 pub type Explain = fn(&str, bool) -> Result<String, String>;
 
+/// How a database limits a query to a page of rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paging {
+    /// `limit 100 offset 0`.
+    LimitOffset,
+    /// `offset 0 rows fetch next 100 rows only`, which needs an `order by`.
+    OffsetFetch,
+}
+
 /// How Kuery opens and closes transactions and savepoints.
 pub struct Transactions {
     /// Starts a transaction that can only read (and takes its snapshot).
@@ -74,7 +89,8 @@ pub struct Transactions {
     /// Keywords before a savepoint's name.
     pub savepoint: &'static str,
     pub rollback_to: &'static str,
-    pub release: &'static str,
+    /// Frees a savepoint; `None` where savepoints cannot be released.
+    pub release: Option<&'static str>,
 }
 
 impl PartialEq for Dialect {
@@ -94,9 +110,9 @@ impl std::fmt::Debug for Dialect {
 impl Dialect {
     /// `"orders"`, or `` `orders` `` in MySQL.
     pub fn quote_ident(&self, name: &str) -> String {
-        let quote = self.ident_quote;
-        let doubled = format!("{quote}{quote}");
-        format!("{quote}{}{quote}", name.replace(quote, &doubled))
+        let (open, close) = self.ident_quotes;
+        let doubled = format!("{close}{close}");
+        format!("{open}{}{close}", name.replace(close, &doubled))
     }
 
     /// `"public"."orders"`: the schema is SQLite's attached database
@@ -154,14 +170,50 @@ impl Dialect {
         format!("{} {name}", self.transactions.rollback_to)
     }
 
-    pub fn release(&self, name: &str) -> String {
-        format!("{} {name}", self.transactions.release)
+    /// The statement that frees a savepoint, if the database has one.
+    pub fn release(&self, name: &str) -> Option<String> {
+        self.transactions
+            .release
+            .map(|release| format!("{release} {name}"))
+    }
+
+    /// The clause that limits a query to `limit` rows after `offset`.
+    /// `ordered` says the query already has an `order by`, which
+    /// `OffsetFetch` needs.
+    pub fn page(&self, ordered: bool, limit: u64, offset: u64) -> String {
+        match self.paging {
+            Paging::LimitOffset => format!(" limit {limit} offset {offset}"),
+            Paging::OffsetFetch => {
+                let order = if ordered {
+                    ""
+                } else {
+                    " order by (select null)"
+                };
+                format!("{order} offset {offset} rows fetch next {limit} rows only")
+            }
+        }
+    }
+
+    /// `select * … ` for the first `n` rows of `qualified`, for a new query tab.
+    pub fn first_rows(&self, qualified: &str, n: u64) -> String {
+        match self.paging {
+            Paging::LimitOffset => format!("select *\nfrom {qualified}\nlimit {n};\n"),
+            Paging::OffsetFetch => format!("select top ({n}) *\nfrom {qualified};\n"),
+        }
+    }
+
+    /// Statements as one script that this database runs.
+    pub fn join_script(&self, statements: &[&str]) -> String {
+        match self.batch_separator {
+            Some(separator) => statements.join(&format!("\n{separator}\n")),
+            None => statements.join("; "),
+        }
     }
 }
 
 pub static POSTGRES: Dialect = Dialect {
     name: "PostgreSQL",
-    ident_quote: '"',
+    ident_quotes: ('"', '"'),
     literal: quote_literal,
     as_text: |expr| format!("{expr}::text"),
     like_ignoring_case: "ilike",
@@ -178,15 +230,17 @@ pub static POSTGRES: Dialect = Dialect {
         begin: "begin transaction read write",
         savepoint: "savepoint",
         rollback_to: "rollback to savepoint",
-        release: "release savepoint",
+        release: Some("release savepoint"),
     },
+    paging: Paging::LimitOffset,
+    batch_separator: None,
     implicit_commits: false,
     explain: Some(crate::plan::explain_sql),
 };
 
 pub static SQLITE: Dialect = Dialect {
     name: "SQLite",
-    ident_quote: '"',
+    ident_quotes: ('"', '"'),
     literal: |value| {
         if value.contains('\0') {
             return Err(SqlError::NulByte);
@@ -207,15 +261,17 @@ pub static SQLITE: Dialect = Dialect {
         begin: "begin immediate",
         savepoint: "savepoint",
         rollback_to: "rollback to",
-        release: "release",
+        release: Some("release"),
     },
+    paging: Paging::LimitOffset,
+    batch_separator: None,
     implicit_commits: false,
     explain: None,
 };
 
 pub static MYSQL: Dialect = Dialect {
     name: "MySQL",
-    ident_quote: '`',
+    ident_quotes: ('`', '`'),
     // Backslashes are escapes unless NO_BACKSLASH_ESCAPES is set: text with
     // one goes as hex, which means the same either way.
     literal: |value| {
@@ -239,9 +295,47 @@ pub static MYSQL: Dialect = Dialect {
         begin: "start transaction read write",
         savepoint: "savepoint",
         rollback_to: "rollback to savepoint",
-        release: "release savepoint",
+        release: Some("release savepoint"),
     },
+    paging: Paging::LimitOffset,
+    batch_separator: None,
     implicit_commits: true,
+    explain: None,
+};
+
+pub static MSSQL: Dialect = Dialect {
+    name: "SQL Server",
+    ident_quotes: ('[', ']'),
+    // N'…' keeps characters outside the code page; backslashes are plain.
+    literal: |value| {
+        if value.contains('\0') {
+            return Err(SqlError::NulByte);
+        }
+        Ok(format!("N'{}'", value.replace('\'', "''")))
+    },
+    // ISO 8601 for dates and times; the plain conversion for what has no
+    // style 126 (try_convert gives NULL there).
+    as_text: |expr| {
+        format!("coalesce(try_convert(nvarchar(max), {expr}, 126), convert(nvarchar(max), {expr}))")
+    },
+    like_ignoring_case: "like",
+    nulls_last: false,
+    same: |a, b| format!("({a} = {b} or ({a} is null and {b} is null))"),
+    insert_defaults: "insert into {} default values",
+    parser: || Box::new(sqlparser::dialect::MsSqlDialect {}),
+    formatter: sqlformat::Dialect::Generic,
+    transactions: Transactions {
+        begin_read_only: &["begin transaction kuery_read"],
+        end_read_only: &["if @@trancount > 0 rollback transaction"],
+        begin: "begin transaction",
+        savepoint: "save transaction",
+        rollback_to: "rollback transaction",
+        // T-SQL has no RELEASE: a savepoint just stays until the transaction ends.
+        release: None,
+    },
+    paging: Paging::OffsetFetch,
+    batch_separator: Some("GO"),
+    implicit_commits: false,
     explain: None,
 };
 
@@ -337,6 +431,46 @@ mod tests {
         assert_eq!(lite.same("a", "b"), "a is b");
         assert_eq!(my.same("a", "b"), "a <=> b");
         assert_eq!(my.insert_defaults("`t`"), "insert into `t` () values ()");
+    }
+
+    #[test]
+    fn speaks_t_sql() {
+        let ms = &MSSQL;
+        assert_eq!(ms.quote_qualified("dbo", "a]b"), "[dbo].[a]]b]");
+        assert_eq!(ms.quote_ident("Order Items"), "[Order Items]");
+        assert_eq!(ms.quote_literal("ñandú's").unwrap(), "N'ñandú''s'");
+        assert_eq!(ms.quote_literal(r"C:\tmp").unwrap(), r"N'C:\tmp'");
+        assert_eq!(ms.quote_literal("a\0b"), Err(SqlError::NulByte));
+        assert_eq!(
+            ms.page(false, 100, 0),
+            " order by (select null) offset 0 rows fetch next 100 rows only"
+        );
+        assert_eq!(
+            ms.page(true, 50, 150),
+            " offset 150 rows fetch next 50 rows only"
+        );
+        assert_eq!(POSTGRES.page(true, 50, 150), " limit 50 offset 150");
+        assert_eq!(POSTGRES.page(false, 100, 0), " limit 100 offset 0");
+        assert_eq!(
+            ms.first_rows("[dbo].[t]", 100),
+            "select top (100) *\nfrom [dbo].[t];\n"
+        );
+        assert_eq!(
+            POSTGRES.first_rows("\"public\".\"t\"", 100),
+            "select *\nfrom \"public\".\"t\"\nlimit 100;\n"
+        );
+        assert_eq!(ms.release("s"), None);
+        assert_eq!(
+            POSTGRES.release("s").as_deref(),
+            Some("release savepoint s")
+        );
+        assert_eq!(ms.join_script(&["a", "b"]), "a\nGO\nb");
+        assert_eq!(MYSQL.join_script(&["a", "b"]), "a; b");
+        assert_eq!(ms.order_nulls_last("[n]", true), "[n] is null, [n] desc");
+        assert_eq!(
+            ms.as_text("[n]"),
+            "coalesce(try_convert(nvarchar(max), [n], 126), convert(nvarchar(max), [n]))"
+        );
     }
 
     #[test]
