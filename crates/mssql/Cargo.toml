@@ -9,3 +9,7 @@ futures.workspace = true
 tiberius.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+kuery-core = { workspace = true, features = ["conformance"] }
+async-channel.workspace = true

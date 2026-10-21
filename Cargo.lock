@@ -4073,6 +4073,7 @@ dependencies = [
 name = "kuery-mssql"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "futures",
  "kuery-core",
  "tiberius",

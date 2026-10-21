@@ -535,9 +535,9 @@ fn untrusted_certificate_points_to_the_option() {
     for tls in [TlsMode::Require, TlsMode::Default] {
         let refused = open(&Target { tls, ..target() }, Access::ReadOnly).err();
         assert!(
-            refused
-                .as_deref()
-                .is_some_and(|e| e.contains("trust server certificate")),
+            refused.as_deref().is_some_and(
+                |e| e.contains("trust server certificate") && !e.contains("trust_cert_ca")
+            ),
             "{refused:?}"
         );
     }
@@ -610,4 +610,65 @@ fn statement_timeout_stops_reads_but_not_write_transactions() {
         Some("1")
     );
     run(adapter.as_mut(), "rollback");
+}
+
+#[test]
+fn only_a_missing_permission_downgrades_the_writes_check() {
+    assert!([300, 297, 262].into_iter().all(lacks_permission));
+    assert!(![208, 1222, 18456].into_iter().any(lacks_permission));
+    assert_eq!(probe_verdict(Ok(())), Ok(true));
+    let broken = tiberius::error::Error::Protocol("cut short".into());
+    let refused = probe_verdict(Err(broken)).unwrap_err();
+    assert!(refused.contains("cut short"), "{refused}");
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn a_dropped_connection_ends_the_session_transaction_inside_a_read() {
+    let table = scratch("dropped");
+    let writer = session(target(), Access::ReadWrite);
+    drain_all(writer.run_in_transaction(
+        format!("insert into {table} values (99, N'lost', 1)"),
+        RunOptions::default(),
+    ))
+    .unwrap();
+    assert!(writer.in_transaction());
+    let running = writer.run_read_only(
+        "waitfor delay '00:00:20'; select 1".into(),
+        RunOptions::default(),
+    );
+    let canceller = writer.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        canceller.cancel();
+    });
+    let stopped = drain_all(running);
+    assert!(
+        matches!(stopped, Err(QueryError::Connection(_))),
+        "{stopped:?}"
+    );
+    assert!(!writer.in_transaction());
+    drain_all(writer.run_in_transaction(
+        format!("insert into {table} values (100, N'new', 1)"),
+        RunOptions::default(),
+    ))
+    .unwrap();
+    assert!(writer.in_transaction());
+    drop(writer);
+    drop_scratch(&table);
+}
+
+/// The outcome of a streamed statement.
+fn drain_all(rx: async_channel::Receiver<kuery_core::session::Event>) -> Result<(), QueryError> {
+    use kuery_core::session::Event;
+    block_on(async {
+        while let Ok(event) = rx.recv().await {
+            match event {
+                Event::Finished(_) => return Ok(()),
+                Event::Failed(error) => return Err(error),
+                _ => {}
+            }
+        }
+        Err(QueryError::Cancelled)
+    })
 }

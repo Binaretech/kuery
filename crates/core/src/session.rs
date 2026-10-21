@@ -611,8 +611,14 @@ impl Worker {
         if self.state.in_transaction.load(Ordering::SeqCst) {
             self.exec(&self.dialect().savepoint(READ))?;
             let outcome = job(self);
-            let _ = self.exec(&self.dialect().rollback_to(READ));
+            let undone = self.exec(&self.dialect().rollback_to(READ));
             let _ = self.release(READ);
+            // A dropped connection takes the write transaction with it.
+            if matches!(outcome, Err(QueryError::Connection(_)))
+                || matches!(undone, Err(QueryError::Connection(_)))
+            {
+                self.lose_transaction();
+            }
             return outcome;
         }
         self.exec_all(transactions.begin_read_only)?;

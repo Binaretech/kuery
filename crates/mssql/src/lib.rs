@@ -252,9 +252,11 @@ pub fn open(target: &Target, _access: Access) -> Result<Box<dyn Adapter>, String
         )
         .await
         .map_err(|error| error.to_string())?;
-        let detects_writes = first_row(&mut connection, &format!("select {WRITES}"))
-            .await
-            .is_ok();
+        let detects_writes = probe_verdict(
+            first_row(&mut connection, &format!("select {WRITES}"))
+                .await
+                .map(|_| ()),
+        )?;
         Ok(Box::new(Mssql {
             connection: Some(connection),
             target: target.clone(),
@@ -311,15 +313,29 @@ async fn connect(target: &Target, lock_timeout: Option<u128>) -> Result<Connecti
     Ok(connection)
 }
 
+/// Whether the writes check can run, from the probe's result: a login
+/// without the permission only loses the check; any other failure is an error
+/// (the connection must not open with read-only silently weaker).
+fn probe_verdict(probe: Result<(), tiberius::error::Error>) -> Result<bool, String> {
+    match probe {
+        Ok(()) => Ok(true),
+        Err(tiberius::error::Error::Server(server)) if lacks_permission(server.code()) => Ok(false),
+        Err(error) => Err(format!("Could not check for writes: {error}")),
+    }
+}
+
+/// SQL Server errors 300, 297 and 262: the login may not read what the
+/// writes check reads.
+fn lacks_permission(code: u32) -> bool {
+    matches!(code, 300 | 297 | 262)
+}
+
 fn connect_error(error: tiberius::error::Error, tls: TlsMode) -> String {
     match error {
-        tiberius::error::Error::Tls(detail)
-            if matches!(tls, TlsMode::Default | TlsMode::Require) =>
-        {
-            format!(
-                "The server's certificate is not trusted (SQL Server's own self-signed certificate never is): \
-                 choose TLS \"trust server certificate\" to connect anyway. ({detail})"
-            )
+        tiberius::error::Error::Tls(_) if matches!(tls, TlsMode::Default | TlsMode::Require) => {
+            "The server's certificate is not trusted (SQL Server's own self-signed certificate never is): \
+             choose TLS \"trust server certificate\" to connect anyway."
+                .to_string()
         }
         tiberius::error::Error::Server(server) => server.message().to_string(),
         other => other.to_string(),
