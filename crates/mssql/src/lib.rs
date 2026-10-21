@@ -177,12 +177,16 @@ impl From<&ConnectOptions> for Target {
     }
 }
 
-/// The log records the current transaction wrote outside tempdb: more than
-/// zero after a batch means it wrote (temporary tables do not count).
-const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count), 0) \
+/// The log records the current transaction wrote outside tempdb, less the
+/// one in each database that marks where it began: more than zero after a
+/// batch means it wrote (temporary tables do not count). A read can log that
+/// first record alone: Query Store records each new interval of runtime
+/// stats in a system transaction nested in the running one, which logs the
+/// running one's begin. Every write logs at least one more.
+const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count - 1), 0) \
      from sys.dm_tran_database_transactions \
      where transaction_id = (select transaction_id from sys.dm_tran_current_transaction) \
-       and database_id <> 2)";
+       and database_id <> 2 and database_transaction_log_record_count > 0)";
 
 /// Why the writes check cannot run, as the connection's notice.
 const UNDETECTED: &str = "Read-only is enforced by Kuery's checks and automatic undo only: grant VIEW SERVER PERFORMANCE STATE to this login, or use a login with only db_datareader, for writes to be refused.";

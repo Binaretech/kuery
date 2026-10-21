@@ -346,6 +346,20 @@ Temp-table work (tempdb, `database_id = 2`) is invisible to it, so `#t`,
 writes, DDL included, are visible right after the statement. The value is
 `bigint` (`I64`).
 
+**Amended (task 7b): a read can log one record.** Query Store (on by default
+for new databases since SQL Server 2022) records each new runtime-stats
+interval, and its first-ever setup in a database, in a system transaction
+nested in whatever transaction runs the first query of the interval. That
+logs the running transaction's `LOP_BEGIN_XACT` (108 bytes) and nothing else
+in it, so a plain `select` read `1` once per interval (reproduced with
+`interval_length_minutes = 1` and after `set query_store clear`). Every write
+logs that begin record plus at least one more (measured: insert, update
+including `set q = q`, delete `2`; `alter table add` `10`; `truncate` `11`;
+`grant` `5`; `create table` `20`; `select into` `49`), so the check counts
+`database_transaction_log_record_count - 1` for each database with records.
+Auto-created and auto-updated statistics, sequences, spools, schemabound
+views and `set statistics xml on` all read `0` either way.
+
 **Permission finding (important): the above was run as `sa`, and it does not
 work for an ordinary login.** Tried on the dev server (SQL Server 2022) with
 logins created by `spike -- logins`: `kuery_reader` (user in `shop` with only

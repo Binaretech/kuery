@@ -1195,6 +1195,55 @@ fn reads_keep_the_default_level_where_snapshots_are_not_allowed() {
     }
 }
 
+const QUERY_STORE_DB: &str = "kuery_query_store";
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
+fn reads_are_not_refused_when_query_store_starts_an_interval() {
+    // The first query of each Query Store interval records it in a system
+    // transaction nested in the running one, which logs that one's start.
+    let mut sa = adapter();
+    let drop_db = format!(
+        "if db_id('{QUERY_STORE_DB}') is not null begin \
+         alter database {QUERY_STORE_DB} set single_user with rollback immediate; \
+         drop database {QUERY_STORE_DB} end"
+    );
+    run(sa.as_mut(), &drop_db);
+    run(sa.as_mut(), &format!("create database {QUERY_STORE_DB}"));
+    run(
+        sa.as_mut(),
+        &format!(
+            "alter database {QUERY_STORE_DB} set query_store = on (operation_mode = read_write)"
+        ),
+    );
+    let mut reader = open(&target(), Access::ReadOnly).unwrap();
+    run(
+        reader.as_mut(),
+        &format!(
+            "use {QUERY_STORE_DB}; \
+             create table t (id int primary key, qty int); insert into t values (1, 1)"
+        ),
+    );
+    // A new interval starts with the next query.
+    run(
+        sa.as_mut(),
+        &format!("alter database {QUERY_STORE_DB} set query_store clear"),
+    );
+    for statement in MSSQL.transactions.begin_read_only {
+        run(reader.as_mut(), statement);
+    }
+    let read = fetch(reader.as_mut(), "select qty from t where id = 1");
+    assert_eq!(read.unwrap().get(0, 0), Some("1"));
+    // A write after it still counts.
+    let blocked = reader.execute("update t set qty = 2 where id = 1", &mut Discard);
+    assert_eq!(blocked, Err(QueryError::WritesDisabled));
+    for statement in MSSQL.transactions.end_read_only {
+        run(reader.as_mut(), statement);
+    }
+    drop(reader);
+    run(sa.as_mut(), &drop_db);
+}
+
 /// How many result sets `sql` streams on `adapter`.
 fn result_sets(adapter: &mut dyn Adapter, sql: &str) -> usize {
     let mut seen = Seen::default();
