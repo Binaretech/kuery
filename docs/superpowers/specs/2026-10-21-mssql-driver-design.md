@@ -280,10 +280,29 @@ with the code in `crates/mssql/examples/spike.rs`
 - **TLS backend: rustls 0.23.** `cargo tree -p kuery-mssql -d | grep rustls`
   shows no duplicate rustls; the whole workspace has one `rustls 0.23.46`.
   tiberius' `tokio-rustls` keeps its default `aws_lc_rs` feature, so
-  `aws-lc-sys` is in the build graph, but it already was (polars via reqwest,
-  `kuery-files`); it adds no new native requirement. With the workspace's
-  `ring` feature also on, rustls still negotiates without anyone installing a
-  default provider (verified, TLS connects). No need for `native-tls`.
+  `aws-lc-rs`/`aws-lc-sys` join the build graph (they were not in it before
+  this branch; the spike's "polars already brings it" was wrong). Two
+  consequences, found in the final review:
+  - **rustls then has two providers compiled in, and
+    `ClientConfig::builder()` panics** for want of a default. tiberius itself
+    connects (verified), but Redis (`redis` 1.7) and MySQL (`mysql_async`)
+    build their configs that way, so their TLS connections panicked in the
+    app. The app now installs `ring` as the process-wide provider at startup
+    (`drivers::install_tls_provider`, tested by
+    `rustls_configs_build_with_the_default_provider`).
+  - **Build requirements.** `aws-lc-sys` 0.46 builds with the C compiler alone
+    on every release target: they all have pregenerated bindings (so its cc
+    builder is chosen, not cmake), and `aws-lc-rs`' `prebuilt-nasm` feature
+    (on through rustls) uses the checked-in NASM objects on Windows. So no
+    cmake or NASM step is added to `release.yml`; the C compiler is already
+    needed by `ring`. A target without pregenerated bindings would need cmake
+    (and `bindgen`).
+- **`native-tls` was tried and rejected** (final review): with tiberius'
+  `native-tls` feature instead of `rustls`, `aws-lc-rs` leaves the graph, but
+  on macOS (Security.framework) every encrypted mode (default, require and
+  trust server certificate) hangs in the TLS handshake against the dev
+  server until the 15 s connect timeout; only `disable` connects. So
+  tiberius stays on rustls.
 - TLS mode mapping: see "TLS modes" below. `@@version` reads fine at connect.
 - `sqlparser` 0.63 `MsSqlDialect` **parses `waitfor delay '00:00:20'`** (to
   `Statement::WaitFor`), alone and followed by `; select 1`. So no

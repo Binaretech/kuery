@@ -163,6 +163,8 @@ change when you click Preview Impact.
 
 For builds on a different disk, set `CARGO_TARGET_DIR` before invoking Cargo. On macOS, for example, `export CARGO_TARGET_DIR=/private/tmp/kuery-target` keeps artifacts on the internal disk.
 
+Building needs a C compiler (for `ring` and `aws-lc-sys`, the two rustls crypto providers; the app uses `ring`). On the release targets `aws-lc-sys` needs no cmake or NASM: it ships pregenerated bindings and prebuilt NASM objects. A target outside that list would need cmake.
+
 
 ```bash
 docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, SQL Server 2022 (`mssql` and `mssql-seed`; amd64, emulated on Apple silicon, port 14339, user `sa`, development-only password in `.env.example`), a seeded Redis and an SSH bastion
