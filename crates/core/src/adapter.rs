@@ -99,6 +99,12 @@ pub trait Adapter: Send + 'static {
         false
     }
 
+    /// Something the user should know about this connection, such as a
+    /// protection it cannot give; asked once, at open.
+    fn notice(&self) -> Option<String> {
+        None
+    }
+
     /// The server's sessions, what they run and who blocks whom.
     fn activity(&mut self) -> Result<Activity, QueryError> {
         Err(QueryError::Unsupported(format!(

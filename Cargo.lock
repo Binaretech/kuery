@@ -4074,7 +4074,7 @@ name = "kuery-mssql"
 version = "0.1.0"
 dependencies = [
  "futures",
- "sqlparser 0.63.0",
+ "kuery-core",
  "tiberius",
  "tokio",
  "tokio-util",

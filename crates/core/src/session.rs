@@ -164,6 +164,7 @@ struct Shared {
     server: String,
     access: Access,
     has_activity: bool,
+    notice: Option<String>,
     canceller: Canceller,
     state: Arc<State>,
     opener: Opener,
@@ -217,6 +218,7 @@ impl Session {
                         server: adapter.server(),
                         access,
                         has_activity: adapter.has_activity(),
+                        notice: adapter.notice(),
                         canceller: canceller.clone(),
                         state: state.clone(),
                         opener: opener.clone(),
@@ -275,6 +277,12 @@ impl Session {
     /// Whether the server's sessions can be watched (Server Activity).
     pub fn has_activity(&self) -> bool {
         self.shared.has_activity
+    }
+
+    /// What the driver said the user should know about this connection
+    /// (see [`Adapter::notice`]).
+    pub fn notice(&self) -> Option<&str> {
+        self.shared.notice.as_deref()
     }
 
     pub fn in_transaction(&self) -> bool {

@@ -81,3 +81,27 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+
+  # Loads the sample shop into SQL Server once the server is up (it starts
+  # the `shop` database over each time): docker compose up -d mssql mssql-seed.
+  mssql-seed:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    depends_on:
+      mssql:
+        condition: service_healthy
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -C
+      - -b
+      - -S
+      - mssql
+      - -U
+      - sa
+      - -P
+      - Kuery_dev_2026!
+      - -i
+      - /seed/seed-mssql.sql
+    restart: "no"
+    volumes:
+      - ./seed-mssql.sql:/seed/seed-mssql.sql:ro

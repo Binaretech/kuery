@@ -4,10 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kuery-core.workspace = true
+futures.workspace = true
 tiberius.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-
-[dev-dependencies]
-sqlparser.workspace = true
-futures.workspace = true
