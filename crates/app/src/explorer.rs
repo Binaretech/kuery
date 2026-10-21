@@ -8,7 +8,10 @@
 //! system keychain, and hands an open [`Db`] to the tabs it asks the
 //! workspace to open. The connection list follows the project model.
 
+#[cfg(test)]
+mod bench;
 mod redis_keys;
+mod rows;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,9 +23,10 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel, Render, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel, Render, ScrollStrategy,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle,
+    Window, div, px, uniform_list,
 };
 use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
@@ -113,7 +117,7 @@ pub enum Mode {
     History,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Group {
     Tables,
     Views,
@@ -152,66 +156,6 @@ impl Group {
     }
 }
 
-/// One schema's objects, already filtered by the search text.
-#[derive(Default)]
-struct SchemaObjects {
-    tables: Vec<TableInfo>,
-    views: Vec<TableInfo>,
-    functions: Vec<FunctionInfo>,
-    triggers: Vec<TriggerRef>,
-    enums: Vec<EnumInfo>,
-}
-
-impl SchemaObjects {
-    fn collect(overview: &CatalogOverview, schema: &str, query: &str) -> Self {
-        let matches = |name: &str| query.is_empty() || name.to_lowercase().contains(query);
-        let (tables, views) = overview
-            .tables
-            .iter()
-            .filter(|t| t.table.schema == schema && matches(&t.table.name))
-            .cloned()
-            .partition(|t| t.kind.is_editable());
-        Self {
-            tables,
-            views,
-            functions: overview
-                .functions
-                .iter()
-                .filter(|f| f.schema == schema && matches(&f.name))
-                .cloned()
-                .collect(),
-            triggers: overview
-                .triggers
-                .iter()
-                .filter(|t| {
-                    t.table.schema == schema && (matches(&t.name) || matches(&t.table.name))
-                })
-                .cloned()
-                .collect(),
-            enums: overview
-                .enums
-                .iter()
-                .filter(|e| e.schema == schema && matches(&e.name))
-                .cloned()
-                .collect(),
-        }
-    }
-
-    fn count(&self, group: Group) -> usize {
-        match group {
-            Group::Tables => self.tables.len(),
-            Group::Views => self.views.len(),
-            Group::Functions => self.functions.len(),
-            Group::Triggers => self.triggers.len(),
-            Group::Enums => self.enums.len(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        Group::ALL.iter().all(|g| self.count(*g) == 0)
-    }
-}
-
 pub struct Explorer {
     model: Entity<ProjectModel>,
     connections: Vec<ConnectionNode>,
@@ -233,6 +177,13 @@ pub struct Explorer {
     redis_keys: HashMap<(usize, i64), redis_keys::KeyBrowser>,
     /// Bumped on every edit of the filter, so only the last one rescans.
     filter_edits: u64,
+    /// The tree's rows, built again when the explorer changes or the filter
+    /// does; elements are built only for the rows on screen.
+    rows: Vec<rows::Row>,
+    /// The filter `rows` was built with.
+    rows_query: String,
+    rows_stale: bool,
+    scroll: UniformListScrollHandle,
 }
 
 impl EventEmitter<ExplorerEvent> for Explorer {}
@@ -249,6 +200,9 @@ impl Explorer {
 
         cx.observe(&model, |this, _, cx| this.sync_project(cx))
             .detach();
+        // Whatever changes the tree (an expand, a connection opening, a
+        // catalog arriving) notifies; a hover only redraws.
+        cx.observe_self(|this, _| this.rows_stale = true).detach();
 
         let project = model.read(cx).project.clone();
         let mut explorer = Self {
@@ -274,6 +228,10 @@ impl Explorer {
             history_saves: 0,
             redis_keys: HashMap::new(),
             filter_edits: 0,
+            rows: Vec::new(),
+            rows_query: String::new(),
+            rows_stale: true,
+            scroll: UniformListScrollHandle::new(),
         };
         if !explorer.connections.is_empty() {
             explorer.expanded.insert("0".into());
@@ -300,6 +258,7 @@ impl Explorer {
     /// Collapses every expanded node.
     fn collapse_all(&mut self, cx: &mut Context<Self>) {
         self.expanded.clear();
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -339,6 +298,8 @@ impl Explorer {
             .ok();
         })
         .detach();
+        // The matches start at the top.
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -802,69 +763,158 @@ impl Explorer {
 
     // Render ---------------------------------------------------------------
 
-    fn render_tree(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// Builds the tree's rows again if the explorer changed since, or the
+    /// filter did.
+    fn update_rows(&mut self, cx: &App) {
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let searching = !query.is_empty();
-        let mut rows = Vec::new();
-
-        for (index, node) in self.connections.iter().enumerate() {
-            let key = index.to_string();
-            let expanded = self.expanded.contains(&key)
-                || (searching
-                    && matches!(
-                        node.state,
-                        ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
-                    ));
-            rows.push(self.connection_row(index, node, expanded, cx));
-            if !expanded {
-                continue;
-            }
-            match &node.state {
-                ConnectionState::Idle => {}
-                ConnectionState::Connecting => {
-                    rows.push(note_row(1, "Connecting…", theme::TEXT_TERTIARY))
-                }
-                ConnectionState::Failed(error) => {
-                    rows.push(note_row(1, error.clone(), theme::RED));
-                    let id = node.spec.id.clone();
-                    rows.push(
-                        div()
-                            .id(SharedString::from(format!("fix-{index}")))
-                            .ml(px(40.))
-                            .mb_1()
-                            .text_size(px(12.))
-                            .text_color(color(0x4da3ff))
-                            .hover(|s| s.text_color(color(0x80bdff)))
-                            .child("Edit connection…")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(ExplorerEvent::EditConnection(id.clone()))
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                ConnectionState::RedisReady { db, keyspace } => {
-                    self.redis_rows(index, db, keyspace, &mut rows, cx)
-                }
-                ConnectionState::Ready { catalog, .. } => match catalog {
-                    CatalogState::Loading => {
-                        rows.push(note_row(1, "Loading catalog…", theme::TEXT_TERTIARY))
-                    }
-                    CatalogState::Failed(error) => {
-                        rows.push(note_row(1, error.clone(), theme::RED))
-                    }
-                    CatalogState::Loaded(overview) => {
-                        for schema in &overview.schemas {
-                            let objects = SchemaObjects::collect(overview, schema, &query);
-                            if searching && objects.is_empty() {
-                                continue;
-                            }
-                            self.schema_rows(index, schema, &objects, searching, &mut rows, cx);
-                        }
-                    }
-                },
-            }
+        if !self.rows_stale && query == self.rows_query {
+            return;
         }
-        rows
+        let tree = rows::Tree {
+            expanded: &self.expanded,
+            redis_keys: &self.redis_keys,
+            query: &query,
+        };
+        self.rows = rows::tree_rows(self.connections.iter().map(rows::NodeView::of), &tree);
+        self.rows_query = query;
+        self.rows_stale = false;
+    }
+
+    fn catalog(&self, index: usize) -> Option<&CatalogOverview> {
+        match &self.connections.get(index)?.state {
+            ConnectionState::Ready {
+                catalog: CatalogState::Loaded(overview),
+                ..
+            } => Some(overview),
+            _ => None,
+        }
+    }
+
+    /// The element of one row, in a slot of the same height as every other
+    /// row, which the list needs. A row that no longer matches the catalog
+    /// (it changed since the rows were built) is left empty.
+    fn render_row(&self, position: usize, cx: &mut Context<Self>) -> AnyElement {
+        let row = self
+            .rows
+            .get(position)
+            .and_then(|row| self.row_element(row, position, cx));
+        div()
+            .h(px(ROW_HEIGHT + ROW_GAP))
+            .pb(px(ROW_GAP))
+            .children(row)
+            .into_any_element()
+    }
+
+    fn row_element(
+        &self,
+        row: &rows::Row,
+        position: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use rows::Row;
+        let element = match row {
+            Row::Connection { index, expanded } => {
+                let node = self.connections.get(*index)?;
+                self.connection_row(*index, node, *expanded, cx)
+            }
+            Row::Note { depth, text, tone } => {
+                tree_note(*depth, text.clone(), *tone).into_any_element()
+            }
+            Row::Error { depth, text } => {
+                let (tooltip, full) = (text.clone(), text.to_string());
+                tree_note(*depth, one_line(text).into(), theme::RED)
+                    .id(("explorer-error", position))
+                    .tooltip(move |window, cx| error_tooltip(tooltip.clone(), window, cx))
+                    .context_menu(move |menu, _, _| menu.item(copy("Copy Error", full.clone())))
+                    .into_any_element()
+            }
+            Row::EditConnection { index } => {
+                let id = self.connections.get(*index)?.spec.id.clone();
+                h_flex()
+                    .id(SharedString::from(format!("fix-{index}")))
+                    .h(px(ROW_HEIGHT))
+                    .ml(px(40.))
+                    .text_size(px(12.))
+                    .text_color(color(0x4da3ff))
+                    .hover(|s| s.text_color(color(0x80bdff)))
+                    .child("Edit connection…")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ExplorerEvent::EditConnection(id.clone()))
+                    }))
+                    .into_any_element()
+            }
+            Row::Schema {
+                index,
+                schema,
+                expanded,
+            } => {
+                let schema = self.catalog(*index)?.schemas.get(*schema)?;
+                self.schema_row(*index, schema, *expanded, cx)
+            }
+            Row::Group {
+                index,
+                schema,
+                group,
+                count,
+                open,
+            } => {
+                let schema = self.catalog(*index)?.schemas.get(*schema)?;
+                let key = format!("{index}/{schema}/{}", group.key());
+                tree_row(
+                    SharedString::from(format!("group-{key}")),
+                    2,
+                    Some(*open),
+                    false,
+                )
+                .child(div().flex_1().child(group.label()))
+                .child(counter(count.to_string()))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx)))
+                .into_any_element()
+            }
+            Row::Table { index, table } => {
+                let info = self.catalog(*index)?.tables.get(*table)?;
+                self.table_row(*index, info, cx)
+            }
+            Row::Function { index, function } => {
+                let function = self.catalog(*index)?.functions.get(*function)?;
+                self.function_row(*index, function, cx)
+            }
+            Row::Trigger { index, trigger } => {
+                let trigger = self.catalog(*index)?.triggers.get(*trigger)?;
+                self.trigger_row(*index, trigger, cx)
+            }
+            Row::Enum { index, item } => {
+                let info = self.catalog(*index)?.enums.get(*item)?;
+                self.enum_row(*index, info, cx)
+            }
+            Row::RedisDatabase {
+                index,
+                database,
+                keys,
+                expanded,
+            } => self.database_row(*index, *database, *keys, *expanded, cx),
+            Row::RedisFolder {
+                key,
+                name,
+                count,
+                depth,
+                open,
+                ..
+            } => self.folder_row(key, name, *count, *depth, *open, cx),
+            Row::RedisKey {
+                index,
+                database,
+                label,
+                key,
+                depth,
+            } => self.key_row(*index, *database, label, key, *depth, cx),
+            Row::RedisMore {
+                index,
+                database,
+                count,
+            } => self.more_row(*index, *database, *count, cx),
+        };
+        Some(element)
     }
 
     fn connection_row(
@@ -1035,7 +1085,9 @@ impl Explorer {
                         move |this, _, cx| {
                             this.expanded.insert(index.to_string());
                             this.expanded.insert(format!("{index}/public"));
-                            this.connect(index, cx)
+                            this.connect(index, cx);
+                            // `connect` does nothing while it is connecting.
+                            cx.notify();
                         },
                     ))
                 };
@@ -1059,245 +1111,175 @@ impl Explorer {
         .into_any_element()
     }
 
-    fn schema_rows(
+    fn schema_row(
         &self,
         index: usize,
         schema: &str,
-        objects: &SchemaObjects,
-        searching: bool,
-        rows: &mut Vec<AnyElement>,
+        expanded: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> AnyElement {
         let schema_key = format!("{index}/{schema}");
-        let expanded = searching || self.expanded.contains(&schema_key);
-        rows.push(
-            tree_row(
-                SharedString::from(format!("schema-{schema_key}")),
-                1,
-                Some(expanded),
-                false,
+        tree_row(
+            SharedString::from(format!("schema-{schema_key}")),
+            1,
+            Some(expanded),
+            false,
+        )
+        .child(
+            Icon::new(IconName::FolderClosed)
+                .size(px(14.))
+                .text_color(color(theme::ACCENT)),
+        )
+        .child(div().flex_1().truncate().child(schema.to_owned()))
+        .on_click({
+            let key = schema_key.clone();
+            cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx))
+        })
+        .context_menu({
+            let this = cx.entity().downgrade();
+            let name = schema.to_owned();
+            move |menu, _, _| {
+                let schema = name.clone();
+                menu.item(item_icon(
+                    "New Query",
+                    IconName::Plus,
+                    &this,
+                    move |this, _, cx| this.new_query(index, cx),
+                ))
+                .item(item_icon(
+                    "Open Diagram",
+                    IconName::Network,
+                    &this,
+                    move |this, _, cx| this.open_diagram(index, schema.clone(), cx),
+                ))
+                .item(item_icon(
+                    "Refresh Catalog",
+                    AppIcon::Reload,
+                    &this,
+                    move |this, _, cx| this.load_catalog(index, cx),
+                ))
+                .separator()
+                .item(copy("Copy Name", name.clone()))
+            }
+        })
+        .into_any_element()
+    }
+
+    fn function_row(
+        &self,
+        index: usize,
+        function: &FunctionInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = format!(
+            "{index}/{}/function/{}/{}",
+            function.schema, function.name, function.oid
+        );
+        let selected = self.selected.as_deref() == Some(key.as_str());
+        let function = function.clone();
+        tree_row(SharedString::from(key), 3, None, selected)
+            .child(icon(AppIcon::Code, 0xc49bff, selected))
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .child(format!("{}({})", function.name, function.arguments)),
             )
             .child(
-                Icon::new(IconName::FolderClosed)
-                    .size(px(14.))
-                    .text_color(color(theme::ACCENT)),
+                counter(function.kind.label())
+                    .when(selected, |c| c.text_color(color(theme::TEXT_SECONDARY))),
             )
-            .child(div().flex_1().truncate().child(schema.to_owned()))
             .on_click({
-                let key = schema_key.clone();
-                cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx))
+                let function = function.clone();
+                cx.listener(move |this, _, _, cx| this.open_function(index, function.clone(), cx))
             })
             .context_menu({
                 let this = cx.entity().downgrade();
-                let name = schema.to_owned();
                 move |menu, _, _| {
-                    let schema = name.clone();
-                    menu.item(item_icon(
-                        "New Query",
-                        IconName::Plus,
-                        &this,
-                        move |this, _, cx| this.new_query(index, cx),
-                    ))
-                    .item(item_icon(
-                        "Open Diagram",
-                        IconName::Network,
-                        &this,
-                        move |this, _, cx| this.open_diagram(index, schema.clone(), cx),
-                    ))
-                    .item(item_icon(
-                        "Refresh Catalog",
-                        AppIcon::Reload,
-                        &this,
-                        move |this, _, cx| this.load_catalog(index, cx),
-                    ))
+                    let open = function.clone();
+                    menu.item(item("Open Definition", &this, move |this, _, cx| {
+                        this.open_function(index, open.clone(), cx)
+                    }))
                     .separator()
-                    .item(copy("Copy Name", name.clone()))
+                    .item(copy(
+                        "Copy Name",
+                        quote_qualified(&function.schema, &function.name),
+                    ))
+                    .item(copy(
+                        "Copy Signature",
+                        format!(
+                            "{}({})",
+                            quote_qualified(&function.schema, &function.name),
+                            function.arguments
+                        ),
+                    ))
                 }
             })
-            .into_any_element(),
-        );
-        if !expanded {
-            return;
-        }
+            .into_any_element()
+    }
 
-        for group in Group::ALL {
-            let count = objects.count(group);
-            if count == 0
-                && (searching || matches!(group, Group::Triggers | Group::Enums | Group::Views))
-            {
-                continue;
-            }
-            let group_key = format!("{schema_key}/{}", group.key());
-            let open = searching || self.expanded.contains(&group_key);
-            rows.push(
-                tree_row(
-                    SharedString::from(format!("group-{group_key}")),
-                    2,
-                    Some(open),
-                    false,
-                )
-                .child(div().flex_1().child(group.label()))
-                .child(counter(count.to_string()))
-                .on_click({
-                    let key = group_key.clone();
-                    cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx))
-                })
-                .into_any_element(),
-            );
-            if !open {
-                continue;
-            }
-            match group {
-                Group::Tables | Group::Views => {
-                    let list = if group == Group::Tables {
-                        &objects.tables
-                    } else {
-                        &objects.views
-                    };
-                    for info in list {
-                        rows.push(self.table_row(index, info, cx));
-                    }
+    fn trigger_row(
+        &self,
+        index: usize,
+        trigger: &TriggerRef,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = format!("{index}/{}/trigger/{}", trigger.table.schema, trigger.name);
+        let selected = self.selected.as_deref() == Some(key.as_str());
+        let trigger = trigger.clone();
+        tree_row(SharedString::from(key), 3, None, selected)
+            .child(icon(AppIcon::Sort, theme::AMBER, selected))
+            .child(div().flex_1().truncate().child(trigger.name.clone()))
+            .child(
+                counter(format!("on {}", trigger.table.name))
+                    .when(selected, |c| c.text_color(color(theme::TEXT_SECONDARY))),
+            )
+            .on_click({
+                let trigger = trigger.clone();
+                cx.listener(move |this, _, _, cx| this.open_trigger(index, trigger.clone(), cx))
+            })
+            .context_menu({
+                let this = cx.entity().downgrade();
+                move |menu, _, _| {
+                    let open = trigger.clone();
+                    menu.item(item("Open Table Definition", &this, move |this, _, cx| {
+                        this.open_trigger(index, open.clone(), cx)
+                    }))
+                    .separator()
+                    .item(copy("Copy Name", trigger.name.clone()))
                 }
-                Group::Functions => {
-                    for function in &objects.functions {
-                        let key = format!(
-                            "{index}/{}/function/{}/{}",
-                            function.schema, function.name, function.oid
-                        );
-                        let selected = self.selected.as_deref() == Some(key.as_str());
-                        let function = function.clone();
-                        rows.push(
-                            tree_row(SharedString::from(key), 3, None, selected)
-                                .child(icon(AppIcon::Code, 0xc49bff, selected))
-                                .child(
-                                    div().flex_1().truncate().child(format!(
-                                        "{}({})",
-                                        function.name, function.arguments
-                                    )),
-                                )
-                                .child(
-                                    counter(function.kind.label()).when(selected, |c| {
-                                        c.text_color(color(theme::TEXT_SECONDARY))
-                                    }),
-                                )
-                                .on_click({
-                                    let function = function.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.open_function(index, function.clone(), cx)
-                                    })
-                                })
-                                .context_menu({
-                                    let this = cx.entity().downgrade();
-                                    move |menu, _, _| {
-                                        let open = function.clone();
-                                        menu.item(item(
-                                            "Open Definition",
-                                            &this,
-                                            move |this, _, cx| {
-                                                this.open_function(index, open.clone(), cx)
-                                            },
-                                        ))
-                                        .separator()
-                                        .item(copy(
-                                            "Copy Name",
-                                            quote_qualified(&function.schema, &function.name),
-                                        ))
-                                        .item(copy(
-                                            "Copy Signature",
-                                            format!(
-                                                "{}({})",
-                                                quote_qualified(&function.schema, &function.name),
-                                                function.arguments
-                                            ),
-                                        ))
-                                    }
-                                })
-                                .into_any_element(),
-                        );
-                    }
+            })
+            .into_any_element()
+    }
+
+    fn enum_row(&self, index: usize, info: &EnumInfo, cx: &mut Context<Self>) -> AnyElement {
+        let key = format!("{index}/{}/enum/{}", info.schema, info.name);
+        let selected = self.selected.as_deref() == Some(key.as_str());
+        let info = info.clone();
+        tree_row(SharedString::from(key), 3, None, selected)
+            .child(icon(AppIcon::Filter, theme::GREEN, selected))
+            .child(div().flex_1().truncate().child(info.name.clone()))
+            .child(
+                counter(info.values.len().to_string())
+                    .when(selected, |c| c.text_color(color(theme::TEXT_SECONDARY))),
+            )
+            .on_click({
+                let info = info.clone();
+                cx.listener(move |this, _, _, cx| this.open_enum(index, info.clone(), cx))
+            })
+            .context_menu({
+                let this = cx.entity().downgrade();
+                move |menu, _, _| {
+                    let open = info.clone();
+                    menu.item(item("Show Values", &this, move |this, _, cx| {
+                        this.open_enum(index, open.clone(), cx)
+                    }))
+                    .separator()
+                    .item(copy("Copy Name", quote_qualified(&info.schema, &info.name)))
+                    .item(copy("Copy Values", info.values.join(", ")))
                 }
-                Group::Triggers => {
-                    for trigger in &objects.triggers {
-                        let key =
-                            format!("{index}/{}/trigger/{}", trigger.table.schema, trigger.name);
-                        let selected = self.selected.as_deref() == Some(key.as_str());
-                        let trigger = trigger.clone();
-                        rows.push(
-                            tree_row(SharedString::from(key), 3, None, selected)
-                                .child(icon(AppIcon::Sort, theme::AMBER, selected))
-                                .child(div().flex_1().truncate().child(trigger.name.clone()))
-                                .child(
-                                    counter(format!("on {}", trigger.table.name))
-                                        .when(selected, |c| {
-                                            c.text_color(color(theme::TEXT_SECONDARY))
-                                        }),
-                                )
-                                .on_click({
-                                    let trigger = trigger.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.open_trigger(index, trigger.clone(), cx)
-                                    })
-                                })
-                                .context_menu({
-                                    let this = cx.entity().downgrade();
-                                    move |menu, _, _| {
-                                        let open = trigger.clone();
-                                        menu.item(item(
-                                            "Open Table Definition",
-                                            &this,
-                                            move |this, _, cx| {
-                                                this.open_trigger(index, open.clone(), cx)
-                                            },
-                                        ))
-                                        .separator()
-                                        .item(copy("Copy Name", trigger.name.clone()))
-                                    }
-                                })
-                                .into_any_element(),
-                        );
-                    }
-                }
-                Group::Enums => {
-                    for info in &objects.enums {
-                        let key = format!("{index}/{}/enum/{}", info.schema, info.name);
-                        let selected = self.selected.as_deref() == Some(key.as_str());
-                        let info = info.clone();
-                        rows.push(
-                            tree_row(SharedString::from(key), 3, None, selected)
-                                .child(icon(AppIcon::Filter, theme::GREEN, selected))
-                                .child(div().flex_1().truncate().child(info.name.clone()))
-                                .child(
-                                    counter(info.values.len().to_string()).when(selected, |c| {
-                                        c.text_color(color(theme::TEXT_SECONDARY))
-                                    }),
-                                )
-                                .on_click({
-                                    let info = info.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.open_enum(index, info.clone(), cx)
-                                    })
-                                })
-                                .context_menu({
-                                    let this = cx.entity().downgrade();
-                                    move |menu, _, _| {
-                                        let open = info.clone();
-                                        menu.item(item("Show Values", &this, move |this, _, cx| {
-                                            this.open_enum(index, open.clone(), cx)
-                                        }))
-                                        .separator()
-                                        .item(copy(
-                                            "Copy Name",
-                                            quote_qualified(&info.schema, &info.name),
-                                        ))
-                                        .item(copy("Copy Values", info.values.join(", ")))
-                                    }
-                                })
-                                .into_any_element(),
-                        );
-                    }
-                }
-            }
-        }
+            })
+            .into_any_element()
     }
 
     fn table_row(&self, index: usize, info: &TableInfo, cx: &mut Context<Self>) -> AnyElement {
@@ -1473,6 +1455,18 @@ impl Explorer {
         rows
     }
 
+    /// Saved queries and history: few enough rows to build them all.
+    fn render_list(&self, rows: Vec<AnyElement>) -> AnyElement {
+        div()
+            .id("explorer-body")
+            .flex_1()
+            .overflow_y_scroll()
+            .px(px(6.))
+            .pb_3()
+            .child(v_flex().gap(px(1.)).children(rows))
+            .into_any_element()
+    }
+
     /// Opens a History entry's SQL in a new tab on its connection.
     fn open_history(&mut self, connection: &str, sql: &str, cx: &mut Context<Self>) {
         let db = self
@@ -1617,6 +1611,10 @@ fn header_button(
         .on_click(on_click)
 }
 
+/// Every row of the explorer tree is this tall, with this gap below.
+const ROW_HEIGHT: f32 = 28.;
+const ROW_GAP: f32 = 1.;
+
 /// A clickable tree row with indentation and an optional disclosure chevron.
 fn tree_row(
     id: SharedString,
@@ -1637,7 +1635,7 @@ fn tree_row(
     };
     h_flex()
         .id(id)
-        .h(px(28.))
+        .h(px(ROW_HEIGHT))
         .pl(px(8. + depth as f32 * 16.))
         .pr_2()
         .gap(px(7.))
@@ -1663,6 +1661,18 @@ fn counter(text: impl Into<SharedString>) -> gpui_kit::Div {
         .child(text.into())
 }
 
+/// A line of text in the explorer tree, as tall as its rows and cut to one
+/// line.
+fn tree_note(depth: usize, text: SharedString, tone: u32) -> gpui_kit::Div {
+    h_flex()
+        .h(px(ROW_HEIGHT))
+        .pl(px(26. + depth as f32 * 14.))
+        .pr_2()
+        .text_size(px(12.))
+        .text_color(color(tone))
+        .child(div().flex_1().truncate().child(text))
+}
+
 fn note_row(depth: usize, text: impl Into<SharedString>, tone: u32) -> AnyElement {
     div()
         .pl(px(26. + depth as f32 * 14.))
@@ -1672,6 +1682,35 @@ fn note_row(depth: usize, text: impl Into<SharedString>, tone: u32) -> AnyElemen
         .text_color(color(tone))
         .child(text.into())
         .into_any_element()
+}
+
+/// An error on one line, for its row: line breaks would lay it out over
+/// the rows below.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Errors this long wrap in a tooltip of a fixed width; a tooltip is laid
+/// out at its content's width, so it would otherwise be one clipped line.
+const WRAP_ERRORS_FROM: usize = 60;
+
+/// The whole error, wrapped, with its line breaks.
+fn error_tooltip(
+    text: SharedString,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) -> gpui_kit::AnyView {
+    gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+        div()
+            .when(text.len() > WRAP_ERRORS_FROM, |d| d.w(px(420.)))
+            .whitespace_normal()
+            .child(text.clone())
+    })
+    .build(window, cx)
 }
 
 /// `18204` → `18.2k`, as in the design's sidebar.
@@ -1686,9 +1725,25 @@ fn compact(n: u64) -> String {
 impl Render for Explorer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.mode {
-            Mode::Explorer => self.render_tree(cx),
-            Mode::Queries => self.render_queries(cx),
-            Mode::History => self.render_history(cx),
+            Mode::Explorer => {
+                self.update_rows(cx);
+                uniform_list(
+                    "explorer-tree",
+                    self.rows.len(),
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|position| this.render_row(position, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&self.scroll)
+                .flex_1()
+                .px(px(6.))
+                .pb_3()
+                .into_any_element()
+            }
+            Mode::Queries => self.render_list(self.render_queries(cx)),
+            Mode::History => self.render_list(self.render_history(cx)),
         };
         let open = self
             .connections
@@ -1759,15 +1814,7 @@ impl Render for Explorer {
                         .child(Input::new(&self.search).small().cleanable(true)),
                 )
             })
-            .child(
-                div()
-                    .id("explorer-body")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px(px(6.))
-                    .pb_3()
-                    .child(v_flex().gap(px(1.)).children(body)),
-            )
+            .child(body)
             .child(
                 div()
                     .px_3()
@@ -1793,5 +1840,14 @@ mod tests {
         assert_eq!(compact(86), "86");
         assert_eq!(compact(18_204), "18.2k");
         assert_eq!(compact(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn puts_an_error_on_one_line() {
+        assert_eq!(
+            one_line("could not connect:\n  ssh: Permission denied\r\n\n(publickey)"),
+            "could not connect: ssh: Permission denied (publickey)"
+        );
+        assert_eq!(one_line("refused"), "refused");
     }
 }
