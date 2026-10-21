@@ -8,6 +8,8 @@
 //! system keychain, and hands an open [`Db`] to the tabs it asks the
 //! workspace to open. The connection list follows the project model.
 
+#[cfg(test)]
+mod bench;
 mod redis_keys;
 
 use std::collections::{HashMap, HashSet};
