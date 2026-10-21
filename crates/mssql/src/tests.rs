@@ -495,7 +495,7 @@ fn notice_for(login: &str, setup: &[&str], cleanup: &[&str]) -> Option<String> {
 fn the_notice_shows_for_every_login_that_can_write() {
     let _shop = changing_shop();
     assert_eq!(notice_for("kuery_n_reader", &[], &[]), None);
-    let can_write: [(&str, &[&str], &[&str]); 5] = [
+    let can_write: [(&str, &[&str], &[&str]); 8] = [
         (
             "kuery_n_ddl",
             &["alter role db_ddladmin add member {user}"],
@@ -523,6 +523,21 @@ fn the_notice_shows_for_every_login_that_can_write() {
             "kuery_n_execute",
             &["grant execute on schema::dbo to {user}"],
             &[],
+        ),
+        (
+            "kuery_n_impersonate",
+            &["use master; grant impersonate on login::sa to {user}"],
+            &["use master; revoke impersonate on login::sa from {user}"],
+        ),
+        (
+            "kuery_n_secadmin",
+            &["alter server role securityadmin add member {user}"],
+            &["alter server role securityadmin drop member {user}"],
+        ),
+        (
+            "kuery_n_control",
+            &["use master; grant control on login::sa to {user}"],
+            &["use master; revoke control on login::sa from {user}"],
         ),
     ];
     let silent: Vec<&str> = can_write

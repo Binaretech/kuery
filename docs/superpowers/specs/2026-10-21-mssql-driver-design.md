@@ -254,10 +254,17 @@ PostgreSQL and are new work for this driver.
    the empty one each fixed role owns) and no object; no granted `INSERT`,
    `UPDATE`, `DELETE`, `ALTER`, `CONTROL`, `TAKE OWNERSHIP`, `EXECUTE`
    (procedures write through ownership chains), `IMPERSONATE`, `CREATE …` or
-   `ALTER ANY …` at any scope; and no `CONTROL SERVER`, `ALTER ANY DATABASE`
-   or `IMPERSONATE ANY LOGIN`. Tested with a `db_datareader`-only login (no
-   warning) and with `db_ddladmin`, a schema owner, a table owner,
-   `grant insert` on a table and `grant execute on schema::dbo` (warning).
+   `ALTER ANY …` at database, schema or object scope. At server scope
+   (`sys.login_token`, `sys.server_role_members`, `is_srvrolemember`,
+   `sys.server_permissions`, `fn_my_permissions(null, 'SERVER')`): in no
+   server role but `public`; no `IMPERSONATE` or `CONTROL` on any login
+   (class 101; `fn_my_permissions` does not list those); none of
+   `CONTROL SERVER`, `ALTER ANY DATABASE`, `IMPERSONATE ANY LOGIN`,
+   `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`. Other server permissions are
+   not checked. Tested with a `db_datareader`-only login (no warning) and
+   with `db_ddladmin`, a schema owner, a table owner, `grant insert` on a
+   table, `grant execute on schema::dbo`, `grant impersonate on login::sa`,
+   `grant control on login::sa` and `securityadmin` membership (warning).
 
 ## Suggested order
 

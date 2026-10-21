@@ -203,7 +203,11 @@ const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count
 ///   empty schema each fixed role owns (`db_datareader`'s own);
 /// - none was granted a permission that writes, changes schema or runs code
 ///   (procedures write through ownership chains), at any scope;
-/// - the login has no server permission over every database.
+/// - at server scope: the login (or a server role in its token) is in no
+///   server role but `public`, holds no `IMPERSONATE` or `CONTROL` on a
+///   login (it could act as that login), and has none of `CONTROL SERVER`,
+///   `ALTER ANY DATABASE`, `IMPERSONATE ANY LOGIN`, `ALTER ANY LOGIN` or
+///   `ALTER ANY SERVER ROLE`. Other server permissions are not looked at.
 const READS_ONLY: &str = "with token as ( \
          select principal_id from sys.user_token \
          union select database_principal_id() union select 0) \
@@ -232,7 +236,28 @@ const READS_ONLY: &str = "with token as ( \
                               or p.permission_name like 'ALTER ANY %')) \
        and not exists (select 1 from fn_my_permissions(null, 'SERVER') \
                        where permission_name in ('CONTROL SERVER', 'ALTER ANY DATABASE', \
-                                                 'IMPERSONATE ANY LOGIN')) \
+                                                 'IMPERSONATE ANY LOGIN', 'ALTER ANY LOGIN', \
+                                                 'ALTER ANY SERVER ROLE')) \
+       and not exists (select 1 from sys.login_token t \
+                       where t.type = 'SERVER ROLE' and t.name <> 'public') \
+       and not exists (select 1 from sys.server_role_members m \
+                       join sys.server_principals r on r.principal_id = m.role_principal_id \
+                       where m.member_principal_id = suser_id() and r.name <> 'public') \
+       and is_srvrolemember('securityadmin') = 0 \
+       and is_srvrolemember('serveradmin') = 0 \
+       and is_srvrolemember('setupadmin') = 0 \
+       and is_srvrolemember('processadmin') = 0 \
+       and is_srvrolemember('diskadmin') = 0 \
+       and is_srvrolemember('dbcreator') = 0 \
+       and is_srvrolemember('bulkadmin') = 0 \
+       and not exists (select 1 from sys.server_permissions p \
+                       where (p.grantee_principal_id = suser_id() \
+                              or p.grantee_principal_id in (select principal_id from sys.login_token)) \
+                         and p.state in ('G', 'W') \
+                         and ((p.class = 101 and p.permission_name in ('IMPERSONATE', 'CONTROL')) \
+                              or p.permission_name in ('CONTROL SERVER', 'ALTER ANY DATABASE', \
+                                                       'IMPERSONATE ANY LOGIN', 'ALTER ANY LOGIN', \
+                                                       'ALTER ANY SERVER ROLE'))) \
      then 1 else 0 end";
 
 /// Why the writes check cannot run, as the connection's notice.

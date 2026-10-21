@@ -339,8 +339,12 @@ through is detected and refused with an error; without it the write is
 undone silently, and the connection shows a warning in the status bar,
 unless Kuery can tell the login only reads: its user's roles (nested ones
 included) are only `public` and `db_datareader`, it owns no schema or object,
-it has no write, DDL, `EXECUTE` or `IMPERSONATE` permission at any scope, and
-no server permission over every database. Any doubt shows the warning. A
+it has no write, DDL, `EXECUTE` or `IMPERSONATE` permission in the
+database, and at server scope it is in no server role but `public`, holds no
+`IMPERSONATE` or `CONTROL` on a login, and has none of `CONTROL SERVER`,
+`ALTER ANY DATABASE`, `IMPERSONATE ANY LOGIN`, `ALTER ANY LOGIN` or `ALTER ANY
+SERVER ROLE` (other server permissions are not checked). Any doubt shows the
+warning. A
 login with only `db_datareader` is the strongest guarantee. If the
 permission check fails for a reason other than missing permission, the
 connection does not open.
