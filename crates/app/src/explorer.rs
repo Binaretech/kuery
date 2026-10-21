@@ -821,13 +821,11 @@ impl Explorer {
                 tree_note(*depth, text.clone(), *tone).into_any_element()
             }
             Row::Error { depth, text } => {
-                let tooltip = text.clone();
-                tree_note(*depth, text.clone(), theme::RED)
+                let (tooltip, full) = (text.clone(), text.to_string());
+                tree_note(*depth, one_line(text).into(), theme::RED)
                     .id(("explorer-error", position))
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
-                            .build(window, cx)
-                    })
+                    .tooltip(move |window, cx| error_tooltip(tooltip.clone(), window, cx))
+                    .context_menu(move |menu, _, _| menu.item(copy("Copy Error", full.clone())))
                     .into_any_element()
             }
             Row::EditConnection { index } => {
@@ -1087,7 +1085,9 @@ impl Explorer {
                         move |this, _, cx| {
                             this.expanded.insert(index.to_string());
                             this.expanded.insert(format!("{index}/public"));
-                            this.connect(index, cx)
+                            this.connect(index, cx);
+                            // `connect` does nothing while it is connecting.
+                            cx.notify();
                         },
                     ))
                 };
@@ -1687,6 +1687,35 @@ fn note_row(depth: usize, text: impl Into<SharedString>, tone: u32) -> AnyElemen
         .into_any_element()
 }
 
+/// An error on one line, for its row: line breaks would lay it out over
+/// the rows below.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Errors this long wrap in a tooltip of a fixed width; a tooltip is laid
+/// out at its content's width, so it would otherwise be one clipped line.
+const WRAP_ERRORS_FROM: usize = 60;
+
+/// The whole error, wrapped, with its line breaks.
+fn error_tooltip(
+    text: SharedString,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) -> gpui_kit::AnyView {
+    gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+        div()
+            .when(text.len() > WRAP_ERRORS_FROM, |d| d.w(px(420.)))
+            .whitespace_normal()
+            .child(text.clone())
+    })
+    .build(window, cx)
+}
+
 /// `18204` → `18.2k`, as in the design's sidebar.
 fn compact(n: u64) -> String {
     match n {
@@ -1814,5 +1843,14 @@ mod tests {
         assert_eq!(compact(86), "86");
         assert_eq!(compact(18_204), "18.2k");
         assert_eq!(compact(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn puts_an_error_on_one_line() {
+        assert_eq!(
+            one_line("could not connect:\n  ssh: Permission denied\r\n\n(publickey)"),
+            "could not connect: ssh: Permission denied (publickey)"
+        );
+        assert_eq!(one_line("refused"), "refused");
     }
 }

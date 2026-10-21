@@ -323,7 +323,7 @@ impl Explorer {
     ) -> AnyElement {
         h_flex()
             .id(SharedString::from(format!("redis-more-{index}-{database}")))
-            .h(px(28.))
+            .h(px(ROW_HEIGHT))
             .pl(px(26. + 2. * 14.))
             .text_size(px(12.))
             .text_color(color(0x4da3ff))
