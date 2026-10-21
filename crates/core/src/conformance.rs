@@ -233,7 +233,10 @@ pub fn keeps_write_transactions_until_commit(fixture: &Fixture) {
     let other = open(fixture, Access::ReadOnly);
     let name = &scratch.name;
     let summary = drain(writer.run_in_transaction(
-        format!("update {name} set qty = qty + 10; delete from {name} where id = 1"),
+        writer.dialect().join_script(&[
+            &format!("update {name} set qty = qty + 10"),
+            &format!("delete from {name} where id = 1"),
+        ]),
         RunOptions::default(),
     ))
     .unwrap();
@@ -248,7 +251,10 @@ pub fn keeps_write_transactions_until_commit(fixture: &Fixture) {
 
     // A failing script undoes only itself.
     let failed = drain(writer.run_in_transaction(
-        format!("update {name} set qty = 0; insert into kuery_nowhere values (1)"),
+        writer.dialect().join_script(&[
+            &format!("update {name} set qty = 0"),
+            "insert into kuery_nowhere values (1)",
+        ]),
         RunOptions::default(),
     ));
     assert!(
@@ -275,7 +281,10 @@ pub fn keeps_whole_scripts_or_nothing(fixture: &Fixture) {
     let writer = &scratch.writer;
     let name = &scratch.name;
     let failed = drain(writer.run_autocommit(
-        format!("delete from {name}; insert into kuery_nowhere values (1)"),
+        writer.dialect().join_script(&[
+            &format!("delete from {name}"),
+            "insert into kuery_nowhere values (1)",
+        ]),
         RunOptions::default(),
     ));
     assert!(failed.is_err());
@@ -297,7 +306,10 @@ pub fn previews_and_undoes(fixture: &Fixture) {
     let writer = &scratch.writer;
     let name = &scratch.name;
     let impacts = block_on(writer.preview(
-        format!("update {name} set qty = 0 where id < 3; select * from {name}"),
+        writer.dialect().join_script(&[
+            &format!("update {name} set qty = 0 where id < 3"),
+            &format!("select * from {name}"),
+        ]),
         RunOptions::default(),
     ))
     .unwrap();

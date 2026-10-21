@@ -7,7 +7,10 @@
 use std::fmt;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    Delete, Expr, FromTable, ObjectName, ObjectType, Query, SessionParamStatsTopic, SetExpr,
+    SetSessionParamKind, Statement, TableFactor, TableObject, Visit, Visitor,
+};
 use sqlparser::parser::Parser;
 
 use crate::sql::Dialect;
@@ -44,6 +47,38 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_xact_lock",
     "set_config",
     "setval",
+    // T-SQL: running programs, reading files and other servers, mail.
+    "xp_cmdshell",
+    "openrowset",
+    "opendatasource",
+    "openquery",
+    "sp_send_dbmail",
+];
+
+/// T-SQL stored procedures that only read. `EXEC` of anything else may write.
+const READ_ONLY_PROCEDURES: &[&str] = &[
+    "sp_help",
+    "sp_helptext",
+    "sp_helpindex",
+    "sp_columns",
+    "sp_tables",
+    "sp_who",
+    "sp_who2",
+    "sp_spaceused",
+    "sp_databases",
+    "sp_server_info",
+];
+
+/// T-SQL `SET` options that only change how this session shows or reads
+/// data. Anything else (`implicit_transactions`, `identity_insert`,
+/// `rowcount`…) is refused.
+const SESSION_OPTIONS: &[&str] = &[
+    "nocount",
+    "showplan_xml",
+    "arithabort",
+    "quoted_identifier",
+    "language",
+    "dateformat",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +135,9 @@ pub fn check(sql: &str) -> Result<(), Rejection> {
 
 /// The same, for a database speaking `dialect`.
 pub fn check_in(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
+    if dialect.batch_separator.is_some() {
+        return check_batch(dialect, sql);
+    }
     let statements = Parser::parse_sql(&*dialect.parser(), sql)
         .map_err(|error| Rejection::Parse(error.to_string()))?;
 
@@ -110,15 +148,47 @@ pub fn check_in(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
     }
 }
 
+/// A database whose script unit is a batch (T-SQL) runs several statements
+/// at once, so one batch may hold many; they must all be reads or touch
+/// only what the session itself made.
+fn check_batch(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
+    let batches = crate::script::statements_in(dialect, sql)
+        .ok_or_else(|| Rejection::Parse("unterminated string, comment or identifier".into()))?;
+    let batch = match batches.as_slice() {
+        [] => return Err(Rejection::Empty),
+        [batch] => &sql[batch.clone()],
+        many => return Err(Rejection::MultipleStatements(many.len())),
+    };
+    let statements = Parser::parse_sql(&*dialect.parser(), batch)
+        .map_err(|error| Rejection::Parse(error.to_string()))?;
+    if statements.is_empty() {
+        return Err(Rejection::Empty);
+    }
+    statements.iter().try_for_each(|statement| {
+        match statement.visit(&mut ReadOnlyVisitor {
+            session_local: true,
+        }) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(rejection) => Err(rejection),
+        }
+    })
+}
+
 /// Checks that one parsed statement only reads data.
 pub(crate) fn check_statement(statement: &Statement) -> Result<(), Rejection> {
-    match statement.visit(&mut ReadOnlyVisitor) {
+    match statement.visit(&mut ReadOnlyVisitor {
+        session_local: false,
+    }) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(rejection) => Err(rejection),
     }
 }
 
-struct ReadOnlyVisitor;
+struct ReadOnlyVisitor {
+    /// Also allow what only touches the session: variables, `#temp` tables,
+    /// session options and a few read-only procedures (T-SQL).
+    session_local: bool,
+}
 
 impl Visitor for ReadOnlyVisitor {
     type Break = Rejection;
@@ -143,7 +213,7 @@ impl Visitor for ReadOnlyVisitor {
                 | Statement::ShowCollation { .. }
                 | Statement::ShowViews { .. }
         );
-        if allowed {
+        if allowed || (self.session_local && is_session_local(statement)) {
             ControlFlow::Continue(())
         } else {
             ControlFlow::Break(Rejection::Statement(statement_kind(statement)))
@@ -154,7 +224,7 @@ impl Visitor for ReadOnlyVisitor {
         if !query.locks.is_empty() {
             return ControlFlow::Break(Rejection::LockingClause);
         }
-        if creates_table(&query.body) {
+        if creates_table(&query.body, self.session_local) {
             return ControlFlow::Break(Rejection::SelectInto);
         }
         ControlFlow::Continue(())
@@ -183,13 +253,132 @@ fn check_function_name(name: &ObjectName) -> ControlFlow<Rejection> {
     }
 }
 
-/// `SELECT … INTO table`, also inside UNION/INTERSECT.
-fn creates_table(body: &SetExpr) -> bool {
+/// `SELECT … INTO table`, also inside UNION/INTERSECT. With `session_local`
+/// a `#temp` table is no table worth refusing.
+fn creates_table(body: &SetExpr, session_local: bool) -> bool {
     match body {
-        SetExpr::Select(select) => select.into.is_some(),
-        SetExpr::SetOperation { left, right, .. } => creates_table(left) || creates_table(right),
+        SetExpr::Select(select) => select.into.as_ref().is_some_and(|into| {
+            !(session_local
+                && !into.targets.is_empty()
+                && into.targets.iter().all(|target| match target {
+                    Expr::Identifier(ident) => is_temp_table(&ident.value),
+                    _ => false,
+                }))
+        }),
+        SetExpr::SetOperation { left, right, .. } => {
+            creates_table(left, session_local) || creates_table(right, session_local)
+        }
         _ => false,
     }
+}
+
+/// `#t` and `##t`.
+fn is_temp_table(name: &str) -> bool {
+    name.starts_with('#')
+}
+
+/// A name that lives and dies with the session: `#t`, `##t` or `@t`.
+fn is_session_local_name(name: &ObjectName) -> bool {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .is_some_and(|ident| is_temp_table(&ident.value) || ident.value.starts_with('@')),
+        _ => false,
+    }
+}
+
+fn is_session_local_table(factor: &TableFactor) -> bool {
+    matches!(factor, TableFactor::Table { name, .. } if is_session_local_name(name))
+}
+
+/// T-SQL statements that cannot change anything outside this session. Their
+/// expressions are still visited, so a subquery or function in them is
+/// checked like any other.
+fn is_session_local(statement: &Statement) -> bool {
+    match statement {
+        Statement::Declare { .. } | Statement::WaitFor(_) => true,
+        Statement::Set(set) => match set {
+            sqlparser::ast::Set::SingleAssignment { variable, .. } => {
+                variable.to_string().starts_with('@')
+            }
+            sqlparser::ast::Set::SetTransaction {
+                modes,
+                snapshot,
+                session,
+            } => {
+                !session
+                    && snapshot.is_none()
+                    && modes.iter().all(|mode| {
+                        matches!(mode, sqlparser::ast::TransactionMode::IsolationLevel(_))
+                    })
+            }
+            sqlparser::ast::Set::SetSessionParam(param) => match param {
+                SetSessionParamKind::Statistics(statistics) => matches!(
+                    statistics.topic,
+                    SessionParamStatsTopic::IO
+                        | SessionParamStatsTopic::Time
+                        | SessionParamStatsTopic::Xml
+                ),
+                SetSessionParamKind::Generic(generic) => match generic.names.as_slice() {
+                    [name] => {
+                        let name = name.to_string().to_lowercase();
+                        SESSION_OPTIONS.contains(&name.as_str()) || name.starts_with("ansi_")
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        },
+        Statement::Execute {
+            name: Some(name), ..
+        } => is_read_only_procedure(name),
+        Statement::CreateTable(create) => is_session_local_name(&create.name),
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            ..
+        } => names.iter().all(is_session_local_name),
+        Statement::Insert(insert) => {
+            matches!(&insert.table, TableObject::TableName(name) if is_session_local_name(name))
+        }
+        Statement::Update(update) => is_session_local_table(&update.table.relation),
+        Statement::Delete(delete) => deletes_only_session_local(delete),
+        _ => false,
+    }
+}
+
+/// `sp_help` and friends, as the system procedures (not a same-named one in
+/// a user schema).
+fn is_read_only_procedure(name: &ObjectName) -> bool {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase())
+        .collect();
+    let [prefix @ .., procedure] = parts.as_slice() else {
+        return false;
+    };
+    let system_schema = matches!(
+        prefix
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [] | ["sys"] | ["master", "dbo"] | ["master", "sys"]
+    );
+    system_schema && READ_ONLY_PROCEDURES.contains(&procedure.as_str())
+}
+
+fn deletes_only_session_local(delete: &Delete) -> bool {
+    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &delete.from;
+    delete.using.is_none()
+        && delete.tables.iter().all(is_session_local_name)
+        && !from.is_empty()
+        && from
+            .iter()
+            .all(|table| is_session_local_table(&table.relation))
 }
 
 /// Short statement name for the error message, e.g. `DELETE`.
@@ -346,6 +535,57 @@ mod tests {
             rejected("select 1; select 2"),
             Rejection::MultipleStatements(2)
         );
+    }
+
+    #[test]
+    fn t_sql_allows_session_local_statements_in_one_batch() {
+        use crate::sql::MSSQL;
+        let ok = |sql| assert_eq!(check_in(&MSSQL, sql), Ok(()), "{sql}");
+        let no = |sql| assert!(check_in(&MSSQL, sql).is_err(), "{sql}");
+        ok("declare @n int = 3; select top (@n) * from dbo.orders");
+        ok("set @n = 4");
+        ok("select * into #t from dbo.orders; select * from #t");
+        ok("select * into ##t from dbo.orders");
+        ok("exec sp_help 'dbo.orders'");
+        ok("execute sp_who2");
+        ok("set statistics io on");
+        ok("set nocount on");
+        ok("set transaction isolation level read uncommitted");
+        ok("waitfor delay '00:00:01'");
+        ok("waitfor delay '00:00:20'; select 1");
+        ok("create table #t (id int); insert into #t values (1); drop table #t");
+        ok("declare @t table (id int); insert into @t values (1); update @t set id = 2");
+        ok("select 1\nGO");
+        no("select * into dbo.copy from dbo.orders");
+        no("select * into #t from dbo.orders; select * into dbo.copy from #t");
+        no("exec dbo.recalculate");
+        no("exec xp_cmdshell 'dir'");
+        no("exec sp_send_dbmail @recipients = 'a@b.c'");
+        no("select * from openrowset('SQLNCLI', 'x', 'select 1')");
+        no("select * from openquery(srv, 'select 1')");
+        no("select next value for dbo.seq");
+        no("update dbo.orders set total = 0");
+        no("insert into dbo.orders values (1)");
+        no("drop table dbo.orders");
+        no("set implicit_transactions on");
+        no("set identity_insert dbo.orders on");
+        no("waitfor delay '00:00:01'; delete from dbo.orders");
+        no("exec ('delete from dbo.orders')");
+        no("exec dbo.sp_help 'x'");
+        no("set @n = (select count(*) from openquery(srv, 'select 1'))");
+        assert_eq!(
+            check_in(&MSSQL, "select * from openrowset('a', 'b', 'c')"),
+            Err(Rejection::Function("openrowset".into()))
+        );
+        assert_eq!(
+            check_in(&MSSQL, "select * into dbo.copy from dbo.orders"),
+            Err(Rejection::SelectInto)
+        );
+        assert!(matches!(
+            check_in(&MSSQL, "select 1\nGO\nselect 2"),
+            Err(Rejection::MultipleStatements(2))
+        ));
+        assert_eq!(check_in(&MSSQL, "-- nothing\nGO"), Err(Rejection::Empty));
     }
 
     #[test]

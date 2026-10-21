@@ -1,6 +1,8 @@
 //! Where each statement of a script is, so the editor can run the one under
 //! the cursor. Semicolons inside strings, quoted identifiers, comments and
-//! dollar-quoted bodies do not split statements.
+//! dollar-quoted bodies do not split statements. For a database with a batch
+//! separator (`GO` in T-SQL) the unit is the batch instead: statements run
+//! together and only a separator line splits.
 
 use std::ops::Range;
 
@@ -17,7 +19,8 @@ pub fn statements(sql: &str) -> Option<Vec<Range<usize>>> {
 }
 
 /// The same, for a database speaking `dialect` (MySQL's `#` comments and
-/// backslash escapes, say).
+/// backslash escapes, say). With a batch separator, one range per batch: the
+/// separator lines are left out and `;` does not split.
 pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> {
     let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
@@ -31,10 +34,28 @@ pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> 
     let mut end = 0;
     for token in &tokens {
         let (from, to) = (offsets.of(token.span.start), offsets.of(token.span.end));
+        if let (Some(separator), Token::Word(word)) = (dialect.batch_separator, &token.token) {
+            if word.quote_style.is_none()
+                && word.value.eq_ignore_ascii_case(separator)
+                && alone_on_its_line(sql, from, to)
+            {
+                if let (Some(start), true) = (start, has_code) {
+                    ranges.push(start..end);
+                }
+                (start, has_code) = (None, false);
+                continue;
+            }
+        }
         match &token.token {
             Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab) => {}
             Token::Whitespace(_) => {
                 start.get_or_insert(from);
+            }
+            // Inside a batch a `;` ends a statement, not the unit.
+            Token::SemiColon if dialect.batch_separator.is_some() => {
+                if has_code {
+                    end = to;
+                }
             }
             Token::SemiColon => {
                 if let (Some(start), true) = (start, has_code) {
@@ -54,6 +75,14 @@ pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> 
         ranges.push(start..end);
     }
     Some(ranges)
+}
+
+/// Whether the token at `from..to` is all there is on its line.
+fn alone_on_its_line(sql: &str, from: usize, to: usize) -> bool {
+    let blank = |text: &str| text.chars().all(|c| c != '\n' && c.is_whitespace());
+    let line_start = sql[..from].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = sql[to..].find('\n').map_or(sql.len(), |index| to + index);
+    blank(&sql[line_start..from]) && blank(&sql[to..line_end])
 }
 
 /// The statement to run for a cursor at byte `offset`: the one it is in, or
@@ -154,6 +183,56 @@ mod tests {
     fn multibyte_text_keeps_byte_offsets() {
         let sql = "select 'ñandú';\nselect 'été'";
         assert_eq!(texts(sql), ["select 'ñandú'", "select 'été'"]);
+    }
+
+    #[test]
+    fn go_lines_split_t_sql_scripts_into_batches() {
+        use crate::sql::MSSQL;
+        let sql = "declare @n int = 1;\nselect @n;\nGO\nselect 2\n  go  \n-- GO in a comment\nselect 'GO'";
+        let batches: Vec<&str> = statements_in(&MSSQL, sql)
+            .unwrap()
+            .into_iter()
+            .map(|range| &sql[range])
+            .collect();
+        assert_eq!(
+            batches,
+            [
+                "declare @n int = 1;\nselect @n;",
+                "select 2",
+                "-- GO in a comment\nselect 'GO'"
+            ]
+        );
+        assert_eq!(
+            statements_in(&MSSQL, "select 1; select 2").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            statements_in(&crate::sql::POSTGRES, "select 1; select 2")
+                .unwrap()
+                .len(),
+            2
+        );
+        // Only a line holding nothing but GO splits; empty batches vanish.
+        let sql = "select 1 as go\nGO\nGO\nselect [go]\nselect 'a\nGO\nb'\n/*\nGO\n*/";
+        let batches: Vec<&str> = statements_in(&MSSQL, sql)
+            .unwrap()
+            .into_iter()
+            .map(|range| &sql[range])
+            .collect();
+        assert_eq!(
+            batches,
+            ["select 1 as go", "select [go]\nselect 'a\nGO\nb'"]
+        );
+    }
+
+    #[test]
+    fn the_cursor_picks_a_go_batch() {
+        use crate::sql::MSSQL;
+        let sql = "select 1;\nselect 2\nGO\nselect 3";
+        let at = |offset| &sql[statement_at_in(&MSSQL, sql, offset).unwrap()];
+        assert_eq!(at(0), "select 1;\nselect 2");
+        assert_eq!(at(sql.find("2").unwrap()), "select 1;\nselect 2");
+        assert_eq!(at(sql.len()), "select 3");
     }
 
     #[test]
