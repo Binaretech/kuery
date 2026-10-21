@@ -3,17 +3,21 @@
 //! they were opened on.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
+use gpui_kit::base::{HandleEdge, resize_handle};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::resizable::resize_handle_appearance;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PromptLevel,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, EntityId,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::catalog::TableInfo;
 
@@ -22,9 +26,9 @@ use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
 use crate::commands::{
-    ClearRecentProjects, CloseTab, NewConnection, NewQuery, NextTab, OpenCommandPalette,
-    OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab, QueryDataFiles,
-    ShowServerActivity, ToggleSidebar,
+    ClearRecentProjects, CloseTab, FindInSidebar, NewConnection, NewQuery, NextTab,
+    OpenCommandPalette, OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab,
+    QueryDataFiles, ShowServerActivity, ToggleSidebar,
 };
 use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
@@ -40,6 +44,7 @@ use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab};
 use crate::recent::{self, RecentProject};
 use crate::redis_console::ConsoleTab;
 use crate::redis_key_tab::KeyTab;
+use crate::settings;
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
 
@@ -137,6 +142,19 @@ impl Tab {
     }
 }
 
+/// How long the sidebar's width has to stay put before it is saved.
+const SIDEBAR_SAVE_DELAY: Duration = Duration::from_millis(400);
+
+/// What the sidebar's right edge carries while it is dragged.
+#[derive(Clone)]
+struct SidebarResize;
+
+impl Render for SidebarResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 pub struct WorkspaceView {
     model: Entity<ProjectModel>,
     explorer: Entity<Explorer>,
@@ -146,6 +164,11 @@ pub struct WorkspaceView {
     active: usize,
     queries_opened: usize,
     sidebar_visible: bool,
+    /// Kept while the sidebar is hidden, so showing it again restores it.
+    sidebar_width: Pixels,
+    /// The pending save of the width; a new width replaces it, so a drag is
+    /// written once it pauses rather than on every pixel.
+    sidebar_width_save: Option<Task<()>>,
     palette: Option<Entity<CommandPalette>>,
     /// What had focus before the palette opened, so commands run there.
     focus_before_palette: Option<FocusHandle>,
@@ -261,6 +284,8 @@ impl WorkspaceView {
             active: 0,
             queries_opened: 0,
             sidebar_visible: true,
+            sidebar_width: px(settings::sidebar_width()),
+            sidebar_width_save: None,
             palette: None,
             focus_before_palette: None,
             focus_handle,
@@ -885,8 +910,49 @@ impl WorkspaceView {
         self.open_new_query(window, cx);
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_visible = !self.sidebar_visible;
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar_visible(!self.sidebar_visible, window, cx);
+    }
+
+    /// Shows or hides the sidebar. Hiding it takes the focus out of it, or
+    /// the window's shortcuts would be left with nowhere to go.
+    fn set_sidebar_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !visible && self.explorer.focus_handle(cx).contains_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+        self.sidebar_visible = visible;
+        cx.notify();
+    }
+
+    /// Shows the sidebar's tree and moves the focus to its filter field.
+    fn find_in_sidebar(&mut self, _: &FindInSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        self.explorer
+            .update(cx, |explorer, cx| explorer.focus_filter(window, cx));
+        cx.notify();
+    }
+
+    /// Follows the sidebar's right edge while it is dragged.
+    fn on_sidebar_drag(&mut self, event: &DragMoveEvent<SidebarResize>, cx: &mut Context<Self>) {
+        let width = event.event.position.x - event.bounds.left();
+        self.resize_sidebar(f32::from(width), cx);
+    }
+
+    /// Sets the sidebar's width, within its limits, and saves it for every
+    /// project once it stops changing.
+    fn resize_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = settings::clamp_sidebar_width(width);
+        if px(width) == self.sidebar_width {
+            return;
+        }
+        self.sidebar_width = px(width);
+        let executor = cx.background_executor().clone();
+        self.sidebar_width_save = Some(cx.background_spawn(async move {
+            executor.timer(SIDEBAR_SAVE_DELAY).await;
+            if let Err(error) = settings::set_sidebar_width(width) {
+                eprintln!("kuery: could not save the sidebar width: {error}");
+            }
+        }));
         cx.notify();
     }
 
@@ -1148,10 +1214,10 @@ impl WorkspaceView {
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
                 })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     let showing = this.sidebar_visible && this.explorer.read(cx).mode() == mode;
                     if showing {
-                        this.sidebar_visible = false;
+                        this.set_sidebar_visible(false, window, cx);
                     } else {
                         this.sidebar_visible = true;
                         this.explorer
@@ -1223,6 +1289,49 @@ impl WorkspaceView {
                 "Keyboard Shortcuts",
                 || Box::new(OpenKeymapFile),
             ))
+    }
+
+    /// The sidebar at its width. Its right edge is the handle that resizes
+    /// it; a double-click on the edge puts the default width back.
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("sidebar")
+            .relative()
+            .flex()
+            .h_full()
+            .w(self.sidebar_width)
+            .flex_shrink_0()
+            .on_drag_move(cx.listener(|this, event, _, cx| this.on_sidebar_drag(event, cx)))
+            .child(self.explorer.clone())
+            .child(
+                resize_handle::<SidebarResize, SidebarResize>("sidebar-edge", Axis::Horizontal)
+                    .inside(HandleEdge::Trailing)
+                    .with_appearance(resize_handle_appearance())
+                    .on_drag(SidebarResize, |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| drag.as_ref().clone())
+                    }),
+            )
+            .child(
+                // The handle takes the mouse for itself, so the double-click
+                // is caught by a band laid over it that does not.
+                div()
+                    .id("sidebar-edge-reset")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .w(px(5.))
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if event.click_count == 2 {
+                                this.resize_sidebar(settings::SIDEBAR_DEFAULT_WIDTH, cx);
+                            }
+                        }),
+                    ),
+            )
     }
 
     /// The bottom bar: the active connection and mode on the left, the last
@@ -1703,6 +1812,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::new_query))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::find_in_sidebar))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::open_schema_diagram))
@@ -1730,7 +1840,9 @@ impl Render for WorkspaceView {
                     .min_h_0()
                     .items_start()
                     .child(self.render_activity_rail(cx))
-                    .when(self.sidebar_visible, |row| row.child(self.explorer.clone()))
+                    .when(self.sidebar_visible, |row| {
+                        row.child(self.render_sidebar(cx))
+                    })
                     .child(
                         v_flex()
                             .flex_1()

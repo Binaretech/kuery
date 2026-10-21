@@ -480,6 +480,55 @@ mod tests {
         }
     }
 
+    /// What a keystroke runs with focus in `stack` (outermost context first),
+    /// next to the find binding every text field has.
+    fn action_in_contexts(keys: &str, stack: &[&str]) -> Option<String> {
+        use gpui_kit::component::input::Search;
+        use gpui_kit::{KeyContext, Keymap, Keystroke};
+
+        let mut bindings = vec![KeyBinding::new("secondary-f", Search, Some("Input"))];
+        let (resolved, _) = resolve(&[]);
+        bindings.extend(command_bindings(&resolved).0);
+        let keymap = Keymap::new(bindings);
+        let stack: Vec<KeyContext> = stack
+            .iter()
+            .map(|context| KeyContext::parse(context).unwrap())
+            .collect();
+        let keys = keys.replace("secondary", if IS_MAC { "cmd" } else { "ctrl" });
+        let (matched, _) = keymap.bindings_for_input(&[Keystroke::parse(&keys).unwrap()], &stack);
+        matched
+            .first()
+            .map(|binding| binding.action().name().to_string())
+    }
+
+    #[test]
+    fn secondary_f_finds_in_the_sidebar_only_from_the_sidebar() {
+        let find = Some("kuery::FindInSidebar");
+        assert_eq!(
+            action_in_contexts("secondary-f", &["Workspace", "Explorer"]).as_deref(),
+            find
+        );
+        // Again from the sidebar's own filter field, instead of the field's find.
+        assert_eq!(
+            action_in_contexts("secondary-f", &["Workspace", "Explorer", "Input"]).as_deref(),
+            find
+        );
+        // The SQL editor keeps its own find, and elsewhere nothing happens.
+        assert_eq!(
+            action_in_contexts(
+                "secondary-f",
+                &["Workspace", "QueryTab", "Input mode=editor"]
+            )
+            .as_deref(),
+            Some("input::Search")
+        );
+        assert_eq!(action_in_contexts("secondary-f", &["Workspace"]), None);
+        assert_eq!(
+            action_in_contexts("secondary-f", &["Workspace", "TableTab"]),
+            None
+        );
+    }
+
     #[test]
     fn shortcuts_also_apply_inside_text_fields() {
         assert_eq!(

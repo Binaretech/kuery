@@ -28,6 +28,7 @@ actions!(
         PreviousTab,
         NewQuery,
         ToggleSidebar,
+        FindInSidebar,
         OpenKeymapFile,
         ReloadKeymap,
         OpenProject,
@@ -178,6 +179,14 @@ pub const COMMANDS: &[Command] = &[
         action: action!(ToggleSidebar),
         defaults: &["secondary-b"],
         context: None,
+    },
+    Command {
+        id: "sidebar.find",
+        title: "Find in Sidebar",
+        category: "View",
+        action: action!(FindInSidebar),
+        defaults: &["secondary-f"],
+        context: Some("Explorer"),
     },
     Command {
         id: "query.run",
@@ -420,5 +429,14 @@ mod tests {
             find("window.close").unwrap().defaults,
             &["secondary-shift-w"]
         );
+    }
+
+    #[test]
+    fn find_in_sidebar_is_secondary_f_in_the_explorer() {
+        let command = find("sidebar.find").unwrap();
+        assert_eq!(command.defaults, &["secondary-f"]);
+        assert_eq!(command.context, Some("Explorer"));
+        assert_eq!(command.category, "View");
+        assert_eq!((command.action)().name(), "kuery::FindInSidebar");
     }
 }
