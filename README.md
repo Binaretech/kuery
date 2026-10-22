@@ -272,6 +272,14 @@ Linux, with additional database integration jobs. The
 [release workflow](.github/workflows/release.yml) packages Linux x86_64,
 macOS Apple Silicon/Intel and Windows x86_64 builds for tagged releases.
 
+The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
+release workflow refuses a tag that does not match it. To release, bump that
+version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
+
+```sh
+git tag v0.2.2 && git push origin v0.2.2
+```
+
 The macOS app is signed with a Developer ID certificate, notarized and stapled
 when these repository secrets are set; without them it gets an ad-hoc signature
 and macOS blocks it until it is allowed in System Settings → Privacy & Security
