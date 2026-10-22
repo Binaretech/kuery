@@ -305,15 +305,21 @@ fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
 /// unsaved SQL, an open transaction (rolled back on quit) or staged row
 /// changes.
 pub fn request_quit(cx: &mut App) {
-    confirm_leave("Quit", cx, |cx| cx.quit());
+    confirm_leave("Quit", cx, |_| {}, |cx| cx.quit());
 }
 
 /// Runs `then` (which quits or restarts) once nothing would be lost, or the
 /// user agrees to lose it; `verb` names what happens ("Quit", "Restart").
+/// `cancelled` runs instead when the user keeps working.
 ///
 /// Deferred: the action asking for it arrives while a window is handling the
 /// event, and that window could not show the question then.
-pub fn confirm_leave(verb: &'static str, cx: &mut App, then: impl FnOnce(&mut App) + 'static) {
+pub fn confirm_leave(
+    verb: &'static str,
+    cx: &mut App,
+    cancelled: impl FnOnce(&mut App) + 'static,
+    then: impl FnOnce(&mut App) + 'static,
+) {
     cx.defer(move |cx| {
         let open = cx.windows();
         let unsaved: Vec<AnyWindowHandle> = state(cx)
@@ -364,6 +370,8 @@ pub fn confirm_leave(verb: &'static str, cx: &mut App, then: impl FnOnce(&mut Ap
         cx.spawn(async move |cx| {
             if let Ok(0) = answer.await {
                 cx.update(then);
+            } else {
+                cx.update(cancelled);
             }
         })
         .detach();

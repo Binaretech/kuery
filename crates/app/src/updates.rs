@@ -51,12 +51,45 @@ enum Status {
 
 struct Updates {
     status: Status,
+    /// A restart was asked for and is waiting on the "Restart Kuery?"
+    /// prompt or the install, so another one must not start.
+    restart_pending: bool,
     /// Why updates are unavailable, when they are (a development build, an
     /// app not installed from a release).
     updater: Result<(Arc<Updater>, Installation), String>,
 }
 
 impl Global for Updates {}
+
+/// Whether a restart into the downloaded update can start.
+enum Restart {
+    /// The archive to install, and where.
+    Begin(PathBuf, Installation),
+    /// One is already under way.
+    Busy,
+    NotReady,
+}
+
+impl Updates {
+    /// Starts a restart unless one is under way; [`Self::end_restart`]
+    /// allows the next one when it is cancelled or fails.
+    fn begin_restart(&mut self) -> Restart {
+        if self.restart_pending || matches!(self.status, Status::Installing) {
+            return Restart::Busy;
+        }
+        let (Status::Ready { archive, .. }, Ok((_, installation))) = (&self.status, &self.updater)
+        else {
+            return Restart::NotReady;
+        };
+        let restart = Restart::Begin(archive.clone(), installation.clone());
+        self.restart_pending = true;
+        restart
+    }
+
+    fn end_restart(&mut self) {
+        self.restart_pending = false;
+    }
+}
 
 /// Registers the update actions and, in a release build, starts checking.
 pub fn init(cx: &mut App) {
@@ -70,6 +103,7 @@ pub fn init(cx: &mut App) {
     let available = updater.is_ok();
     cx.set_global(Updates {
         status: Status::Idle,
+        restart_pending: false,
         updater,
     });
     cx.on_action(|_: &CheckForUpdates, cx| check(true, cx));
@@ -183,7 +217,19 @@ async fn download(updater: Arc<Updater>, update: Update, manual: bool, cx: &mut 
             cx,
         )
     });
-    let dir = crate::paths::cache_dir().join("updates");
+    let Some(dir) = crate::paths::cache_dir().map(|cache| cache.join("updates")) else {
+        cx.update(|cx| {
+            set_status(Status::Idle, cx);
+            report(
+                manual,
+                format!(
+                    "Couldn't download Kuery {version}: no folder to save it in (HOME is not set)."
+                ),
+                cx,
+            );
+        });
+        return;
+    };
     let (progress, received) = async_channel::unbounded();
     let task = cx.background_executor().spawn(async move {
         // Only the latest download is kept.
@@ -222,18 +268,20 @@ async fn download(updater: Arc<Updater>, update: Update, manual: bool, cx: &mut 
 /// Installs the downloaded update and restarts, once no window has work that
 /// would be lost (or the user agrees to lose it).
 fn restart_to_update(cx: &mut App) {
-    let updates = cx.global::<Updates>();
-    let (Status::Ready { archive, .. }, Ok((_, installation))) =
-        (&updates.status, &updates.updater)
-    else {
-        notify(
-            Notification::info("No update is ready yet. Check for Updates… looks for one."),
-            cx,
-        );
-        return;
+    let (archive, installation) = match cx.global_mut::<Updates>().begin_restart() {
+        Restart::Begin(archive, installation) => (archive, installation),
+        // The prompt or the install is already showing.
+        Restart::Busy => return,
+        Restart::NotReady => {
+            notify(
+                Notification::info("No update is ready yet. Check for Updates… looks for one."),
+                cx,
+            );
+            return;
+        }
     };
-    let (archive, installation) = (archive.clone(), installation.clone());
-    crate::app::confirm_leave("Restart", cx, move |cx| {
+    let cancelled = |cx: &mut App| cx.global_mut::<Updates>().end_restart();
+    crate::app::confirm_leave("Restart", cx, cancelled, move |cx| {
         let ready = std::mem::replace(&mut cx.global_mut::<Updates>().status, Status::Installing);
         cx.refresh_windows();
         cx.spawn(async move |cx| {
@@ -247,6 +295,7 @@ fn restart_to_update(cx: &mut App) {
                     cx.restart();
                 }
                 Err(error) => {
+                    cx.global_mut::<Updates>().end_restart();
                     set_status(ready, cx);
                     notify(
                         Notification::error(format!(
@@ -362,6 +411,8 @@ fn notify(note: Notification, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -391,9 +442,77 @@ mod tests {
             Some("Downloading Kuery 0.3.0…")
         );
         assert_eq!(
+            status_text(&ready()).as_deref(),
+            Some("Restart to update to 0.3.0")
+        );
+        assert_eq!(
             status_text(&Status::Installing).as_deref(),
             Some("Installing the update…")
         );
+    }
+
+    fn ready() -> Status {
+        Status::Ready {
+            update: Update {
+                version: "0.3.0".parse().unwrap(),
+                notes_url: String::new(),
+                asset: kuery_update::Asset {
+                    url: String::new(),
+                    sha256: String::new(),
+                    signature: String::new(),
+                },
+                file_name: "kuery.zip".into(),
+            },
+            archive: PathBuf::from("/cache/updates/kuery.zip"),
+        }
+    }
+
+    fn updates(status: Status) -> Updates {
+        let updater = Updater::new(
+            kuery_update::MANIFEST_URL,
+            PUBLIC_KEY,
+            "0.2.1",
+            "linux-x86_64",
+        )
+        .unwrap();
+        let installation = Installation::Binary {
+            exe: "/opt/kuery/kuery".into(),
+        };
+        Updates {
+            status,
+            restart_pending: false,
+            updater: Ok((Arc::new(updater), installation)),
+        }
+    }
+
+    #[test]
+    fn a_restart_begins_once_until_it_ends() {
+        // Restart clicked twice before the "Restart Kuery?" prompt is
+        // answered must not install twice.
+        let mut updates = updates(ready());
+        assert!(matches!(
+            updates.begin_restart(),
+            Restart::Begin(archive, _) if archive == Path::new("/cache/updates/kuery.zip")
+        ));
+        assert!(matches!(updates.begin_restart(), Restart::Busy));
+        // Cancelled, or the install failed: Restart works again.
+        updates.end_restart();
+        assert!(matches!(updates.begin_restart(), Restart::Begin(..)));
+    }
+
+    #[test]
+    fn no_restart_without_a_ready_update() {
+        assert!(matches!(
+            updates(Status::Idle).begin_restart(),
+            Restart::NotReady
+        ));
+        assert!(matches!(
+            updates(Status::Installing).begin_restart(),
+            Restart::Busy
+        ));
+        let mut unavailable = updates(ready());
+        unavailable.updater = Err("Updates are off in development builds.".into());
+        assert!(matches!(unavailable.begin_restart(), Restart::NotReady));
     }
 
     #[test]
