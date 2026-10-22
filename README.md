@@ -272,9 +272,11 @@ Tests marked `ignored` require the development databases or SSH bastion; they
 are separate from the default suite. CI is configured for macOS, Windows and
 Linux, with additional database integration jobs. The
 [release workflow](.github/workflows/release.yml) packages Linux x86_64,
-macOS Apple Silicon/Intel and Windows x86_64 builds for tagged releases.
+macOS and Windows x86_64 builds for tagged releases. The macOS build is a
+single universal app (Apple Silicon and Intel, merged with `lipo`), shipped as
+a `.dmg` installer and a `.zip`.
 
-The macOS app is signed with a Developer ID certificate, notarized and stapled
+The macOS app and disk image are signed with a Developer ID certificate, notarized and stapled
 when these repository secrets are set; without them it gets an ad-hoc signature
 and macOS blocks it until it is allowed in System Settings → Privacy & Security
 → Open Anyway:
@@ -286,6 +288,14 @@ and macOS blocks it until it is allowed in System Settings → Privacy & Securit
 | `APPLE_API_KEY` | An App Store Connect API key (`AuthKey_XXXX.p8`, "Developer" access), base64-encoded |
 | `APPLE_API_KEY_ID` | That key's ID |
 | `APPLE_API_ISSUER_ID` | The issuer ID shown above the keys in App Store Connect → Users and Access → Integrations |
+
+The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
+release workflow refuses a tag that does not match it. To release, bump that
+version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
+
+```sh
+git tag v0.2.2 && git push origin v0.2.2
+```
 
 When reporting a bug, include the platform, build/commit, steps to reproduce
 and a small synthetic dataset or query where possible. Remove credentials and
