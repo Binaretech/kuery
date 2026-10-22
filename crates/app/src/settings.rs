@@ -4,6 +4,9 @@
 //! ```toml
 //! [sidebar]
 //! width = 300.0
+//!
+//! [updates]
+//! check_automatically = true
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -20,12 +23,20 @@ pub const SIDEBAR_MAX_WIDTH: f32 = 480.;
 struct File {
     #[serde(default)]
     sidebar: Sidebar,
+    #[serde(default)]
+    updates: Updates,
 }
 
 #[derive(Default, Deserialize)]
 struct Sidebar {
     #[serde(default)]
     width: Option<f32>,
+}
+
+#[derive(Default, Deserialize)]
+struct Updates {
+    #[serde(default)]
+    check_automatically: Option<bool>,
 }
 
 /// A sidebar width kept within the limits; anything that is not a number
@@ -48,6 +59,21 @@ pub fn set_sidebar_width(width: f32) -> std::io::Result<()> {
     set_sidebar_width_in(&path(), width)
 }
 
+/// Whether to look for a new version at startup and every few hours (on
+/// unless turned off).
+pub fn check_updates_automatically() -> bool {
+    check_updates_automatically_in(&path())
+}
+
+pub fn set_check_updates_automatically(on: bool) -> std::io::Result<()> {
+    set_in(
+        &path(),
+        "updates",
+        "check_automatically",
+        toml::Value::Boolean(on),
+    )
+}
+
 fn path() -> PathBuf {
     crate::paths::config_dir().join("settings.toml")
 }
@@ -59,9 +85,19 @@ fn sidebar_width_in(path: &Path) -> f32 {
         .map_or(SIDEBAR_DEFAULT_WIDTH, clamp_sidebar_width)
 }
 
-/// Sets `sidebar.width` and keeps everything else in the file as it was. A
-/// file that cannot be read as TOML is left alone rather than replaced.
+fn check_updates_automatically_in(path: &Path) -> bool {
+    read(path).updates.check_automatically.unwrap_or(true)
+}
+
+/// Sets `sidebar.width`, keeping everything else in the file.
 fn set_sidebar_width_in(path: &Path, width: f32) -> std::io::Result<()> {
+    let width = f64::from(clamp_sidebar_width(width));
+    set_in(path, "sidebar", "width", toml::Value::Float(width))
+}
+
+/// Sets `[section] key` and keeps everything else in the file as it was. A
+/// file that cannot be read as TOML is left alone rather than replaced.
+fn set_in(path: &Path, section: &str, key: &str, value: toml::Value) -> std::io::Result<()> {
     let mut table = match std::fs::read_to_string(path) {
         Ok(text) => text.parse::<toml::Table>().map_err(|error| {
             std::io::Error::new(
@@ -72,17 +108,14 @@ fn set_sidebar_width_in(path: &Path, width: f32) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(error) => return Err(error),
     };
-    let sidebar = table
-        .entry("sidebar")
+    let section = table
+        .entry(section)
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if !sidebar.is_table() {
-        *sidebar = toml::Value::Table(toml::Table::new());
+    if !section.is_table() {
+        *section = toml::Value::Table(toml::Table::new());
     }
-    if let toml::Value::Table(sidebar) = sidebar {
-        sidebar.insert(
-            "width".into(),
-            toml::Value::Float(f64::from(clamp_sidebar_width(width))),
-        );
+    if let toml::Value::Table(section) = section {
+        section.insert(key.into(), value);
     }
     write(path, &table)
 }
@@ -152,6 +185,27 @@ mod tests {
         // A broken file is not saved over.
         assert!(set_sidebar_width_in(&file, 300.).is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not toml at all [");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn update_checks_are_on_until_turned_off() {
+        let file = temp_file("updates");
+        assert!(check_updates_automatically_in(&file));
+        set_in(
+            &file,
+            "updates",
+            "check_automatically",
+            toml::Value::Boolean(false),
+        )
+        .unwrap();
+        assert!(!check_updates_automatically_in(&file));
+        // Turning it off keeps the sidebar width, and the other way round.
+        set_sidebar_width_in(&file, 300.).unwrap();
+        assert!(!check_updates_automatically_in(&file));
+        assert_eq!(sidebar_width_in(&file), 300.);
+        std::fs::write(&file, "[updates]\ncheck_automatically = \"no\"\n").unwrap();
+        assert!(check_updates_automatically_in(&file));
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

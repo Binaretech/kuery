@@ -22,6 +22,8 @@ pub enum Error {
     Signature(String),
     #[error("the signature is for \"{found}\", not \"{expected}\"")]
     SignedFor { expected: String, found: String },
+    #[error("the update could not be installed: {0}")]
+    Install(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

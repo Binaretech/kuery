@@ -18,6 +18,7 @@ use crate::query_tab::{
     UseFullWrite, UseReadOnly, UseWrite,
 };
 use crate::table_tab::{ReloadTable, SaveTableChanges};
+use crate::updates::{CheckForUpdates, RestartToUpdate, ToggleAutomaticUpdateChecks};
 
 actions!(
     kuery,
@@ -353,6 +354,30 @@ pub const COMMANDS: &[Command] = &[
         title: "Reload Keymap",
         category: "Preferences",
         action: action!(ReloadKeymap),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "updates.check",
+        title: "Check for Updates…",
+        category: "Updates",
+        action: action!(CheckForUpdates),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "updates.restart",
+        title: "Restart to Update",
+        category: "Updates",
+        action: action!(RestartToUpdate),
+        defaults: &[],
+        context: None,
+    },
+    Command {
+        id: "updates.toggle_automatic",
+        title: "Toggle Automatic Update Checks",
+        category: "Updates",
+        action: action!(ToggleAutomaticUpdateChecks),
         defaults: &[],
         context: None,
     },
