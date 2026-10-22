@@ -29,10 +29,8 @@ pub fn explain_sql(statement: &str, analyze: bool) -> Result<String, String> {
     Ok(format!("EXPLAIN ({options}) {statement}"))
 }
 
-/// What SQL Server needs to return `statement`'s plan as showplan XML:
-/// estimated, or with `analyze` measured by running it (`statistics xml`,
-/// whose last result set is the plan). The `GO` lines make it three batches,
-/// as `set showplan_xml` must be alone in its batch.
+/// SQL Server showplan XML for `statement`, estimated or (`analyze`) measured with `statistics xml`.
+/// The `GO` lines make three batches: `set showplan_xml` must be alone in its batch.
 pub fn showplan_sql(statement: &str, analyze: bool) -> Result<String, String> {
     let statement = single_statement(statement)?;
     let option = if analyze {

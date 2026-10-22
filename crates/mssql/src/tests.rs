@@ -78,10 +78,8 @@ fn drop_scratch(table: &str) {
     run(adapter().as_mut(), &format!("drop table {table}"));
 }
 
-/// One result set: its columns and rows.
 type Streamed = (Vec<String>, Vec<Vec<Option<String>>>);
 
-/// Every result set a statement streams, in order.
 #[derive(Default)]
 struct Seen(Vec<Streamed>);
 
@@ -1408,7 +1406,6 @@ fn reads_are_not_refused_when_query_store_starts_an_interval() {
     run(sa.as_mut(), &drop_db);
 }
 
-/// How many result sets `sql` streams on `adapter`.
 fn result_sets(adapter: &mut dyn Adapter, sql: &str) -> usize {
     let mut seen = Seen::default();
     adapter.execute(sql, &mut seen).unwrap();

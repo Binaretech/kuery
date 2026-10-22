@@ -180,34 +180,15 @@ impl From<&ConnectOptions> for Target {
     }
 }
 
-/// The log records the current transaction wrote outside tempdb, less the
-/// one in each database that marks where it began: more than zero after a
-/// batch means it wrote (temporary tables do not count). A read can log that
-/// first record alone: Query Store records each new interval of runtime
-/// stats in a system transaction nested in the running one, which logs the
-/// running one's begin. Every write logs at least one more.
+/// Log records the transaction wrote outside tempdb, less the begin record per database: more than zero means it wrote.
+/// Query Store can log just that begin record during a read; every write logs at least one more.
 const WRITES: &str = "(select coalesce(sum(database_transaction_log_record_count - 1), 0) \
      from sys.dm_tran_database_transactions \
      where transaction_id = (select transaction_id from sys.dm_tran_current_transaction) \
        and database_id <> 2 and database_transaction_log_record_count > 0)";
 
-/// 1 when the login can only read the current database, anything else when
-/// it may write (or Kuery cannot tell). Only read when the writes check
-/// cannot run, to decide whether the notice is worth showing; every doubt
-/// shows it. The login can only read when all hold for its user and every
-/// principal in its token (`sys.user_token`: roles, nested ones and Windows
-/// groups included, plus `public`):
-/// - it is not `dbo`, `db_owner` or `sysadmin`, and its roles are only
-///   `public` and `db_datareader`;
-/// - none owns a schema or an object (an owner may change it), but for the
-///   empty schema each fixed role owns (`db_datareader`'s own);
-/// - none was granted a permission that writes, changes schema or runs code
-///   (procedures write through ownership chains), at any scope;
-/// - at server scope: the login (or a server role in its token) is in no
-///   server role but `public`, holds no `IMPERSONATE` or `CONTROL` on a
-///   login (it could act as that login), and has none of `CONTROL SERVER`,
-///   `ALTER ANY DATABASE`, `IMPERSONATE ANY LOGIN`, `ALTER ANY LOGIN` or
-///   `ALTER ANY SERVER ROLE`. Other server permissions are not looked at.
+/// 1 when the login can only read the current database, anything else (or an error) when it may write.
+/// Only used when the writes check cannot run, to decide whether to show the notice. Fails open: any doubt shows it.
 const READS_ONLY: &str = "with token as ( \
          select principal_id from sys.user_token \
          union select database_principal_id() union select 0) \
@@ -283,7 +264,6 @@ pub struct Mssql {
     /// [`READS_ONLY`]); without the writes check, only such a login gets the
     /// notice.
     may_write: bool,
-    /// The session's read-only transaction is open.
     reading: bool,
     /// The database allows snapshot isolation: reads use it, so they do not
     /// wait for other sessions' uncommitted rows.
@@ -591,7 +571,6 @@ async fn after_batch(connection: &mut Connection, check_writes: bool) -> Result<
     })
 }
 
-/// How a batch ended.
 enum Ended {
     Ran(Result<bool, QueryError>, Result<After, QueryError>),
     Cancelled,
@@ -669,9 +648,6 @@ impl Mssql {
             let run = async {
                 let streamed = stream(connection, sql, rows).await;
                 // Also after an error: a batch may have written before it.
-                // Rows nobody reads any more (the sink cancelled) are read
-                // and dropped first, by the next query, when reconnecting
-                // would lose a write transaction.
                 let after = match &streamed {
                     Err(QueryError::Database { .. }) | Ok(_) if plans_only => Ok(unchanged),
                     Err(QueryError::Database { .. }) | Ok(_) => {
@@ -699,9 +675,7 @@ impl Mssql {
         stop.end();
 
         let (streamed, after) = match ended {
-            // The sink cancelled (its reader went away): stop the statement
-            // rather than let the server stream the rest, which the next
-            // query would have to read first.
+            // The reader went away: stop the statement so the next query does not have to read the rest.
             Ended::Ran(Err(QueryError::Cancelled), _) if !loses_writes => {
                 self.reconnect().map_err(|error| {
                     QueryError::Connection(format!("Stopped, and could not reconnect: {error}"))
@@ -848,9 +822,7 @@ impl Adapter for Mssql {
         for (index, text) in texts.iter().enumerate() {
             outcome = self.run_batch(text, rows);
             if outcome.is_err() {
-                // A failed batch must not leave a mode on (`set showplan_xml
-                // on`) that a closing `set ... off` batch was to end; a lost
-                // or stopped connection starts over without it anyway.
+                // A failed batch must not leave a plan mode on that a later `set ... off` batch was to end.
                 let reconnected = matches!(
                     outcome,
                     Err(QueryError::Cancelled | QueryError::Connection(_))

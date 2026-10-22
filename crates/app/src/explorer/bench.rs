@@ -1,14 +1,12 @@
 //! What one frame of the sidebar costs with a large catalog: 3000 tables and
 //! 3000 functions in one schema, both groups open, in a headless window.
-//! Not run with the suite; run it on its own:
+//! Run it on its own:
 //!
 //! ```sh
 //! cargo test -p kuery explorer_frame_cost -- --ignored --nocapture
 //! ```
 //!
-//! The headless platform lays out and paints but does not rasterize, and its
-//! text system is a stand-in, so the numbers are lower than on screen; they
-//! compare builds of the sidebar, not frames.
+//! The numbers compare builds of the sidebar, not on-screen frames.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

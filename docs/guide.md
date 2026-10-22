@@ -344,8 +344,7 @@ database, and at server scope it is in no server role but `public`, holds no
 `IMPERSONATE` or `CONTROL` on a login, and has none of `CONTROL SERVER`,
 `ALTER ANY DATABASE`, `IMPERSONATE ANY LOGIN`, `ALTER ANY LOGIN` or `ALTER ANY
 SERVER ROLE` (other server permissions are not checked). Any doubt shows the
-warning. A
-login with only `db_datareader` is the strongest guarantee. If the
+warning. A login with only `db_datareader` is the strongest guarantee. If the
 permission check fails for a reason other than missing permission, the
 connection does not open.
 

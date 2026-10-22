@@ -39,7 +39,7 @@ const ALL_VIEWS: Views = Views {
          outer apply sys.dm_exec_sql_text(coalesce(r.sql_handle, c.most_recent_sql_handle)) t",
 };
 
-/// What a login without it can read.
+/// The views a login without `VIEW SERVER STATE` can read.
 const SESSION_VIEWS: Views = Views {
     transaction: "cast(null as int)",
     waiting: "cast(null as nvarchar(200))",
