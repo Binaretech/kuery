@@ -14,6 +14,7 @@ kuery-sqlite = { path = "crates/sqlite" }
 kuery-mysql = { path = "crates/mysql" }
 kuery-mssql = { path = "crates/mssql" }
 kuery-files = { path = "crates/files" }
+kuery-update = { path = "crates/update" }
 
 # Local file analytics; keep Polars behind kuery-files, separate from core's Arrow.
 polars = { version = "=0.55.2", default-features = false, features = ["lazy", "csv", "json", "parquet", "temporal", "timezones", "dtype-date", "dtype-datetime", "dtype-duration", "dtype-time", "dtype-decimal", "dtype-struct", "dtype-array", "dtype-i8", "dtype-i16", "dtype-u8", "dtype-u16"] }
@@ -48,6 +49,14 @@ rustls-native-certs = "0.8"
 tokio-postgres-rustls = "0.14"
 # Async, reconnecting connections; TLS through the same rustls (and `ring`) as Postgres.
 redis = { version = "1.7", default-features = false, features = ["acl", "streams", "tokio-comp", "tokio-rustls-comp", "connection-manager"] }
+
+# The updater: the manifest and archives over HTTPS (blocking, run off the UI
+# thread), with rustls and `ring` like the database connections.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+# Update archives are signed with minisign; the app only verifies.
+minisign-verify = "0.2"
+semver = "1"
+sha2 = "0.10"
 
 # gpui-kit pins its own gpui version; upgrade it on purpose, never by accident.
 # SQL for query tabs; Bash for the Redis console, whose lines are shell-like
