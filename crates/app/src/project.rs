@@ -152,7 +152,11 @@ impl ConnectionSpec {
                 .map(|home| Path::new(&home).join(rest))
                 .unwrap_or_else(|| PathBuf::from(written)),
             None if Path::new(written).is_absolute() => PathBuf::from(written),
-            None => root.join(written),
+            // One component at a time, so the path uses the platform's separator.
+            None => written
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(root.to_path_buf(), |path, part| path.join(part)),
         };
         ConnectionSpec {
             database: path.display().to_string(),
@@ -585,13 +589,19 @@ mod tests {
         assert!(file.is_file());
         assert_eq!(file.environment(), Environment::Development);
         assert_eq!(file.target(), "dev/shop.sqlite");
-        let root = Path::new("/work/app");
-        assert_eq!(file.resolved(root).database, "/work/app/dev/shop.sqlite");
+        let (root, data) = if cfg!(windows) {
+            (r"C:\work\app", r"C:\data\x.db")
+        } else {
+            ("/work/app", "/data/x.db")
+        };
+        let root = Path::new(root);
+        let expected = root.join("dev").join("shop.sqlite");
+        assert_eq!(file.resolved(root).database, expected.display().to_string());
         let absolute = ConnectionSpec {
-            database: "/data/x.db".into(),
+            database: data.into(),
             ..file.clone()
         };
-        assert_eq!(absolute.resolved(root).database, "/data/x.db");
+        assert_eq!(absolute.resolved(root).database, data);
         let production = ConnectionSpec {
             environment: Some("production".into()),
             ..file
