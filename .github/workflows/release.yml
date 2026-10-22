@@ -145,41 +145,14 @@ jobs:
           codesign --force --options runtime --timestamp --sign "$identity" "$app"
           codesign --verify --strict --verbose=2 "$app"
 
+          # The installer step signs and notarizes the disk image with these.
+          echo "MACOS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
           echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          auth=(--key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
-          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Kuery-notarize.zip"
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
 
-          # Submit first and wait separately, so the submission ID is known
-          # even when Apple is slow (a new team's first submissions can take
-          # hours; later ones usually take minutes).
-          id="$(xcrun notarytool submit "$RUNNER_TEMP/Kuery-notarize.zip" "${auth[@]}" --output-format json | jq -r .id)"
-          if [[ -z "$id" || "$id" == null ]]; then
-            echo "::error::notarytool did not return a submission ID."
-            exit 1
-          fi
-          echo "Notarization submission: $id"
-          # Poll instead of `notarytool wait`, which gives up on the first
-          # network error; a failed check is simply retried.
-          status=""
-          deadline=$((SECONDS + 2 * 60 * 60))
-          while (( SECONDS < deadline )); do
-            status="$(xcrun notarytool info "$id" "${auth[@]}" --output-format json 2>/dev/null | jq -r '.status // empty' || true)"
-            if [[ -n "$status" && "$status" != "In Progress" ]]; then
-              break
-            fi
-            echo "$(date -u +%H:%M:%S) status: ${status:-unavailable, retrying}"
-            sleep 30
-          done
-          if [[ -z "$status" || "$status" == "In Progress" ]]; then
-            echo "::error::Notarization submission $id did not finish within 2 hours; check it with 'xcrun notarytool info $id'."
-            exit 1
-          fi
-          if [[ "$status" != Accepted ]]; then
-            xcrun notarytool log "$id" "${auth[@]}" || true
-            echo "::error::Notarization submission $id finished with status $status."
-            exit 1
-          fi
-          rm "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Kuery-notarize.zip"
+          .github/scripts/notarize.sh "$RUNNER_TEMP/Kuery-notarize.zip"
 
           # Staple the ticket so the app opens offline without asking Apple.
           xcrun stapler staple "$app"
@@ -189,9 +162,36 @@ jobs:
         if: runner.os == 'macOS'
         run: (cd dist && ditto -c -k --keepParent "$ARCHIVE" "$ARCHIVE.zip")
 
+      # The installer: a disk image with Kuery.app next to a link to
+      # /Applications, so installing is dragging one onto the other. With the
+      # Apple secrets it is signed, notarized and stapled like the app.
+      - name: Installer (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          staging="$RUNNER_TEMP/dmg"
+          dmg="dist/$ARCHIVE.dmg"
+          mkdir -p "$staging"
+          ditto "dist/$ARCHIVE/Kuery.app" "$staging/Kuery.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname Kuery -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg"
+
+          if [[ -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+            echo "::warning::Apple signing secrets are not set; the disk image is not signed or notarized."
+            exit 0
+          fi
+          codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$dmg"
+          .github/scripts/notarize.sh "$dmg"
+          xcrun stapler staple "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
       - name: Remove signing keychain (macOS)
         if: always() && runner.os == 'macOS'
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -207,6 +207,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.dmg
           if-no-files-found: error
 
   release:
