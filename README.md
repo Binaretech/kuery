@@ -289,6 +289,15 @@ and macOS blocks it until it is allowed in System Settings → Privacy & Securit
 | `APPLE_API_KEY_ID` | That key's ID |
 | `APPLE_API_ISSUER_ID` | The issuer ID shown above the keys in App Store Connect → Users and Access → Integrations |
 
+Each release also publishes `latest.json`, which the in-app updater reads from
+the latest release, and a minisign signature (`.minisig`) for every archive it
+installs. The app only installs archives signed by the key whose public half is
+[`crates/app/assets/update.pub`](crates/app/assets/update.pub); the release
+workflow checks its signatures against that file. The secret half is the
+`UPDATE_SIGNING_KEY` repository secret (the passwordless minisign secret key
+file's contents). Keep a backup of it: without it, no update can be signed for
+the apps already installed.
+
 The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
 release workflow refuses a tag that does not match it. To release, bump that
 version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
