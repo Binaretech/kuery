@@ -270,9 +270,11 @@ Tests marked `ignored` require the development databases or SSH bastion; they
 are separate from the default suite. CI is configured for macOS, Windows and
 Linux, with additional database integration jobs. The
 [release workflow](.github/workflows/release.yml) packages Linux x86_64,
-macOS Apple Silicon/Intel and Windows x86_64 builds for tagged releases.
+macOS and Windows x86_64 builds for tagged releases. The macOS build is a
+single universal app (Apple Silicon and Intel, merged with `lipo`), shipped as
+a `.dmg` installer and a `.zip`.
 
-The macOS app is signed with a Developer ID certificate, notarized and stapled
+The macOS app and disk image are signed with a Developer ID certificate, notarized and stapled
 when these repository secrets are set; without them it gets an ad-hoc signature
 and macOS blocks it until it is allowed in System Settings → Privacy & Security
 → Open Anyway:
