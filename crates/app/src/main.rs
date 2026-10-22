@@ -46,6 +46,7 @@ mod table_tab;
 mod theme;
 mod tunnel;
 mod ui;
+mod updates;
 mod welcome;
 mod workspace;
 mod write_mode;
@@ -71,6 +72,7 @@ fn main() {
             audit::init(cx);
             // After gpui_kit::init, so the keymap can keep its bindings.
             keymap::init(cx);
+            updates::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

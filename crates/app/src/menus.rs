@@ -11,6 +11,7 @@ use crate::commands::{
     ReloadDataFile, ReloadKeymap, ToggleSidebar,
 };
 use crate::query_tab::{SaveQuery, SaveQueryAs};
+use crate::updates::CheckForUpdates;
 
 actions!(kuery, [Quit, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
 
@@ -47,6 +48,8 @@ pub fn set_menus(cx: &mut App) {
 
     cx.set_menus([
         Menu::new("Kuery").items([
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
             MenuItem::action("Command Palette…", OpenCommandPalette),
             MenuItem::separator(),
             MenuItem::action("Open Keymap File", OpenKeymapFile),

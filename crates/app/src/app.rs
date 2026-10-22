@@ -304,11 +304,17 @@ fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
 /// Quits, asking first if a project window has work that would be lost:
 /// unsaved SQL, an open transaction (rolled back on quit) or staged row
 /// changes.
-///
-/// Deferred: the Quit action arrives while a window is handling the event,
-/// and that window could not show the question then.
 pub fn request_quit(cx: &mut App) {
-    cx.defer(|cx| {
+    confirm_leave("Quit", cx, |cx| cx.quit());
+}
+
+/// Runs `then` (which quits or restarts) once nothing would be lost, or the
+/// user agrees to lose it; `verb` names what happens ("Quit", "Restart").
+///
+/// Deferred: the action asking for it arrives while a window is handling the
+/// event, and that window could not show the question then.
+pub fn confirm_leave(verb: &'static str, cx: &mut App, then: impl FnOnce(&mut App) + 'static) {
+    cx.defer(move |cx| {
         let open = cx.windows();
         let unsaved: Vec<AnyWindowHandle> = state(cx)
             .windows
@@ -325,7 +331,7 @@ pub fn request_quit(cx: &mut App) {
             .map(|entry| entry.handle)
             .collect();
         let Some(&first) = unsaved.first() else {
-            cx.quit();
+            then(cx);
             return;
         };
         let handle = cx
@@ -345,19 +351,19 @@ pub fn request_quit(cx: &mut App) {
             window.activate_window();
             window.prompt(
                 PromptLevel::Warning,
-                "Quit Kuery?",
+                &format!("{verb} Kuery?"),
                 Some(&detail),
-                &["Quit", "Cancel"],
+                &[verb, "Cancel"],
                 cx,
             )
         });
         let Ok(answer) = answer else {
-            cx.quit();
+            then(cx);
             return;
         };
         cx.spawn(async move |cx| {
             if let Ok(0) = answer.await {
-                cx.update(|cx| cx.quit());
+                cx.update(then);
             }
         })
         .detach();

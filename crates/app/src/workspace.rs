@@ -1581,6 +1581,7 @@ impl WorkspaceView {
             .text_color(color(theme::TEXT_TERTIARY))
             .child(left.flex_1())
             .child(right)
+            .children(crate::updates::status_item(cx))
     }
 
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -1,4 +1,5 @@
-//! Where the app keeps per-user files (keymap, recent projects).
+//! Where the app keeps per-user files (keymap, recent projects) and what
+//! it can throw away (downloaded updates).
 
 use std::path::PathBuf;
 
@@ -9,6 +10,27 @@ const LEGACY_NAME: &str = "dbadmin";
 /// Windows and `$XDG_CONFIG_HOME/kuery` (or `~/.config/kuery`) elsewhere.
 pub fn config_dir() -> PathBuf {
     config_dir_named("kuery")
+}
+
+/// `~/Library/Caches/kuery` on macOS, `%LOCALAPPDATA%\kuery` on Windows and
+/// `$XDG_CACHE_HOME/kuery` (or `~/.cache/kuery`) elsewhere.
+pub fn cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    if cfg!(target_os = "macos") {
+        home.join("Library/Caches/kuery")
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_dir_named(""))
+            .join("kuery")
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache"))
+            .join("kuery")
+    }
 }
 
 /// Moves the config folder from before the rename (`…/dbadmin`) to
