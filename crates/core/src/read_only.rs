@@ -150,9 +150,7 @@ pub fn check_in(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
     }
 }
 
-/// A database whose script unit is a batch (T-SQL) runs several statements
-/// at once, so one batch may hold many; they must all be reads or touch
-/// only what the session itself made.
+/// A T-SQL batch runs its statements together, so every one must read or touch only what the session made.
 fn check_batch(dialect: &Dialect, sql: &str) -> Result<(), Rejection> {
     let batches = crate::script::statements_in(dialect, sql)
         .ok_or_else(|| Rejection::Parse("unterminated string, comment or identifier".into()))?;

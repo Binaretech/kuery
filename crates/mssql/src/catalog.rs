@@ -56,7 +56,6 @@ fn flag(cell: &Option<String>) -> bool {
     cell.as_deref().is_some_and(|value| value != "0")
 }
 
-/// A column of a table or view.
 struct Column {
     schema: String,
     table: String,
@@ -110,7 +109,6 @@ fn columns(adapter: &mut Mssql, filter: &str) -> Result<Vec<Column>, QueryError>
         .collect())
 }
 
-/// One column of a foreign key.
 struct ForeignKey {
     schema: String,
     table: String,
