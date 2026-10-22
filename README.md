@@ -287,6 +287,14 @@ and macOS blocks it until it is allowed in System Settings → Privacy & Securit
 | `APPLE_API_KEY_ID` | That key's ID |
 | `APPLE_API_ISSUER_ID` | The issuer ID shown above the keys in App Store Connect → Users and Access → Integrations |
 
+The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
+release workflow refuses a tag that does not match it. To release, bump that
+version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
+
+```sh
+git tag v0.2.2 && git push origin v0.2.2
+```
+
 When reporting a bug, include the platform, build/commit, steps to reproduce
 and a small synthetic dataset or query where possible. Remove credentials and
 private data from screenshots and sample files.

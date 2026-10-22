@@ -16,8 +16,35 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # The app reports the Cargo.toml version (the macOS bundle and the updater
+  # read it), so a tag must match it: bump `[workspace.package] version`
+  # before tagging.
+  version:
+    name: Version matches the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::No version in [workspace.package] of Cargo.toml."
+            exit 1
+          fi
+          echo "Cargo.toml version: $version"
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            echo "Not a tag push; nothing to compare."
+            exit 0
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $version; bump [workspace.package] version to ${GITHUB_REF_NAME#v} or tag v$version."
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
