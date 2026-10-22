@@ -22,10 +22,13 @@ jobs:
   version:
     name: Version matches the tag
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compare.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Compare
+        id: compare
         run: |
           version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
           if [[ -z "$version" ]]; then
@@ -33,6 +36,7 @@ jobs:
             exit 1
           fi
           echo "Cargo.toml version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "$GITHUB_REF_TYPE" != tag ]]; then
             echo "Not a tag push; nothing to compare."
             exit 0
@@ -290,10 +294,55 @@ jobs:
             dist/*.dmg
           if-no-files-found: error
 
+  # Signs the archives the in-app updater installs and writes latest.json,
+  # which the app reads from the latest release to find new versions.
+  update-manifest:
+    name: Update manifest
+    needs: [version, build, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kuery-*
+          path: dist
+          merge-multiple: true
+
+      - name: Sign and write latest.json
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if [[ -z "$UPDATE_SIGNING_KEY" ]]; then
+            if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+              echo "::error::UPDATE_SIGNING_KEY is not set; a release without signed updates would leave the updater nothing to install."
+              exit 1
+            fi
+            echo "::warning::UPDATE_SIGNING_KEY is not set; no latest.json for this run."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag="$GITHUB_REF_NAME"; else tag="${GITHUB_SHA::7}"; fi
+          key="$RUNNER_TEMP/update.key"
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+          UPDATE_SIGNING_KEY_PATH="$key" .github/scripts/update-manifest.sh dist "$VERSION" "$tag" "$GITHUB_REPOSITORY"
+          rm "$key"
+          mkdir update
+          mv dist/latest.json dist/*.minisig update/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuery-update
+          path: update/
+          if-no-files-found: ignore
+
   release:
     name: GitHub release
     if: github.ref_type == 'tag'
-    needs: [build, macos-universal]
+    needs: [build, macos-universal, update-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
