@@ -6,6 +6,7 @@
 //! staged, the exact SQL is shown, and they are applied together in one
 //! transaction.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ use kuery_core::session::RunOptions;
 actions!(kuery, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
+use crate::audit::{self, AuditAction, AuditRecord};
 use crate::chrome;
 use crate::connection::Db;
 use crate::context_menus::{Cell, item};
@@ -113,6 +115,8 @@ struct Pending {
 
 pub struct TableTab {
     db: Db,
+    /// The project folder, for the audit log.
+    project: PathBuf,
     info: TableInfo,
     definition: Load<TableDefinition>,
     view: TableView,
@@ -136,6 +140,7 @@ pub struct TableTab {
 impl TableTab {
     pub fn new(
         db: Db,
+        project: PathBuf,
         info: TableInfo,
         view: TableView,
         window: &mut Window,
@@ -204,6 +209,7 @@ impl TableTab {
 
         Self {
             db,
+            project,
             info,
             definition: Load::Loading,
             view,
@@ -817,11 +823,33 @@ impl TableTab {
         }
         let statements: Vec<WriteStatement> =
             self.pending.iter().map(|p| p.statement.clone()).collect();
+        let sql = statements
+            .iter()
+            .map(|statement| format!("{};", statement.sql()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count = statements.len();
         self.apply = ApplyState::Applying;
         let apply = self.db.session.apply(statements);
         self.apply_task = Some(cx.spawn(async move |this, cx| {
             let result = apply.await;
             this.update(cx, |this, cx| {
+                let (outcome, changed, failed) = match &result {
+                    Ok(rows) => (
+                        format!("Applied · {count} changes · {rows} rows"),
+                        Some((count, *rows)),
+                        false,
+                    ),
+                    Err(error) => (
+                        format!(
+                            "Apply failed: {} · nothing was kept",
+                            describe_error(error.clone())
+                        ),
+                        None,
+                        true,
+                    ),
+                };
+                this.audit(&sql, outcome, changed, failed, cx);
                 match result {
                     Ok(rows) => {
                         this.pending.clear();
@@ -836,6 +864,35 @@ impl TableTab {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Logs an apply of staged changes to the audit log, off the UI thread.
+    fn audit(
+        &self,
+        sql: &str,
+        outcome: String,
+        changed: Option<(usize, u64)>,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let record = AuditRecord {
+            at: AuditRecord::now_at(),
+            project: self.project.display().to_string(),
+            connection: self.db.name.to_string(),
+            environment: self.db.environment.label().to_string(),
+            mode: "Row edits".into(),
+            action: AuditAction::Apply,
+            sql: sql.to_string(),
+            outcome,
+            changed,
+            failed,
+        };
+        cx.background_spawn(async move {
+            if let Err(error) = audit::append(&record) {
+                eprintln!("kuery: could not write the audit log: {error}");
+            }
+        })
+        .detach();
     }
 
     // Render ---------------------------------------------------------------

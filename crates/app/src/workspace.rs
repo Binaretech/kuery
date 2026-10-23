@@ -521,7 +521,8 @@ impl WorkspaceView {
                 index
             }
             None => {
-                let tab = cx.new(|cx| TableTab::new(db, info, view, window, cx));
+                let project = self.model.read(cx).project.root.clone();
+                let tab = cx.new(|cx| TableTab::new(db, project, info, view, window, cx));
                 self.tabs.push(Tab::Table(tab));
                 self.tabs.len() - 1
             }
