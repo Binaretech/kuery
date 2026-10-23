@@ -222,6 +222,17 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .mod-fig{grid-column:1/8}.mod-txt{grid-column:8/13}
 .cta-l{grid-column:1/13}.cta-r{grid-column:1/13;max-width:520px;margin-top:48px}
 .t1{grid-column:1/7}.t2{grid-column:7/13}.t3{grid-column:1/7}.t4{grid-column:7/13}.t5{grid-column:1/13}.t6{grid-column:1/13}
+/* workflow: a wider pane, and its table without the status column */
+.pin-r{grid-column:6/13}
+.ps{inset:24px}
+.win-bar .r{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.fr{grid-template-columns:0.8fr 0.9fr 1.5fr 0.9fr;font-size:12.5px}
+.fr > :nth-child(4){display:none}
+.tree{padding:18px;font-size:13px;line-height:24px}
+}
+/* too narrow for the folder tree's comments; the step text says what the folders hold */
+@media (max-width: 860px){
+.tree .c{display:none}
 }
 @media (max-width: 760px){
 .g12{display:flex;flex-direction:column}
@@ -251,11 +262,7 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .ps{position:static;opacity:1;transform:none;pointer-events:auto;margin:24px calc(-1 * var(--m)) 0;padding:16px;background:var(--s2)}
 .ps .win{height:auto}
 .tree{padding:16px;font-size:12.5px;line-height:22px;overflow-x:auto}
-/* the step above says what the folders hold */
-.tree .c{display:none}
 .win-bar .r{display:none}
-.fr{grid-template-columns:0.8fr 0.9fr 1.5fr 0.9fr;font-size:12.5px}
-.fr > :nth-child(4){display:none}
 .step{min-height:0;margin-top:56px;gap:12px;color:var(--ink)}
 .step .h3{font-size:22px}
 .step .h3::before{content:'';display:block;width:40px;height:4px;background:var(--accent);margin-bottom:16px}
