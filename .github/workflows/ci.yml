@@ -13,6 +13,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Debug info makes cold builds and caches much bigger, and CI only needs
+  # it for backtraces.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   build:
@@ -24,6 +28,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+
+      # NTFS and Defender scanning make Windows builds slow; a trusted ReFS
+      # Dev Drive avoids both. The build runs in its copy of the checkout.
+      - name: Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v4
+        with:
+          drive-size: 30GB
+          workspace-copy: true
+          trusted-dev-drive: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
+            RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup
 
       # What gpui needs to link on Linux (X11, Wayland and fonts).
       - name: System dependencies
@@ -37,18 +54,27 @@ jobs:
 
       # The version comes from rust-toolchain.toml.
       - name: Toolchain
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.DEV_DRIVE_WORKSPACE || '.' }}
+          # PRs reuse main's cache; saving one per PR costs minutes.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
+      # Lints barely differ between platforms; Linux is the fastest to check.
       - name: Clippy
+        if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # In the Dev Drive copy on Windows, the checkout elsewhere.
       - name: Tests
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: cargo test --workspace --locked
 
   postgres:
@@ -104,9 +130,13 @@ jobs:
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # One at a time: several tests change the shared seeded `orders`
+      # table inside transactions and deadlock when they overlap.
       - name: Ignored kuery-pg tests
-        run: cargo test -p kuery-pg --locked -- --ignored
+        run: cargo test -p kuery-pg --locked -- --ignored --test-threads=1
 
   redis:
     name: kuery-redis tests against Redis
@@ -133,6 +163,8 @@ jobs:
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Ignored kuery-redis tests
         run: cargo test -p kuery-redis --locked -- --ignored
@@ -168,6 +200,8 @@ jobs:
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Ignored kuery-mssql tests
         run: cargo test -p kuery-mssql --locked -- --ignored
