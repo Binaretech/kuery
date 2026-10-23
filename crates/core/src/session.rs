@@ -951,11 +951,12 @@ impl Worker {
             match outcome {
                 Ok(changed) => summary.affected += changed,
                 Err(error) => {
-                    // The reader went away: stop the statement on the server
-                    // too. Not when the server reported the cancel itself: a
+                    // The reader went away and the statement stopped for it:
+                    // stop it on the server too. Not when the server reported
+                    // the cancel itself, nor after another error ended it: a
                     // cancel that arrives after the statement ended stops the
                     // next one (Postgres cancels whatever the connection runs).
-                    if stream.reader_gone.get() {
+                    if stream.reader_gone.get() && matches!(error, QueryError::Cancelled) {
                         (self.canceller)();
                     }
                     return Err(error);

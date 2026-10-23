@@ -3,7 +3,8 @@
 //! `select fail` and `update fail` fail, `select slow` runs until cancelled
 //! and then ends as if nothing happened (like MySQL's killed `SLEEP`), and
 //! `select interrupted` runs until cancelled and then fails as cancelled
-//! (like Postgres). `select endless` streams rows until the reader goes away.
+//! (like Postgres). `select endless` streams rows until the reader goes away;
+//! `select stubborn` ignores that and then fails some other way.
 //! Every cancel the session sends is logged as `cancel`.
 //! `select deadlock` fails the way a deadlock victim does on SQL Server (the
 //! server rolls back the whole transaction, so the next `rollback to` fails),
@@ -90,6 +91,10 @@ impl Adapter for Fake {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(QueryError::Cancelled)
+            }
+            ["select", "stubborn"] => {
+                let _ = rows.columns(vec!["n".into()], None);
+                Err(QueryError::Connection("closed after the statement".into()))
             }
             ["select", "endless"] => {
                 rows.columns(vec!["n".into()], None)?;
@@ -506,6 +511,19 @@ fn a_reader_that_goes_away_stops_the_statement_on_the_server() {
         Some("cancel"),
         "{log:?}"
     );
+}
+
+#[test]
+fn only_a_cancelled_statement_is_cancelled_on_the_server() {
+    let (session, log) = open(Access::ReadOnly);
+    // The reader is gone, but the statement ended with another error: no
+    // statement is left to stop, and a cancel could reach the next one.
+    drop(session.run_read_only("select stubborn".into(), RunOptions::default()));
+    drain(session.run_read_only("select 1".into(), RunOptions::default()))
+        .1
+        .unwrap();
+    let log = log.take();
+    assert!(!log.iter().any(|sql| sql == "cancel"), "{log:?}");
 }
 
 #[test]
