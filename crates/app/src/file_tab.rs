@@ -27,6 +27,35 @@ use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::{format_bytes, thousands};
 
+/// Describes the data file at `path`, by its canonical path. It touches the
+/// disk, so callers run it in the background.
+pub fn load_source(path: std::path::PathBuf) -> Result<FileSource, String> {
+    let mut source = FileSource::new(path).map_err(|e| e.to_string())?;
+    source.path = source.path.canonicalize().map_err(|e| e.to_string())?;
+    Ok(source)
+}
+
+/// Query files with no previewed file to query.
+pub fn no_files_to_query(window: &mut Window, cx: &mut App) {
+    drop(window.prompt(
+        gpui_kit::PromptLevel::Info,
+        "Open a data file first",
+        Some("Wait for a file preview to finish, then choose Query files."),
+        &["OK"],
+        cx,
+    ));
+}
+
+pub fn data_file_error(error: &str, window: &mut Window, cx: &mut App) {
+    drop(window.prompt(
+        gpui_kit::PromptLevel::Critical,
+        "Could not open data file",
+        Some(error),
+        &["OK"],
+        cx,
+    ));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Data,

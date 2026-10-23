@@ -1,7 +1,8 @@
 //! Kuery: a desktop database manager built with gpui.
 //!
-//! `kuery [folder]` opens the project in `folder` (creating its `.kuery/`
-//! if needed); without an argument the welcome window lists recent projects.
+//! `kuery [PATH...]` opens each folder as a project (creating its `.kuery/`
+//! if needed) and each data file in a tab; without a path the welcome window
+//! lists recent projects. `kuery --help` lists the options.
 
 // Release builds on Windows open no console window next to the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -12,6 +13,7 @@ mod app_icon;
 mod assets;
 mod audit;
 mod chrome;
+mod cli;
 mod commands;
 mod completion;
 mod connection;
@@ -24,6 +26,7 @@ mod explorer;
 mod file_jobs;
 mod file_query_tab;
 mod file_tab;
+mod file_window;
 mod grid;
 mod history;
 mod keymap;
@@ -51,15 +54,31 @@ mod welcome;
 mod workspace;
 mod write_mode;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use cli::Command;
+
 fn main() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let targets = match cli::parse(std::env::args_os().skip(1), &cwd) {
+        Ok(Command::Open(targets)) => targets,
+        Ok(Command::Help) => {
+            print!("{}", cli::help());
+            return;
+        }
+        Ok(Command::Version) => {
+            println!("{}", cli::version());
+            return;
+        }
+        Err(error) => {
+            eprintln!("kuery: {error}");
+            std::process::exit(1);
+        }
+    };
     paths::migrate_legacy_config_dir();
     log_panics();
     drivers::install_tls_provider();
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
-    let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
         .with_assets(assets::AppAssets)
@@ -81,13 +100,7 @@ fn main() {
             })
             .detach();
 
-            let opened = match &folder {
-                Some(folder) => app::open_project(folder, cx)
-                    .map_err(|error| eprintln!("kuery: {error}"))
-                    .is_ok(),
-                None => false,
-            };
-            if !opened {
+            if !app::open_targets(&targets, cx) {
                 app::open_welcome(cx);
             }
             cx.activate(true);

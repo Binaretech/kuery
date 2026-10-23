@@ -1,5 +1,5 @@
-//! App-wide state and windows: one window per project, plus a welcome window
-//! when no project is open.
+//! App-wide state and windows: one window per project, a welcome window
+//! when no project is open, and one for data files opened without a project.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +9,9 @@ use gpui_kit::{
     PathPromptOptions, PromptLevel, Render, Window, WindowBounds, WindowOptions, px, size,
 };
 
+use crate::cli::Target;
 use crate::commands::{ClearRecentProjects, OpenProject, OpenRecentProject};
+use crate::file_window::FileWindow;
 use crate::project::{Project, ProjectModel};
 use crate::secrets::SecretStore;
 use crate::welcome::Welcome;
@@ -21,6 +23,8 @@ pub struct AppState {
     /// Open project windows, so opening a project twice focuses it.
     windows: Vec<ProjectWindowEntry>,
     welcome: Option<(AnyWindowHandle, Entity<Welcome>)>,
+    /// The window for data files opened with no project window open.
+    files: Option<(AnyWindowHandle, Entity<FileWindow>)>,
 }
 
 struct ProjectWindowEntry {
@@ -74,6 +78,7 @@ pub fn init(redis: Arc<kuery_redis::Engine>, secrets: Arc<dyn SecretStore>, cx: 
         secrets,
         windows: Vec::new(),
         welcome: None,
+        files: None,
     });
     cx.on_action(|_: &OpenProject, cx| request_open(None, cx.active_window(), cx));
     cx.on_action(|action: &OpenRecentProject, cx| {
@@ -261,6 +266,98 @@ fn replace_project(
     Ok(())
 }
 
+/// Opens what `kuery [PATH...]` names: each folder as a project, then each
+/// data file where [`destination`] says. Failures go to stderr; returns
+/// whether anything opened.
+pub fn open_targets(targets: &[Target], cx: &mut App) -> bool {
+    let mut any = false;
+    let mut opened = None;
+    for target in targets {
+        if let Target::Project(folder) = target {
+            match open_project(folder, cx) {
+                Ok(()) => {
+                    any = true;
+                    let folder = canonical(folder);
+                    opened = state(cx)
+                        .windows
+                        .iter()
+                        .find(|entry| entry.folder == folder)
+                        .map(|entry| entry.handle);
+                }
+                Err(error) => report_error(None, &error, cx),
+            }
+        }
+    }
+    for target in targets {
+        if let Target::DataFile(path) = target {
+            match open_data_file(path.clone(), opened, cx) {
+                Ok(()) => any = true,
+                Err(error) => eprintln!("kuery: {error}"),
+            }
+        }
+    }
+    any
+}
+
+fn open_data_file(
+    path: PathBuf,
+    opened: Option<AnyWindowHandle>,
+    cx: &mut App,
+) -> Result<(), String> {
+    let state = state(cx);
+    let projects: Vec<_> = state.windows.iter().map(|entry| entry.handle).collect();
+    let files = state.files.as_ref().map(|(handle, _)| *handle);
+    match destination(opened, cx.active_window(), files, &projects) {
+        Destination::Project(handle) => {
+            let view = state
+                .windows
+                .iter()
+                .find(|entry| entry.handle == handle)
+                .map(|entry| entry.view.clone())
+                .ok_or("The project window was closed")?;
+            handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let workspace = view.read(cx).workspace.clone();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.open_data_path(path, window, cx)
+                    });
+                })
+                .map_err(|_| "The project window was closed".to_string())
+        }
+        Destination::Files => {
+            let (handle, view) = files_window(cx)?;
+            handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    view.update(cx, |files, cx| files.open_data_path(path, window, cx));
+                })
+                .map_err(|_| "The data files window was closed".to_string())
+        }
+    }
+}
+
+/// The window for data files without a project, opened if needed.
+fn files_window(cx: &mut App) -> Result<(AnyWindowHandle, Entity<FileWindow>), String> {
+    if let Some((handle, view)) = state(cx).files.clone()
+        && handle.update(cx, |_, _, _| ()).is_ok()
+    {
+        return Ok((handle, view));
+    }
+    let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        ..crate::app_icon::window_options()
+    };
+    let opened = gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| FileWindow::new(window, cx))
+    })
+    .map_err(|error| format!("Could not open a window: {error}"))?;
+    cx.global_mut::<AppState>().files = Some(opened.clone());
+    close_welcome(cx);
+    Ok(opened)
+}
+
 /// Brings the window of the project in `folder` to the front, if there is one.
 fn focus_existing(folder: &Path, cx: &mut App) -> bool {
     let existing = state(cx)
@@ -406,5 +503,78 @@ fn close_welcome(cx: &mut App) {
         window
             .update(cx, |_, window, _| window.remove_window())
             .ok();
+    }
+}
+
+/// Where a data file from the command line opens.
+#[derive(Debug, PartialEq, Eq)]
+enum Destination<W> {
+    /// The project window with this handle.
+    Project(W),
+    /// The window without a project, opened if needed.
+    Files,
+}
+
+/// The project the same command opened wins, then the active window (a
+/// project, or the one without), then the newest project window.
+fn destination<W: Copy + PartialEq>(
+    opened: Option<W>,
+    active: Option<W>,
+    files: Option<W>,
+    projects: &[W],
+) -> Destination<W> {
+    if let Some(opened) = opened {
+        return Destination::Project(opened);
+    }
+    match active {
+        Some(active) if projects.contains(&active) => Destination::Project(active),
+        Some(active) if files == Some(active) => Destination::Files,
+        _ => projects
+            .last()
+            .map_or(Destination::Files, |newest| Destination::Project(*newest)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_data_file_opens_in_the_project_the_command_opened() {
+        assert_eq!(
+            destination(Some(2), Some(1), None, &[1, 2]),
+            Destination::Project(2)
+        );
+    }
+
+    #[test]
+    fn otherwise_in_the_active_window() {
+        assert_eq!(
+            destination(None, Some(1), Some(3), &[1, 2]),
+            Destination::Project(1)
+        );
+        assert_eq!(
+            destination(None, Some(3), Some(3), &[1, 2]),
+            Destination::Files
+        );
+    }
+
+    #[test]
+    fn otherwise_in_the_newest_project_window() {
+        // The welcome window, or none, is active.
+        assert_eq!(
+            destination(None, Some(9), None, &[1, 2]),
+            Destination::Project(2)
+        );
+        assert_eq!(
+            destination(None, None, Some(3), &[1, 2]),
+            Destination::Project(2)
+        );
+    }
+
+    #[test]
+    fn without_a_project_window_it_opens_in_the_window_without_a_project() {
+        assert_eq!(destination::<u8>(None, None, None, &[]), Destination::Files);
+        assert_eq!(destination(None, Some(9), Some(3), &[]), Destination::Files);
     }
 }
