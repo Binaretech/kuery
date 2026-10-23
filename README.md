@@ -10,11 +10,12 @@
 </p>
 
 <p align="center">
+  <a href="https://angel-afonso.github.io/kuery/">Website</a> ·
   <a href="#features">Features</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="docs/guide.md">User &amp; development guide</a> ·
-  <a href="https://github.com/angel-afonso/kuery/releases">Releases</a>
+  <a href="https://github.com/angel-afonso/kuery/releases/latest">Download</a>
 </p>
 
 Kuery brings database administration and file analytics into one desktop app.
@@ -28,8 +29,9 @@ Built in Rust with [GPUI Kit](https://crates.io/crates/gpui-kit),
 Windows and Linux.
 
 > **Project status:** early prototype under active development. The features
-> below describe the current source tree. Tagged release builds may lag behind
-> recent changes; file SQL is currently a temporary, read-only workspace.
+> below describe the current source tree. [Release builds](https://github.com/angel-afonso/kuery/releases/latest)
+> may lag behind recent changes and update themselves once installed; file SQL
+> is currently a temporary, read-only workspace.
 
 ![Kuery querying local sales data with SQL and displaying the grouped results](docs/screenshots/file-sql.jpg)
 
@@ -49,6 +51,7 @@ Windows and Linux.
 | **Projects & navigation** | Keep connection definitions, saved SQL and diagram positions in a folder-based project. Use recent projects, the command palette, contextual menus, history and configurable shortcuts. |
 | **Connectivity** | Use driver-specific TLS settings and OpenSSH tunnels. Connection passwords are stored in the operating system's credential store rather than the project file. |
 | **Result workflows** | Copy cells and rows as text, TSV or JSON. Export database SQL query results to CSV, TSV or JSON. File SQL results currently use the shared grid's copy menus. |
+| **Updates** | Release builds check for a newer release at startup and every six hours, download and verify it in the background, and offer to restart into it. Check by hand with **Check for Updates…**; turn the automatic check off with **Toggle Automatic Update Checks**. |
 
 ## Screenshots
 
@@ -105,6 +108,28 @@ Database SQL uses the selected database's dialect. File SQL uses Polars SQL;
 SQL features and functions are not interchangeable across engines.
 
 ## Getting started
+
+### Install a release
+
+Download the build for your platform from the
+[website](https://angel-afonso.github.io/kuery/#download) or the
+[latest release](https://github.com/angel-afonso/kuery/releases/latest):
+
+| Platform | File | Install |
+| --- | --- | --- |
+| **macOS** (Apple Silicon and Intel) | `kuery-<version>-universal-apple-darwin.dmg` | Open the disk image and drag Kuery onto Applications. A `.zip` of the app is also published. |
+| **Windows** x64 | `kuery-<version>-x86_64-pc-windows-msvc.zip` | Unzip it and run `kuery.exe`. |
+| **Linux** x86_64 (glibc) | `kuery-<version>-x86_64-unknown-linux-gnu.tar.gz` | Extract it and run `./kuery`. |
+
+Each release lists the archives' SHA-256 checksums in `SHA256SUMS`. Once
+installed, Kuery updates itself: it only installs archives whose checksum and
+minisign signature match the release's `latest.json`. The automatic check can
+also be turned off in `settings.toml` in the user config directory:
+
+```toml
+[updates]
+check_automatically = false
+```
 
 ### Run from source
 
@@ -253,6 +278,7 @@ Profile.
 | [`kuery-sqlite`](crates/sqlite) | SQLite adapter and local database access. |
 | [`kuery-redis`](crates/redis) | Redis runtime, key browsing, value handling and console commands. |
 | [`kuery-files`](crates/files) | Polars readers, schema metadata, bounded previews and read-only file SQL. |
+| [`kuery-update`](crates/update) | Release checks, verified downloads and in-place installs for the in-app updater, with no UI dependencies. |
 
 See the [driver architecture](docs/guide.md#drivers) for adapter responsibilities
 and the shared conformance tests.
@@ -303,12 +329,32 @@ release workflow refuses a tag that does not match it. To release, bump that
 version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
 
 ```sh
-git tag v0.2.2 && git push origin v0.2.2
+git tag v0.3.1 && git push origin v0.3.1
 ```
 
-When reporting a bug, include the platform, build/commit, steps to reproduce
-and a small synthetic dataset or query where possible. Remove credentials and
-private data from screenshots and sample files.
+### Website
+
+The [website](https://angel-afonso.github.io/kuery/) is plain HTML, CSS and
+JavaScript in [`site/`](site). The [Pages workflow](.github/workflows/pages.yml)
+assembles it with [`build-site.sh`](.github/scripts/build-site.sh), which adds
+the screenshots from `docs/screenshots` and the app icon, and fills in the
+latest release's version and download links; it refuses to publish links to
+files the release does not have. The site deploys on every push to `main` that
+touches it, and the release workflow redeploys it after publishing a release.
+To preview it locally, build it with a tag and serve the output:
+
+```bash
+.github/scripts/build-site.sh /tmp/kuery-site/kuery v0.3.0
+python3 -m http.server 8000 --directory /tmp/kuery-site
+```
+
+Then open `http://localhost:8000/kuery/`.
+
+### Reporting bugs
+
+Include the platform, build/commit, steps to reproduce and a small synthetic
+dataset or query where possible. Remove credentials and private data from
+screenshots and sample files.
 
 ## Branding and acknowledgements
 
