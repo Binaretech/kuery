@@ -845,7 +845,8 @@ pub fn parse_timestamp(value: &str) -> Option<f64> {
 
 /// A timestamp's wall-clock seconds and its offset in seconds.
 fn timestamp_parts(value: &str) -> Option<(f64, f64)> {
-    if value.len() < 19 {
+    // Timestamps are ASCII; anything else could split a character when sliced.
+    if value.len() < 19 || !value.is_ascii() {
         return None;
     }
     let date = parse_date(&value[..10])?;
@@ -1194,6 +1195,25 @@ mod tests {
             assert_eq!(days_from_civil(year, month, day), days);
         }
         assert_eq!(civil_from_days(20_741), (2026, 10, 15));
+    }
+
+    #[test]
+    fn text_that_is_not_ascii_is_no_timestamp() {
+        for value in [
+            "Crème brûlée recipe",
+            "東京都の天気予報です",
+            "2026-10-1é 10:00:00",
+            "2026-10-15 1é:00:00",
+            "2026-10-15 10:00:é0+01",
+            "2026-10-15 10:00:00+é1",
+        ] {
+            assert_eq!(parse_timestamp(value), None, "{value}");
+            assert_eq!(wall_clock(value), None, "{value}");
+        }
+        assert_eq!(
+            infer_kind(["東京都の天気予報です"].into_iter()),
+            ColumnKind::Text
+        );
     }
 
     #[test]
