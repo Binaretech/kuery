@@ -17,6 +17,8 @@ use crate::query_tab::{
     PreviewImpact, RollbackTransaction, RunAll, RunQuery, SaveQuery, SaveQueryAs, ToggleResults,
     UseFullWrite, UseReadOnly, UseWrite,
 };
+#[cfg(target_os = "macos")]
+use crate::shell_command::InstallShellCommand;
 use crate::table_tab::{ReloadTable, SaveTableChanges};
 use crate::updates::{CheckForUpdates, RestartToUpdate, ToggleAutomaticUpdateChecks};
 
@@ -365,6 +367,15 @@ pub const COMMANDS: &[Command] = &[
         defaults: &[],
         context: None,
     },
+    #[cfg(target_os = "macos")]
+    Command {
+        id: "shell.install",
+        title: "Install kuery Command",
+        category: "Kuery",
+        action: action!(InstallShellCommand),
+        defaults: &[],
+        context: None,
+    },
     Command {
         id: "updates.restart",
         title: "Restart to Update",
@@ -437,6 +448,14 @@ pub fn find(id: &str) -> Option<&'static Command> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_shell_command_installs_from_the_palette() {
+        let command = find("shell.install").unwrap();
+        assert_eq!(command.title, "Install kuery Command");
+        assert_eq!((command.action)().name(), "kuery::InstallShellCommand");
+    }
 
     #[test]
     fn ids_are_unique_and_dotted() {

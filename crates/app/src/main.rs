@@ -46,6 +46,7 @@ mod redis_write;
 mod results;
 mod secrets;
 mod settings;
+mod shell_command;
 mod table_tab;
 mod theme;
 mod tunnel;
@@ -61,6 +62,7 @@ use cli::Command;
 use instance::{HandOff, Listener};
 
 fn main() {
+    attach_console();
     let cwd = std::env::current_dir().unwrap_or_default();
     let targets = match cli::parse(std::env::args_os().skip(1), &cwd) {
         Ok(Command::Open(targets)) => targets,
@@ -108,6 +110,7 @@ fn main() {
             // After gpui_kit::init, so the keymap can keep its bindings.
             keymap::init(cx);
             updates::init(cx);
+            shell_command::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -141,6 +144,18 @@ fn open(targets: &[cli::Target], cx: &mut gpui_kit::App) {
     }
     app::report_open_errors(&opened.errors, cx);
     cx.activate(true);
+}
+
+/// A Windows release build has no console of its own (it would open one
+/// next to the app), so it prints into the terminal that started it, if any.
+fn attach_console() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    // SAFETY: no arguments to uphold; it fails harmlessly without a parent
+    // console.
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 /// Started from a terminal, a release build runs the app in a process of
