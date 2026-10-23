@@ -2,6 +2,7 @@
 //! what it reports while it runs, how it fails, and the [`Session`] that
 //! drives any driver's [`Adapter`] by the same rules.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -933,6 +934,7 @@ impl Worker {
             batch_rows: options.first_batch_rows.max(1),
             rows: 0,
             first_batch_after: None,
+            reader_gone: Cell::new(false),
         };
         let mut summary = Summary {
             rows: 0,
@@ -949,9 +951,11 @@ impl Worker {
             match outcome {
                 Ok(changed) => summary.affected += changed,
                 Err(error) => {
-                    if matches!(error, QueryError::Cancelled) {
-                        // The reader went away: stop the statement on the
-                        // server too.
+                    // The reader went away: stop the statement on the server
+                    // too. Not when the server reported the cancel itself: a
+                    // cancel that arrives after the statement ended stops the
+                    // next one (Postgres cancels whatever the connection runs).
+                    if stream.reader_gone.get() {
                         (self.canceller)();
                     }
                     return Err(error);
@@ -1018,13 +1022,16 @@ struct Stream<'a> {
     /// Rows of the current result.
     rows: usize,
     first_batch_after: Option<Duration>,
+    /// Whether a send failed because the receiver was dropped.
+    reader_gone: Cell<bool>,
 }
 
 impl Stream<'_> {
     fn send(&self, event: Event) -> Result<(), QueryError> {
-        self.tx
-            .send_blocking(event)
-            .map_err(|_| QueryError::Cancelled)
+        self.tx.send_blocking(event).map_err(|_| {
+            self.reader_gone.set(true);
+            QueryError::Cancelled
+        })
     }
 
     /// Sends what is left of the current result.
