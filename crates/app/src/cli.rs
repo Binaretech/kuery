@@ -42,9 +42,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>, cwd: &Path) -> Result<Com
 }
 
 fn target(path: &Path) -> Result<Target, String> {
-    let path = path
-        .canonicalize()
-        .map_err(|_| format!("{}: no such file or folder", path.display()))?;
+    let path = path.canonicalize().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("{}: no such file or folder", path.display()),
+        _ => format!("{}: {error}", path.display()),
+    })?;
     if path.is_dir() {
         Ok(Target::Project(path))
     } else if kuery_files::FileFormat::from_path(&path).is_ok() {
@@ -134,6 +135,26 @@ mod tests {
         assert_eq!(
             parse(args(&["missing.csv"]), &dir.0),
             Err(format!("{}: no such file or folder", missing.display()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_read_says_why() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = dir();
+        let locked = dir.0.join("project");
+        std::fs::write(locked.join("orders.csv"), "id\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let parsed = parse(args(&["project/orders.csv"]), &dir.0);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = parsed.unwrap_err();
+        assert!(
+            error.starts_with(&format!("{}: ", locked.join("orders.csv").display()))
+                && error.contains("Permission denied")
+                && !error.contains("no such file"),
+            "{error}"
         );
     }
 

@@ -284,7 +284,7 @@ pub fn open_targets(targets: &[Target], cx: &mut App) -> bool {
                         .find(|entry| entry.folder == folder)
                         .map(|entry| entry.handle);
                 }
-                Err(error) => report_error(None, &error, cx),
+                Err(error) => eprintln!("kuery: {error}"),
             }
         }
     }

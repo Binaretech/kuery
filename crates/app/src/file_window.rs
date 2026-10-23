@@ -140,7 +140,8 @@ impl FileWindow {
         cx.notify();
     }
 
-    /// File tabs have nothing to save, so closing one needs no question.
+    /// Closes without asking, as project windows close these tabs: a data
+    /// file has nothing to save, and a Query files tab's SQL is not kept.
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.tabs.remove(index);
