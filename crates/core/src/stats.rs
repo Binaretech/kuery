@@ -503,7 +503,7 @@ pub fn infer_kind<'a>(values: impl Iterator<Item = &'a str>) -> ColumnKind {
     .unwrap_or(ColumnKind::Text)
 }
 
-pub(crate) fn parse_number(value: &str) -> Option<f64> {
+pub fn parse_number(value: &str) -> Option<f64> {
     value.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
