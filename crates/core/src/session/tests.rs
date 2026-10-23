@@ -1,7 +1,10 @@
 //! The session's rules, against a fake adapter that logs what it is asked
 //! to run: `select N` returns N rows, `update N` changes N rows,
 //! `select fail` and `update fail` fail, `select slow` runs until cancelled
-//! and then ends as if nothing happened (like MySQL's killed `SLEEP`).
+//! and then ends as if nothing happened (like MySQL's killed `SLEEP`), and
+//! `select interrupted` runs until cancelled and then fails as cancelled
+//! (like Postgres). `select endless` streams rows until the reader goes away.
+//! Every cancel the session sends is logged as `cancel`.
 //! `select deadlock` fails the way a deadlock victim does on SQL Server (the
 //! server rolls back the whole transaction, so the next `rollback to` fails),
 //! and `select lost` the way a dropped connection does. `select panic` and
@@ -81,6 +84,19 @@ impl Adapter for Fake {
                 rows.row(&[Some("1")])?;
                 Ok(0)
             }
+            ["select", "interrupted"] => {
+                rows.columns(vec!["interrupted".into()], None)?;
+                while !self.stop.swap(false, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(QueryError::Cancelled)
+            }
+            ["select", "endless"] => {
+                rows.columns(vec!["n".into()], None)?;
+                loop {
+                    rows.row(&[Some("1")])?;
+                }
+            }
             ["select", n] => {
                 let count: usize = n.parse().unwrap_or(1);
                 let kinds = rows.wants_kinds().then(|| vec![ColumnKind::Integer]);
@@ -100,8 +116,11 @@ impl Adapter for Fake {
     }
 
     fn canceller(&self) -> Canceller {
-        let stop = self.stop.clone();
-        Arc::new(move || stop.store(true, Ordering::SeqCst))
+        let (stop, log) = (self.stop.clone(), self.log.clone());
+        Arc::new(move || {
+            log.0.lock().unwrap().push("cancel".into());
+            stop.store(true, Ordering::SeqCst);
+        })
     }
 
     fn overview(&mut self) -> Result<CatalogOverview, QueryError> {
@@ -451,6 +470,42 @@ fn a_cancel_does_not_reach_the_next_run() {
     assert!(!finished, "the next run was stopped by the earlier cancel");
     session.cancel();
     assert!(matches!(drain(next).1, Err(QueryError::Cancelled)));
+}
+
+#[test]
+fn a_cancel_the_server_reports_is_not_sent_again() {
+    let (session, log) = open(Access::ReadOnly);
+    let rx = session.run_read_only("select interrupted".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(50));
+    session.cancel();
+    assert!(matches!(drain(rx).1, Err(QueryError::Cancelled)));
+    // Postgres stops whatever runs when a cancel arrives, so a second one
+    // sent after the statement stopped would stop the next one.
+    let next = session.run_read_only("select slow".into(), RunOptions::default());
+    std::thread::sleep(Duration::from_millis(400));
+    let finished = std::iter::from_fn(|| next.try_recv().ok())
+        .any(|event| matches!(event, Event::Finished(_) | Event::Failed(_)));
+    assert!(!finished, "the next run was stopped by a repeated cancel");
+    session.cancel();
+    assert!(matches!(drain(next).1, Err(QueryError::Cancelled)));
+    let cancels = log.take().into_iter().filter(|sql| sql == "cancel").count();
+    assert_eq!(cancels, 2, "one cancel for each statement");
+}
+
+#[test]
+fn a_reader_that_goes_away_stops_the_statement_on_the_server() {
+    let (session, log) = open(Access::ReadOnly);
+    drop(session.run_read_only("select endless".into(), RunOptions::default()));
+    drain(session.run_read_only("select 1".into(), RunOptions::default()))
+        .1
+        .unwrap();
+    let log = log.take();
+    let endless = log.iter().position(|sql| sql == "select endless").unwrap();
+    assert_eq!(
+        log.get(endless + 1).map(String::as_str),
+        Some("cancel"),
+        "{log:?}"
+    );
 }
 
 #[test]
