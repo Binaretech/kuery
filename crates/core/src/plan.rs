@@ -33,6 +33,12 @@ pub fn explain_sql(statement: &str, analyze: bool) -> Result<String, String> {
 /// The `GO` lines make three batches: `set showplan_xml` must be alone in its batch.
 pub fn showplan_sql(statement: &str, analyze: bool) -> Result<String, String> {
     let statement = single_statement(statement)?;
+    // A `GO` line of its own would end the showplan batch, and what came
+    // after it would run as a batch like any other.
+    if script::statements_in(&crate::sql::MSSQL, statement).is_none_or(|batches| batches.len() > 1)
+    {
+        return Err("Explain one batch at a time: put the cursor on it".into());
+    }
     let option = if analyze {
         "statistics xml"
     } else {
@@ -1089,6 +1095,11 @@ mod tests {
             "set statistics xml on\nGO\nselect 1\nGO\nset statistics xml off"
         );
         assert!(showplan_sql("select 1; select 2", false).is_err());
+        for analyze in [false, true] {
+            assert!(showplan_sql("select 1\nGO\nselect 2", analyze).is_err());
+            assert!(showplan_sql("select 1\ngo\nupdate t set a = 1", analyze).is_err());
+        }
+        assert!(showplan_sql("select [go] from t", false).is_ok());
         assert!(is_explain("-- why slow?\nEXPLAIN (ANALYZE) select 1"));
         assert!(is_explain("explain select 1"));
         assert!(!is_explain("explained_rows"));
