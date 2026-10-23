@@ -133,8 +133,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # One at a time: several tests change the shared seeded `orders`
+      # table inside transactions and deadlock when they overlap.
       - name: Ignored kuery-pg tests
-        run: cargo test -p kuery-pg --locked -- --ignored
+        run: cargo test -p kuery-pg --locked -- --ignored --test-threads=1
 
   redis:
     name: kuery-redis tests against Redis
