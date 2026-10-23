@@ -12,7 +12,7 @@ pub enum Command {
     Open(Vec<Target>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     Project(PathBuf),
     DataFile(PathBuf),

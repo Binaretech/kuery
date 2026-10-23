@@ -29,6 +29,7 @@ mod file_tab;
 mod file_window;
 mod grid;
 mod history;
+mod instance;
 mod keymap;
 mod menus;
 mod palette;
@@ -57,6 +58,7 @@ mod write_mode;
 use std::sync::Arc;
 
 use cli::Command;
+use instance::{HandOff, Listener};
 
 fn main() {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -75,6 +77,19 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let address = instance::address();
+    match instance::hand_off(&address, &targets) {
+        Ok(HandOff::Delivered) => return,
+        Ok(HandOff::NotRunning) => {}
+        // Hung, or from another version: start a Kuery of our own.
+        Err(error) => eprintln!("kuery: the running Kuery did not answer: {error}"),
+    }
+    if detach() {
+        return;
+    }
+    let listener = Listener::bind(&address)
+        .map_err(|error| eprintln!("kuery: other kuery commands will start their own app: {error}"))
+        .ok();
     paths::migrate_legacy_config_dir();
     log_panics();
     drivers::install_tls_provider();
@@ -100,11 +115,58 @@ fn main() {
             })
             .detach();
 
-            if !app::open_targets(&targets, cx) {
-                app::open_welcome(cx);
+            if let Some(listener) = listener {
+                let (sent, received) = async_channel::unbounded();
+                listener.serve(move |targets| {
+                    let _ = sent.try_send(targets);
+                });
+                cx.spawn(async move |cx| {
+                    while let Ok(targets) = received.recv().await {
+                        cx.update(|cx| open(&targets, cx));
+                    }
+                })
+                .detach();
             }
-            cx.activate(true);
+            open(&targets, cx);
         });
+}
+
+/// Opens what a `kuery` command names, or the welcome window when nothing
+/// opened and no window is left, and brings Kuery to the front.
+fn open(targets: &[cli::Target], cx: &mut gpui_kit::App) {
+    if !app::open_targets(targets, cx) && cx.windows().is_empty() {
+        app::open_welcome(cx);
+    }
+    cx.activate(true);
+}
+
+/// Started from a terminal, a release build runs the app in a process of
+/// its own and returns the prompt, like the command a running Kuery answers.
+/// Returns whether that process took over.
+fn detach() -> bool {
+    use std::io::IsTerminal as _;
+
+    const FOREGROUND: &str = "KUERY_FOREGROUND";
+    if cfg!(debug_assertions)
+        || std::env::var_os(FOREGROUND).is_some()
+        || !std::io::stdout().is_terminal()
+    {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(FOREGROUND, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Out of the terminal's process group, so closing it leaves Kuery open.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn().is_ok()
 }
 
 /// Appends every panic, with its backtrace, to `panic.log` in the config
