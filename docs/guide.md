@@ -150,7 +150,10 @@ command palette, sidebar and panel toggles), an activity rail on the left
 (Explorer, Saved Queries, History; Audit Log and Keyboard Shortcuts at the
 bottom; clicking the active view hides the sidebar), the sidebar, tabs, and a
 status bar with the active connection and environment, the tab's mode or
-transaction, the last run and the cursor position.
+transaction, the last run and the cursor position. Its right corner shows the
+running Kuery version (`Version: 0.3.2`) or, while updating, `Checking for
+updates`, `New update available`, `Downloading updates` and finally `Restart
+to update`, which restarts into the new version when clicked.
 
 Toolbars put actions behind icon buttons whose tooltips name the shortcut.
 There are no colored banners: a query tab's mode is the Read / Write / Full
