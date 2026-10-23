@@ -17,7 +17,7 @@ use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, Enter, InputEvent, Paste, SelectAll, ShowCompletions,
 };
 use gpui_kit::component::native_menu::NativeMenu;
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::TableState;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -44,6 +44,7 @@ use crate::profile_charts;
 use crate::profile_view::ProfilePanel;
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
+use crate::results_pane::ResultsPane;
 use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
 use crate::write_mode::{self, Review};
@@ -212,6 +213,8 @@ pub struct QueryTab {
     save_error: Option<String>,
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
+    /// The grid with its totals and cell inspector.
+    results: Entity<ResultsPane>,
     run: RunState,
     run_task: Option<Task<()>>,
     editor_height: Pixels,
@@ -264,7 +267,10 @@ impl QueryTab {
             }
         })
         .detach();
-        let table = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
+        });
+        let results = cx.new(|cx| ResultsPane::new(table.clone(), cx));
         let plan = cx.new(|_| PlanPanel::default());
         cx.subscribe_in(
             &plan,
@@ -289,6 +295,7 @@ impl QueryTab {
             save_error: None,
             editor,
             table,
+            results,
             run: RunState::Idle,
             run_task: None,
             editor_height: DEFAULT_EDITOR_HEIGHT,
@@ -2093,17 +2100,12 @@ impl Render for QueryTab {
                     })
                     .child(self.render_panel_header(cx))
                     .when(!collapsed, |split| {
-                        split.child(
-                            div().flex_1().min_h_0().child(match self.panel_tab {
-                                PanelTab::Results => DataTable::new(&self.table)
-                                    .stripe(true)
-                                    .bordered(false)
-                                    .into_any_element(),
-                                PanelTab::Output => self.render_output(mono).into_any_element(),
-                                PanelTab::Profile => self.render_profile(cx),
-                                PanelTab::Plan => self.plan.clone().into_any_element(),
-                            }),
-                        )
+                        split.child(div().flex_1().min_h_0().child(match self.panel_tab {
+                            PanelTab::Results => self.results.clone().into_any_element(),
+                            PanelTab::Output => self.render_output(mono).into_any_element(),
+                            PanelTab::Profile => self.render_profile(cx),
+                            PanelTab::Plan => self.plan.clone().into_any_element(),
+                        }))
                     }),
             )
     }

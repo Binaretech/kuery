@@ -5,6 +5,7 @@ use crate::{
     profile_view::ProfilePanel,
     query_tab::{CancelQuery, FormatSql, RunQuery},
     results::ResultsDelegate,
+    results_pane::ResultsPane,
     theme::{self, color},
     ui::{format_duration, thousands},
 };
@@ -13,7 +14,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Editor, EditorState},
-    table::{DataTable, TableState},
+    table::TableState,
     v_flex,
 };
 use gpui_kit::{
@@ -89,6 +90,7 @@ pub struct FileQueryTab {
     sources: Vec<Source>,
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
+    results: Entity<ResultsPane>,
     profile: Entity<ProfilePanel>,
     show_profile: bool,
     status: String,
@@ -134,10 +136,14 @@ impl FileQueryTab {
             editor.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(catalog)));
             editor
         });
+        let table = cx.new(|cx| {
+            TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
+        });
         Self {
             sources,
             editor,
-            table: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
+            results: cx.new(|cx| ResultsPane::new(table.clone(), cx)),
+            table,
             profile: cx.new(|_| ProfilePanel::default()),
             show_profile: false,
             status: "Ready · full file inputs · read only".into(),
@@ -381,10 +387,7 @@ impl Render for FileQueryTab {
             .child(div().flex_1().min_h_0().child(if self.show_profile {
                 self.profile.clone().into_any_element()
             } else {
-                DataTable::new(&self.table)
-                    .stripe(true)
-                    .bordered(false)
-                    .into_any_element()
+                self.results.clone().into_any_element()
             }))
     }
 }
