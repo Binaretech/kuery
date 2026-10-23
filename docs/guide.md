@@ -162,6 +162,15 @@ actions, and before a script that writes runs, a review dialog lists its
 statements, flags the risky ones, and fills in the rows each one would
 change when you click Preview Impact.
 
+Result grids (query, File SQL and data file tabs) select cells and columns.
+Selecting one shows a bar under the grid with the column's kind, its values
+and NULLs and, for numbers, their sum, average, minimum and maximum over every
+row the result holds; they are added up off the UI thread once the query
+ends. Double-click a cell, or click **Inspector** in the bar, to open the
+inspector beside the grid: the selected cell's whole value, JSON indented,
+with its length and a **Copy Value** button; it follows the selection. The
+grid itself shows the first 200 characters of a value, on one line.
+
 ## Development
 
 For builds on a different disk, set `CARGO_TARGET_DIR` before invoking Cargo. On macOS, for example, `export CARGO_TARGET_DIR=/private/tmp/kuery-target` keeps artifacts on the internal disk.
