@@ -93,7 +93,9 @@ impl Adapter for Fake {
                 Err(QueryError::Cancelled)
             }
             ["select", "stubborn"] => {
+                // Sends until the reader is surely gone, then fails anyway.
                 let _ = rows.columns(vec!["n".into()], None);
+                while rows.row(&[Some("1")]).is_ok() {}
                 Err(QueryError::Connection("closed after the statement".into()))
             }
             ["select", "endless"] => {
