@@ -39,12 +39,12 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .hero-copy .lead{font-size:var(--t-body);max-width:38ch}
 .acts{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
 .meta{font-size:var(--t-small);color:var(--muted)}
-.stage{grid-column:5/13;margin-right:calc(-1 * var(--m));background:var(--accent);height:720px;padding:56px 0 0 56px;overflow:hidden;clip-path:polygon(128px 0,100% 0,100% 100%,0 100%,0 128px);animation:stagein 1.1s .24s var(--ease) both}
+.stage{grid-column:5/13;justify-self:end;width:min(1040px,calc(100% + var(--m)));margin-right:calc(-1 * var(--m));background:var(--accent);height:720px;padding:56px 0 0 56px;overflow:hidden;clip-path:polygon(128px 0,100% 0,100% 100%,0 100%,0 128px);animation:stagein 1.1s .24s var(--ease) both}
 @keyframes stagein{from{opacity:0;transform:translateY(64px)}to{opacity:1;transform:none}}
 @keyframes rise{from{opacity:0;transform:translateY(28px)}to{opacity:1;transform:none}}
 
 /* product fragment (hero) */
-.frag{width:880px;background:#111114;color:#e9e9ec;border:1px solid #2a2a31;border-radius:10px 0 0 0;font:13px/1.4 'Geist',sans-serif;letter-spacing:0;box-shadow:0 30px 80px rgba(3,10,30,.45)}
+.frag{width:max(880px,100%);background:#111114;color:#e9e9ec;border:1px solid #2a2a31;border-radius:10px 0 0 0;font:13px/1.4 'Geist',sans-serif;letter-spacing:0;box-shadow:0 30px 80px rgba(3,10,30,.45)}
 .f-tabs{display:flex;align-items:stretch;height:42px;background:#0d0d10;border-bottom:1px solid #24242b;border-radius:10px 0 0 0;padding-left:8px}
 .f-tab{display:flex;align-items:center;gap:8px;padding:0 16px;background:none;border:0;border-bottom:2px solid transparent;color:#9a9aa4;font:13px 'Geist',sans-serif;cursor:pointer;transition:color .15s,background .15s}
 .f-tab:hover{color:#e9e9ec;background:#16161a}
@@ -222,7 +222,7 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .links a:not(.btn){display:none}
 .h1{font-size:clamp(30px,8.2vw,64px)}
 .hero-row{margin-top:28px;gap:40px}
-.stage{margin-left:calc(-1 * var(--m));height:560px;padding:32px 0 0 16px;clip-path:polygon(72px 0,100% 0,100% 100%,0 100%,0 72px)}
+.stage{width:auto;margin-left:calc(-1 * var(--m));height:560px;padding:32px 0 0 16px;clip-path:polygon(72px 0,100% 0,100% 100%,0 100%,0 72px)}
 .frag{width:720px}
 .sec-head{margin-bottom:36px}
 .board{padding-inline:8px}
