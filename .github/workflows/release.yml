@@ -1,7 +1,8 @@
 name: Release
 
 # Pushing a tag such as `v0.1.0` builds Kuery for every platform and publishes
-# the archives as a GitHub release. Running it by hand only builds them and
+# the archives as a GitHub release; the Version workflow makes that tag and
+# runs this one from it. Running it by hand from a branch only builds them and
 # keeps the archives as workflow artifacts.
 on:
   push:

@@ -786,12 +786,14 @@ The Rust toolchain is pinned in `rust-toolchain.toml` (gpui uses APIs stabilized
 
 `.github/workflows/release.yml` builds release binaries for Linux (x86_64),
 macOS (Apple Silicon and Intel, as an ad-hoc signed `Kuery.app`) and Windows
-(x86_64). Pushing a tag publishes them as a GitHub release with a
-`SHA256SUMS` file:
+(x86_64). A `v*` tag publishes them as a GitHub release with a
+`SHA256SUMS` file. Running the workflow by hand from a branch (Actions →
+Release → Run workflow) only builds the archives and keeps them as workflow
+artifacts.
 
-```sh
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-Running the workflow by hand (Actions → Release → Run workflow) only builds the
-archives and keeps them as workflow artifacts.
+`.github/workflows/version.yml` makes the tag. Run by hand with `patch`,
+`minor`, `major` or an exact version, it opens a pull request that bumps
+`[workspace.package] version` in `Cargo.toml` and `Cargo.lock`. When a new
+version lands on `main`, it tags `vX.Y.Z` and starts the release from that tag
+(a tag pushed with the workflow's token does not trigger the release by
+itself).

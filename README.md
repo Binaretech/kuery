@@ -325,12 +325,14 @@ file's contents). Keep a backup of it: without it, no update can be signed for
 the apps already installed.
 
 The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
-release workflow refuses a tag that does not match it. To release, bump that
-version (and `Cargo.lock`, e.g. with `cargo check`), merge it, then tag:
-
-```sh
-git tag v0.3.1 && git push origin v0.3.1
-```
+release workflow refuses a tag that does not match it. To release, run the
+[Version workflow](.github/workflows/version.yml) (Actions → Version → Run
+workflow) with `patch`, `minor` or `major`, or an exact version. It opens a
+pull request that bumps `Cargo.toml` and `Cargo.lock`; merging it tags
+`vX.Y.Z` and starts the release. Any other change to that version merged into
+`main` is tagged and released the same way. The Version workflow needs
+"Allow GitHub Actions to create and approve pull requests" (Settings →
+Actions → General).
 
 ### Website
 
