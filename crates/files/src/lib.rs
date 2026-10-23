@@ -45,6 +45,21 @@ pub enum Error {
     FileChanged(PathBuf),
     #[error("A row cannot fit in the preview byte budget ({0} bytes)")]
     RowTooLarge(usize),
+    #[error("Polars stopped on this input: {0}")]
+    Internal(String),
+}
+
+/// Runs `read`, turning a panic inside Polars into an error: a malformed file
+/// or query must not take the app down with it.
+pub(crate) fn contained<T>(read: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "an internal error".into());
+        Err(Error::Internal(message))
+    })
 }
 
 impl FileSource {
@@ -61,5 +76,19 @@ impl FileSource {
             format: self.format,
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_while_reading_becomes_an_error() {
+        let result: Result<()> = contained(|| panic!("bad page header"));
+        assert!(matches!(result, Err(Error::Internal(message)) if message == "bad page header"));
+        let result: Result<()> = contained(|| panic!("row {} is broken", 7));
+        assert!(matches!(result, Err(Error::Internal(message)) if message == "row 7 is broken"));
+        assert_eq!(contained(|| Ok(3)).ok(), Some(3));
     }
 }

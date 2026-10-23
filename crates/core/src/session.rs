@@ -3,6 +3,7 @@
 //! drives any driver's [`Adapter`] by the same rules.
 
 use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -236,7 +237,13 @@ impl Session {
                     canceller,
                 };
                 while let Ok(job) = queue.recv() {
-                    job(&mut worker);
+                    if panic::catch_unwind(AssertUnwindSafe(|| job(&mut worker))).is_err() {
+                        // The adapter may have stopped anywhere: drop it, which
+                        // closes the connection (rolling back its transaction),
+                        // and refuse what comes next.
+                        worker.abandon();
+                        break;
+                    }
                 }
             })
             .is_ok();
@@ -302,7 +309,15 @@ impl Session {
     {
         let (sent, received) = oneshot::channel();
         let queued = self.shared.jobs.send(Box::new(move |worker: &mut Worker| {
-            let _ = sent.send(job(worker));
+            let outcome = match panic::catch_unwind(AssertUnwindSafe(|| job(worker))) {
+                Ok(outcome) => outcome,
+                Err(payload) => {
+                    worker.abandon();
+                    let _ = sent.send(Err(internal_error()));
+                    panic::resume_unwind(payload);
+                }
+            };
+            let _ = sent.send(outcome);
         }));
         async move {
             queued.map_err(|_| QueryError::Connection("the connection is closed".into()))?;
@@ -320,19 +335,22 @@ impl Session {
             + 'static,
     {
         let (tx, rx) = async_channel::bounded(4);
-        let failed = tx.clone();
-        let queued = self.shared.jobs.send(Box::new(move |worker: &mut Worker| {
-            let event = match job(worker, &tx) {
-                Ok(summary) => Event::Finished(summary),
-                Err(error) => Event::Failed(error),
+        let unrun = Unrun(Some(tx.clone()));
+        // Not queued, or dropped from the queue when the session ends: `unrun`
+        // still ends the stream.
+        let _ = self.shared.jobs.send(Box::new(move |worker: &mut Worker| {
+            unrun.disarm();
+            let event = match panic::catch_unwind(AssertUnwindSafe(|| job(worker, &tx))) {
+                Ok(Ok(summary)) => Event::Finished(summary),
+                Ok(Err(error)) => Event::Failed(error),
+                Err(payload) => {
+                    worker.abandon();
+                    let _ = tx.send_blocking(Event::Failed(internal_error()));
+                    panic::resume_unwind(payload);
+                }
             };
             let _ = tx.send_blocking(event);
         }));
-        if queued.is_err() {
-            let _ = failed.try_send(Event::Failed(QueryError::Connection(
-                "the connection is closed".into(),
-            )));
-        }
         rx
     }
 
@@ -558,6 +576,13 @@ impl Worker {
             Access::ReadWrite => Ok(()),
             Access::ReadOnly => Err(QueryError::WritesDisabled),
         }
+    }
+
+    /// After a panic: nothing runs, and the transaction goes with the
+    /// connection the session is about to drop.
+    fn abandon(&mut self) {
+        self.state.running.store(false, Ordering::SeqCst);
+        self.state.in_transaction.store(false, Ordering::SeqCst);
     }
 
     /// A statement is running, for [`Session::cancel`].
@@ -941,6 +966,32 @@ impl Worker {
         summary.elapsed = started.elapsed();
         Ok(summary)
     }
+}
+
+/// A streamed job's channel, failing its stream if the job never runs.
+struct Unrun(Option<async_channel::Sender<Event>>);
+
+impl Unrun {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unrun {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.try_send(Event::Failed(QueryError::Connection(
+                "the connection is closed".into(),
+            )));
+        }
+    }
+}
+
+/// What a job that panicked reports. The session ends with it.
+fn internal_error() -> QueryError {
+    QueryError::Connection(
+        "the connection stopped after an internal error; reconnect to go on".into(),
+    )
 }
 
 /// The statements of a script, in order; the whole text when it cannot be

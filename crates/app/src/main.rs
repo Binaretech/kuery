@@ -56,6 +56,7 @@ use std::sync::Arc;
 
 fn main() {
     paths::migrate_legacy_config_dir();
+    log_panics();
     drivers::install_tls_provider();
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
     let folder = std::env::args_os().nth(1).map(PathBuf::from);
@@ -91,4 +92,39 @@ fn main() {
             }
             cx.activate(true);
         });
+}
+
+/// Appends every panic, with its backtrace, to `panic.log` in the config
+/// folder: a panic on a gpui thread ends the app, and an app opened from the
+/// Finder or the Start menu has nowhere else to say why.
+fn log_panics() {
+    let log = paths::config_dir().join("panic.log");
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let thread = std::thread::current();
+        let entry = format!(
+            "--- Kuery {}, Unix time {}, thread '{}'\n{info}\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+            thread.name().unwrap_or("unnamed"),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        let written = log
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+            })
+            .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()));
+        if let Err(error) = written {
+            eprintln!("kuery: could not write {}: {error}", log.display());
+        }
+    }));
 }

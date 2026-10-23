@@ -45,6 +45,10 @@ impl FileDataset {
     /// Reads a prefix, never a representative sample or an automatic full count.
     /// Reopen the dataset to accept a changed source. This method is synchronous.
     pub fn preview(&self, request: PreviewRequest) -> Result<PreviewResult> {
+        crate::contained(|| self.read_preview(request))
+    }
+
+    fn read_preview(&self, request: PreviewRequest) -> Result<PreviewResult> {
         request.validate()?;
         self.check_unchanged()?;
         let result = self
