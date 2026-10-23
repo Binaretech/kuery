@@ -55,15 +55,43 @@ fn shell_quoted(text: &str) -> String {
 /// The AppleScript that makes the link as an administrator.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn admin_script(link: &Path, exe: &Path) -> String {
-    let folder = link.parent().unwrap_or(Path::new("/"));
+    let folder = shell_quoted(&link.parent().unwrap_or(Path::new("/")).to_string_lossy());
+    let exe = shell_quoted(&exe.to_string_lossy());
+    let link = shell_quoted(&link.to_string_lossy());
+    // Checked again as root: only a link, or nothing, is replaced.
     let shell = format!(
-        "mkdir -p {} && ln -sfn {} {}",
-        shell_quoted(&folder.to_string_lossy()),
-        shell_quoted(&exe.to_string_lossy()),
-        shell_quoted(&link.to_string_lossy()),
+        "mkdir -p {folder} && {{ [ -L {link} ] || [ ! -e {link} ]; }} && ln -sfn {exe} {link}"
     );
     let literal = shell.replace('\\', r"\\").replace('"', "\\\"");
     format!("do shell script \"{literal}\" with administrator privileges")
+}
+
+/// Whether `exe` stays where it is: not on a disk image, and not in the
+/// temporary copy macOS runs an app from until it is moved out of Downloads.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn installed_location(exe: &Path) -> Result<(), String> {
+    let moving = exe.starts_with("/Volumes")
+        || exe
+            .components()
+            .any(|component| component.as_os_str() == "AppTranslocation");
+    if moving {
+        Err("Move Kuery to the Applications folder and open it from there first.".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// What osascript's exit says: linked, the password prompt cancelled
+/// (`Ok(false)`), or why it failed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn osascript_outcome(success: bool, stderr: &str) -> Result<bool, String> {
+    if success {
+        Ok(true)
+    } else if stderr.contains("(-128)") {
+        Ok(false)
+    } else {
+        Err(stderr.trim().to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -81,6 +109,10 @@ fn install(cx: &mut App) {
             return;
         }
     };
+    if let Err(error) = installed_location(&exe) {
+        notify(Notification::error(error), cx);
+        return;
+    }
     match plan(link, &exe) {
         Ok(Plan::AlreadyInstalled) => notify(
             Notification::info(format!("The kuery command is already installed in {LINK}.")),
@@ -136,14 +168,10 @@ fn make_link(link: &Path, exe: &Path) -> Result<bool, String> {
                 .arg(admin_script(link, exe))
                 .output()
                 .map_err(|error| error.to_string())?;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if output.status.success() {
-                Ok(true)
-            } else if stderr.contains("(-128)") {
-                Ok(false)
-            } else {
-                Err(stderr.trim().to_string())
-            }
+            osascript_outcome(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stderr),
+            )
         }
         Err(error) => Err(error.to_string()),
     }
@@ -232,7 +260,50 @@ mod tests {
                 Path::new("/usr/local/bin/kuery"),
                 Path::new(r#"/Apps/My "K".app/kuery"#)
             ),
-            r#"do shell script "mkdir -p '/usr/local/bin' && ln -sfn '/Apps/My \"K\".app/kuery' '/usr/local/bin/kuery'" with administrator privileges"#
+            r#"do shell script "mkdir -p '/usr/local/bin' && { [ -L '/usr/local/bin/kuery' ] || [ ! -e '/usr/local/bin/kuery' ]; } && ln -sfn '/Apps/My \"K\".app/kuery' '/usr/local/bin/kuery'" with administrator privileges"#
         );
+    }
+
+    #[test]
+    fn a_kuery_that_is_not_installed_cannot_link_itself() {
+        assert_eq!(
+            installed_location(Path::new("/Applications/Kuery.app/Contents/MacOS/kuery")),
+            Ok(())
+        );
+        let moved = "Move Kuery to the Applications folder and open it from there first.";
+        for exe in [
+            "/Volumes/Kuery 0.3.2/Kuery.app/Contents/MacOS/kuery",
+            "/private/var/folders/x/AppTranslocation/1234/d/Kuery.app/Contents/MacOS/kuery",
+        ] {
+            assert_eq!(
+                installed_location(Path::new(exe)),
+                Err(moved.into()),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_password_prompt_outcome() {
+        assert_eq!(osascript_outcome(true, ""), Ok(true));
+        assert_eq!(
+            osascript_outcome(false, "0:30: execution error: User canceled. (-128)\n"),
+            Ok(false)
+        );
+        assert_eq!(
+            osascript_outcome(false, "execution error: ln: denied (1)\n"),
+            Err("execution error: ln: denied (1)".into())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn links_directly_into_a_writable_folder_and_replaces_an_old_link() {
+        let dir = dir();
+        let link = dir.0.join("kuery");
+        std::os::unix::fs::symlink("/old/kuery", &link).unwrap();
+        let exe = Path::new("/Applications/Kuery.app/Contents/MacOS/kuery");
+        assert_eq!(make_link(&link, exe), Ok(true));
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
     }
 }
