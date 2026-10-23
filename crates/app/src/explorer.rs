@@ -225,7 +225,7 @@ impl Explorer {
         cx.observe_self(|this, _| this.rows_stale = true).detach();
 
         let project = model.read(cx).project.clone();
-        let mut explorer = Self {
+        let explorer = Self {
             model,
             connections: project
                 .connections
@@ -254,12 +254,9 @@ impl Explorer {
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         };
-        if !explorer.connections.is_empty() {
-            explorer.expanded.insert("0".into());
-            explorer.expanded.insert("0/public".into());
-            explorer.expanded.insert("0/public/tables".into());
-            explorer.connect(0, cx);
-        }
+        // No connection opens by itself: the project file says where it goes
+        // (host, SSH bastion, which stored password), and a cloned project
+        // is someone else's file.
         explorer
     }
 
