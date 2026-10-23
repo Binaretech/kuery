@@ -91,6 +91,12 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .sec-head .h2{grid-column:1/7}
 .sec-head p{grid-column:8/13;font-size:var(--t-body)}
 
+/* contributors */
+.people{display:flex;flex-wrap:wrap;gap:16px;list-style:none;padding:0;margin:0}
+.person{display:block;border-radius:50%;transition:transform .18s var(--ease)}
+.person:hover{transform:translateY(-3px)}
+.person img{display:block;width:72px;height:72px;border-radius:50%;background:var(--s3)}
+
 /* sources board */
 .board{display:flex;flex-direction:column;gap:4px;padding-inline:12px}
 .brow{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));column-gap:var(--g);align-items:start;width:100%;height:76px;padding:22px 24px 0;background:var(--s1);color:var(--ink);border:0;text-align:left;font:inherit;cursor:pointer;overflow:hidden;transition:height .5s var(--ease),background .3s,color .3s}
@@ -216,6 +222,17 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .mod-fig{grid-column:1/8}.mod-txt{grid-column:8/13}
 .cta-l{grid-column:1/13}.cta-r{grid-column:1/13;max-width:520px;margin-top:48px}
 .t1{grid-column:1/7}.t2{grid-column:7/13}.t3{grid-column:1/7}.t4{grid-column:7/13}.t5{grid-column:1/13}.t6{grid-column:1/13}
+/* workflow: a wider pane, and its table without the status column */
+.pin-r{grid-column:6/13}
+.ps{inset:24px}
+.win-bar .r{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.fr{grid-template-columns:0.8fr 0.9fr 1.5fr 0.9fr;font-size:12.5px}
+.fr > :nth-child(4){display:none}
+.tree{padding:18px;font-size:13px;line-height:24px}
+}
+/* too narrow for the folder tree's comments; the step text says what the folders hold */
+@media (max-width: 860px){
+.tree .c{display:none}
 }
 @media (max-width: 760px){
 .g12{display:flex;flex-direction:column}
@@ -224,7 +241,7 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .hero-row{margin-top:28px;gap:40px}
 .stage{width:auto;margin-left:calc(-1 * var(--m));height:560px;padding:32px 0 0 16px;clip-path:polygon(72px 0,100% 0,100% 100%,0 100%,0 72px)}
 .frag{width:720px}
-.sec-head{margin-bottom:36px}
+.sec-head{margin-bottom:36px;align-items:flex-start}
 .board{padding-inline:8px}
 .brow{height:64px;padding:18px 16px 0;display:flex;flex-wrap:wrap;column-gap:12px}
 .brow .bn{flex:1;font-size:20px}
@@ -234,16 +251,21 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .bd{order:3;flex-basis:100%;margin-top:20px;font-size:16px}
 .mod-fig{width:100%}
 .mod-txt{margin-top:20px}
-.pin-h{order:0;margin-bottom:24px}
-.pin-l{order:2}
-.pin-r{order:1;position:sticky;top:0;height:46svh;z-index:2;margin-inline:calc(-1 * var(--m));align-self:stretch}
+/* workflow: each step followed by its pane, nothing pinned */
+.pin{align-items:stretch}
+.pin-h{order:0;margin-bottom:0}
+.pin-l,.pin-r,.pin-stage{display:contents}
+[data-step="0"]{order:1}[data-pane="0"]{order:2}
+[data-step="1"]{order:3}[data-pane="1"]{order:4}
+[data-step="2"]{order:5}[data-pane="2"]{order:6}
 .stage,.mod-fig,.cta-r{align-self:stretch}
-.ps{inset:16px}
+.ps{position:static;opacity:1;transform:none;pointer-events:auto;margin:24px calc(-1 * var(--m)) 0;padding:16px;background:var(--s2)}
+.ps .win{height:auto}
+.tree{padding:16px;font-size:12.5px;line-height:22px;overflow-x:auto}
 .win-bar .r{display:none}
-.fr{grid-template-columns:0.8fr 0.9fr 1.5fr 0.9fr;font-size:12.5px}
-.fr > :nth-child(4){display:none}
-.step{min-height:60svh}
+.step{min-height:0;margin-top:56px;gap:12px;color:var(--ink)}
 .step .h3{font-size:22px}
+.step .h3::before{content:'';display:block;width:40px;height:4px;background:var(--accent);margin-bottom:16px}
 .lcol{max-width:none}
 .cta{padding-top:72px}
 .cta-l .h2{font-size:13vw}
