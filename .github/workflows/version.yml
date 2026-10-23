@@ -1,0 +1,142 @@
+name: Version
+
+# Running it by hand (Actions → Version → Run workflow) opens a pull request
+# that bumps `[workspace.package] version` in Cargo.toml and Cargo.lock.
+# Merging that pull request (or any change to that version on `main`) tags
+# `vX.Y.Z` and starts the Release workflow, which builds and publishes it.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version instead (e.g. 1.0.0); overrides the bump
+        type: string
+        required: false
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  propose:
+    name: Open the version pull request
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          current="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [[ -n "$EXACT" ]]; then
+            next="${EXACT#v}"
+          else
+            IFS=. read -r major minor patch <<< "${current%%-*}"
+            case "$BUMP" in
+              major) next="$((major + 1)).0.0" ;;
+              minor) next="$major.$((minor + 1)).0" ;;
+              *) next="$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+          if [[ ! "$next" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$next is not a version like 1.2.3."
+            exit 1
+          fi
+          if [[ "$next" == "$current" || "$(printf '%s\n' "$current" "$next" | sort -V | tail -1)" != "$next" ]]; then
+            echo "::error::$next is not newer than the current version $current."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
+            echo "::error::The tag v$next already exists."
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "release-$next" >/dev/null; then
+            echo "::error::The branch release-$next already exists; merge or delete its pull request first."
+            exit 1
+          fi
+          echo "Version: $current → $next"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Bump Cargo.toml and Cargo.lock
+        env:
+          CURRENT: ${{ steps.next.outputs.current }}
+          NEXT: ${{ steps.next.outputs.next }}
+        run: |
+          sed -i "/^\[workspace.package\]/,/^\[/s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+          # Rewrites only the workspace crates' versions in the lock file.
+          cargo update --workspace
+          changed="$(git diff --name-only | sort | tr '\n' ' ')"
+          if [[ "$changed" != "Cargo.lock Cargo.toml " ]]; then
+            echo "::error::Expected Cargo.toml and Cargo.lock to change, got: $changed"
+            exit 1
+          fi
+          git diff --stat
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.next.outputs.next }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "release-$NEXT"
+          git commit -am "chore: release $NEXT"
+          git push origin "release-$NEXT"
+          gh pr create --base main --head "release-$NEXT" \
+            --title "chore: release $NEXT" \
+            --body "Bumps the workspace version to $NEXT (Cargo.toml and Cargo.lock).
+
+          Merging this tags \`v$NEXT\` and starts the Release workflow, which builds and publishes it.
+
+          Opened by the Version workflow (run ${{ github.run_id }}). Pull requests opened this way do not start CI on their own; it runs again on \`main\` after the merge."
+
+  tag:
+    name: Tag and release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # A tag pushed with the workflow's token does not start other
+      # workflows, so the release is started by hand from the tag.
+      - name: Tag the new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists; nothing to release."
+            exit 0
+          fi
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "$tag"
+          gh workflow run release.yml --ref "$tag"
+          echo "Tagged $tag and started the Release workflow."
