@@ -36,9 +36,9 @@ cp docs/screenshots/{file-sql,file-data,file-profile,database-browser}.jpg \
 cp crates/app/assets/branding/kuery.png "$out/assets/kuery.png"
 touch "$out/.nojekyll"
 
-# People with commits, most first. Bots and AI coding agents are left out:
-# GitHub counts commits by author, so an agent that commits as itself would
-# otherwise be listed next to the people.
+# People with commits, most first, as avatars. Bots and AI coding agents are
+# left out: GitHub counts commits by author, so an agent that commits as
+# itself would otherwise be listed next to the people.
 agents='claude|claude-code|copilot|copilot-swe-agent|devin-ai-integration|cursor|cursoragent'
 agents+='|codex|chatgpt-codex-connector|google-labs-jules|gemini-code-assist|openhands-agent'
 agents+='|aider|sweep-ai|codegen-sh'
@@ -52,11 +52,9 @@ if [[ -n "$repo" ]] &&
     | .[]
     | select(.type == "User")
     | select(.login | test("\\[bot\\]$|^(" + $agents + ")$"; "i") | not)
-    | "<li><a class=\"person\" href=\"\(.html_url | @html)\">"
-      + "<img src=\"\(.avatar_url | @html)&amp;s=96\" width=\"48\" height=\"48\" alt=\"\" loading=\"lazy\">"
-      + "<span class=\"pn\">\(.login | @html)</span>"
-      + "<span class=\"pc\">\(.contributions) commit\(if .contributions == 1 then "" else "s" end)</span>"
-      + "</a></li>"' >"$people" &&
+    | "<li><a class=\"person\" href=\"\(.html_url | @html)\" title=\"\(.login | @html)\">"
+      + "<img src=\"\(.avatar_url | @html)&amp;s=144\" width=\"72\" height=\"72\""
+      + " alt=\"\(.login | @html)\" loading=\"lazy\"></a></li>"' >"$people" &&
   [[ -s "$people" ]]; then
   for page in $(find "$out" -name '*.html'); do
     awk -v list="$people" '
