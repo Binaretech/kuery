@@ -17,6 +17,32 @@ Detailed workflows, file-reader behavior, connection configuration and developme
 | `crates/files` | Local CSV/TSV, JSON, JSONL/NDJSON and Parquet previews with Polars, native schema metadata, and conversion to the same results as SQL. No UI. |
 | `crates/app` | The gpui app (`gpui-kit`, pinned version). Custom fonts and icons in `crates/app/assets`. |
 
+## Command line
+
+`kuery [PATH...]` opens each folder as a project and each data file in a tab;
+`kuery --help` and `kuery --version` print and exit. Relative paths are taken
+from the terminal's folder. A missing path, an unsupported file or an unknown
+option prints an error and exits with status 1 before anything opens.
+
+- **Where data files open:** in the project the same command opened, else the
+  active window (a project window, or the data files window), else the newest
+  project window. With no project window open they open in a **Data files**
+  window: file tabs and Query files, without connections, saved queries or
+  history.
+- **One Kuery:** the first Kuery listens on a per-user socket
+  (`kuery.sock` in the config folder; a named pipe on Windows). A later
+  `kuery` command sends it the paths and returns at once; the running app
+  opens them, comes to the front, and shows any path that failed to open in
+  a prompt. A socket left by a crashed Kuery is replaced. Development builds
+  use `kuery-dev.sock`, apart from installed ones.
+- **From a terminal:** a release build starts the app in its own process and
+  returns the prompt. On Windows the release build prints `--help` and errors
+  into the terminal that started it.
+- **On PATH (macOS):** **Install kuery Command** links `/usr/local/bin/kuery`
+  to the app's binary, asking for an administrator password when needed. It
+  replaces only an older link, and refuses while Kuery runs from a disk image
+  or from Downloads before it was moved.
+
 ## Local data files
 
 In a project window, use **File › Open Data File…** (`secondary-shift-o`), the
@@ -192,8 +218,8 @@ that folder, so it can live in a code repository:
 ```
 
 Open a folder from the welcome window, with "Open Project…" (`secondary-o`),
-or from the command line with `cargo run -p kuery -- <folder>`; a folder
-without `.kuery/` becomes a new project. Opening a project from a project
+or from the command line with `kuery <folder>` (`cargo run -p kuery --
+<folder>` from source); a folder without `.kuery/` becomes a new project. Opening a project from a project
 window asks whether it takes over that window (after confirming if tabs have
 unsaved changes) or gets a new one; a project that is already open is just
 brought to the front.
