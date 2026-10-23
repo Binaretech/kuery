@@ -213,12 +213,10 @@ async fn accept(
     use tokio::net::windows::named_pipe::ServerOptions;
 
     loop {
-        if let Err(error) = pipe.connect().await {
-            eprintln!("kuery: a kuery command could not connect: {error}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
+        let connected = pipe.connect().await;
         // An instance serves one command; the next one waits on a new one.
+        // A failed instance is dropped too: connecting again on it fails
+        // the same way (a command that went away before the connect).
         let next = match ServerOptions::new().create(&address) {
             Ok(next) => next,
             Err(error) => {
@@ -226,8 +224,13 @@ async fn accept(
                 return;
             }
         };
-        let connected = std::mem::replace(&mut pipe, next);
-        tokio::spawn(answer(connected, open.clone()));
+        let served = std::mem::replace(&mut pipe, next);
+        match connected {
+            Ok(()) => {
+                tokio::spawn(answer(served, open.clone()));
+            }
+            Err(error) => eprintln!("kuery: a kuery command could not connect: {error}"),
+        }
     }
 }
 

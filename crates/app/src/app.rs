@@ -266,11 +266,18 @@ fn replace_project(
     Ok(())
 }
 
+/// What a `kuery` command opened.
+pub struct Opened {
+    pub any: bool,
+    /// Why the paths that did not open failed, for [`report_open_errors`].
+    pub errors: Vec<String>,
+}
+
 /// Opens what `kuery [PATH...]` names: each folder as a project, then each
-/// data file where [`destination`] says. Failures go to stderr; returns
-/// whether anything opened.
-pub fn open_targets(targets: &[Target], cx: &mut App) -> bool {
+/// data file where [`destination`] says.
+pub fn open_targets(targets: &[Target], cx: &mut App) -> Opened {
     let mut any = false;
+    let mut errors = Vec::new();
     let mut opened = None;
     for target in targets {
         if let Target::Project(folder) = target {
@@ -284,7 +291,7 @@ pub fn open_targets(targets: &[Target], cx: &mut App) -> bool {
                         .find(|entry| entry.folder == folder)
                         .map(|entry| entry.handle);
                 }
-                Err(error) => eprintln!("kuery: {error}"),
+                Err(error) => errors.push(error),
             }
         }
     }
@@ -292,11 +299,11 @@ pub fn open_targets(targets: &[Target], cx: &mut App) -> bool {
         if let Target::DataFile(path) = target {
             match open_data_file(path.clone(), opened, cx) {
                 Ok(()) => any = true,
-                Err(error) => eprintln!("kuery: {error}"),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
             }
         }
     }
-    any
+    Opened { any, errors }
 }
 
 fn open_data_file(
@@ -506,6 +513,38 @@ fn close_welcome(cx: &mut App) {
     }
 }
 
+/// The prompt for paths a `kuery` command named that did not open.
+fn open_errors_prompt(errors: &[String]) -> Option<(String, String)> {
+    let title = match errors.len() {
+        0 => return None,
+        1 => "Could not open a path".to_string(),
+        count => format!("Could not open {count} paths"),
+    };
+    Some((title, errors.join("\n")))
+}
+
+/// Shows why paths a `kuery` command named did not open, in the active
+/// window (the command has returned, and a detached or running Kuery has no
+/// terminal), and on stderr.
+pub fn report_open_errors(errors: &[String], cx: &mut App) {
+    for error in errors {
+        eprintln!("kuery: {error}");
+    }
+    let Some((title, detail)) = open_errors_prompt(errors) else {
+        return;
+    };
+    // After the windows this command opened are on screen.
+    cx.defer(move |cx| {
+        let window = cx.active_window().or_else(|| cx.windows().last().copied());
+        if let Some(window) = window {
+            let _ = window.update(cx, |_, window, cx| {
+                // Nothing to wait for: the prompt only has an OK button.
+                drop(window.prompt(PromptLevel::Critical, &title, Some(&detail), &["OK"], cx));
+            });
+        }
+    });
+}
+
 /// Where a data file from the command line opens.
 #[derive(Debug, PartialEq, Eq)]
 enum Destination<W> {
@@ -538,6 +577,22 @@ fn destination<W: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_failures_are_shown_together() {
+        assert_eq!(open_errors_prompt(&[]), None);
+        assert_eq!(
+            open_errors_prompt(&["/work/shop: Permission denied".into()]),
+            Some((
+                "Could not open a path".into(),
+                "/work/shop: Permission denied".into()
+            ))
+        );
+        assert_eq!(
+            open_errors_prompt(&["a: no".into(), "b: no".into()]),
+            Some(("Could not open 2 paths".into(), "a: no\nb: no".into()))
+        );
+    }
 
     #[test]
     fn a_data_file_opens_in_the_project_the_command_opened() {

@@ -132,11 +132,14 @@ fn main() {
 }
 
 /// Opens what a `kuery` command names, or the welcome window when nothing
-/// opened and no window is left, and brings Kuery to the front.
+/// opened and no window is left, shows why any path failed, and brings
+/// Kuery to the front.
 fn open(targets: &[cli::Target], cx: &mut gpui_kit::App) {
-    if !app::open_targets(targets, cx) && cx.windows().is_empty() {
+    let opened = app::open_targets(targets, cx);
+    if !opened.any && cx.windows().is_empty() {
         app::open_welcome(cx);
     }
+    app::report_open_errors(&opened.errors, cx);
     cx.activate(true);
 }
 

@@ -143,19 +143,30 @@ mod tests {
     fn a_path_that_cannot_be_read_says_why() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        /// Gives the folder its permissions back, even when the test fails.
+        struct Unlock(PathBuf);
+
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
         let dir = dir();
         let locked = dir.0.join("project");
-        std::fs::write(locked.join("orders.csv"), "id\n").unwrap();
+        let file = locked.join("orders.csv");
+        std::fs::write(&file, "id\n").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let parsed = parse(args(&["project/orders.csv"]), &dir.0);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = parsed.unwrap_err();
-        assert!(
-            error.starts_with(&format!("{}: ", locked.join("orders.csv").display()))
-                && error.contains("Permission denied")
-                && !error.contains("no such file"),
-            "{error}"
+        let _unlock = Unlock(locked.clone());
+        // Root reads the folder anyway: nothing to check then.
+        let Err(cause) = file.canonicalize() else {
+            return;
+        };
+        assert_eq!(
+            parse(args(&["project/orders.csv"]), &dir.0),
+            Err(format!("{}: {cause}", file.display()))
         );
+        assert_ne!(cause.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
