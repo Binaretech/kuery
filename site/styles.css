@@ -234,16 +234,25 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .bd{order:3;flex-basis:100%;margin-top:20px;font-size:16px}
 .mod-fig{width:100%}
 .mod-txt{margin-top:20px}
-.pin-h{order:0;margin-bottom:24px}
-.pin-l{order:2}
-.pin-r{order:1;position:sticky;top:0;height:46svh;z-index:2;margin-inline:calc(-1 * var(--m));align-self:stretch}
+/* workflow: each step followed by its pane, nothing pinned */
+.pin{align-items:stretch}
+.pin-h{order:0;margin-bottom:0}
+.pin-l,.pin-r,.pin-stage{display:contents}
+[data-step="0"]{order:1}[data-pane="0"]{order:2}
+[data-step="1"]{order:3}[data-pane="1"]{order:4}
+[data-step="2"]{order:5}[data-pane="2"]{order:6}
 .stage,.mod-fig,.cta-r{align-self:stretch}
-.ps{inset:16px}
+.ps{position:static;opacity:1;transform:none;pointer-events:auto;margin:24px calc(-1 * var(--m)) 0;padding:16px;background:var(--s2)}
+.ps .win{height:auto}
+.tree{padding:16px;font-size:12.5px;line-height:22px;overflow-x:auto}
+/* the step above says what the folders hold */
+.tree .c{display:none}
 .win-bar .r{display:none}
 .fr{grid-template-columns:0.8fr 0.9fr 1.5fr 0.9fr;font-size:12.5px}
 .fr > :nth-child(4){display:none}
-.step{min-height:60svh}
+.step{min-height:0;margin-top:56px;gap:12px;color:var(--ink)}
 .step .h3{font-size:22px}
+.step .h3::before{content:'';display:block;width:40px;height:4px;background:var(--accent);margin-bottom:16px}
 .lcol{max-width:none}
 .cta{padding-top:72px}
 .cta-l .h2{font-size:13vw}
