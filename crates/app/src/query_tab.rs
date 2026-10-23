@@ -92,6 +92,8 @@ struct WriteSession {
     affected: u64,
     opened: Option<Instant>,
     last_run: Instant,
+    /// A commit or rollback is on its way.
+    ending: bool,
 }
 
 impl WriteSession {
@@ -103,6 +105,7 @@ impl WriteSession {
             affected: 0,
             opened: None,
             last_run: Instant::now(),
+            ending: false,
         }
     }
 
@@ -110,6 +113,7 @@ impl WriteSession {
         self.statements = 0;
         self.affected = 0;
         self.opened = None;
+        self.ending = false;
     }
 }
 
@@ -592,6 +596,18 @@ impl QueryTab {
     /// away, depending on the write mode; otherwise read-only (on the write
     /// connection when write mode is on, so it sees uncommitted changes).
     fn execute(&mut self, sql: String, writes: bool, cx: &mut Context<Self>) {
+        // A write goes on when its receiver is dropped (it sends no rows to
+        // notice), and its outcome and audit record would be lost with it.
+        if self.is_running() && self.run_writes {
+            self.log(
+                "RUN",
+                "A write is still running: wait for it to finish, or cancel it first".into(),
+                true,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let (session, kind) = match &self.write {
             WriteState::On(write) => (write.session.clone(), Some(write.kind)),
             _ => (self.db.session.clone(), None),
@@ -1125,12 +1141,30 @@ impl QueryTab {
         note: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), ()>> {
-        let WriteState::On(write) = &self.write else {
+        if self.is_running() {
+            self.log(
+                if commit { "COMMIT" } else { "ROLLBACK" },
+                format!(
+                    "Not {}: a run is still going on in this transaction; wait for it \
+                     to finish, or cancel it first",
+                    if commit { "committed" } else { "rolled back" }
+                ),
+                true,
+                cx,
+            );
+            cx.notify();
+            return Task::ready(Err(()));
+        }
+        let WriteState::On(write) = &mut self.write else {
             return Task::ready(Ok(()));
         };
         if !write.session.in_transaction() {
             return Task::ready(Ok(()));
         }
+        if write.ending {
+            return Task::ready(Err(()));
+        }
+        write.ending = true;
         let session = write.session.clone();
         let (statements, affected) = (write.statements, write.affected);
         cx.spawn(async move |this, cx| {
@@ -1203,7 +1237,7 @@ impl QueryTab {
                     let WriteState::On(write) = &this.write else {
                         return;
                     };
-                    if !write.session.in_transaction() || this.is_running() {
+                    if !write.session.in_transaction() || write.ending || this.is_running() {
                         return;
                     }
                     let idle = write.last_run.elapsed();

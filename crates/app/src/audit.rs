@@ -1,6 +1,7 @@
-//! Audit log of write mode: every run that writes, every preview, commit and
-//! rollback, one JSON object per line in `audit.jsonl` in the user config
-//! directory (never in a project folder, which may be committed).
+//! Audit log of writes: every run that writes, every preview, commit and
+//! rollback, and every apply of staged row changes, one JSON object per line
+//! in `audit.jsonl` in the user config directory (never in a project folder,
+//! which may be committed).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ pub enum AuditAction {
     Preview,
     Commit,
     Rollback,
+    /// Staged row changes from a table tab.
+    Apply,
 }
 
 impl AuditAction {
@@ -26,6 +29,7 @@ impl AuditAction {
             AuditAction::Preview => "preview",
             AuditAction::Commit => "commit",
             AuditAction::Rollback => "rollback",
+            AuditAction::Apply => "apply",
         }
     }
 }

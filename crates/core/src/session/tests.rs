@@ -4,7 +4,8 @@
 //! and then ends as if nothing happened (like MySQL's killed `SLEEP`).
 //! `select deadlock` fails the way a deadlock victim does on SQL Server (the
 //! server rolls back the whole transaction, so the next `rollback to` fails),
-//! and `select lost` the way a dropped connection does.
+//! and `select lost` the way a dropped connection does. `select panic` and
+//! `update panic` panic, like a driver with a bug.
 
 use std::sync::Mutex;
 
@@ -67,6 +68,7 @@ impl Adapter for Fake {
                 self.gone = Some(lost.clone());
                 Err(lost)
             }
+            [_, "panic"] => panic!("the fake driver broke"),
             [_, "fail"] => Err(QueryError::Database {
                 code: "42000".into(),
                 message: "failed on purpose".into(),
@@ -187,6 +189,29 @@ fn drain(rx: async_channel::Receiver<Event>) -> (Vec<usize>, Result<Summary, Que
         }
         (batches, Err(QueryError::Cancelled))
     })
+}
+
+#[test]
+fn a_job_that_panics_ends_the_session_and_says_so() {
+    let (session, _) = open(Access::ReadWrite);
+    let (_, outcome) =
+        drain(session.run_in_transaction("update panic".into(), RunOptions::default()));
+    assert!(
+        matches!(outcome, Err(QueryError::Connection(_))),
+        "{outcome:?}"
+    );
+    assert!(!session.in_transaction());
+    let next = block_on(session.fetch_all("select 1".into(), RunOptions::default()));
+    assert!(matches!(next, Err(QueryError::Connection(_))), "{next:?}");
+
+    let (session, _) = open(Access::ReadOnly);
+    let outcome = block_on(session.fetch_all("select panic".into(), RunOptions::default()));
+    assert!(
+        matches!(outcome, Err(QueryError::Connection(_))),
+        "{outcome:?}"
+    );
+    let (_, next) = drain(session.run_read_only("select 1".into(), RunOptions::default()));
+    assert!(matches!(next, Err(QueryError::Connection(_))), "{next:?}");
 }
 
 #[test]

@@ -260,12 +260,7 @@ impl WorkspaceView {
             let Some(view) = this.upgrade() else {
                 return true;
             };
-            if !view
-                .read(cx)
-                .tabs
-                .iter()
-                .any(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
-            {
+            if !view.read(cx).has_unsaved_changes(cx) {
                 view.update(cx, |view, _| view.flush_sidebar_width());
                 return true;
             }
@@ -526,7 +521,8 @@ impl WorkspaceView {
                 index
             }
             None => {
-                let tab = cx.new(|cx| TableTab::new(db, info, view, window, cx));
+                let project = self.model.read(cx).project.root.clone();
+                let tab = cx.new(|cx| TableTab::new(db, project, info, view, window, cx));
                 self.tabs.push(Tab::Table(tab));
                 self.tabs.len() - 1
             }
@@ -761,32 +757,59 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Closes the window, asking first if tabs have open transactions: closing
-    /// drops their connections, which rolls them back.
+    /// Closes the window, asking first if tabs have unsaved SQL, staged row
+    /// changes or open transactions: closing loses the first two and drops
+    /// the connections, which rolls the transactions back.
     fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.needs_attention(cx))
+            .count();
+        if unsaved == 0 {
+            self.flush_sidebar_width();
+            window.remove_window();
+            return;
+        }
         let open = self
             .tabs
             .iter()
             .filter(|tab| matches!(tab, Tab::Query(q) if q.read(cx).in_transaction()))
             .count();
-        if open == 0 {
-            self.flush_sidebar_width();
-            window.remove_window();
-            return;
-        }
+        let tabs = if unsaved == 1 {
+            "A tab has".to_string()
+        } else {
+            format!("{unsaved} tabs have")
+        };
+        let (title, detail, close) = if open == unsaved {
+            (
+                "Close the window and roll back?",
+                format!(
+                    "{} not committed. Closing the window rolls {} back.",
+                    if open == 1 {
+                        "A tab has a transaction that is".to_string()
+                    } else {
+                        format!("{open} tabs have transactions that are")
+                    },
+                    if open == 1 { "it" } else { "them" }
+                ),
+                "Roll Back and Close",
+            )
+        } else {
+            (
+                "Close the window without saving?",
+                format!(
+                    "{tabs} unsaved SQL, staged row changes or an open transaction. \
+                     They will be lost, and open transactions rolled back."
+                ),
+                "Close Without Saving",
+            )
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Close the window and roll back?",
-            Some(&format!(
-                "{} not committed. Closing the window rolls {} back.",
-                if open == 1 {
-                    "A tab has a transaction that is".to_string()
-                } else {
-                    format!("{open} tabs have transactions that are")
-                },
-                if open == 1 { "it" } else { "them" }
-            )),
-            &["Roll Back and Close", "Cancel"],
+            title,
+            Some(&detail),
+            &[close, "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {

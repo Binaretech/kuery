@@ -536,9 +536,9 @@ In both write modes:
   status bar ends them. A thin amber line under the title bar marks a
   production connection.
 - Writes have a 60 s `statement_timeout` and a 5 s `lock_timeout`. A
-  transaction with no runs for 10 minutes is rolled back. Closing the tab asks whether to commit; closing the
-  window or turning write mode off with a transaction open asks first too,
-  and so does quitting (which also asks about unsaved SQL and staged row
+  transaction with no runs for 10 minutes is rolled back. Closing the tab asks whether to commit; turning
+  write mode off with a transaction open asks first too, and so do closing
+  the window and quitting (which also ask about unsaved SQL and staged row
   changes).
 
 - **Preview Impact**, in the confirmation or as a command (palette and the

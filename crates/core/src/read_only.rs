@@ -8,9 +8,9 @@ use std::fmt;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, Expr, FromTable, ObjectName, ObjectType, OutputClause, Query, SessionParamStatsTopic,
-    SetExpr, SetSessionParamKind, Statement, TableFactor, TableObject, TableWithJoins,
-    UpdateTableFromKind, Visit, Visitor,
+    Delete, Expr, FromTable, ObjectName, ObjectNamePart, ObjectType, OutputClause, Query,
+    SessionParamStatsTopic, SetExpr, SetSessionParamKind, Statement, TableFactor, TableObject,
+    TableWithJoins, UpdateTableFromKind, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
@@ -28,25 +28,49 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "load_extension",
     "writefile",
     "edit",
+    // PostgreSQL: other sessions and servers, locks, files, settings,
+    // statistics and replication.
     "dblink",
+    "dblink_connect",
+    "dblink_connect_u",
     "dblink_exec",
+    "dblink_open",
+    "dblink_send_query",
     "lo_export",
     "lo_import",
     "lo_unlink",
     "nextval",
     "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_all",
+    "pg_advisory_unlock_shared",
     "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
     "pg_cancel_backend",
+    "pg_create_logical_replication_slot",
+    "pg_create_physical_replication_slot",
     "pg_create_restore_point",
+    "pg_drop_replication_slot",
+    "pg_file_rename",
+    "pg_file_unlink",
+    "pg_file_write",
     "pg_logical_emit_message",
     "pg_notify",
     "pg_promote",
     "pg_reload_conf",
     "pg_rotate_logfile",
+    "pg_stat_reset",
+    "pg_stat_reset_shared",
+    "pg_stat_reset_single_function_counters",
+    "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_slru",
     "pg_switch_wal",
     "pg_terminate_backend",
     "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
     "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
     "set_config",
     "setval",
     // T-SQL: running programs, reading files and other servers, mail.
@@ -294,13 +318,26 @@ impl Visitor for ReadOnlyVisitor {
         // Functions used as a table: `select * from dblink(...)`.
         check_function_name(relation)
     }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Rejection> {
+        // `from lateral f(...)`, whose name is no relation to the visitor.
+        match factor {
+            TableFactor::Function { name, .. } => check_function_name(name),
+            _ => ControlFlow::Continue(()),
+        }
+    }
 }
 
+/// Refuses `name` if it is a side-effect function, however it is qualified
+/// or quoted (`"…"`, `` `…` `` or `[…]`).
 fn check_function_name(name: &ObjectName) -> ControlFlow<Rejection> {
-    let full = name.to_string().to_lowercase();
-    let unqualified = full.rsplit('.').next().unwrap_or(&full).trim_matches('"');
-    if SIDE_EFFECT_FUNCTIONS.contains(&unqualified) {
-        ControlFlow::Break(Rejection::Function(unqualified.to_string()))
+    let unqualified = match name.0.last() {
+        Some(ObjectNamePart::Identifier(ident)) => ident.value.to_lowercase(),
+        Some(ObjectNamePart::Function(function)) => function.name.value.to_lowercase(),
+        None => return ControlFlow::Continue(()),
+    };
+    if SIDE_EFFECT_FUNCTIONS.contains(&unqualified.as_str()) {
+        ControlFlow::Break(Rejection::Function(unqualified))
     } else {
         ControlFlow::Continue(())
     }
@@ -612,6 +649,48 @@ mod tests {
         assert_eq!(
             rejected("select * from dblink('host=x', 'delete from t') as t(n int)"),
             Rejection::Function("dblink".into())
+        );
+    }
+
+    #[test]
+    fn rejects_side_effect_functions_called_as_lateral_tables() {
+        for sql in [
+            "select * from lateral pg_terminate_backend(123)",
+            "select * from orders, lateral dblink_exec('host=x', 'delete from t') as t",
+            "select * from lateral pg_catalog.pg_reload_conf()",
+        ] {
+            assert!(matches!(rejected(sql), Rejection::Function(_)), "{sql}");
+        }
+        allowed("select * from orders, lateral generate_series(1, orders.id) as n");
+    }
+
+    #[test]
+    fn rejects_side_effect_functions_however_they_are_quoted() {
+        let cases: [(&Dialect, &str); 8] = [
+            (
+                &crate::sql::POSTGRES,
+                "select \"pg_terminate_backend\"(123)",
+            ),
+            (
+                &crate::sql::POSTGRES,
+                "select \"pg_catalog\".\"set_config\"('a', 'b', true)",
+            ),
+            (&crate::sql::POSTGRES, "select PG_Advisory_Lock_Shared(1)"),
+            (&crate::sql::MYSQL, "select `get_lock`('x', 10)"),
+            (&crate::sql::MYSQL, "select `GET_LOCK`('x', 10)"),
+            (&crate::sql::MYSQL, "select load_file('/etc/hosts')"),
+            (&crate::sql::SQLITE, "select [load_extension]('x')"),
+            (&crate::sql::SQLITE, "select `writefile`('x', 'y')"),
+        ];
+        for (dialect, sql) in cases {
+            assert!(
+                matches!(check_in(dialect, sql), Err(Rejection::Function(_))),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            check_in(&crate::sql::MYSQL, "select `id`, `name` from `orders`"),
+            Ok(())
         );
     }
 

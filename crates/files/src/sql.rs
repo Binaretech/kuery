@@ -31,6 +31,10 @@ pub struct SqlResult {
 /// Synchronous: call on a worker. The output limit is applied after SQL, so
 /// aggregates and joins see entire inputs. It does not bound engine working memory.
 pub fn query_files(files: &[SqlFile], sql: &str, output: PreviewRequest) -> Result<SqlResult> {
+    crate::contained(|| run_query(files, sql, output))
+}
+
+fn run_query(files: &[SqlFile], sql: &str, output: PreviewRequest) -> Result<SqlResult> {
     output.validate()?;
     validate(sql)?;
     let mut context = SQLContext::new();
