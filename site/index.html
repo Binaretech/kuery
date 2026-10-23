@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kuery — databases and files, one query</title>
+<meta name="description" content="Kuery is a native desktop app, written in Rust, for browsing PostgreSQL, MySQL, SQL Server, SQLite and Redis, and for running SQL over CSV, JSON and Parquet.">
+<meta name="theme-color" content="#0b0b0d">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Kuery — databases and files, one query">
+<meta property="og:description" content="A native workspace for databases, SQL and local data exploration. macOS, Windows and Linux.">
+<meta property="og:url" content="https://angel-afonso.github.io/kuery/">
+<meta property="og:image" content="https://angel-afonso.github.io/kuery/assets/screenshots/file-sql.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="assets/kuery.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="styles.css">
+<script src="main.js" defer></script>
+</head>
+<body>
+<div class="k">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav wrap">
+<a class="brand" href="#top"><img src="assets/kuery.png" width="32" height="32" alt=""><span>Kuery</span></a>
+<nav class="links" aria-label="Main">
+<a href="#features">Features</a>
+<a href="#sources">Sources</a>
+<a href="#workflow">Workflow</a>
+<a href="https://github.com/angel-afonso/kuery">GitHub</a>
+<a class="btn btn-sm" href="#download">Download</a>
+</nav>
+</header>
+
+<main id="main">
+<section class="hero wrap" id="top">
+<h1 class="h1"><span class="l1">Databases and files.</span><span class="l2">One query.</span></h1>
+<div class="hero-row g12">
+<div class="hero-copy">
+<p class="lead">Kuery is a native desktop app, written in Rust, for browsing PostgreSQL, MySQL, SQL Server, SQLite and Redis, and for running SQL over CSV, JSON and Parquet without importing anything.</p>
+<div class="acts">
+<a class="btn" href="#download"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12"/><path d="m6 11 6 6 6-6"/><path d="M4 20h16"/></svg><span>Download for <span data-os-name>macOS</span></span></a>
+<a class="tlink" href="https://github.com/angel-afonso/kuery">View the source<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>
+</div>
+<p class="meta">%TAG% for macOS, Windows and Linux. Built with GPUI, Apache Arrow and Polars. Try the editor on the right: pick a source and press Run.</p>
+</div>
+
+<div class="stage">
+<div class="frag" data-ui>
+<div class="f-tabs" role="tablist" aria-label="Example sources">
+<button class="f-tab on" type="button" role="tab" aria-selected="true" data-src="0"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>File SQL</button>
+<button class="f-tab" type="button" role="tab" aria-selected="false" data-src="1"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>local-dev · PostgreSQL</button>
+<button class="f-tab" type="button" role="tab" aria-selected="false" data-src="2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>events.parquet</button>
+<span class="f-plus" aria-hidden="true">+</span>
+</div>
+<div class="f-bar">
+<button class="f-run" type="button" data-run><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>Run <span class="f-k">⌘↵</span></button>
+<button class="f-ghost" type="button" data-cancel disabled>Cancel</button>
+<button class="f-ghost" type="button" data-format>Format</button>
+<span class="f-eng"><span class="dot"></span><span data-engine>Polars SQL · read only</span></span>
+</div>
+<div class="f-ed">
+<pre class="f-gut" aria-hidden="true" data-gutter></pre>
+<pre class="f-code" aria-label="SQL statement" data-code></pre>
+</div>
+<div class="f-rh"><span class="f-rt on">Results</span><span class="f-rt">Profile</span><span class="f-st" data-status></span></div>
+<div class="f-row f-head" data-head></div>
+<div data-out aria-live="polite"></div>
+</div>
+</div>
+</div>
+</section>
+
+<section class="sec" id="sources">
+<div class="wrap g12 sec-head">
+<h2 class="h2 rv">Eight sources. One grid.</h2>
+<p class="muted rv d1">Database SQL speaks each engine's own dialect. File SQL runs Polars over complete inputs. Every result lands in the same virtualized grid, with the same Profile view. Open a row to see what each source supports.</p>
+</div>
+<div class="board rv d1" data-ui>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">CSV / TSV</span><span class="bf b1">Inferred schema</span><span class="bf b2">Polars SQL</span><span class="bf b3">Comma, semicolon, tab</span><span class="bs file">File</span><span class="bd"><span>Header and NULL options, preview limits up to 100,000 rows, and a clear marker for preview versus complete file.</span><span>Queries read the whole file; the grid shows up to 10,000 output rows.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">JSON / JSONL</span><span class="bf b1">Object records</span><span class="bf b2">Polars SQL</span><span class="bf b3">Up to 32 MiB</span><span class="bs file">File</span><span class="bd"><span>JSON is an array of objects; JSONL and NDJSON hold one object per nonblank line.</span><span>Schema conflicts raise an error instead of silently dropping values.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">Parquet</span><span class="bf b1">Native schema</span><span class="bf b2">Polars SQL</span><span class="bf b3">Lazy scans</span><span class="bs file">File</span><span class="bd"><span>Keeps native schema metadata; nested and binary values get readable representations.</span><span>Join it with a CSV or a JSON file in the same File SQL tab.</span></span></button>
+<button class="brow open" type="button" aria-expanded="true"><span class="bn">PostgreSQL</span><span class="bf b1">Schemas to enums</span><span class="bf b2">SQL editor</span><span class="bf b3">TLS and SSH</span><span class="bs db">Database</span><span class="bd"><span>Streaming results, cancellation, timeouts and plans with timing, row-estimate comparisons and insights.</span><span>Routines, triggers, enums and definitions sit in the explorer beside your files.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">MySQL / MariaDB</span><span class="bf b1">Databases as schemas</span><span class="bf b2">SQL editor</span><span class="bf b3">TLS and SSH</span><span class="bs db">Database</span><span class="bd"><span>Tables, views and routines, with explicit write modes when you need them.</span><span>DDL that commits implicitly is refused wherever rollback is promised.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">SQL Server</span><span class="bf b1">Schemas, routines</span><span class="bf b2">GO batches</span><span class="bf b3">Query plans</span><span class="bs db">Database</span><span class="bd"><span>Databases, schemas, tables, views and routines, plus query plans and server activity.</span><span>SQL Server logins, with a documented read-only guarantee.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">SQLite</span><span class="bf b1">Local file</span><span class="bf b2">Query-only reads</span><span class="bf b3">Existing files only</span><span class="bs db">Database</span><span class="bd"><span>Opens existing database files; a missing path never creates an empty database.</span><span>Explicit write modes when you decide to change something.</span></span></button>
+<button class="brow" type="button" aria-expanded="false"><span class="bn">Redis</span><span class="bf b1">Keys via SCAN</span><span class="bf b2">Command console</span><span class="bf b3">Streams</span><span class="bs kv">Key-value</span><span class="bd"><span>Strings, JSON, hashes, lists, sets, sorted sets and streams, each in its own inspector.</span><span>Read-only by default; writes apply at once and have no rollback.</span></span></button>
+</div>
+</section>
+
+<section class="sec wrap" id="features">
+<div class="g12 sec-head">
+<h2 class="h2 rv">Everything after the first query</h2>
+<p class="muted rv d1">Kuery is built for the part that comes next: reading the data, explaining it, and changing it without surprises. Each view below is a real capture of the app with synthetic data.</p>
+</div>
+<div class="mods">
+
+<article class="mod g12">
+<figure class="mod-fig f1 rv" role="img" aria-label="A CSV file open in Kuery with typed columns and a complete-file row count" style="height: 340px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">Open the file. Skip the import.</h3>
+<p>CSV and TSV, JSON arrays, JSONL and Parquet open in the same grid you use for query results, with native or inferred types for every column.</p>
+<p class="muted">Change the delimiter, header and NULL options, then reload. The grid always says whether you are looking at a preview or the complete file.</p>
+</div>
+</article>
+
+<article class="mod g12">
+<figure class="mod-fig f2 rv" role="img" aria-label="Kuery Profile comparing revenue across regions with box plots" style="height: 320px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">Understand the result, not only the rows</h3>
+<p>Profile shows missing and distinct values, distributions, percentiles, categories and timelines for the rows you just pulled.</p>
+<p class="muted">Compare groups with box plots, cross tabs, time breakdowns and numeric correlations. Analysis runs when you ask for it, on the result in front of you.</p>
+</div>
+</article>
+
+<article class="mod g12">
+<figure class="mod-fig f3 rv" role="img" aria-label="A PostgreSQL query plan drawn as a graph with timing for each step" style="height: 420px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">See where the time went</h3>
+<p>Read EXPLAIN output as a tree or a graph. Every step shows its rows, cost and share of the total time; PostgreSQL adds measured timings, row-estimate checks and plain-language insights.</p>
+<p class="muted">Compare two plans before you ship the index.</p>
+</div>
+</article>
+
+<article class="mod g12">
+<figure class="mod-fig f4 rv" role="img" aria-label="Kuery asking to review two changes, flagging an UPDATE without WHERE as risky" style="height: 360px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">Writes you read before they run</h3>
+<p>Every project starts read-only. Choose an explicit write mode and Kuery previews the impact, flags an UPDATE with no WHERE, and keeps the changes in a transaction until you commit.</p>
+<p class="muted">Environment policies decide what development, staging and production allow. Table edits are staged and checked before they are saved.</p>
+</div>
+</article>
+
+<article class="mod g12">
+<figure class="mod-fig f5 rv" role="img" aria-label="A SQLite orders table open in the Kuery database browser" style="height: 400px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">Browse without writing a query</h3>
+<p>Connections, schemas, tables, views, routines, triggers and types in one explorer. Filter, sort and page on the server, then inspect columns, keys, indexes and definitions.</p>
+<p class="muted">Schema diagrams draw foreign keys with crow's-foot relationships and remember where you put each card.</p>
+</div>
+</article>
+
+<article class="mod g12">
+<figure class="mod-fig f6 rv" role="img" aria-label="The Kuery Redis console running HGETALL and ZRANGE against a local cache" style="height: 300px"></figure>
+<div class="mod-txt rv d1">
+<h3 class="h3">Redis, with the same care</h3>
+<p>Browse keys with SCAN and inspect strings, JSON, hashes, lists, sets, sorted sets and streams. Run commands in a console built for it.</p>
+<p class="muted">Read-only by default. Redis writes apply at once and cannot be rolled back, so Kuery makes you choose them on purpose.</p>
+</div>
+</article>
+
+</div>
+</section>
+
+<section class="sec wrap g12 pin" id="workflow">
+<h2 class="h2 pin-h rv">From folder to answer</h2>
+<div class="pin-l">
+<div class="step on" data-step="0">
+<h3 class="h3">First, open a folder.</h3>
+<p>A Kuery project is a plain folder with a small .kuery directory: connection definitions, saved SQL and diagram positions. Passwords go to your system's credential store, never into the project.</p>
+</div>
+<div class="step" data-step="1">
+<h3 class="h3">Then open a file or a connection.</h3>
+<p>Press ⌘⇧O for CSV, JSON or Parquet, or add PostgreSQL, MySQL, SQL Server, SQLite or Redis with TLS and an OpenSSH tunnel.</p>
+</div>
+<div class="step" data-step="2">
+<h3 class="h3">Finally, ask it in SQL.</h3>
+<p>Join files with Polars SQL or query the database in its own dialect. Copy cells and rows as text, TSV or JSON, or export to a file.</p>
+</div>
+</div>
+<div class="pin-r">
+<div class="pin-stage">
+<div class="ps on" data-ui data-pane="0">
+<div class="win">
+<div class="win-bar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Open project<span class="r">⌘O</span></div>
+<pre class="tree">retail-analytics/
+├── orders.csv
+├── regional_targets.json
+├── events.parquet
+└── .kuery/
+    ├── project.toml   <span class="c"># connections, no passwords</span>
+    ├── queries/       <span class="c"># saved SQL</span>
+    └── diagrams/      <span class="c"># card positions</span></pre>
+</div>
+</div>
+<div class="ps" data-ui data-pane="1">
+<div class="win">
+<div class="win-bar">orders.csv<span class="chip on">Data</span><span class="chip">Columns</span><span class="chip">Profile</span><span class="r">618 rows · complete file</span></div>
+<div class="fr h"><span><b>order_id</b>i64</span><span><b>month</b>str</span><span><b>region</b>str</span><span><b>status</b>str</span><span class="n"><b>revenue</b>f64</span></div>
+<div class="fr"><samp>10421</samp><samp>2026-06</samp><samp>Europe</samp><samp>completed</samp><samp class="n">342.79</samp></div>
+<div class="fr"><samp>10422</samp><samp>2026-06</samp><samp>Latin America</samp><samp>completed</samp><samp class="n">399.16</samp></div>
+<div class="fr"><samp>10423</samp><samp>2026-06</samp><samp>North America</samp><samp>refunded</samp><samp class="n">298.50</samp></div>
+<div class="fr"><samp>10424</samp><samp>2026-06</samp><samp>Europe</samp><samp>completed</samp><samp class="n">618.32</samp></div>
+<div class="fr"><samp>10425</samp><samp>2026-05</samp><samp>Latin America</samp><samp>completed</samp><samp class="n">705.84</samp></div>
+<div class="fr"><samp>10426</samp><samp>2026-05</samp><samp>North America</samp><samp>completed</samp><samp class="n">524.00</samp></div>
+<div class="fr"><samp>10427</samp><samp>2026-05</samp><samp>Europe</samp><samp>pending</samp><samp class="n">76.70</samp></div>
+</div>
+</div>
+<div class="ps" data-ui data-pane="2">
+<div class="win">
+<div class="win-bar">File SQL<span class="r">Polars SQL · read only</span></div>
+<pre class="tree"><span class="kw">SELECT</span> region, <span class="kw">COUNT</span>(*) <span class="kw">AS</span> orders,
+  <span class="kw">ROUND</span>(<span class="kw">SUM</span>(revenue), <span class="nu">2</span>) <span class="kw">AS</span> revenue
+<span class="kw">FROM</span> <span class="tb">orders</span>
+<span class="kw">WHERE</span> status = <span class="st">'completed'</span>
+<span class="kw">GROUP BY</span> region <span class="kw">ORDER BY</span> revenue <span class="kw">DESC</span>;</pre>
+<div class="f-row f-head" style="grid-template-columns: 1.4fr 0.8fr 1fr"><span>region</span><span class="n">orders</span><span class="n">revenue</span></div>
+<div class="f-row" style="grid-template-columns: 1.4fr 0.8fr 1fr"><samp>Latin America</samp><samp class="n">206</samp><samp class="n">82226.96</samp></div>
+<div class="f-row" style="grid-template-columns: 1.4fr 0.8fr 1fr"><samp>Europe</samp><samp class="n">206</samp><samp class="n">70713.87</samp></div>
+<div class="f-row" style="grid-template-columns: 1.4fr 0.8fr 1fr"><samp>North America</samp><samp class="n">206</samp><samp class="n">61915.01</samp></div>
+<div class="win-bar" style="border-bottom: 0; border-top: 1px solid #24242b">3 result rows · 19 ms · full file inputs</div>
+</div>
+</div>
+</div>
+</div>
+</section>
+
+<section class="sec wrap g12 two" id="more">
+<div class="lcol">
+<h2 class="h2 rv">Also in the box</h2>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #2f86ff"></span>Schema diagrams</span><span class="v">Crow's-foot</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #3ecf8e"></span>SSH tunnels</span><span class="v">OpenSSH</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #3ecf8e"></span>TLS</span><span class="v">Per driver</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #f5a524"></span>Passwords</span><span class="v">OS credential store</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #2f86ff"></span>Export results</span><span class="v">CSV, TSV, JSON</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #2f86ff"></span>Copy cells and rows</span><span class="v">Text, TSV, JSON</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #ff7a6b"></span>Environment policies</span><span class="v">dev, staging, prod</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #f5a524"></span>Query cancellation</span><span class="v">Timeouts too</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #a6a6b0"></span>Saved SQL and history</span><span class="v">Per project</span></div>
+<div class="lrow rv"><span class="nm"><span class="sw" style="background: #a6a6b0"></span>Recent projects</span><span class="v">Welcome window</span></div>
+</div>
+<div class="lcol">
+<h2 class="h2 rv">Keys you will use daily</h2>
+<div class="seg" role="group" aria-label="Keyboard layout"><button class="on" type="button" aria-pressed="true" data-keys="mac">macOS</button><button type="button" aria-pressed="false" data-keys="pc">Windows and Linux</button></div>
+<div class="lrow rv"><span class="nm">Command palette</span><kbd class="kbd" data-mac="⌘K" data-pc="Ctrl+K">⌘K</kbd></div>
+<div class="lrow rv"><span class="nm">Open project</span><kbd class="kbd" data-mac="⌘O" data-pc="Ctrl+O">⌘O</kbd></div>
+<div class="lrow rv"><span class="nm">Open data file</span><kbd class="kbd" data-mac="⌘⇧O" data-pc="Ctrl+Shift+O">⌘⇧O</kbd></div>
+<div class="lrow rv"><span class="nm">Run statement or selection</span><kbd class="kbd" data-mac="⌘↵" data-pc="Ctrl+Enter">⌘↵</kbd></div>
+<div class="lrow rv"><span class="nm">Format SQL</span><kbd class="kbd" data-mac="⌘⇧F" data-pc="Ctrl+Shift+F">⌘⇧F</kbd></div>
+<div class="lrow rv"><span class="nm">Cancel query</span><kbd class="kbd" data-mac="⌘." data-pc="Ctrl+.">⌘.</kbd></div>
+<div class="lrow rv"><span class="nm">Save query</span><kbd class="kbd" data-mac="⌘S" data-pc="Ctrl+S">⌘S</kbd></div>
+<div class="lrow rv"><span class="nm">Toggle sidebar</span><kbd class="kbd" data-mac="⌘B" data-pc="Ctrl+B">⌘B</kbd></div>
+<div class="lrow rv"><span class="nm">Close tab</span><kbd class="kbd" data-mac="⌘W" data-pc="Ctrl+W">⌘W</kbd></div>
+<p class="muted" style="margin-top: 20px; font-size: 15px">Every shortcut is configurable in keymap.toml.</p>
+</div>
+</section>
+
+<section class="cta wrap g12" id="download">
+<div class="cta-l">
+<h2 class="h2 rv">Run your first query.</h2>
+<p class="rv d1">Download Kuery %VERSION%, open a folder, and press ⌘↵. Every release ships with SHA256 checksums. Kuery is an early prototype under active development, so expect it to move fast.</p>
+</div>
+<div class="cta-r">
+<div class="dlg rv d1" data-ui role="group" aria-label="Download Kuery">
+<div class="dlg-h"><strong>Download Kuery</strong><span>%TAG% · latest release</span></div>
+<div class="dseg" role="group" aria-label="Platform">
+<button class="on" type="button" aria-pressed="true" data-plat="0">macOS</button>
+<button type="button" aria-pressed="false" data-plat="1">Windows</button>
+<button type="button" aria-pressed="false" data-plat="2">Linux</button>
+<button type="button" aria-pressed="false" data-plat="3">Source</button>
+</div>
+<div class="dbody" data-panel="0">
+<div class="dfile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg><code>kuery-%TAG%-universal-apple-darwin.dmg</code></div>
+<p style="color: #c6c6cd">Universal app for Apple silicon and Intel. Open the disk image and drag Kuery onto Applications.</p>
+<a class="d-btn" href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/kuery-%TAG%-universal-apple-darwin.dmg"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12"/><path d="m6 11 6 6 6-6"/><path d="M4 20h16"/></svg>Download .dmg</a>
+<div class="dfoot"><a href="https://github.com/angel-afonso/kuery/releases">All releases</a><a href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/SHA256SUMS">SHA256SUMS</a></div>
+</div>
+<div class="dbody" data-panel="1" hidden>
+<div class="dfile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg><code>kuery-%TAG%-x86_64-pc-windows-msvc.zip</code></div>
+<p style="color: #c6c6cd">x64 build. Unzip it and run kuery.exe.</p>
+<a class="d-btn" href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/kuery-%TAG%-x86_64-pc-windows-msvc.zip"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12"/><path d="m6 11 6 6 6-6"/><path d="M4 20h16"/></svg>Download .zip</a>
+<div class="dfoot"><a href="https://github.com/angel-afonso/kuery/releases">All releases</a><a href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/SHA256SUMS">SHA256SUMS</a></div>
+</div>
+<div class="dbody" data-panel="2" hidden>
+<div class="dfile"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg><code>kuery-%TAG%-x86_64-unknown-linux-gnu.tar.gz</code></div>
+<p style="color: #c6c6cd">x86_64 build for glibc systems. Extract it and run ./kuery.</p>
+<a class="d-btn" href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/kuery-%TAG%-x86_64-unknown-linux-gnu.tar.gz"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12"/><path d="m6 11 6 6 6-6"/><path d="M4 20h16"/></svg>Download .tar.gz</a>
+<div class="dfoot"><a href="https://github.com/angel-afonso/kuery/releases">All releases</a><a href="https://github.com/angel-afonso/kuery/releases/download/%TAG%/SHA256SUMS">SHA256SUMS</a></div>
+</div>
+<div class="dbody" data-panel="3" hidden>
+<pre class="dsrc" data-src-cmds>git clone https://github.com/angel-afonso/kuery.git
+cd kuery
+cargo run --locked -p kuery</pre>
+<p style="color: #c6c6cd">Uses the toolchain pinned in rust-toolchain.toml. Linux needs the Wayland, X11 and Vulkan headers listed in the README.</p>
+<button class="d-btn" type="button" data-copy>Copy commands</button>
+<div class="dfoot"><a href="https://github.com/angel-afonso/kuery">Repository</a><a href="https://github.com/angel-afonso/kuery/blob/main/docs/guide.md">Development guide</a></div>
+</div>
+</div>
+</div>
+</section>
+</main>
+
+<footer class="foot">
+<div class="tile t1"><p>Kuery keeps UI, results and data engines apart: Arrow-backed results, Polars for files, one adapter per database.</p><p class="muted" style="font-size: 14px">© 2026 Ángel Afonso</p></div>
+<nav class="tile t2" aria-label="Footer"><ul><li><a href="#features">Features</a></li><li><a href="#sources">Sources</a></li><li><a href="#workflow">Workflow</a></li><li><a href="#download">Download</a></li><li><a href="https://github.com/angel-afonso/kuery/blob/main/docs/guide.md">User guide</a></li></ul></nav>
+<div class="tile t3"><p>Early prototype, in active development.</p><p class="muted" style="font-size: 14px">macOS · Windows · Linux</p></div>
+<div class="tile t4"><p class="muted" style="font-size: 14px">Source, issues and releases</p><a href="https://github.com/angel-afonso/kuery">github.com/angel-afonso/kuery</a></div>
+<div class="tile t5"><img src="assets/kuery.png" width="120" height="120" alt=""><span>kuery</span></div>
+<a class="tile t6" href="https://github.com/angel-afonso/kuery">Star it on GitHub<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M6 18 18 6"/><path d="M8 6h10v10"/></svg></a>
+</footer>
+</div>
+</body>
+</html>

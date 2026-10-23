@@ -346,6 +346,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -364,3 +365,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Kuery $GITHUB_REF_NAME" \
             --generate-notes
+
+      # Point the website's download links at the new release.
+      - name: Update the website
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
