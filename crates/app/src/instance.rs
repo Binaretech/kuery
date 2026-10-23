@@ -262,6 +262,15 @@ mod tests {
 
     use super::*;
 
+    /// Removes the test's socket file when it ends (a pipe goes by itself).
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     fn test_address() -> PathBuf {
         let id = crate::project::new_id();
         if cfg!(windows) {
@@ -279,10 +288,10 @@ mod tests {
     }
 
     /// A listener on a new address whose hand-offs arrive on the receiver.
-    fn serve() -> (PathBuf, mpsc::Receiver<Vec<Target>>) {
-        let address = test_address();
+    fn serve() -> (Cleanup, mpsc::Receiver<Vec<Target>>) {
+        let address = Cleanup(test_address());
         let (sent, received) = mpsc::channel();
-        Listener::bind(&address)
+        Listener::bind(&address.0)
             .unwrap()
             .serve(move |targets| sent.send(targets).unwrap());
         (address, received)
@@ -291,13 +300,16 @@ mod tests {
     #[test]
     fn the_running_kuery_receives_the_paths() {
         let (address, received) = serve();
-        assert_eq!(hand_off(&address, &targets()).unwrap(), HandOff::Delivered);
+        assert_eq!(
+            hand_off(&address.0, &targets()).unwrap(),
+            HandOff::Delivered
+        );
         assert_eq!(
             received.recv_timeout(Duration::from_secs(5)).unwrap(),
             targets()
         );
         // And the next command's, with nothing to open: it comes to the front.
-        assert_eq!(hand_off(&address, &[]).unwrap(), HandOff::Delivered);
+        assert_eq!(hand_off(&address.0, &[]).unwrap(), HandOff::Delivered);
         assert_eq!(
             received.recv_timeout(Duration::from_secs(5)).unwrap(),
             vec![]
@@ -315,14 +327,17 @@ mod tests {
     #[test]
     fn a_second_kuery_cannot_listen() {
         let (address, _received) = serve();
-        assert!(Listener::bind(&address).is_err());
+        assert!(Listener::bind(&address.0).is_err());
     }
 
     #[test]
     fn a_garbled_message_is_ignored() {
         let (address, received) = serve();
-        send_raw(&address, b"not json\n");
-        assert_eq!(hand_off(&address, &targets()).unwrap(), HandOff::Delivered);
+        send_raw(&address.0, b"not json\n");
+        assert_eq!(
+            hand_off(&address.0, &targets()).unwrap(),
+            HandOff::Delivered
+        );
         assert_eq!(
             received.recv_timeout(Duration::from_secs(5)).unwrap(),
             targets()
@@ -352,6 +367,7 @@ mod tests {
     #[test]
     fn a_stale_socket_is_replaced() {
         let address = test_address();
+        let _cleanup = Cleanup(address.clone());
         drop(std::os::unix::net::UnixListener::bind(&address).unwrap());
         assert!(address.exists());
         assert_eq!(hand_off(&address, &targets()).unwrap(), HandOff::NotRunning);

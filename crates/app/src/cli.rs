@@ -21,13 +21,20 @@ pub enum Target {
 /// Reads the arguments after the program name; relative paths are taken
 /// from `cwd`. `--help` and `--version` win over everything else.
 pub fn parse(args: impl IntoIterator<Item = OsString>, cwd: &Path) -> Result<Command, String> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    let options = args.iter().take_while(|arg| *arg != "--");
+    for arg in options {
+        match arg.to_str() {
+            Some("-h" | "--help") => return Ok(Command::Help),
+            Some("-V" | "--version") => return Ok(Command::Version),
+            _ => {}
+        }
+    }
     let mut paths = Vec::new();
     let mut options = true;
     for arg in args {
         match arg.to_str() {
             Some("--") if options => options = false,
-            Some("-h" | "--help") if options => return Ok(Command::Help),
-            Some("-V" | "--version") if options => return Ok(Command::Version),
             Some(option) if options && option.starts_with('-') && option != "-" => {
                 return Err(format!("unknown option {option} (see kuery --help)"));
             }
@@ -190,6 +197,10 @@ mod tests {
         for flag in ["-V", "--version"] {
             assert_eq!(parse(args(&[flag]), &dir.0), Ok(Command::Version));
         }
+        assert_eq!(
+            parse(args(&["--bogus", "--help"]), &dir.0),
+            Ok(Command::Help)
+        );
     }
 
     #[test]
