@@ -15,6 +15,7 @@ use gpui_kit::{
 use crate::context_menus::REVEAL_LABEL;
 use crate::recent::{self, RecentProject};
 use crate::theme::{self, color};
+use crate::ui;
 
 pub struct Welcome {
     recent: Vec<RecentProject>,
@@ -51,11 +52,11 @@ impl Welcome {
         let group = SharedString::from(format!("recent-{index}"));
         let path = project.path.clone();
         let available = project.available;
-        let detail = if available {
+        let detail = SharedString::from(if available {
             project.display_path()
         } else {
             format!("Folder not found · {}", project.display_path())
-        };
+        });
 
         let action = |id: &'static str, icon: IconName, tooltip: &'static str| {
             Button::new((id, index))
@@ -68,6 +69,8 @@ impl Welcome {
         h_flex()
             .id(("recent", index))
             .group(group.clone())
+            .w_full()
+            .min_w_0()
             .px_3()
             .py_2()
             .gap_3()
@@ -93,43 +96,49 @@ impl Welcome {
                     .min_w_0()
                     .child(
                         div()
+                            .truncate()
                             .font_weight(FontWeight::MEDIUM)
                             .when(!available, |name| {
                                 name.text_color(color(theme::TEXT_TERTIARY))
                             })
                             .child(project.name.clone()),
                     )
-                    .child(
+                    .child(if available {
                         div()
                             .truncate()
                             .text_size(px(11.5))
-                            .text_color(color(if available {
-                                theme::TEXT_TERTIARY
-                            } else {
-                                theme::AMBER
-                            }))
-                            .child(detail),
-                    ),
+                            .text_color(color(theme::TEXT_TERTIARY))
+                            .child(detail)
+                            .into_any_element()
+                    } else {
+                        // The warning wraps onto a second line, then ends in
+                        // an ellipsis; the tooltip shows all of it.
+                        div()
+                            .id(("recent-warning", index))
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .text_size(px(11.5))
+                            .text_color(color(theme::AMBER))
+                            .tooltip(ui::tooltip(detail.clone()))
+                            .child(detail)
+                            .into_any_element()
+                    }),
             )
             .child(
                 h_flex()
                     .gap_1()
                     .flex_shrink_0()
-                    // Shown on hover, except for missing folders: removing
-                    // them is the only thing left to do.
-                    .when(available, |actions| {
-                        actions.invisible().group_hover(group, |s| s.visible())
-                    })
+                    // Reveal shows on hover; remove is always there.
                     .when(available, |actions| {
                         let path = path.clone();
-                        actions.child(
+                        actions.child(div().invisible().group_hover(group, |s| s.visible()).child(
                             action("reveal-recent", IconName::FolderOpen, REVEAL_LABEL).on_click(
                                 move |_, _, cx| {
                                     cx.stop_propagation();
                                     cx.reveal_path(&path);
                                 },
                             ),
-                        )
+                        ))
                     })
                     .child(
                         action(
@@ -148,7 +157,7 @@ impl Welcome {
 
 impl Render for Welcome {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut recent = v_flex().gap(px(2.));
+        let mut recent = v_flex().w_full().gap(px(2.));
         for (index, project) in self.recent.iter().enumerate() {
             recent = recent.child(self.render_row(index, project, cx));
         }
@@ -218,6 +227,10 @@ impl Render for Welcome {
                     .child(
                         v_flex()
                             .flex_1()
+                            // Lets long paths truncate instead of widening
+                            // the column past the window.
+                            .min_w_0()
+                            .overflow_hidden()
                             .h_full()
                             .p_6()
                             .gap_2()
@@ -249,6 +262,7 @@ impl Render for Welcome {
                                 div()
                                     .id("recent-list")
                                     .flex_1()
+                                    .min_w_0()
                                     .overflow_y_scroll()
                                     .child(recent),
                             ),
