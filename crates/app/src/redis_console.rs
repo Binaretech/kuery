@@ -22,9 +22,9 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Task, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::redis::{Class, classify, command_lines, split_command};
 
@@ -117,6 +117,20 @@ impl ConsoleTab {
 
     pub fn db(&self) -> &RedisDb {
         &self.db
+    }
+
+    pub fn database(&self) -> i64 {
+        self.database
+    }
+
+    /// The commands in the editor.
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).text().to_string()
+    }
+
+    pub fn set_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_value(text, window, cx));
     }
 
     pub fn title(&self) -> SharedString {

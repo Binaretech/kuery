@@ -251,6 +251,10 @@ impl TableTab {
         &self.db
     }
 
+    pub fn view(&self) -> TableView {
+        self.view
+    }
+
     pub fn set_view(&mut self, view: TableView, cx: &mut Context<Self>) {
         self.view = view;
         cx.notify();

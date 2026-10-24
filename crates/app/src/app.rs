@@ -14,6 +14,7 @@ use crate::commands::{ClearRecentProjects, OpenProject, OpenRecentProject};
 use crate::file_window::FileWindow;
 use crate::project::{Project, ProjectModel};
 use crate::secrets::SecretStore;
+use crate::session::{self, Contents, Placement, Session, WindowState};
 use crate::welcome::Welcome;
 use crate::workspace::WorkspaceView;
 
@@ -212,17 +213,23 @@ fn open_requested(folder: Option<PathBuf>, origin: Option<AnyWindowHandle>, cx: 
 /// Opens the project in `folder` in its own window, or focuses the window if
 /// it is already open.
 pub fn open_project(folder: &Path, cx: &mut App) -> Result<(), String> {
+    open_project_at(folder, None, cx).map(|_| ())
+}
+
+/// [`open_project`], with the window where `placement` says. Returns the
+/// new window, or `None` if the project's window was already open.
+fn open_project_at(
+    folder: &Path,
+    placement: Option<&Placement>,
+    cx: &mut App,
+) -> Result<Option<(AnyWindowHandle, Entity<ProjectWindow>)>, String> {
     let folder = canonical(folder);
     if focus_existing(&folder, cx) {
-        return Ok(());
+        return Ok(None);
     }
 
     let project = Project::open_or_init(&folder)?;
-    let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..crate::app_icon::window_options()
-    };
+    let options = window_options(size(px(1440.), px(900.)), placement, cx);
     let (handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| ProjectWindow::new(project, window, cx))
     })
@@ -233,12 +240,33 @@ pub fn open_project(folder: &Path, cx: &mut App) -> Result<(), String> {
     state.windows.push(ProjectWindowEntry {
         folder: folder.clone(),
         handle,
-        view,
+        view: view.clone(),
     });
     crate::recent::add(&folder);
     recents_changed(cx);
     close_welcome(cx);
-    Ok(())
+    Ok(Some((handle, view)))
+}
+
+/// A new window's options: centered at `default` size, or where `placement`
+/// says.
+fn window_options(
+    default: gpui_kit::Size<gpui_kit::Pixels>,
+    placement: Option<&Placement>,
+    cx: &App,
+) -> WindowOptions {
+    let (bounds, display_id) = match placement {
+        Some(placement) => placement.window_bounds(cx),
+        None => (
+            WindowBounds::Windowed(Bounds::centered(None, default, cx)),
+            None,
+        ),
+    };
+    WindowOptions {
+        window_bounds: Some(bounds),
+        display_id,
+        ..crate::app_icon::window_options()
+    }
 }
 
 fn replace_project(
@@ -346,16 +374,19 @@ fn open_data_file(
 
 /// The window for data files without a project, opened if needed.
 fn files_window(cx: &mut App) -> Result<(AnyWindowHandle, Entity<FileWindow>), String> {
+    files_window_at(None, cx)
+}
+
+fn files_window_at(
+    placement: Option<&Placement>,
+    cx: &mut App,
+) -> Result<(AnyWindowHandle, Entity<FileWindow>), String> {
     if let Some((handle, view)) = state(cx).files.clone()
         && handle.update(cx, |_, _, _| ()).is_ok()
     {
         return Ok((handle, view));
     }
-    let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..crate::app_icon::window_options()
-    };
+    let options = window_options(size(px(1200.), px(800.)), placement, cx);
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| FileWindow::new(window, cx))
     })
@@ -409,17 +440,49 @@ fn report_error(origin: Option<AnyWindowHandle>, error: &str, cx: &mut App) {
 /// unsaved SQL, an open transaction (rolled back on quit) or staged row
 /// changes.
 pub fn request_quit(cx: &mut App) {
-    confirm_leave("Quit", cx, |_| {}, |cx| cx.quit());
+    confirm_leave(Leave::Quit, cx, |_| {}, |cx| cx.quit());
+}
+
+/// How Kuery goes away, which decides what is lost.
+#[derive(Clone, Copy)]
+pub enum Leave {
+    Quit,
+    /// To update: the windows and their SQL come back (see
+    /// [`save_session`]), open transactions and staged row changes do not.
+    Restart,
+}
+
+impl Leave {
+    fn verb(self) -> &'static str {
+        match self {
+            Leave::Quit => "Quit",
+            Leave::Restart => "Restart",
+        }
+    }
+
+    fn loses_work(self, workspace: &WorkspaceView, cx: &App) -> bool {
+        match self {
+            Leave::Quit => workspace.has_unsaved_changes(cx),
+            Leave::Restart => workspace.loses_work_on_restart(cx),
+        }
+    }
+
+    fn lost(self) -> &'static str {
+        match self {
+            Leave::Quit => "unsaved SQL, an open transaction or staged row changes",
+            Leave::Restart => "an open transaction or staged row changes",
+        }
+    }
 }
 
 /// Runs `then` (which quits or restarts) once nothing would be lost, or the
-/// user agrees to lose it; `verb` names what happens ("Quit", "Restart").
-/// `cancelled` runs instead when the user keeps working.
+/// user agrees to lose it. `cancelled` runs instead when the user keeps
+/// working.
 ///
 /// Deferred: the action asking for it arrives while a window is handling the
 /// event, and that window could not show the question then.
 pub fn confirm_leave(
-    verb: &'static str,
+    leave: Leave,
     cx: &mut App,
     cancelled: impl FnOnce(&mut App) + 'static,
     then: impl FnOnce(&mut App) + 'static,
@@ -430,14 +493,7 @@ pub fn confirm_leave(
             .windows
             .iter()
             .filter(|entry| open.contains(&entry.handle))
-            .filter(|entry| {
-                entry
-                    .view
-                    .read(cx)
-                    .workspace
-                    .read(cx)
-                    .has_unsaved_changes(cx)
-            })
+            .filter(|entry| leave.loses_work(entry.view.read(cx).workspace.read(cx), cx))
             .map(|entry| entry.handle)
             .collect();
         let Some(&first) = unsaved.first() else {
@@ -449,14 +505,15 @@ pub fn confirm_leave(
             .filter(|active| unsaved.contains(active))
             .unwrap_or(first);
         let detail = format!(
-            "{} unsaved SQL, an open transaction or staged row changes. They will \
-             be lost, and open transactions rolled back.",
+            "{} {}. They will be lost, and open transactions rolled back.",
             if unsaved.len() == 1 {
                 "A window has".to_string()
             } else {
                 format!("{} windows have", unsaved.len())
-            }
+            },
+            leave.lost()
         );
+        let verb = leave.verb();
         let answer = handle.update(cx, |_, window, cx| {
             window.activate_window();
             window.prompt(
@@ -480,6 +537,100 @@ pub fn confirm_leave(
         })
         .detach();
     });
+}
+
+/// Saves the open windows and their tabs, for the next start to reopen:
+/// called just before restarting to update.
+pub fn save_session(cx: &mut App) {
+    // Back to front, so the window in front opens last and stays in front.
+    let mut order = cx.windows();
+    match cx.window_stack() {
+        Some(stack) => order.sort_by_key(|handle| {
+            std::cmp::Reverse(stack.iter().position(|h| h == handle).unwrap_or(usize::MAX))
+        }),
+        None => {
+            if let Some(active) = cx.active_window() {
+                order.retain(|handle| *handle != active);
+                order.push(active);
+            }
+        }
+    }
+    let state = state(cx);
+    let projects: Vec<_> = state
+        .windows
+        .iter()
+        .map(|entry| (entry.handle, entry.folder.clone(), entry.view.clone()))
+        .collect();
+    let files = state.files.clone();
+    let mut windows = Vec::new();
+    for handle in order {
+        let saved = if let Some((_, folder, view)) = projects.iter().find(|(h, ..)| *h == handle) {
+            handle.update(cx, |_, window, cx| WindowState {
+                placement: Some(Placement::of(window, cx)),
+                contents: Contents::Project {
+                    folder: folder.clone(),
+                    workspace: view.read(cx).workspace.read(cx).session(cx),
+                },
+            })
+        } else if let Some((_, view)) = files.as_ref().filter(|(h, _)| *h == handle) {
+            handle.update(cx, |_, window, cx| {
+                let (files, active) = view.read(cx).session(cx);
+                WindowState {
+                    placement: Some(Placement::of(window, cx)),
+                    contents: Contents::Files { files, active },
+                }
+            })
+        } else {
+            // The welcome window opens by itself when nothing else does.
+            continue;
+        };
+        windows.extend(saved.ok());
+    }
+    if let Err(error) = session::save(&Session { windows }) {
+        eprintln!("kuery: could not save the open windows for the restart: {error}");
+    }
+}
+
+/// Reopens the windows [`save_session`] saved, where they were. Returns
+/// whether any opened.
+pub fn restore_session(session: Session, cx: &mut App) -> bool {
+    let mut any = false;
+    for saved in session.windows {
+        let placement = saved.placement.as_ref();
+        match saved.contents {
+            Contents::Project { folder, workspace } => {
+                // Gone since, or no longer a project: not created again.
+                if !Project::is_project(&folder) {
+                    continue;
+                }
+                match open_project_at(&folder, placement, cx) {
+                    Ok(Some((handle, view))) => {
+                        any = true;
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let workspace_view = view.read(cx).workspace.clone();
+                            workspace_view.update(cx, |workspace_view, cx| {
+                                workspace_view.restore(workspace, window, cx)
+                            });
+                        });
+                    }
+                    Ok(None) => any = true,
+                    Err(error) => eprintln!("kuery: {error}"),
+                }
+            }
+            Contents::Files { files, active } => match files_window_at(placement, cx) {
+                Ok((handle, view)) => {
+                    any = true;
+                    let _ = handle.update(cx, |_, window, cx| {
+                        view.update(cx, |files_view, cx| {
+                            files_view.restore(files, active, window, cx)
+                        });
+                    });
+                }
+                Err(error) => eprintln!("kuery: {error}"),
+            },
+        }
+    }
+    any
 }
 
 /// Refreshes what shows the recent projects: the menu bar and the welcome

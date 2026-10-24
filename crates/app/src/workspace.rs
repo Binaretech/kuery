@@ -2,6 +2,7 @@
 //! and table tabs. Query and table tabs belong to the connection
 //! they were opened on.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use gpui_kit::{
     MouseDownEvent, ParentElement as _, Pixels, PromptLevel, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
-use kuery_core::catalog::TableInfo;
+use kuery_core::catalog::{TableInfo, TableRef};
 
 use crate::activity_tab::{ActivityEvent, ActivityTab};
 use crate::assets::AppIcon;
@@ -44,6 +45,7 @@ use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab};
 use crate::recent::{self, RecentProject};
 use crate::redis_console::ConsoleTab;
 use crate::redis_key_tab::KeyTab;
+use crate::session::{self, TabState, WorkspaceState};
 use crate::settings;
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
@@ -100,6 +102,79 @@ impl Tab {
             | Tab::File(_)
             | Tab::FileQuery(_) => false,
         }
+    }
+
+    /// Whether restarting to update loses work: the SQL comes back, but
+    /// open transactions and staged row changes do not.
+    fn loses_work_on_restart(&self, cx: &App) -> bool {
+        match self {
+            Tab::Query(query) => query.read(cx).in_transaction(),
+            Tab::Table(table) => table.read(cx).has_pending(),
+            Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::RedisConsole(_)
+            | Tab::Diagram(_)
+            | Tab::Activity(_)
+            | Tab::File(_)
+            | Tab::FileQuery(_) => false,
+        }
+    }
+
+    /// What reopens the tab after a restart. Query files is not kept: it
+    /// needs its files' previews first.
+    fn session(&self, cx: &App) -> Option<TabState> {
+        Some(match self {
+            Tab::Query(query) => {
+                let query = query.read(cx);
+                TabState::Query {
+                    connection: query.db().name.to_string(),
+                    title: query.title().to_string(),
+                    file: query.file().map(PathBuf::from),
+                    text: query.text(cx),
+                    saved: query.saved_text().to_string(),
+                }
+            }
+            Tab::Table(table) => {
+                let table = table.read(cx);
+                let info = table.info();
+                TabState::Table {
+                    connection: table.db().name.to_string(),
+                    schema: info.table.schema.clone(),
+                    name: info.table.name.clone(),
+                    table_kind: info.kind.into(),
+                    view: table.view().into(),
+                }
+            }
+            Tab::Diagram(diagram) => {
+                let diagram = diagram.read(cx);
+                TabState::Diagram {
+                    connection: diagram.db().name.to_string(),
+                    schema: diagram.schema().to_string(),
+                }
+            }
+            Tab::Activity(activity) => TabState::Activity {
+                connection: activity.read(cx).db().name.to_string(),
+            },
+            Tab::RedisKey(key) => {
+                let key = key.read(cx);
+                TabState::RedisKey {
+                    connection: key.db().name.to_string(),
+                    database: key.database(),
+                    key: key.key().to_string(),
+                }
+            }
+            Tab::RedisConsole(console) => {
+                let console = console.read(cx);
+                TabState::RedisConsole {
+                    connection: console.db().name.to_string(),
+                    database: console.database(),
+                    text: console.text(cx),
+                }
+            }
+            Tab::File(file) => TabState::File {
+                path: file.read(cx).path().to_path_buf(),
+            },
+            Tab::FileQuery(_) => return None,
+        })
     }
 
     fn db(&self, cx: &App) -> Option<Db> {
@@ -160,6 +235,17 @@ pub struct WorkspaceView {
     explorer: Entity<Explorer>,
     /// Saved queries waiting for their connection to open: (connection, file).
     waiting_for_connection: Vec<(String, PathBuf)>,
+    /// Tabs from before a restart waiting for their connection to open,
+    /// with their place among the saved tabs.
+    restoring: Vec<(usize, TabState)>,
+    /// The saved place of each tab restored so far, so the ones still coming
+    /// back go where they were.
+    restored_places: HashMap<EntityId, usize>,
+    /// The saved place of the tab that was active, until it is back.
+    restore_active: Option<usize>,
+    /// The window reopened tabs from before a restart, so connecting does
+    /// not add a starter tab.
+    restored_session: bool,
     tabs: Vec<Tab>,
     active: usize,
     queries_opened: usize,
@@ -188,6 +274,7 @@ impl WorkspaceView {
             window,
             |this, _, event: &ExplorerEvent, window, cx| match event {
                 ExplorerEvent::Connected(db) => {
+                    this.restore_sql_tabs(db, window, cx);
                     let waiting: Vec<PathBuf> = this
                         .waiting_for_connection
                         .iter()
@@ -200,7 +287,7 @@ impl WorkspaceView {
                         this.open_saved_query(path, window, cx);
                     }
                     // The first connection to open gets a query tab to start with.
-                    if this.tabs.is_empty() {
+                    if this.tabs.is_empty() && !this.restored_session {
                         this.open_query(
                             db.clone(),
                             None,
@@ -238,8 +325,9 @@ impl WorkspaceView {
                     this.open_diagram(db.clone(), schema.clone(), window, cx)
                 }
                 ExplorerEvent::RedisConnected(db) => {
+                    this.restore_redis_tabs(db, window, cx);
                     // The first connection to open gets a console to start with.
-                    if this.tabs.is_empty() {
+                    if this.tabs.is_empty() && !this.restored_session {
                         this.open_redis_console(db.clone(), db.session.default_db(), window, cx);
                     }
                     cx.notify();
@@ -283,6 +371,10 @@ impl WorkspaceView {
             model,
             explorer,
             waiting_for_connection: Vec::new(),
+            restoring: Vec::new(),
+            restored_places: HashMap::new(),
+            restore_active: None,
+            restored_session: false,
             tabs: Vec::new(),
             active: 0,
             queries_opened: 0,
@@ -299,6 +391,212 @@ impl WorkspaceView {
     /// edits or an open transaction, or a table with pending row changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         self.tabs.iter().any(|tab| tab.needs_attention(cx))
+    }
+
+    /// Whether restarting to update now would lose work: an open
+    /// transaction or staged row changes. Unsaved SQL comes back.
+    pub fn loses_work_on_restart(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| tab.loses_work_on_restart(cx))
+    }
+
+    /// What reopens this window's tabs after a restart.
+    pub fn session(&self, cx: &App) -> WorkspaceState {
+        let tabs: Vec<(usize, TabState)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| Some((index, tab.session(cx)?)))
+            .collect();
+        let explorer = self.explorer.read(cx);
+        WorkspaceState {
+            connections: explorer.open_connections(),
+            active: tabs
+                .iter()
+                .position(|(index, _)| *index == self.active)
+                .unwrap_or(0),
+            tabs: tabs.into_iter().map(|(_, tab)| tab).collect(),
+            queries_opened: self.queries_opened,
+            sidebar_visible: self.sidebar_visible,
+            sidebar: explorer.mode().into(),
+            expanded: explorer.expanded(),
+        }
+    }
+
+    /// Reopens what [`Self::session`] saved before a restart. Data files
+    /// open right away; the other tabs once their connection, opened again
+    /// here, is ready. A tab whose connection fails or is gone stays closed.
+    pub fn restore(&mut self, state: WorkspaceState, window: &mut Window, cx: &mut Context<Self>) {
+        self.restored_session = true;
+        self.sidebar_visible = state.sidebar_visible;
+        self.queries_opened = state.queries_opened;
+        self.restore_active = Some(state.active);
+        self.explorer.update(cx, |explorer, cx| {
+            explorer.set_mode(state.sidebar.into(), cx);
+            explorer.set_expanded(state.expanded, cx);
+        });
+        let mut connections = state.connections;
+        for (place, tab) in state.tabs.into_iter().enumerate() {
+            match tab {
+                TabState::File { path } => self.restore_data_file(place, path, window, cx),
+                tab => {
+                    if let Some(name) = tab.connection()
+                        && !connections.iter().any(|open| open == name)
+                    {
+                        connections.push(name.to_string());
+                    }
+                    self.restoring.push((place, tab));
+                }
+            }
+        }
+        for name in connections {
+            let exists = self
+                .explorer
+                .update(cx, |explorer, cx| explorer.ensure_connected(&name, cx));
+            if !exists {
+                self.restoring
+                    .retain(|(_, tab)| tab.connection() != Some(name.as_str()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn restore_data_file(
+        &mut self,
+        place: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let shown = path.clone();
+            let source = cx
+                .background_spawn(async move { crate::file_tab::load_source(path) })
+                .await;
+            this.update_in(cx, |this, window, cx| match source {
+                Ok(source) => {
+                    let tab = this.new_file_tab(source, window, cx);
+                    this.insert_restored(place, tab, window, cx);
+                }
+                // Moved or deleted since: nothing to reopen.
+                Err(error) => eprintln!("kuery: could not reopen {}: {error}", shown.display()),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reopens the waiting tabs of a SQL connection that just opened.
+    fn restore_sql_tabs(&mut self, db: &Db, window: &mut Window, cx: &mut Context<Self>) {
+        for (place, state) in self.take_restoring(&db.name) {
+            let tab = match state {
+                TabState::Query {
+                    title,
+                    file,
+                    text,
+                    saved,
+                    ..
+                } => {
+                    let tab = self.new_query_tab(
+                        db.clone(),
+                        Some(title.into()),
+                        Some(text),
+                        file,
+                        window,
+                        cx,
+                    );
+                    if let Tab::Query(query) = &tab {
+                        query.update(cx, |query, cx| query.restore_saved_text(saved, cx));
+                    }
+                    tab
+                }
+                TabState::Table {
+                    schema,
+                    name,
+                    table_kind,
+                    view,
+                    ..
+                } => {
+                    let info = TableInfo {
+                        table: TableRef::new(schema, name),
+                        kind: table_kind.into(),
+                        estimated_rows: None,
+                        comment: None,
+                    };
+                    self.new_table_tab(db.clone(), info, view.into(), window, cx)
+                }
+                TabState::Diagram { schema, .. } => {
+                    self.new_diagram_tab(db.clone(), schema, window, cx)
+                }
+                TabState::Activity { .. } => self.new_activity_tab(db.clone(), window, cx),
+                TabState::RedisKey { .. }
+                | TabState::RedisConsole { .. }
+                | TabState::File { .. } => {
+                    continue;
+                }
+            };
+            self.insert_restored(place, tab, window, cx);
+        }
+    }
+
+    /// Reopens the waiting tabs of a Redis connection that just opened.
+    fn restore_redis_tabs(&mut self, db: &RedisDb, window: &mut Window, cx: &mut Context<Self>) {
+        for (place, state) in self.take_restoring(&db.name) {
+            let tab = match state {
+                TabState::RedisKey { database, key, .. } => {
+                    self.new_redis_key_tab(db.clone(), database, key, window, cx)
+                }
+                TabState::RedisConsole { database, text, .. } => {
+                    let console = self.new_redis_console_tab(db.clone(), database, window, cx);
+                    console.update(cx, |console, cx| console.set_text(text, window, cx));
+                    Tab::RedisConsole(console)
+                }
+                TabState::Query { .. }
+                | TabState::Table { .. }
+                | TabState::Diagram { .. }
+                | TabState::Activity { .. }
+                | TabState::File { .. } => continue,
+            };
+            self.insert_restored(place, tab, window, cx);
+        }
+    }
+
+    fn take_restoring(&mut self, connection: &str) -> Vec<(usize, TabState)> {
+        let (taken, waiting) = std::mem::take(&mut self.restoring)
+            .into_iter()
+            .partition(|(_, tab)| tab.connection() == Some(connection));
+        self.restoring = waiting;
+        taken
+    }
+
+    /// Puts a restored tab back in its place, and shows it if it was the
+    /// active one (or the first to come back).
+    fn insert_restored(
+        &mut self,
+        place: usize,
+        tab: Tab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let places: Vec<Option<usize>> = self
+            .tabs
+            .iter()
+            .map(|tab| self.restored_places.get(&tab.id()).copied())
+            .collect();
+        let index = session::restored_position(&places, place);
+        let first = self.tabs.is_empty();
+        self.restored_places.insert(tab.id(), place);
+        self.tabs.insert(index, tab);
+        if self.restore_active == Some(place) {
+            self.restore_active = None;
+            self.activate(index, window, cx);
+        } else if first {
+            self.activate(index, window, cx);
+        } else {
+            if index <= self.active {
+                self.active += 1;
+            }
+            cx.notify();
+        }
     }
 
     fn query_data_files(
@@ -360,9 +658,7 @@ impl WorkspaceView {
                         |tab| matches!(tab, Tab::File(file) if file.read(cx).matches(&source)),
                     );
                     let index = existing.unwrap_or_else(|| {
-                        let file = cx.new(|cx| FileTab::new(source, window, cx));
-                        cx.observe(&file, |_, _, cx| cx.notify()).detach();
-                        this.tabs.push(Tab::File(file));
+                        this.tabs.push(this.new_file_tab(source, window, cx));
                         this.tabs.len() - 1
                     });
                     this.activate(index, window, cx);
@@ -374,6 +670,17 @@ impl WorkspaceView {
         .detach();
     }
 
+    fn new_file_tab(
+        &self,
+        source: kuery_files::FileSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let file = cx.new(|cx| FileTab::new(source, window, cx));
+        cx.observe(&file, |_, _, cx| cx.notify()).detach();
+        Tab::File(file)
+    }
+
     fn open_query(
         &mut self,
         db: Db,
@@ -383,6 +690,20 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tab = self.new_query_tab(db, title, sql, file, window, cx);
+        self.tabs.push(tab);
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn new_query_tab(
+        &mut self,
+        db: Db,
+        title: Option<SharedString>,
+        sql: Option<String>,
+        file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
         let title = title.unwrap_or_else(|| {
             self.queries_opened += 1;
             format!("Query {}", self.queries_opened).into()
@@ -404,8 +725,7 @@ impl WorkspaceView {
             cx.notify();
         })
         .detach();
-        self.tabs.push(Tab::Query(tab));
-        self.activate(self.tabs.len() - 1, window, cx);
+        Tab::Query(tab)
     }
 
     fn open_new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -508,13 +828,24 @@ impl WorkspaceView {
                 index
             }
             None => {
-                let project = self.model.read(cx).project.root.clone();
-                let tab = cx.new(|cx| TableTab::new(db, project, info, view, window, cx));
-                self.tabs.push(Tab::Table(tab));
+                self.tabs
+                    .push(self.new_table_tab(db, info, view, window, cx));
                 self.tabs.len() - 1
             }
         };
         self.activate(index, window, cx);
+    }
+
+    fn new_table_tab(
+        &self,
+        db: Db,
+        info: TableInfo,
+        view: TableView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let project = self.model.read(cx).project.root.clone();
+        Tab::Table(cx.new(|cx| TableTab::new(db, project, info, view, window, cx)))
     }
 
     /// Opens a schema's diagram, or shows the tab it is already open in.
@@ -533,22 +864,32 @@ impl WorkspaceView {
             _ => false,
         });
         let index = existing.unwrap_or_else(|| {
-            let project = self.model.read(cx).project.root.clone();
-            let tab = cx.new(|cx| DiagramTab::new(db.clone(), schema, project, cx));
-            cx.subscribe_in(
-                &tab,
-                window,
-                move |this, _, event: &DiagramEvent, window, cx| match event {
-                    DiagramEvent::OpenTable(info) => {
-                        this.open_table(db.clone(), info.clone(), TableView::Data, window, cx)
-                    }
-                },
-            )
-            .detach();
-            self.tabs.push(Tab::Diagram(tab));
+            self.tabs.push(self.new_diagram_tab(db, schema, window, cx));
             self.tabs.len() - 1
         });
         self.activate(index, window, cx);
+    }
+
+    fn new_diagram_tab(
+        &self,
+        db: Db,
+        schema: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let project = self.model.read(cx).project.root.clone();
+        let tab = cx.new(|cx| DiagramTab::new(db.clone(), schema, project, cx));
+        cx.subscribe_in(
+            &tab,
+            window,
+            move |this, _, event: &DiagramEvent, window, cx| match event {
+                DiagramEvent::OpenTable(info) => {
+                    this.open_table(db.clone(), info.clone(), TableView::Data, window, cx)
+                }
+            },
+        )
+        .detach();
+        Tab::Diagram(tab)
     }
 
     /// Opens a connection's server activity, or shows the tab it is already
@@ -559,27 +900,31 @@ impl WorkspaceView {
             _ => false,
         });
         let index = existing.unwrap_or_else(|| {
-            let project = self.model.read(cx).project.root.clone();
-            let tab = cx.new(|cx| ActivityTab::new(db.clone(), project, cx));
-            cx.subscribe_in(
-                &tab,
-                window,
-                move |this, _, event: &ActivityEvent, window, cx| match event {
-                    ActivityEvent::OpenQuery(sql) => this.open_query(
-                        db.clone(),
-                        Some("Session query".into()),
-                        Some(sql.clone()),
-                        None,
-                        window,
-                        cx,
-                    ),
-                },
-            )
-            .detach();
-            self.tabs.push(Tab::Activity(tab));
+            self.tabs.push(self.new_activity_tab(db, window, cx));
             self.tabs.len() - 1
         });
         self.activate(index, window, cx);
+    }
+
+    fn new_activity_tab(&self, db: Db, window: &mut Window, cx: &mut Context<Self>) -> Tab {
+        let project = self.model.read(cx).project.root.clone();
+        let tab = cx.new(|cx| ActivityTab::new(db.clone(), project, cx));
+        cx.subscribe_in(
+            &tab,
+            window,
+            move |this, _, event: &ActivityEvent, window, cx| match event {
+                ActivityEvent::OpenQuery(sql) => this.open_query(
+                    db.clone(),
+                    Some("Session query".into()),
+                    Some(sql.clone()),
+                    None,
+                    window,
+                    cx,
+                ),
+            },
+        )
+        .detach();
+        Tab::Activity(tab)
     }
 
     /// The palette's Show Server Activity, for the active connection.
@@ -630,12 +975,23 @@ impl WorkspaceView {
             _ => false,
         });
         let index = existing.unwrap_or_else(|| {
-            let project = self.model.read(cx).project.root.clone();
-            let tab = cx.new(|cx| KeyTab::new(db, database, key, project, window, cx));
-            self.tabs.push(Tab::RedisKey(tab));
+            self.tabs
+                .push(self.new_redis_key_tab(db, database, key, window, cx));
             self.tabs.len() - 1
         });
         self.activate(index, window, cx);
+    }
+
+    fn new_redis_key_tab(
+        &self,
+        db: RedisDb,
+        database: i64,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let project = self.model.read(cx).project.root.clone();
+        Tab::RedisKey(cx.new(|cx| KeyTab::new(db, database, key, project, window, cx)))
     }
 
     fn open_redis_console(
@@ -645,11 +1001,21 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let project = self.model.read(cx).project.root.clone();
-        let tab = cx.new(|cx| ConsoleTab::new(db, database, project, window, cx));
-        self.tabs.push(Tab::RedisConsole(tab));
+        let console = self.new_redis_console_tab(db, database, window, cx);
+        self.tabs.push(Tab::RedisConsole(console));
         let index = self.tabs.len() - 1;
         self.activate(index, window, cx);
+    }
+
+    fn new_redis_console_tab(
+        &self,
+        db: RedisDb,
+        database: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ConsoleTab> {
+        let project = self.model.read(cx).project.root.clone();
+        cx.new(|cx| ConsoleTab::new(db, database, project, window, cx))
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

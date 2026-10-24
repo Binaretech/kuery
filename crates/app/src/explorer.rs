@@ -562,6 +562,34 @@ impl Explorer {
         self.db(index)
     }
 
+    /// The connections open or opening, by name.
+    pub fn open_connections(&self) -> Vec<String> {
+        self.connections
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.state,
+                    ConnectionState::Connecting
+                        | ConnectionState::Ready { .. }
+                        | ConnectionState::RedisReady { .. }
+                )
+            })
+            .map(|node| node.spec.name.clone())
+            .collect()
+    }
+
+    /// The tree's expanded nodes, in a stable order.
+    pub fn expanded(&self) -> Vec<String> {
+        let mut expanded: Vec<String> = self.expanded.iter().cloned().collect();
+        expanded.sort();
+        expanded
+    }
+
+    pub fn set_expanded(&mut self, expanded: Vec<String>, cx: &mut Context<Self>) {
+        self.expanded = expanded.into_iter().collect();
+        cx.notify();
+    }
+
     /// Starts opening the named connection if it is not open yet. Returns
     /// whether such a connection exists.
     pub fn ensure_connected(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
