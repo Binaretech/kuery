@@ -21,4 +21,4 @@ pub use verify::verify_file;
 
 /// The manifest the app reads: always the newest release's.
 pub const MANIFEST_URL: &str =
-    "https://github.com/angel-afonso/kuery/releases/latest/download/latest.json";
+    "https://github.com/Binaretech/kuery/releases/latest/download/latest.json";

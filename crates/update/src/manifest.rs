@@ -93,16 +93,16 @@ mod tests {
 
     const MANIFEST: &str = r#"{
       "version": "0.3.0",
-      "notes_url": "https://github.com/angel-afonso/kuery/releases/tag/v0.3.0",
+      "notes_url": "https://github.com/Binaretech/kuery/releases/tag/v0.3.0",
       "pub_date": "2026-10-22T17:20:00Z",
       "platforms": {
         "darwin-aarch64": {
-          "url": "https://github.com/angel-afonso/kuery/releases/download/v0.3.0/kuery-v0.3.0-universal-apple-darwin.zip",
+          "url": "https://github.com/Binaretech/kuery/releases/download/v0.3.0/kuery-v0.3.0-universal-apple-darwin.zip",
           "sha256": "33d1629235442b8f7b7110b3e6aea67f0b4d2a8f80e46d89fac58b566e6bf3d8",
           "signature": "untrusted comment: signature from minisign secret key\nRUT...\ntrusted comment: kuery 0.3.0 kuery-v0.3.0-universal-apple-darwin.zip\n..."
         },
         "linux-x86_64": {
-          "url": "https://github.com/angel-afonso/kuery/releases/download/v0.3.0/kuery-v0.3.0-x86_64-unknown-linux-gnu.tar.gz",
+          "url": "https://github.com/Binaretech/kuery/releases/download/v0.3.0/kuery-v0.3.0-x86_64-unknown-linux-gnu.tar.gz",
           "sha256": "b5a08988be052363d035f26d1314a1ca69f83ca9c491277b14a6c4459507b4d5",
           "signature": "..."
         }

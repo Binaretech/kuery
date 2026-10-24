@@ -10,12 +10,12 @@
 </p>
 
 <p align="center">
-  <a href="https://angel-afonso.github.io/kuery/">Website</a> ·
+  <a href="https://binaretech.github.io/kuery/">Website</a> ·
   <a href="#features">Features</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="docs/guide.md">User &amp; development guide</a> ·
-  <a href="https://github.com/angel-afonso/kuery/releases/latest">Download</a>
+  <a href="https://github.com/Binaretech/kuery/releases/latest">Download</a>
 </p>
 
 Kuery brings database administration and file analytics into one desktop app.
@@ -29,7 +29,7 @@ Built in Rust with [GPUI Kit](https://crates.io/crates/gpui-kit),
 Windows and Linux.
 
 > **Project status:** early prototype under active development. The features
-> below describe the current source tree. [Release builds](https://github.com/angel-afonso/kuery/releases/latest)
+> below describe the current source tree. [Release builds](https://github.com/Binaretech/kuery/releases/latest)
 > may lag behind recent changes and update themselves once installed; file SQL
 > is currently a temporary, read-only workspace.
 
@@ -112,8 +112,8 @@ SQL features and functions are not interchangeable across engines.
 ### Install a release
 
 Download the build for your platform from the
-[website](https://angel-afonso.github.io/kuery/#download) or the
-[latest release](https://github.com/angel-afonso/kuery/releases/latest):
+[website](https://binaretech.github.io/kuery/#download) or the
+[latest release](https://github.com/Binaretech/kuery/releases/latest):
 
 | Platform | File | Install |
 | --- | --- | --- |
@@ -159,7 +159,7 @@ Install the toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml) and
 the native build dependencies for your platform. Then:
 
 ```bash
-git clone https://github.com/angel-afonso/kuery.git
+git clone https://github.com/Binaretech/kuery.git
 cd kuery
 cargo run --locked -p kuery
 ```
@@ -361,7 +361,7 @@ Actions → General).
 
 ### Website
 
-The [website](https://angel-afonso.github.io/kuery/) is plain HTML, CSS and
+The [website](https://binaretech.github.io/kuery/) is plain HTML, CSS and
 JavaScript in [`site/`](site). The [Pages workflow](.github/workflows/pages.yml)
 assembles it with [`build-site.sh`](.github/scripts/build-site.sh), which adds
 the screenshots from `docs/screenshots` and the app icon, and fills in the
