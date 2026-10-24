@@ -1,12 +1,13 @@
-//! Shared interface pieces: number and time formatting, titled groups, tags
-//! and the segmented control.
+//! Shared interface pieces: number and time formatting, titled groups, tags,
+//! wrapping tooltips and the segmented control.
 
 use std::time::Duration;
 
 use gpui_kit::component::h_flex;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
-    AnyElement, Div, FontWeight, IntoElement, ParentElement as _, SharedString, Styled as _, div,
-    px,
+    AnyElement, AnyView, App, Div, FontWeight, IntoElement, ParentElement as _, SharedString,
+    Styled as _, Window, div, px,
 };
 
 use crate::theme::{self, color};
@@ -110,6 +111,20 @@ pub fn placeholder(text: impl Into<SharedString>) -> AnyElement {
         .text_color(color(theme::TEXT_TERTIARY))
         .child(text.into())
         .into_any_element()
+}
+
+/// How wide a [`tooltip`] grows before its text wraps.
+pub const TOOLTIP_MAX_WIDTH: f32 = 360.;
+
+/// A tooltip whose text wraps instead of running past the window, which
+/// tooltips cannot leave. Pass it to `.tooltip(...)`.
+pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    let text = text.into();
+    move |window, cx| {
+        let text = text.clone();
+        Tooltip::element(move |_, _| div().max_w(px(TOOLTIP_MAX_WIDTH)).child(text.clone()))
+            .build(window, cx)
+    }
 }
 
 #[cfg(test)]
