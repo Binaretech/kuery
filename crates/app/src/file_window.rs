@@ -84,6 +84,67 @@ impl FileWindow {
         .detach();
     }
 
+    /// The open data files and the index of the active one among them, to
+    /// reopen after a restart. Query files tabs are not kept.
+    pub fn session(&self, cx: &App) -> (Vec<PathBuf>, usize) {
+        let files: Vec<(usize, PathBuf)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| match tab {
+                Tab::File(file) => Some((index, file.read(cx).path().to_path_buf())),
+                Tab::Query(_) => None,
+            })
+            .collect();
+        let active = files
+            .iter()
+            .position(|(index, _)| *index == self.active)
+            .unwrap_or(0);
+        (files.into_iter().map(|(_, path)| path).collect(), active)
+    }
+
+    /// Reopens what [`Self::session`] saved, in order. Files that are gone
+    /// are left out.
+    pub fn restore(
+        &mut self,
+        files: Vec<PathBuf>,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let sources = cx
+                .background_spawn(async move {
+                    files
+                        .into_iter()
+                        .map(|path| {
+                            crate::file_tab::load_source(path.clone()).map_err(|error| {
+                                eprintln!("kuery: could not reopen {}: {error}", path.display())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let mut shown = None;
+                for (index, source) in sources.into_iter().enumerate() {
+                    let Ok(source) = source else { continue };
+                    let file = cx.new(|cx| FileTab::new(source, window, cx));
+                    cx.observe(&file, |_, _, cx| cx.notify()).detach();
+                    this.tabs.push(Tab::File(file));
+                    if index <= active {
+                        shown = Some(this.tabs.len() - 1);
+                    }
+                }
+                if let Some(index) = shown {
+                    this.activate(index, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn open_data_file(&mut self, _: &OpenDataFile, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
             files: true,

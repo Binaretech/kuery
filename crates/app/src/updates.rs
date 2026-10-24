@@ -274,7 +274,7 @@ fn restart_to_update(cx: &mut App) {
         }
     };
     let cancelled = |cx: &mut App| cx.global_mut::<Updates>().end_restart();
-    crate::app::confirm_leave("Restart", cx, cancelled, move |cx| {
+    crate::app::confirm_leave(crate::app::Leave::Restart, cx, cancelled, move |cx| {
         let ready = std::mem::replace(&mut cx.global_mut::<Updates>().status, Status::Installing);
         cx.refresh_windows();
         cx.spawn(async move |cx| {
@@ -284,6 +284,7 @@ fn restart_to_update(cx: &mut App) {
                 .await;
             cx.update(|cx| match installed {
                 Ok(path) => {
+                    crate::app::save_session(cx);
                     cx.set_restart_path(path);
                     cx.restart();
                 }

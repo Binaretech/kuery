@@ -46,6 +46,7 @@ mod redis_write;
 mod results;
 mod results_pane;
 mod secrets;
+mod session;
 mod settings;
 mod shell_command;
 mod table_tab;
@@ -94,6 +95,8 @@ fn main() {
         .map_err(|error| eprintln!("kuery: other kuery commands will start their own app: {error}"))
         .ok();
     paths::migrate_legacy_config_dir();
+    // What was open before restarting to update; read once.
+    let restored = session::take();
     log_panics();
     drivers::install_tls_provider();
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
@@ -130,6 +133,9 @@ fn main() {
                     }
                 })
                 .detach();
+            }
+            if let Some(restored) = restored {
+                app::restore_session(restored, cx);
             }
             open(&targets, cx);
         });

@@ -340,6 +340,24 @@ impl QueryTab {
         self.dirty
     }
 
+    /// The editor's text.
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).text().to_string()
+    }
+
+    /// The text as last saved (or as opened).
+    pub fn saved_text(&self) -> &str {
+        &self.saved_text
+    }
+
+    /// Takes `saved` as the text last saved, for a tab reopened after a
+    /// restart with the edits it had: they show as unsaved again.
+    pub fn restore_saved_text(&mut self, saved: String, cx: &mut Context<Self>) {
+        self.dirty = *self.editor.read(cx).text() != saved;
+        self.saved_text = saved;
+        cx.notify();
+    }
+
     /// Saves to the tab's file, or asks where if it has none.
     pub fn request_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save(&SaveQuery, window, cx);
