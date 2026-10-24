@@ -4075,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "kuery"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4107,7 +4107,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "async-channel",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-files"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4136,7 +4136,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-mssql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "futures",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-mysql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "futures",
@@ -4159,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-pg"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-redis"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "redis",
  "thiserror 2.0.21",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-sqlite"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "futures",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "kuery-update"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "minisign",
  "minisign-verify",
