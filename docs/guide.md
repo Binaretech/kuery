@@ -150,7 +150,10 @@ command palette, sidebar and panel toggles), an activity rail on the left
 (Explorer, Saved Queries, History; Audit Log and Keyboard Shortcuts at the
 bottom; clicking the active view hides the sidebar), the sidebar, tabs, and a
 status bar with the active connection and environment, the tab's mode or
-transaction, the last run and the cursor position.
+transaction, the last run and the cursor position. Its right corner shows the
+running Kuery version (`Version: 0.3.2`) or, while updating, `Checking for
+updates`, `New update available`, `Downloading updates` and finally `Restart
+to update`, which restarts into the new version when clicked.
 
 Toolbars put actions behind icon buttons whose tooltips name the shortcut.
 There are no colored banners: a query tab's mode is the Read / Write / Full
@@ -158,6 +161,15 @@ control, an open transaction or staged row changes are a pill with their
 actions, and before a script that writes runs, a review dialog lists its
 statements, flags the risky ones, and fills in the rows each one would
 change when you click Preview Impact.
+
+Result grids (query, File SQL and data file tabs) select cells and columns.
+Selecting one shows a bar under the grid with the column's kind, its values
+and NULLs and, for numbers, their sum, average, minimum and maximum over every
+row the result holds; they are added up off the UI thread once the query
+ends. Double-click a cell, or click **Inspector** in the bar, to open the
+inspector beside the grid: the selected cell's whole value, JSON indented,
+with its length and a **Copy Value** button; it follows the selection. The
+grid itself shows the first 200 characters of a value, on one line.
 
 ## Development
 

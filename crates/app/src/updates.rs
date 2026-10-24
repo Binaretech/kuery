@@ -38,8 +38,9 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 enum Status {
     Idle,
     Checking,
+    /// A newer release was found; its download is about to start.
+    Available,
     Downloading {
-        version: String,
         percent: Option<u8>,
     },
     Ready {
@@ -163,7 +164,7 @@ fn check(manual: bool, cx: &mut App) {
             }
             return;
         }
-        Status::Checking | Status::Downloading { .. } | Status::Installing => {
+        Status::Checking | Status::Available | Status::Downloading { .. } | Status::Installing => {
             if manual {
                 notify(
                     Notification::info("Kuery is already updating; this takes a moment."),
@@ -208,15 +209,7 @@ fn check(manual: bool, cx: &mut App) {
 /// status bar, then offers the restart.
 async fn download(updater: Arc<Updater>, update: Update, manual: bool, cx: &mut AsyncApp) {
     let version = update.version.to_string();
-    cx.update(|cx| {
-        set_status(
-            Status::Downloading {
-                version: version.clone(),
-                percent: None,
-            },
-            cx,
-        )
-    });
+    cx.update(|cx| set_status(Status::Available, cx));
     let Some(dir) = crate::paths::cache_dir().map(|cache| cache.join("updates")) else {
         cx.update(|cx| {
             set_status(Status::Idle, cx);
@@ -245,9 +238,9 @@ async fn download(updater: Arc<Updater>, update: Update, manual: bool, cx: &mut 
         })?;
         Ok::<_, kuery_update::Error>((update, archive))
     });
+    cx.update(|cx| set_status(Status::Downloading { percent: None }, cx));
     while let Ok(percent) = received.recv().await {
-        let version = version.clone();
-        cx.update(|cx| set_status(Status::Downloading { version, percent }, cx));
+        cx.update(|cx| set_status(Status::Downloading { percent }, cx));
     }
     match task.await {
         Ok((update, archive)) => cx.update(|cx| {
@@ -335,11 +328,14 @@ fn toggle_automatic_checks(cx: &mut App) {
     }
 }
 
-/// What the status bar shows while updating, or when an update is ready.
-pub fn status_item(cx: &App) -> Option<AnyElement> {
-    let status = &cx.try_global::<Updates>()?.status;
-    let text = status_text(status)?;
-    Some(match status {
+/// The status bar's right corner: the running version, or how far an update
+/// has got.
+pub fn status_item(cx: &App) -> AnyElement {
+    let status = cx
+        .try_global::<Updates>()
+        .map_or(&Status::Idle, |updates| &updates.status);
+    let text = status_text(status);
+    match status {
         Status::Ready { .. } => div()
             .id("restart-to-update")
             .cursor_pointer()
@@ -348,19 +344,21 @@ pub fn status_item(cx: &App) -> Option<AnyElement> {
             .on_click(|_, _, cx| restart_to_update(cx))
             .into_any_element(),
         _ => div().child(text).into_any_element(),
-    })
+    }
 }
 
-fn status_text(status: &Status) -> Option<String> {
+fn status_text(status: &Status) -> String {
     match status {
-        Status::Idle | Status::Checking => None,
+        Status::Idle => format!("Version: {}", env!("CARGO_PKG_VERSION")),
+        Status::Checking => "Checking for updates".into(),
+        Status::Available => "New update available".into(),
         Status::Downloading {
-            version,
             percent: Some(percent),
-        } => Some(format!("Downloading Kuery {version}… {percent}%")),
-        Status::Downloading { version, .. } => Some(format!("Downloading Kuery {version}…")),
-        Status::Ready { update, .. } => Some(format!("Restart to update to {}", update.version)),
-        Status::Installing => Some("Installing the update…".into()),
+            ..
+        } => format!("Downloading updates {percent}%"),
+        Status::Downloading { .. } => "Downloading updates".into(),
+        Status::Ready { .. } => "Restart to update".into(),
+        Status::Installing => "Installing the update…".into(),
     }
 }
 
@@ -426,29 +424,19 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_shows_downloads_and_ready_updates() {
-        let downloading = |percent| Status::Downloading {
-            version: "0.3.0".into(),
-            percent,
-        };
-        assert_eq!(status_text(&Status::Idle), None);
-        assert_eq!(status_text(&Status::Checking), None);
+    fn the_status_bar_shows_the_version_and_each_update_step() {
+        let downloading = |percent| Status::Downloading { percent };
+        let current = format!("Version: {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(status_text(&Status::Idle), current);
+        assert_eq!(status_text(&Status::Checking), "Checking for updates");
+        assert_eq!(status_text(&Status::Available), "New update available");
+        assert_eq!(status_text(&downloading(None)), "Downloading updates");
         assert_eq!(
-            status_text(&downloading(Some(42))).as_deref(),
-            Some("Downloading Kuery 0.3.0… 42%")
+            status_text(&downloading(Some(42))),
+            "Downloading updates 42%"
         );
-        assert_eq!(
-            status_text(&downloading(None)).as_deref(),
-            Some("Downloading Kuery 0.3.0…")
-        );
-        assert_eq!(
-            status_text(&ready()).as_deref(),
-            Some("Restart to update to 0.3.0")
-        );
-        assert_eq!(
-            status_text(&Status::Installing).as_deref(),
-            Some("Installing the update…")
-        );
+        assert_eq!(status_text(&ready()), "Restart to update");
+        assert_eq!(status_text(&Status::Installing), "Installing the update…");
     }
 
     fn ready() -> Status {

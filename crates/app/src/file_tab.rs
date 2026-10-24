@@ -6,7 +6,7 @@ use std::path::Path;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::DropdownMenu as _;
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::TableState;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
@@ -24,6 +24,7 @@ use crate::context_menus::item;
 use crate::file_jobs::{self, LoadState};
 use crate::profile_view::ProfilePanel;
 use crate::results::ResultsDelegate;
+use crate::results_pane::ResultsPane;
 use crate::theme::{self, color};
 use crate::ui::{format_bytes, thousands};
 
@@ -70,6 +71,7 @@ pub struct FileTab {
     draft_limit: usize,
     null_literal: Entity<InputState>,
     table: Entity<TableState<ResultsDelegate>>,
+    results: Entity<ResultsPane>,
     profile: Entity<ProfilePanel>,
     preview: Option<PreviewResult>,
     error: Option<String>,
@@ -83,7 +85,10 @@ pub struct FileTab {
 
 impl FileTab {
     pub fn new(source: FileSource, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let table = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
+        });
+        let results = cx.new(|cx| ResultsPane::new(table.clone(), cx));
         let profile = cx.new(|_| ProfilePanel::default());
         let null_literal = cx.new(|cx| {
             InputState::new(window, cx)
@@ -97,6 +102,7 @@ impl FileTab {
             draft_limit: PreviewRequest::default().row_limit,
             null_literal,
             table,
+            results,
             profile,
             preview: None,
             error: None,
@@ -430,42 +436,37 @@ impl Render for FileTab {
                 )
                 .into_any_element();
         }
-        content = content.child(
-            div().flex_1().min_h_0().child(match self.view {
-                View::Data => DataTable::new(&self.table)
-                    .stripe(true)
-                    .bordered(false)
-                    .into_any_element(),
-                View::Profile => self.profile.clone().into_any_element(),
-                View::Schema => {
-                    let mut schema = v_flex()
-                        .id("file-schema-list")
-                        .overflow_y_scroll()
-                        .p_4()
-                        .gap_2();
-                    if let Some(preview) = &self.preview {
-                        for column in &preview.schema {
-                            schema = schema.child(
-                                h_flex().gap_4().child(column.name.clone()).child(format!(
-                                    "{}{}",
-                                    column.native_type,
-                                    if column.inferred { " · inferred" } else { "" }
-                                )),
-                            );
-                        }
-                        for warning in &preview.warnings {
-                            schema = schema.child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(color(theme::TEXT_TERTIARY))
-                                    .child(warning.clone()),
-                            );
-                        }
+        content = content.child(div().flex_1().min_h_0().child(match self.view {
+            View::Data => self.results.clone().into_any_element(),
+            View::Profile => self.profile.clone().into_any_element(),
+            View::Schema => {
+                let mut schema = v_flex()
+                    .id("file-schema-list")
+                    .overflow_y_scroll()
+                    .p_4()
+                    .gap_2();
+                if let Some(preview) = &self.preview {
+                    for column in &preview.schema {
+                        schema = schema.child(h_flex().gap_4().child(column.name.clone()).child(
+                            format!(
+                                "{}{}",
+                                column.native_type,
+                                if column.inferred { " · inferred" } else { "" }
+                            ),
+                        ));
                     }
-                    schema.into_any_element()
+                    for warning in &preview.warnings {
+                        schema = schema.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(color(theme::TEXT_TERTIARY))
+                                .child(warning.clone()),
+                        );
+                    }
                 }
-            }),
-        );
+                schema.into_any_element()
+            }
+        }));
         content.into_any_element()
     }
 }

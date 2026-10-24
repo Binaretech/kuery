@@ -20,11 +20,16 @@ use crate::theme;
 /// Items a tab adds to a row's context menu, above the copy items.
 pub type RowMenu = Rc<dyn Fn(PopupMenu, usize, &App) -> PopupMenu>;
 
+/// Characters a cell shows in the grid; the inspector shows the whole value.
+const CELL_PREVIEW: usize = 200;
+
 #[derive(Default)]
 pub struct ResultsDelegate {
     set: ResultSet,
     columns: Vec<Column>,
     running: bool,
+    /// Counts the results shown, so a view can tell they were replaced.
+    generation: u64,
     /// The cell last right-clicked, for the row's context menu.
     menu_cell: Option<(usize, usize)>,
     row_menu: Option<RowMenu>,
@@ -42,9 +47,19 @@ impl ResultsDelegate {
     pub fn start(&mut self) {
         *self = Self {
             running: true,
+            generation: self.generation + 1,
             row_menu: self.row_menu.take(),
             ..Self::default()
         };
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether rows may still arrive.
+    pub fn is_running(&self) -> bool {
+        self.running
     }
 
     pub fn set_row_menu(&mut self, menu: Option<RowMenu>) {
@@ -150,7 +165,7 @@ impl TableDelegate for ResultsDelegate {
             Some(Some(text)) => div()
                 .font_family(mono)
                 .truncate()
-                .child(SharedString::from(text.to_owned()))
+                .child(cell_preview(text))
                 .into_any_element(),
             Some(None) => div()
                 .font_family(mono)
@@ -222,9 +237,33 @@ impl TableDelegate for ResultsDelegate {
     }
 }
 
+/// The start of `text` on one line: a cell is drawn on every frame it is
+/// visible, so a value of megabytes must not be copied whole each time.
+fn cell_preview(text: &str) -> SharedString {
+    let mut preview: String = text
+        .chars()
+        .take(CELL_PREVIEW)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().nth(CELL_PREVIEW).is_some() {
+        preview.push('…');
+    }
+    preview.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_show_the_start_of_long_values_on_one_line() {
+        assert_eq!(cell_preview("a\tb\nc").as_ref(), "a b c");
+        let long = "é".repeat(CELL_PREVIEW + 5);
+        let preview = cell_preview(&long);
+        assert_eq!(preview.chars().count(), CELL_PREVIEW + 1);
+        assert!(preview.ends_with('…'));
+        assert_eq!(cell_preview(&"x".repeat(CELL_PREVIEW)).len(), CELL_PREVIEW);
+    }
 
     #[test]
     fn reloaded_preview_replaces_old_columns_rows_and_types() {
