@@ -44,6 +44,7 @@ mod redis_console;
 mod redis_key_tab;
 mod redis_write;
 mod results;
+mod results_pane;
 mod secrets;
 mod settings;
 mod shell_command;

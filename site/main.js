@@ -189,11 +189,23 @@
   platButtons.forEach((b, i) => b.addEventListener('click', () => showPlat(i)));
 
   const ua = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
+  // Phones and tablets get no desktop build; iPadOS says it is a Mac.
+  const mobile = (navigator.userAgentData && navigator.userAgentData.mobile)
+    || /android|iphone|ipad|ipod/i.test(navigator.userAgent)
+    || (/mac/i.test(ua) && navigator.maxTouchPoints > 1);
   let os = 'macOS', plat = 0;
   if (/win/i.test(ua)) { os = 'Windows'; plat = 1; }
-  else if (/linux|x11/i.test(ua) && !/android/i.test(navigator.userAgent)) { os = 'Linux'; plat = 2; }
+  else if (/linux|x11/i.test(ua)) { os = 'Linux'; plat = 2; }
   $$('[data-os-name]').forEach((el) => { el.textContent = os; });
-  if (plat !== 0) {
+  // The hero button downloads this platform's build; elsewhere it leads to all of them.
+  const dl = $('[data-dl]');
+  const file = panels[plat] && $('.d-btn', panels[plat]);
+  if (dl && mobile) {
+    dl.lastElementChild.textContent = 'Download';
+  } else if (dl && file) {
+    dl.href = file.href;
+  }
+  if (plat !== 0 && !mobile) {
     showPlat(plat);
     $$('kbd[data-pc]').forEach((k) => { k.textContent = k.dataset.pc; });
     keyButtons.forEach((x) => { const on = x.dataset.keys === 'pc'; x.classList.toggle('on', on); x.setAttribute('aria-pressed', String(on)); });

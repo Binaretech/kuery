@@ -51,7 +51,7 @@ Windows and Linux.
 | **Projects & navigation** | Keep connection definitions, saved SQL and diagram positions in a folder-based project. Use recent projects, the command palette, contextual menus, history and configurable shortcuts. |
 | **Connectivity** | Use driver-specific TLS settings and OpenSSH tunnels. Connection passwords are stored in the operating system's credential store rather than the project file. |
 | **Result workflows** | Copy cells and rows as text, TSV or JSON. Export database SQL query results to CSV, TSV or JSON. File SQL results currently use the shared grid's copy menus. |
-| **Updates** | Release builds check for a newer release at startup and every six hours, download and verify it in the background, and offer to restart into it. Check by hand with **Check for Updates…**; turn the automatic check off with **Toggle Automatic Update Checks**. |
+| **Updates** | Release builds check for a newer release at startup and every six hours, download and verify it in the background, and offer to restart into it. The status bar's right corner shows the running version (`Version: 0.3.2`) or the update's progress: `Checking for updates`, `New update available`, `Downloading updates`, then `Restart to update` (click it to restart). Check by hand with **Check for Updates…**; turn the automatic check off with **Toggle Automatic Update Checks**. |
 
 ## Screenshots
 

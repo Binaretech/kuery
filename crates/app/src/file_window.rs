@@ -287,7 +287,7 @@ impl FileWindow {
             .text_color(color(theme::TEXT_TERTIARY))
             .child(div().flex_1().min_w_0().child("Data files · read only"))
             .children(status)
-            .children(crate::updates::status_item(cx))
+            .child(crate::updates::status_item(cx))
     }
 }
 
