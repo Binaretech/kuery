@@ -35,6 +35,26 @@ pub struct Source {
     pub columns: Vec<ColumnSchema>,
 }
 
+/// What Query files queries: every file with a preview, the one at `active`
+/// first.
+pub fn query_sources<'a>(
+    files: impl IntoIterator<Item = &'a crate::file_tab::FileTab>,
+    active: Option<&std::path::Path>,
+) -> Vec<Source> {
+    let mut sources = files
+        .into_iter()
+        .filter_map(|file| file.sql_source())
+        .collect::<Vec<_>>();
+    if let Some(index) = active.and_then(|active| {
+        sources
+            .iter()
+            .position(|(source, _, _)| source.path == active)
+    }) {
+        sources.rotate_left(index);
+    }
+    name_sources(sources)
+}
+
 /// Names are independent of SQL syntax/filenames, and collisions are explicit.
 pub fn name_sources(
     sources: Vec<(

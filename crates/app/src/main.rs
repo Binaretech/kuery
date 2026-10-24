@@ -1,7 +1,8 @@
 //! Kuery: a desktop database manager built with gpui.
 //!
-//! `kuery [folder]` opens the project in `folder` (creating its `.kuery/`
-//! if needed); without an argument the welcome window lists recent projects.
+//! `kuery [PATH...]` opens each folder as a project (creating its `.kuery/`
+//! if needed) and each data file in a tab; without a path the welcome window
+//! lists recent projects. `kuery --help` lists the options.
 
 // Release builds on Windows open no console window next to the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -12,6 +13,7 @@ mod app_icon;
 mod assets;
 mod audit;
 mod chrome;
+mod cli;
 mod commands;
 mod completion;
 mod connection;
@@ -24,8 +26,10 @@ mod explorer;
 mod file_jobs;
 mod file_query_tab;
 mod file_tab;
+mod file_window;
 mod grid;
 mod history;
+mod instance;
 mod keymap;
 mod menus;
 mod palette;
@@ -43,6 +47,7 @@ mod results;
 mod results_pane;
 mod secrets;
 mod settings;
+mod shell_command;
 mod table_tab;
 mod theme;
 mod tunnel;
@@ -52,15 +57,46 @@ mod welcome;
 mod workspace;
 mod write_mode;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use cli::Command;
+use instance::{HandOff, Listener};
+
 fn main() {
+    attach_console();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let targets = match cli::parse(std::env::args_os().skip(1), &cwd) {
+        Ok(Command::Open(targets)) => targets,
+        Ok(Command::Help) => {
+            print!("{}", cli::help());
+            return;
+        }
+        Ok(Command::Version) => {
+            println!("{}", cli::version());
+            return;
+        }
+        Err(error) => {
+            eprintln!("kuery: {error}");
+            std::process::exit(1);
+        }
+    };
+    let address = instance::address();
+    match instance::hand_off(&address, &targets) {
+        Ok(HandOff::Delivered) => return,
+        Ok(HandOff::NotRunning) => {}
+        // Hung, or from another version: start a Kuery of our own.
+        Err(error) => eprintln!("kuery: the running Kuery did not answer: {error}"),
+    }
+    if detach() {
+        return;
+    }
+    let listener = Listener::bind(&address)
+        .map_err(|error| eprintln!("kuery: other kuery commands will start their own app: {error}"))
+        .ok();
     paths::migrate_legacy_config_dir();
     log_panics();
     drivers::install_tls_provider();
     let redis = Arc::new(kuery_redis::Engine::new().expect("start the Redis runtime"));
-    let folder = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
         .with_assets(assets::AppAssets)
@@ -75,6 +111,7 @@ fn main() {
             // After gpui_kit::init, so the keymap can keep its bindings.
             keymap::init(cx);
             updates::init(cx);
+            shell_command::init(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -82,17 +119,73 @@ fn main() {
             })
             .detach();
 
-            let opened = match &folder {
-                Some(folder) => app::open_project(folder, cx)
-                    .map_err(|error| eprintln!("kuery: {error}"))
-                    .is_ok(),
-                None => false,
-            };
-            if !opened {
-                app::open_welcome(cx);
+            if let Some(listener) = listener {
+                let (sent, received) = async_channel::unbounded();
+                listener.serve(move |targets| {
+                    let _ = sent.try_send(targets);
+                });
+                cx.spawn(async move |cx| {
+                    while let Ok(targets) = received.recv().await {
+                        cx.update(|cx| open(&targets, cx));
+                    }
+                })
+                .detach();
             }
-            cx.activate(true);
+            open(&targets, cx);
         });
+}
+
+/// Opens what a `kuery` command names, or the welcome window when nothing
+/// opened and no window is left, shows why any path failed, and brings
+/// Kuery to the front.
+fn open(targets: &[cli::Target], cx: &mut gpui_kit::App) {
+    let opened = app::open_targets(targets, cx);
+    if !opened.any && cx.windows().is_empty() {
+        app::open_welcome(cx);
+    }
+    app::report_open_errors(&opened.errors, cx);
+    cx.activate(true);
+}
+
+/// A Windows release build has no console of its own (it would open one
+/// next to the app), so it prints into the terminal that started it, if any.
+fn attach_console() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    // SAFETY: no arguments to uphold; it fails harmlessly without a parent
+    // console.
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// Started from a terminal, a release build runs the app in a process of
+/// its own and returns the prompt, like the command a running Kuery answers.
+/// Returns whether that process took over.
+fn detach() -> bool {
+    use std::io::IsTerminal as _;
+
+    const FOREGROUND: &str = "KUERY_FOREGROUND";
+    if cfg!(debug_assertions)
+        || std::env::var_os(FOREGROUND).is_some()
+        || !std::io::stdout().is_terminal()
+    {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(FOREGROUND, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Out of the terminal's process group, so closing it leaves Kuery open.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn().is_ok()
 }
 
 /// Appends every panic, with its backtrace, to `panic.log` in the config

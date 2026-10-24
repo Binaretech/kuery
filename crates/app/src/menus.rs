@@ -49,6 +49,11 @@ pub fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("Kuery").items([
             MenuItem::action("Check for Updates…", CheckForUpdates),
+            #[cfg(target_os = "macos")]
+            MenuItem::action(
+                "Install kuery Command",
+                crate::shell_command::InstallShellCommand,
+            ),
             MenuItem::separator(),
             MenuItem::action("Command Palette…", OpenCommandPalette),
             MenuItem::separator(),

@@ -22,6 +22,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 # Headless windows for the sidebar bench; gpui-kit's own test-support clashes with the lock.
@@ -31,6 +32,9 @@ gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

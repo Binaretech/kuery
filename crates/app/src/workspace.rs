@@ -36,7 +36,7 @@ use crate::context_menus::{copy, item, reveal};
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::file_query_tab::{self, FileQueryTab};
-use crate::file_tab::FileTab;
+use crate::file_tab::{FileTab, data_file_error, no_files_to_query};
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
@@ -307,32 +307,21 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut sources = self
-            .tabs
-            .iter()
-            .filter_map(|tab| match tab {
-                Tab::File(file) => file.read(cx).sql_source(),
+        let active = match self.tabs.get(self.active) {
+            Some(Tab::File(active)) => Some(active.read(cx).path().to_path_buf()),
+            _ => None,
+        };
+        let sources = file_query_tab::query_sources(
+            self.tabs.iter().filter_map(|tab| match tab {
+                Tab::File(file) => Some(file.read(cx)),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
+            }),
+            active.as_deref(),
+        );
         if sources.is_empty() {
-            drop(window.prompt(
-                PromptLevel::Info,
-                "Open a data file first",
-                Some("Wait for a file preview to finish, then choose Query files."),
-                &["OK"],
-                cx,
-            ));
+            no_files_to_query(window, cx);
             return;
         }
-        if let Some(Tab::File(active)) = self.tabs.get(self.active)
-            && let Some(index) = sources
-                .iter()
-                .position(|(source, _, _)| source.path == active.read(cx).path())
-        {
-            sources.rotate_left(index);
-        }
-        let sources = file_query_tab::name_sources(sources);
         let query = cx.new(|cx| FileQueryTab::new(sources, window, cx));
         cx.observe(&query, |_, _, cx| cx.notify()).detach();
         self.tabs.push(Tab::FileQuery(query));
@@ -350,16 +339,20 @@ impl WorkspaceView {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update_in(cx, |this, window, cx| this.open_data_path(path, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the data file at `path` in a tab, or shows its tab if it is
+    /// already open.
+    pub fn open_data_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             let source = cx
-                .background_spawn(async move {
-                    let mut source =
-                        kuery_files::FileSource::new(path).map_err(|e| e.to_string())?;
-                    source.path = source.path.canonicalize().map_err(|e| e.to_string())?;
-                    Ok::<_, String>(source)
-                })
+                .background_spawn(async move { crate::file_tab::load_source(path) })
                 .await;
             this.update_in(cx, |this, window, cx| match source {
                 Ok(source) => {
@@ -374,13 +367,7 @@ impl WorkspaceView {
                     });
                     this.activate(index, window, cx);
                 }
-                Err(error) => drop(window.prompt(
-                    PromptLevel::Critical,
-                    "Could not open data file",
-                    Some(&error),
-                    &["OK"],
-                    cx,
-                )),
+                Err(error) => data_file_error(&error, window, cx),
             })
             .ok();
         })

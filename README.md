@@ -131,6 +131,28 @@ also be turned off in `settings.toml` in the user config directory:
 check_automatically = false
 ```
 
+### Open files and folders from the terminal
+
+```bash
+kuery ~/projects/shop             # open a folder as a project
+kuery orders.csv events.parquet   # open data files in tabs
+kuery --help
+```
+
+`kuery [PATH...]` opens each folder as a project and each CSV, TSV, JSON,
+JSONL/NDJSON or Parquet file in a read-only tab. A data file goes to the
+project the same command opened, else the active project window; with no
+project window open it gets a window of its own. When Kuery is already
+running, the command hands the paths to it and returns; otherwise it starts
+Kuery. A missing path or an unsupported file prints an error and exits with
+status 1.
+
+| Platform | Getting `kuery` on your PATH |
+| --- | --- |
+| **macOS** | Run **Install kuery Command** from the Kuery menu or the command palette. It links `/usr/local/bin/kuery` to the app, asking for an administrator password if that folder needs one. Move Kuery to Applications first. |
+| **Windows** | Add the folder holding `kuery.exe` to `PATH`. |
+| **Linux** | Put the extracted `kuery` in a folder on `PATH`, such as `~/.local/bin`. |
+
 ### Run from source
 
 Install the toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml) and
@@ -143,11 +165,14 @@ cargo run --locked -p kuery
 ```
 
 The welcome window lets you open a folder or create a project. To open a
-project directly:
+project or data file directly:
 
 ```bash
 cargo run --locked -p kuery -- /path/to/project
 ```
+
+A development build hands paths only to another development build, never to
+an installed Kuery.
 
 On Linux, the current CI build installs:
 
