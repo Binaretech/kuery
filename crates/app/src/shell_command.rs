@@ -9,6 +9,7 @@ use gpui_kit::{App, actions};
 actions!(kuery, [InstallShellCommand]);
 
 /// Where the command goes; on the PATH of every macOS shell.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const LINK: &str = "/usr/local/bin/kuery";
 
 pub fn init(cx: &mut App) {
