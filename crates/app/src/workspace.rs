@@ -401,20 +401,27 @@ impl WorkspaceView {
 
     /// What reopens this window's tabs after a restart.
     pub fn session(&self, cx: &App) -> WorkspaceState {
-        let tabs: Vec<(usize, TabState)> = self
+        let open = self
             .tabs
             .iter()
-            .enumerate()
-            .filter_map(|(index, tab)| Some((index, tab.session(cx)?)))
+            .map(|tab| {
+                (
+                    self.restored_places.get(&tab.id()).copied(),
+                    tab.session(cx),
+                )
+            })
             .collect();
+        let (tabs, active) = session::tabs_to_save(
+            open,
+            self.active,
+            self.restoring.clone(),
+            self.restore_active,
+        );
         let explorer = self.explorer.read(cx);
         WorkspaceState {
             connections: explorer.open_connections(),
-            active: tabs
-                .iter()
-                .position(|(index, _)| *index == self.active)
-                .unwrap_or(0),
-            tabs: tabs.into_iter().map(|(_, tab)| tab).collect(),
+            active,
+            tabs,
             queries_opened: self.queries_opened,
             sidebar_visible: self.sidebar_visible,
             sidebar: explorer.mode().into(),

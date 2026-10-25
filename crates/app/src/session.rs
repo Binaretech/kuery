@@ -280,6 +280,37 @@ pub fn restored_position(places: &[Option<usize>], place: usize) -> usize {
         .unwrap_or(places.len())
 }
 
+/// The tabs to save and the active one's index. Tabs still waiting for
+/// their connection keep their place, so restarting again does not lose them.
+pub fn tabs_to_save(
+    open: Vec<(Option<usize>, Option<TabState>)>,
+    active: usize,
+    mut waiting: Vec<(usize, TabState)>,
+    waiting_active: Option<usize>,
+) -> (Vec<TabState>, usize) {
+    let waiting_active =
+        waiting_active.filter(|place| waiting.iter().any(|(other, _)| other == place));
+    let mut tabs: Vec<(Option<usize>, Option<TabState>, bool)> = open
+        .into_iter()
+        .enumerate()
+        .map(|(index, (place, tab))| (place, tab, waiting_active.is_none() && index == active))
+        .collect();
+    waiting.sort_by_key(|(place, _)| *place);
+    for (place, tab) in waiting {
+        let places: Vec<Option<usize>> = tabs.iter().map(|(place, ..)| *place).collect();
+        tabs.insert(
+            restored_position(&places, place),
+            (Some(place), Some(tab), waiting_active == Some(place)),
+        );
+    }
+    let tabs: Vec<(TabState, bool)> = tabs
+        .into_iter()
+        .filter_map(|(_, tab, active)| Some((tab?, active)))
+        .collect();
+    let active = tabs.iter().position(|(_, active)| *active).unwrap_or(0);
+    (tabs.into_iter().map(|(tab, _)| tab).collect(), active)
+}
+
 fn path() -> PathBuf {
     crate::paths::config_dir().join("session.json")
 }
@@ -430,5 +461,49 @@ mod tests {
     fn tabs_opened_since_stay_after_the_restored_ones() {
         assert_eq!(restored_position(&[Some(0), None], 1), 1);
         assert_eq!(restored_position(&[None], 0), 0);
+    }
+
+    fn activity(connection: &str) -> TabState {
+        TabState::Activity {
+            connection: connection.into(),
+        }
+    }
+
+    #[test]
+    fn tabs_waiting_for_their_connection_are_saved_in_their_place() {
+        // Saved as a b c: b still waits, d was opened since.
+        let open = vec![
+            (Some(0), Some(activity("a"))),
+            (Some(2), Some(activity("c"))),
+            (None, Some(activity("d"))),
+        ];
+        let waiting = vec![(1, activity("b"))];
+        assert_eq!(
+            tabs_to_save(open, 1, waiting, None),
+            (
+                vec![activity("a"), activity("b"), activity("c"), activity("d")],
+                2
+            )
+        );
+    }
+
+    #[test]
+    fn the_active_tab_stays_active_while_it_waits() {
+        let open = vec![(Some(1), Some(activity("b")))];
+        let waiting = vec![(2, activity("c")), (0, activity("a"))];
+        assert_eq!(
+            tabs_to_save(open, 0, waiting, Some(2)),
+            (vec![activity("a"), activity("b"), activity("c")], 2)
+        );
+    }
+
+    #[test]
+    fn tabs_that_do_not_come_back_are_left_out() {
+        // A results tab before the active one.
+        let open = vec![(None, None), (None, Some(activity("a")))];
+        assert_eq!(
+            tabs_to_save(open, 1, Vec::new(), None),
+            (vec![activity("a")], 0)
+        );
     }
 }
