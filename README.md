@@ -310,7 +310,9 @@ and the shared conformance tests.
 
 ## Development and contributions
 
-Start with the [user and development guide](docs/guide.md). For a source change,
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request: first-time
+contributors sign the [Contributor License Agreement](CLA.md). Start with the
+[user and development guide](docs/guide.md). For a source change,
 run the checks appropriate to its scope; the repository's standard checks are:
 
 ```bash
