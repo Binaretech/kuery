@@ -280,13 +280,8 @@ pub fn restored_position(places: &[Option<usize>], place: usize) -> usize {
         .unwrap_or(places.len())
 }
 
-/// The tabs to save, in order, and the index of the active one. `open` has
-/// each open tab's place in the restored session (`None` for one opened
-/// since) and what reopens it (`None` for one that does not come back);
-/// `waiting` has the tabs from the restored session still waiting for their
-/// connection, and `waiting_active` the place of the active one if it is
-/// still among them. The waiting tabs go where they will come back, so
-/// restarting again before their connection opens does not lose them.
+/// The tabs to save and the active one's index. Tabs still waiting for
+/// their connection keep their place, so restarting again does not lose them.
 pub fn tabs_to_save(
     open: Vec<(Option<usize>, Option<TabState>)>,
     active: usize,
@@ -295,8 +290,6 @@ pub fn tabs_to_save(
 ) -> (Vec<TabState>, usize) {
     let waiting_active =
         waiting_active.filter(|place| waiting.iter().any(|(other, _)| other == place));
-    // Each tab's place in the restored session, what reopens it, and
-    // whether it is the active one.
     let mut tabs: Vec<(Option<usize>, Option<TabState>, bool)> = open
         .into_iter()
         .enumerate()
@@ -478,8 +471,7 @@ mod tests {
 
     #[test]
     fn tabs_waiting_for_their_connection_are_saved_in_their_place() {
-        // Saved as a b c; a and c came back, b's connection is still
-        // opening, and d was opened since.
+        // Saved as a b c: b still waits, d was opened since.
         let open = vec![
             (Some(0), Some(activity("a"))),
             (Some(2), Some(activity("c"))),
