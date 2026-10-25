@@ -2,6 +2,7 @@
 name = "kuery-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 # The tests every SQL driver runs against its database (see `conformance`).

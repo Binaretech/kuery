@@ -310,7 +310,9 @@ and the shared conformance tests.
 
 ## Development and contributions
 
-Start with the [user and development guide](docs/guide.md). For a source change,
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request: first-time
+contributors sign the [Contributor License Agreement](CLA.md). Start with the
+[user and development guide](docs/guide.md). For a source change,
 run the checks appropriate to its scope; the repository's standard checks are:
 
 ```bash
@@ -382,6 +384,19 @@ Then open `http://localhost:8000/kuery/`.
 Include the platform, build/commit, steps to reproduce and a small synthetic
 dataset or query where possible. Remove credentials and private data from
 screenshots and sample files.
+
+## License
+
+Copyright (C) 2026 Ángel Afonso, Hector Zurga and the Kuery contributors.
+
+Kuery is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License, version 3](LICENSE) (GPL-3.0-only).
+It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the license for details.
+
+The license applies to every version of Kuery since the first commit,
+including source and releases published before this file was added.
 
 ## Branding and acknowledgements
 
