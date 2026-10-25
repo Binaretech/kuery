@@ -383,6 +383,19 @@ Include the platform, build/commit, steps to reproduce and a small synthetic
 dataset or query where possible. Remove credentials and private data from
 screenshots and sample files.
 
+## License
+
+Copyright (C) 2026 Ángel Afonso, Hector Zurga and the Kuery contributors.
+
+Kuery is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License, version 3](LICENSE) (GPL-3.0-only).
+It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the license for details.
+
+The license applies to every version of Kuery since the first commit,
+including source and releases published before this file was added.
+
 ## Branding and acknowledgements
 
 The logo above is the same [Kuery application icon](crates/app/assets/branding/kuery.png)

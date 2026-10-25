@@ -99,7 +99,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p "dist/$ARCHIVE"
-          cp target/${{ matrix.target }}/release/kuery README.md "dist/$ARCHIVE/"
+          cp target/${{ matrix.target }}/release/kuery README.md LICENSE "dist/$ARCHIVE/"
           tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
 
       # The macOS builds only compile here; the macos-universal job merges
@@ -124,7 +124,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force "dist/$env:ARCHIVE" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/kuery.exe", README.md "dist/$env:ARCHIVE/"
+          Copy-Item "target/${{ matrix.target }}/release/kuery.exe", README.md, LICENSE "dist/$env:ARCHIVE/"
           Compress-Archive -Path "dist/$env:ARCHIVE" -DestinationPath "dist/$env:ARCHIVE.zip"
 
       - uses: actions/upload-artifact@v4
@@ -176,6 +176,7 @@ jobs:
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp kuery "$app/Contents/MacOS/kuery"
           cp crates/app/assets/branding/kuery.icns "$app/Contents/Resources/kuery.icns"
+          cp LICENSE "$app/Contents/Resources/LICENSE"
           cat > "$app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -195,7 +196,7 @@ jobs:
           </plist>
           EOF
           plutil -lint "$app/Contents/Info.plist"
-          cp README.md "dist/$ARCHIVE/"
+          cp README.md LICENSE "dist/$ARCHIVE/"
 
       # With the Apple secrets set, the app is signed with the Developer ID
       # certificate, notarized and stapled, so Gatekeeper opens it without a
