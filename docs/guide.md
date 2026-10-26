@@ -842,6 +842,7 @@ PR workflow by hand from `main` (`.github/workflows/release-pr.yml`) opens a
 release pull request, or updates the open one, that raises the version from
 the conventional commits since the last tag (`feat:` minor, other commits
 patch, `!` or `BREAKING CHANGE` major, or minor until 1.0) and adds them to `CHANGELOG.md`.
-Merging it releases that version. If a release fails after its tag was
+Merging it releases that version; wait for that Release run to tag it before
+running Release PR again, or it proposes the same version. If a release fails after its tag was
 pushed, later pushes skip it (the tag exists): re-run the failed jobs, or run
 the Release workflow by hand from the tag.
