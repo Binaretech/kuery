@@ -25,7 +25,7 @@ pub fn statements_in(dialect: &Dialect, sql: &str) -> Option<Vec<Range<usize>>> 
     let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
-    let offsets = Offsets::new(sql);
+    let mut offsets = Offsets::new(sql);
     let mut ranges = Vec::new();
     // Start of the current statement (its first comment or token) and
     // whether it has anything besides comments.
@@ -119,6 +119,9 @@ pub fn statement_at_in(dialect: &Dialect, sql: &str, offset: usize) -> Option<Ra
 pub(crate) struct Offsets<'a> {
     sql: &'a str,
     line_starts: Vec<usize>,
+    /// The last position turned (line, column, byte). Tokens come in order,
+    /// so the next one is counted from here, not from the start of the line.
+    last: (usize, usize, usize),
 }
 
 impl<'a> Offsets<'a> {
@@ -126,21 +129,31 @@ impl<'a> Offsets<'a> {
         let line_starts = std::iter::once(0)
             .chain(sql.match_indices('\n').map(|(index, _)| index + 1))
             .collect();
-        Self { sql, line_starts }
+        Self {
+            sql,
+            line_starts,
+            last: (0, 0, 0),
+        }
     }
 
-    pub(crate) fn of(&self, location: Location) -> usize {
-        let Some(&line_start) = self
-            .line_starts
-            .get((location.line as usize).saturating_sub(1))
-        else {
+    pub(crate) fn of(&mut self, location: Location) -> usize {
+        let line = (location.line as usize).saturating_sub(1);
+        let Some(&line_start) = self.line_starts.get(line) else {
             return self.sql.len();
         };
         let column = (location.column as usize).saturating_sub(1);
-        self.sql[line_start..]
+        let (from_column, from) = match self.last {
+            (last_line, last_column, byte) if last_line == line && last_column <= column => {
+                (last_column, byte)
+            }
+            _ => (0, line_start),
+        };
+        let byte = self.sql[from..]
             .char_indices()
-            .nth(column)
-            .map_or(self.sql.len(), |(index, _)| line_start + index)
+            .nth(column - from_column)
+            .map_or(self.sql.len(), |(index, _)| from + index);
+        self.last = (line, column, byte);
+        byte
     }
 }
 
@@ -194,6 +207,26 @@ mod tests {
     fn multibyte_text_keeps_byte_offsets() {
         let sql = "select 'ñandú';\nselect 'été'";
         assert_eq!(texts(sql), ["select 'ñandú'", "select 'été'"]);
+    }
+
+    #[test]
+    fn multibyte_text_on_one_line_keeps_byte_offsets() {
+        let sql = "select 'ñandú'; select 'été', 'ü'; select 1";
+        assert_eq!(
+            texts(sql),
+            ["select 'ñandú'", "select 'été', 'ü'", "select 1"]
+        );
+    }
+
+    #[test]
+    fn a_long_line_splits_quickly() {
+        // A dump's one-line insert: about 30 KB and 12 000 tokens.
+        let values = vec!["(1, 'ñ')"; 3_000].join(",");
+        let sql = format!("insert into t values {values}; select 1");
+        let started = std::time::Instant::now();
+        assert_eq!(statements(&sql).unwrap().len(), 2);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
     }
 
     #[test]

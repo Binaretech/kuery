@@ -41,7 +41,7 @@ fn protect_dollar_quotes(dialect: &Dialect, sql: &str) -> Option<(String, Vec<St
     let tokens = Tokenizer::new(&*dialect.parser(), sql)
         .tokenize_with_location()
         .ok()?;
-    let offsets = Offsets::new(sql);
+    let mut offsets = Offsets::new(sql);
     let (mut out, mut bodies, mut copied) = (String::new(), Vec::new(), 0);
     for token in &tokens {
         if let Token::DollarQuotedString(_) = token.token {
