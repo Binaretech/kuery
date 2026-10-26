@@ -175,6 +175,7 @@ pub fn applies_row_changes_checking_each_one(fixture: &Fixture) {
         table: scratch.table(fixture),
         columns: vec!["id".into(), "label".into(), "qty".into()],
         primary_key: vec!["id".into()],
+        binary_columns: Vec::new(),
         dialect: writer.dialect(),
     };
     let key = |id: &str| {

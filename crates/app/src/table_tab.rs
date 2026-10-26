@@ -310,11 +310,23 @@ impl TableTab {
 
     fn edit_target(&self) -> Option<EditTarget> {
         let definition = self.definition()?;
+        let dialect = self.db.session.dialect();
         Some(EditTarget {
             table: self.info.table.clone(),
             columns: definition.columns.iter().map(|c| c.name.clone()).collect(),
             primary_key: definition.primary_key(),
-            dialect: self.db.session.dialect(),
+            binary_columns: definition
+                .columns
+                .iter()
+                .filter(|c| {
+                    dialect
+                        .binary
+                        .as_ref()
+                        .is_some_and(|binary| (binary.is_type)(&c.data_type))
+                })
+                .map(|c| c.name.clone())
+                .collect(),
+            dialect,
         })
     }
 

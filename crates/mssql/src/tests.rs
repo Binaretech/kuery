@@ -980,6 +980,7 @@ fn a_column_named_with_a_bracket_round_trips_through_edits() {
         table: TableRef::new("dbo", table.clone()),
         columns: names.iter().map(|n| n.to_string()).collect(),
         primary_key: definition.primary_key(),
+        binary_columns: Vec::new(),
         dialect: &MSSQL,
     };
     let change = edit::build(

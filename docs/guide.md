@@ -343,7 +343,10 @@ start in; the sidebar lists every database the user can see as a schema
 (MySQL's own are left out), with tables, views, functions, procedures and
 triggers. Read-only queries run inside `START TRANSACTION READ ONLY`, and
 production connections also set `SESSION TRANSACTION READ ONLY`. Values show
-as the server writes them, so row edits compare against exactly that.
+as the server writes them, so row edits compare against exactly that. Bytes
+(`BINARY`, `VARBINARY`, the `BLOB`s, `BIT` and spatial columns) show as `0x`
+and uppercase hex, `0x` when empty; edit them in hex too (`0x0A1B`), and rows
+whose key is binary are found by it.
 
 MySQL commits `CREATE`, `ALTER`, `DROP`, `TRUNCATE` and a few others by
 itself, so nothing can undo them: write mode refuses them inside its
