@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/Binaretech/kuery/compare/v0.4.3...v0.4.4) - 2026-10-26
+
+### Fixed
+
+- *(app)* apply sidebar loads to their connection after a reorder
+- *(core)* refuse unreadable MySQL statements where commits are refused
+
+### Other
+
+- *(app)* trim a test helper's comment
+
 ## [0.4.3](https://github.com/Binaretech/kuery/compare/v0.4.2...v0.4.3) - 2026-10-26
 
 ### Fixed
