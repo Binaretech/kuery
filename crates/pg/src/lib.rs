@@ -26,7 +26,7 @@ use kuery_core::result_set::ColumnKind;
 pub use kuery_core::session::{Access, QueryError, RunOptions};
 use kuery_core::sql::{Dialect, POSTGRES};
 use tokio::runtime::Runtime;
-use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
+use tokio_postgres::{CancelToken, Client, SimpleQueryMessage, SimpleQueryRow};
 
 use crate::tls::{Connector, Target};
 
@@ -83,6 +83,18 @@ pub(crate) fn query_error(error: tokio_postgres::Error) -> QueryError {
             },
         },
         None => QueryError::Connection(error.to_string()),
+    }
+}
+
+/// Text that is not UTF-8, as a `SQL_ASCII` database can hold.
+fn not_utf8(row: &SimpleQueryRow, index: usize) -> QueryError {
+    QueryError::Database {
+        code: String::new(),
+        message: format!(
+            "Column \"{}\" has text that is not valid UTF-8, so it cannot be shown \
+             (the database may use the SQL_ASCII encoding)",
+            row.columns()[index].name()
+        ),
     }
 }
 
@@ -247,8 +259,9 @@ impl Adapter for Postgres {
                         rows.columns(names, kinds)?;
                     }
                     SimpleQueryMessage::Row(row) => {
-                        let values: Vec<Option<&str>> =
-                            (0..row.len()).map(|index| row.get(index)).collect();
+                        let values = (0..row.len())
+                            .map(|index| row.try_get(index).map_err(|_| not_utf8(&row, index)))
+                            .collect::<Result<Vec<Option<&str>>, _>>()?;
                         rows.row(&values)?;
                     }
                     SimpleQueryMessage::CommandComplete(count) if !returns_rows => {
