@@ -1,0 +1,36 @@
+name: Release PR
+
+# Run by hand from main (Actions → Release PR → Run workflow) when a release
+# is wanted: release-plz opens the release pull request, or updates the open
+# one, with the next version from the conventional commits since the last
+# `v*` tag and their CHANGELOG.md entries (see release-plz.toml). Merging it
+# makes the Release workflow tag that version and publish it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: Release pull request
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

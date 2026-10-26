@@ -4,10 +4,10 @@
 
 Kuery's version and changelog come from the commit messages, through
 [release-plz](https://release-plz.dev) (configured in `release-plz.toml`).
-There is no changeset file to add: every commit you make is the changeset. On
-each push to `main`, release-plz reads the commits since the last `vX.Y.Z` tag,
-picks the next version from their types, and adds their titles to
-`CHANGELOG.md` in a release pull request.
+There is no changeset file to add: every commit you make is the changeset.
+When a maintainer runs the Release PR workflow, release-plz reads the commits
+since the last `vX.Y.Z` tag, picks the next version from their types, and adds
+their titles to `CHANGELOG.md` in a release pull request.
 
 So every commit that changes behavior must be a
 [Conventional Commit](https://www.conventionalcommits.org):

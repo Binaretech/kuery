@@ -4,8 +4,8 @@ name: Release
 # merged release-plz pull request) tags that version, builds Kuery for every
 # platform and publishes the archives as a GitHub release. A `v*` tag pushed
 # by hand does the same for that tag. Running it by hand from a branch only
-# builds them and keeps the archives as workflow artifacts. Every push to
-# main also keeps the release pull request up to date (see release-plz.toml).
+# builds them and keeps the archives as workflow artifacts. The release pull
+# request comes from the Release PR workflow, run by hand.
 on:
   push:
     branches: [main]
@@ -409,26 +409,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
-
-  # Opens or updates the release pull request: the next version from the
-  # conventional commits since the last tag, and their CHANGELOG.md entries.
-  # After the tag, so a version just released is not proposed again.
-  release-pr:
-    name: Release pull request
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: version
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ github.token }}

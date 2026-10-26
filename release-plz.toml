@@ -1,7 +1,7 @@
-# release-plz keeps a release pull request open on main: it raises the
-# workspace version from the conventional commits since the last `v*` tag
-# and adds them to CHANGELOG.md. Merging it makes the Release workflow tag
-# that version and publish it.
+# release-plz opens the release pull request when the Release PR workflow is
+# run by hand: it raises the workspace version from the conventional commits
+# since the last `v*` tag and adds them to CHANGELOG.md. Merging it makes the
+# Release workflow tag that version and publish it.
 
 [workspace]
 # Kuery is not on crates.io: the last release is the latest `v*` tag.

@@ -352,13 +352,16 @@ file's contents). Keep a backup of it: without it, no update can be signed for
 the apps already installed.
 
 Releases are versioned from the commit messages, which follow
-[Conventional Commits](https://www.conventionalcommits.org). On every push to
-`main`, [release-plz](https://release-plz.dev) (configured in
-[`release-plz.toml`](release-plz.toml)) keeps a "chore: release X.Y.Z" pull
-request open: since the last `vX.Y.Z` tag, a `feat:` commit raises the minor
-version, `fix:` and the rest the patch, and a `!` or `BREAKING CHANGE` the
-major (the minor until 1.0); the pull request bumps `[workspace.package] version` in `Cargo.toml`
-and `Cargo.lock` and adds the commits to [`CHANGELOG.md`](CHANGELOG.md).
+[Conventional Commits](https://www.conventionalcommits.org). To release, run
+the [Release PR workflow](.github/workflows/release-pr.yml) from `main`
+(Actions → Release PR → Run workflow): [release-plz](https://release-plz.dev)
+(configured in [`release-plz.toml`](release-plz.toml)) opens a "chore: release
+X.Y.Z" pull request, or updates the open one; after a release, wait for its
+Release run to tag it first. Since the last `vX.Y.Z` tag, a `feat:` commit
+raises the minor version, `fix:` and the rest the patch, and a `!` or
+`BREAKING CHANGE` the major (the minor until 1.0); the pull request bumps
+`[workspace.package] version` in `Cargo.toml` and `Cargo.lock` and adds the
+commits to [`CHANGELOG.md`](CHANGELOG.md).
 Merging it makes the [Release workflow](.github/workflows/release.yml) tag
 `vX.Y.Z` and publish it; any version merged into `main` that has no tag yet is
 released the same way. A `v*` tag pushed by hand must match the `Cargo.toml`
