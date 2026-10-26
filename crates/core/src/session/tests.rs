@@ -9,7 +9,8 @@
 //! `select deadlock` fails the way a deadlock victim does on SQL Server (the
 //! server rolls back the whole transaction, so the next `rollback to` fails),
 //! and `select lost` the way a dropped connection does. `select panic` and
-//! `update panic` panic, like a driver with a bug.
+//! `update panic` panic, like a driver with a bug. A session opened with
+//! [`open_failing`] also fails the statements it names.
 
 use std::sync::Mutex;
 
@@ -19,7 +20,7 @@ use super::*;
 use crate::catalog::{CatalogColumn, ForeignKey, TableInfo, TableKind};
 use crate::diagram::OnDelete;
 use crate::edit::{self, EditTarget, KeyValue, RowChange};
-use crate::sql::{MYSQL, POSTGRES};
+use crate::sql::{MYSQL, POSTGRES, SQLITE};
 
 #[derive(Clone, Default)]
 struct Log(Arc<Mutex<Vec<String>>>);
@@ -36,6 +37,7 @@ struct Fake {
     stop: Arc<AtomicBool>,
     /// Why the next `rollback to` fails: the transaction is gone.
     gone: Option<QueryError>,
+    failing: &'static [&'static str],
 }
 
 impl Adapter for Fake {
@@ -49,6 +51,12 @@ impl Adapter for Fake {
 
     fn execute(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
         self.log.0.lock().unwrap().push(sql.to_string());
+        if self.failing.contains(&sql) {
+            return Err(QueryError::Database {
+                code: "42000".into(),
+                message: "failed on purpose".into(),
+            });
+        }
         let words: Vec<&str> = sql.split_whitespace().collect();
         match words.as_slice() {
             ["rollback", "to", ..] if self.gone.is_some() => Err(self.gone.clone().unwrap()),
@@ -185,6 +193,14 @@ impl Adapter for Fake {
 }
 
 fn open_with(dialect: &'static Dialect, access: Access) -> (Session, Log) {
+    open_failing(dialect, access, &[])
+}
+
+fn open_failing(
+    dialect: &'static Dialect,
+    access: Access,
+    failing: &'static [&'static str],
+) -> (Session, Log) {
     let log = Log::default();
     let opener_log = log.clone();
     let opener: Opener = Arc::new(move |_| {
@@ -193,6 +209,7 @@ fn open_with(dialect: &'static Dialect, access: Access) -> (Session, Log) {
             log: opener_log.clone(),
             stop: Arc::new(AtomicBool::new(false)),
             gone: None,
+            failing,
         }))
     });
     (block_on(Session::open(opener, access)).unwrap(), log)
@@ -264,6 +281,48 @@ fn reads_in_a_read_only_transaction_in_growing_batches() {
     );
     let set = block_on(session.fetch_all("select 3".into(), RunOptions::default())).unwrap();
     assert_eq!((set.rows(), set.kinds()), (3, &[ColumnKind::Integer][..]));
+}
+
+#[test]
+fn a_read_whose_setup_fails_ends_what_it_began() {
+    // Postgres: the transaction began, so it is rolled back, not left
+    // aborted for every later query.
+    let (session, log) = open_failing(&POSTGRES, Access::ReadOnly, &["select 1"]);
+    let outcome = block_on(session.fetch_all("select 2".into(), RunOptions::default()));
+    assert!(outcome.is_err());
+    assert_eq!(
+        log.take(),
+        ["begin transaction read only", "select 1", "rollback"]
+    );
+    // SQLite: query_only was turned on, so it is turned off again.
+    let (session, log) = open_failing(&SQLITE, Access::ReadWrite, &["begin"]);
+    let outcome = block_on(session.fetch_all("select 2".into(), RunOptions::default()));
+    assert!(outcome.is_err());
+    assert_eq!(
+        log.take(),
+        [
+            "pragma query_only = on",
+            "begin",
+            "rollback",
+            "pragma query_only = off"
+        ]
+    );
+}
+
+#[test]
+fn ending_a_read_runs_every_step_even_after_one_fails() {
+    let (session, log) = open_failing(&SQLITE, Access::ReadWrite, &["rollback"]);
+    block_on(session.fetch_all("select 2".into(), RunOptions::default())).unwrap();
+    assert_eq!(
+        log.take(),
+        [
+            "pragma query_only = on",
+            "begin",
+            "select 2",
+            "rollback",
+            "pragma query_only = off"
+        ]
+    );
 }
 
 #[test]
