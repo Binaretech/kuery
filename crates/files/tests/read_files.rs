@@ -2,7 +2,8 @@ use std::fs::{self, File};
 use std::path::Path;
 
 use kuery_core::compare::{self, CompareOptions, Comparison, Outcome};
-use kuery_core::result_set::ColumnKind;
+use kuery_core::export::{self, Format};
+use kuery_core::result_set::{BatchBuilder, ColumnKind, ResultSet};
 use kuery_core::stats::{self, Mode, Options, Summary};
 use kuery_files::{
     Error, FileDataset, FileFormat, FileSource, LimitReason, MAX_JSON_BYTES, MAX_PREVIEW_ROWS,
@@ -117,6 +118,25 @@ fn csv_options_and_empty_values_are_explicit() {
     assert_eq!(output.results.cell(2, 1), Some(None));
     source.csv.empty_is_null = false;
     assert_eq!(preview(source).results.cell(0, 1), Some(Some("")));
+}
+
+#[test]
+fn an_exported_single_column_reads_back_every_row() {
+    let dir = TempDir::new().unwrap();
+    let mut set = ResultSet::new(vec!["note".into()]);
+    let rows = [Some("a"), None, Some("")];
+    let mut builder = BatchBuilder::new(1, rows.len());
+    for row in rows {
+        builder.push_row(|_| row);
+    }
+    set.push(builder.finish());
+    for name in ["notes.csv", "notes.tsv"] {
+        let mut out = Vec::new();
+        export::write(&set, Format::from_path(Path::new(name)), &mut out).unwrap();
+        let read = preview(text_file(&dir, name, &String::from_utf8(out).unwrap())).results;
+        assert_eq!(read.rows(), 3, "{name}");
+        assert_eq!(read.cell(1, 0), Some(Some("")), "{name}");
+    }
 }
 
 #[test]
