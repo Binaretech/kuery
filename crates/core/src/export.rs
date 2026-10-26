@@ -70,6 +70,10 @@ fn write_separated(
                 line.push_str(&field(value));
             }
         }
+        // A lone empty field would be a blank line, which many readers skip.
+        if line.is_empty() {
+            line.push_str("\"\"");
+        }
         line.push('\n');
         out.write_all(line.as_bytes())
     };
@@ -190,6 +194,22 @@ mod tests {
             render(Format::Tsv),
             "id\tnote\n1\tplain\n2\ta, \"quoted\"\\nline\\twith tab\n3\t\n"
         );
+    }
+
+    #[test]
+    fn a_single_column_keeps_its_null_and_empty_rows() {
+        let mut set = ResultSet::new(vec!["note".into()]);
+        let rows = [Some("a"), None, Some("")];
+        let mut builder = BatchBuilder::new(1, rows.len());
+        for row in rows {
+            builder.push_row(|_| row);
+        }
+        set.push(builder.finish());
+        for format in [Format::Csv, Format::Tsv] {
+            let mut out = Vec::new();
+            write(&set, format, &mut out).unwrap();
+            assert_eq!(out, b"note\na\n\"\"\n\"\"\n", "{format:?}");
+        }
     }
 
     #[test]
