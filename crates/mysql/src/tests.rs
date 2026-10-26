@@ -422,9 +422,11 @@ fn binary_scratch(writer: &Session, name: &str) -> String {
         format!(
             "drop table if exists {table}; \
              create table {table} (id binary(4) primary key, flag bit(3), data blob, \
-                 payload varbinary(8), doc json, note text, qty int); \
+                 payload varbinary(8), doc json, note text, qty int, \
+                 size enum('s', 'm') character set binary, \
+                 tags set('x', 'y') character set binary); \
              insert into {table} values \
-                 (0x01020304, b'101', 0xFF00, 'abc', '{{\"a\": 1}}', 'héllo', 7)"
+                 (0x01020304, b'101', 0xFF00, 'abc', '{{\"a\": 1}}', 'héllo', 7, 'm', 'x,y')"
         ),
         RunOptions::default(),
     ))
@@ -438,11 +440,11 @@ fn reads_binary_values_as_hex() {
     let writer = session(Access::ReadWrite);
     let table = binary_scratch(&writer, "read_binary");
     let set = block_on(writer.fetch_all(
-        format!("select id, flag, data, payload, doc, note, qty from {table}"),
+        format!("select id, flag, data, payload, doc, note, qty, size, tags from {table}"),
         RunOptions::default(),
     ))
     .unwrap();
-    let row: Vec<Option<&str>> = (0..7).map(|column| set.cell(0, column).flatten()).collect();
+    let row: Vec<Option<&str>> = (0..9).map(|column| set.cell(0, column).flatten()).collect();
     assert_eq!(
         row,
         [
@@ -453,6 +455,9 @@ fn reads_binary_values_as_hex() {
             Some(r#"{"a": 1}"#),
             Some("héllo"),
             Some("7"),
+            // Enums and sets are text, even with the binary charset.
+            Some("m"),
+            Some("x,y"),
         ]
     );
     drop_scratch(&writer, &table);

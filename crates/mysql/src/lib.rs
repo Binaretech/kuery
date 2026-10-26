@@ -301,10 +301,17 @@ const BINARY_CHARSET: u16 = 63;
 
 /// Whether a column's values are bytes, shown as hex (see
 /// `kuery_core::sql::Binary`): `BINARY`, `VARBINARY`, the `BLOB`s, `BIT` and
-/// the spatial types. Numbers, dates and JSON report the binary charset
-/// too, but their values are text.
+/// the spatial types. Numbers, dates, JSON, enums and sets can report the
+/// binary charset too, but their values are text.
 fn is_binary(column: &mysql_async::Column) -> bool {
     use ColumnType::*;
+    use mysql_async::consts::ColumnFlags;
+    if column
+        .flags()
+        .intersects(ColumnFlags::ENUM_FLAG | ColumnFlags::SET_FLAG)
+    {
+        return false;
+    }
     match column.column_type() {
         MYSQL_TYPE_BIT | MYSQL_TYPE_GEOMETRY => true,
         MYSQL_TYPE_STRING
