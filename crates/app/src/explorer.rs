@@ -2006,9 +2006,8 @@ mod tests {
         )
     }
 
-    /// Runs the UI until `done` holds, or gives up after a few seconds and
-    /// leaves the assertions to say what is wrong. Sessions answer from their
-    /// own threads, so a result can land after the UI first goes idle.
+    /// Runs the UI until `done` holds or a few seconds pass: sessions answer
+    /// from their own threads, possibly after the UI goes idle.
     fn run_until(
         cx: &mut TestAppContext,
         explorer: &Entity<Explorer>,
