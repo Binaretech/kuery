@@ -173,8 +173,8 @@ pub struct Explorer {
     /// never overwrites a newer one. Holds the last number written.
     history_saved: Arc<Mutex<u64>>,
     history_saves: u64,
-    /// Keys read so far per (connection, Redis database).
-    redis_keys: HashMap<(usize, i64), redis_keys::KeyBrowser>,
+    /// Keys read so far per (connection id, Redis database).
+    redis_keys: redis_keys::KeyBrowsers,
     /// Bumped on every edit of the filter, so only the last one rescans.
     filter_edits: u64,
     /// The tree's rows, built again when the explorer changes or the filter
@@ -510,6 +510,12 @@ impl Explorer {
         self.connections.iter().position(|node| node.spec.id == id)
     }
 
+    /// Where the connection opened with `spec` is now: connections move
+    /// while a load is out. `None` once it is gone or edited.
+    fn place_of(&self, spec: &ConnectionSpec) -> Option<usize> {
+        self.connections.iter().position(|node| node.spec == *spec)
+    }
+
     /// Follows the project model: keeps open connections whose settings did
     /// not change, and refreshes the saved queries.
     fn sync_project(&mut self, cx: &mut Context<Self>) {
@@ -537,11 +543,10 @@ impl Explorer {
         }
         self.queries = project.queries();
         let connections = &self.connections;
-        self.redis_keys.retain(|(index, _), _| {
-            matches!(
-                connections.get(*index).map(|node| &node.state),
-                Some(ConnectionState::RedisReady { .. })
-            )
+        self.redis_keys.retain(|(id, _), _| {
+            connections.iter().any(|node| {
+                node.spec.id == *id && matches!(node.state, ConnectionState::RedisReady { .. })
+            })
         });
         cx.notify();
     }
@@ -602,6 +607,7 @@ impl Explorer {
 
     fn load_catalog(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(db) = self.db(index) else { return };
+        let spec = self.connections[index].spec.clone();
         if let Some(ConnectionState::Ready { catalog, .. }) =
             self.connections.get_mut(index).map(|n| &mut n.state)
         {
@@ -611,6 +617,9 @@ impl Explorer {
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                let Some(index) = this.place_of(&spec) else {
+                    return;
+                };
                 if let Some(ConnectionState::Ready { catalog, .. }) =
                     this.connections.get_mut(index).map(|n| &mut n.state)
                 {
@@ -733,7 +742,8 @@ impl Explorer {
         if let Some(node) = self.connections.get_mut(index) {
             node.state = ConnectionState::Idle;
             self.expanded.remove(&index.to_string());
-            self.redis_keys.retain(|(i, _), _| *i != index);
+            let id = node.spec.id.clone();
+            self.redis_keys.retain(|(other, _), _| *other != id);
             cx.notify();
         }
     }
@@ -1908,7 +1918,234 @@ impl Render for Explorer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use futures::executor::block_on;
+    use gpui::TestAppContext;
+    use gpui_kit::{Bounds, Point, WindowBounds, WindowOptions, px, size};
+    use kuery_core::session::{Access, Opener, Session};
+
     use super::*;
+    use crate::connection::{Environment, RedisDb};
+    use crate::project::Project;
+
+    fn spec(id: &str, driver: &str, port: u16) -> ConnectionSpec {
+        ConnectionSpec {
+            id: id.into(),
+            name: id.into(),
+            driver: driver.into(),
+            host: if port == 0 {
+                String::new()
+            } else {
+                "127.0.0.1".into()
+            },
+            port,
+            database: if port == 0 {
+                "test.sqlite".into()
+            } else {
+                "0".into()
+            },
+            user: String::new(),
+            sslmode: None,
+            environment: Some("development".into()),
+            ssh: None,
+        }
+    }
+
+    /// A sidebar for a project with `connections`, none open.
+    fn open(
+        cx: &mut TestAppContext,
+        connections: Vec<ConnectionSpec>,
+    ) -> (Entity<ProjectModel>, Entity<Explorer>) {
+        // The sessions answer from their own threads.
+        cx.executor().allow_parking();
+        let root =
+            std::env::temp_dir().join(format!("kuery-explorer-{}", crate::project::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(cx);
+        });
+        let model = cx.new(|_| ProjectModel {
+            project: Project {
+                root,
+                name: "shop".into(),
+                workspace: None,
+                connections,
+            },
+        });
+        let explorer = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(256.), px(600.)),
+                })),
+                ..Default::default()
+            };
+            let model = model.clone();
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Explorer::new(model, window, cx))
+            })
+            .unwrap()
+            .1
+        });
+        (model, explorer)
+    }
+
+    fn sqlite_db(root: &std::path::Path) -> Db {
+        let path = root.join("test.sqlite");
+        std::fs::write(&path, b"").unwrap();
+        let opener: Opener = Arc::new(move |access| kuery_sqlite::open(&path, access));
+        let session = block_on(Session::open(opener, Access::ReadWrite)).unwrap();
+        Db::new(
+            "b".into(),
+            Environment::Development,
+            session,
+            "test.sqlite".into(),
+            None,
+        )
+    }
+
+    /// Runs the UI until `done` holds or a few seconds pass: sessions answer
+    /// from their own threads, possibly after the UI goes idle.
+    fn run_until(
+        cx: &mut TestAppContext,
+        explorer: &Entity<Explorer>,
+        done: impl Fn(&Explorer) -> bool,
+    ) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if explorer.read_with(cx, |explorer, _| done(explorer)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn move_connections(
+        cx: &mut TestAppContext,
+        model: &Entity<ProjectModel>,
+        change: impl FnOnce(&mut Vec<ConnectionSpec>),
+    ) {
+        model.update(cx, |model, cx| {
+            change(&mut model.project.connections);
+            cx.notify();
+        });
+    }
+
+    #[gpui::test]
+    fn a_catalog_reaches_its_connection_after_another_is_deleted(cx: &mut TestAppContext) {
+        let (model, explorer) = open(cx, vec![spec("a", "sqlite", 0), spec("b", "sqlite", 0)]);
+        let root = model.read_with(cx, |model, _| model.project.root.clone());
+        let db = sqlite_db(&root);
+        explorer.update(cx, |explorer, cx| {
+            explorer.connections[1].state = ConnectionState::Ready {
+                db,
+                catalog: CatalogState::Loading,
+            };
+            explorer.load_catalog(1, cx);
+        });
+        // A goes while B's catalog loads: B is first now.
+        move_connections(cx, &model, |connections| {
+            connections.remove(0);
+        });
+        run_until(cx, &explorer, |explorer| {
+            !matches!(
+                explorer.connections[0].state,
+                ConnectionState::Ready {
+                    catalog: CatalogState::Loading,
+                    ..
+                }
+            )
+        });
+        explorer.read_with(cx, |explorer, _| {
+            assert_eq!(explorer.connections[0].spec.id, "b");
+            assert!(matches!(
+                explorer.connections[0].state,
+                ConnectionState::Ready {
+                    catalog: CatalogState::Loaded(_),
+                    ..
+                }
+            ));
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev Redis"]
+    fn redis_keys_stay_with_their_connection_after_a_reorder(cx: &mut TestAppContext) {
+        let (model, explorer) = open(
+            cx,
+            vec![spec("a", "redis", 63799), spec("c", "redis", 63799)],
+        );
+        // Kept for the test: its runtime runs the sessions.
+        let engine = Box::leak(Box::new(kuery_redis::Engine::new().unwrap()));
+        explorer.update(cx, |explorer, cx| {
+            for (index, name) in ["a", "c"].into_iter().enumerate() {
+                let target = kuery_redis::Target {
+                    host: "127.0.0.1".into(),
+                    port: 63799,
+                    db: 0,
+                    username: None,
+                    password: None,
+                    tls: false,
+                };
+                let session = block_on(engine.connect(target)).unwrap();
+                let db = RedisDb::new(
+                    name.into(),
+                    Environment::Development,
+                    session,
+                    "127.0.0.1:63799/0".into(),
+                    None,
+                );
+                explorer.connections[index].state = ConnectionState::RedisReady {
+                    db,
+                    keyspace: redis_keys::Keyspace::Loading,
+                };
+            }
+            explorer.toggle_database(0, 0, cx);
+        });
+        cx.run_until_parked();
+        explorer.read_with(cx, |explorer, _| {
+            assert!(explorer.key_browser(0, 0).is_some())
+        });
+
+        // C's databases are being read when the two swap places.
+        explorer.update(cx, |explorer, cx| explorer.load_keyspace(1, cx));
+        move_connections(cx, &model, |connections| connections.reverse());
+        run_until(cx, &explorer, |explorer| {
+            !matches!(
+                explorer.connections[0].state,
+                ConnectionState::RedisReady {
+                    keyspace: redis_keys::Keyspace::Loading,
+                    ..
+                }
+            )
+        });
+        explorer.read_with(cx, |explorer, _| {
+            let ids: Vec<&str> = explorer
+                .connections
+                .iter()
+                .map(|node| node.spec.id.as_str())
+                .collect();
+            assert_eq!(ids, ["c", "a"]);
+            let loaded = |index: usize| {
+                matches!(
+                    explorer.connections[index].state,
+                    ConnectionState::RedisReady {
+                        keyspace: redis_keys::Keyspace::Loaded(_),
+                        ..
+                    }
+                )
+            };
+            assert!(loaded(0), "C's databases went elsewhere");
+            assert!(!loaded(1), "A got C's databases");
+            assert!(explorer.key_browser(0, 0).is_none(), "C got A's keys");
+            assert!(explorer.key_browser(1, 0).is_some(), "A lost its keys");
+        });
+        let root = model.read_with(cx, |model, _| model.project.root.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn compacts_row_counts() {
