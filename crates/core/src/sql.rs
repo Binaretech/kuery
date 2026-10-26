@@ -68,6 +68,20 @@ pub struct Dialect {
     /// What cancelling a session's query does when the server cannot stop
     /// just the query; `None` when it can.
     pub cancel_note: Option<&'static str>,
+    /// How row edits write and compare columns whose values are shown as
+    /// `0x` hex; `None` where binary values are compared as text.
+    pub binary: Option<Binary>,
+}
+
+/// Binary values, shown as `0x` and uppercase hex (`0x0A1B`, `0x` when
+/// empty), the way a dialect writes and compares them.
+pub struct Binary {
+    /// Whether a column of this declared type holds bytes.
+    pub is_type: fn(&str) -> bool,
+    /// A value as it is shown, as a literal; `None` if it is not hex.
+    pub literal: fn(&str) -> Option<String>,
+    /// A column as text, the way its values are shown.
+    pub as_text: fn(&str) -> String,
 }
 
 /// The EXPLAIN statement for a statement, estimated or (`true`) measured.
@@ -254,6 +268,7 @@ pub static POSTGRES: Dialect = Dialect {
     implicit_commits: false,
     explain: Some(crate::plan::explain_sql),
     cancel_note: None,
+    binary: None,
 };
 
 pub static SQLITE: Dialect = Dialect {
@@ -286,6 +301,45 @@ pub static SQLITE: Dialect = Dialect {
     implicit_commits: false,
     explain: None,
     cancel_note: None,
+    binary: None,
+};
+
+/// MySQL's bytes: `BINARY`, `VARBINARY`, the `BLOB`s, `BIT` and the spatial
+/// types, written as `x'…'` and compared through their bytes (`hex` alone
+/// writes `BIT` values as numbers, without leading zeros).
+const MYSQL_BINARY: Binary = Binary {
+    is_type: |data_type| {
+        let name = data_type
+            .split(['(', ' '])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "binary"
+                | "varbinary"
+                | "tinyblob"
+                | "blob"
+                | "mediumblob"
+                | "longblob"
+                | "bit"
+                | "geometry"
+                | "point"
+                | "linestring"
+                | "polygon"
+                | "multipoint"
+                | "multilinestring"
+                | "multipolygon"
+                | "geometrycollection"
+                | "geomcollection"
+        )
+    },
+    literal: |value| {
+        let hex = value.strip_prefix("0x")?;
+        let valid = hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        valid.then(|| format!("x'{hex}'"))
+    },
+    as_text: |expr| format!("concat('0x', hex(cast({expr} as binary)))"),
 };
 
 pub static MYSQL: Dialect = Dialect {
@@ -321,6 +375,7 @@ pub static MYSQL: Dialect = Dialect {
     implicit_commits: true,
     explain: None,
     cancel_note: None,
+    binary: Some(MYSQL_BINARY),
 };
 
 pub static MSSQL: Dialect = Dialect {
@@ -361,6 +416,7 @@ pub static MSSQL: Dialect = Dialect {
         "SQL Server can only end the whole session: its open transaction rolls back, its \
          locks are released and its application loses the connection.",
     ),
+    binary: None,
 };
 
 /// `orders` → `"orders"`, `a"b` → `"a""b"`. Always quoted, so uppercase

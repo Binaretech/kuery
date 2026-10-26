@@ -220,6 +220,7 @@ fn applies_row_changes_with_optimistic_checks() {
         table: TableRef::new("main", "customers"),
         columns: vec!["id".into(), "email".into(), "name".into(), "credit".into()],
         primary_key: vec!["id".into()],
+        binary_columns: Vec::new(),
         dialect: &kuery_core::sql::SQLITE,
     };
     let key = |id: &str| {

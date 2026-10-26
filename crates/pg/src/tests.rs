@@ -329,6 +329,7 @@ fn playground() -> kuery_core::edit::EditTarget {
         table: kuery_core::catalog::TableRef::new("public", "playground_items"),
         columns: vec!["id".into(), "name".into(), "quantity".into(), "note".into()],
         primary_key: vec!["id".into()],
+        binary_columns: Vec::new(),
         dialect: &kuery_core::sql::POSTGRES,
     }
 }

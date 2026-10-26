@@ -147,6 +147,7 @@ fn applies_row_changes_with_optimistic_checks() {
         table: TableRef::new("shop", table.clone()),
         columns: vec!["id".into(), "name".into(), "qty".into()],
         primary_key: vec!["id".into()],
+        binary_columns: Vec::new(),
         dialect: &kuery_core::sql::MYSQL,
     };
     let change_in = |column: &str, old: Option<&str>, new: &str| {
@@ -413,4 +414,130 @@ fn conforms() {
         schema: "shop".into(),
         slow_query: "select benchmark(2000000000, md5('kuery'))".into(),
     });
+}
+
+fn binary_scratch(writer: &Session, name: &str) -> String {
+    let table = format!("scratch_{name}_{}", std::process::id());
+    drain(writer.run_autocommit(
+        format!(
+            "drop table if exists {table}; \
+             create table {table} (id binary(4) primary key, flag bit(3), data blob, \
+                 payload varbinary(8), doc json, note text, qty int, \
+                 size enum('s', 'm') character set binary, \
+                 tags set('x', 'y') character set binary); \
+             insert into {table} values \
+                 (0x01020304, b'101', 0xFF00, 'abc', '{{\"a\": 1}}', 'héllo', 7, 'm', 'x,y')"
+        ),
+        RunOptions::default(),
+    ))
+    .unwrap();
+    table
+}
+
+#[test]
+#[ignore = "needs the dev MySQL"]
+fn reads_binary_values_as_hex() {
+    let writer = session(Access::ReadWrite);
+    let table = binary_scratch(&writer, "read_binary");
+    let set = block_on(writer.fetch_all(
+        format!("select id, flag, data, payload, doc, note, qty, size, tags from {table}"),
+        RunOptions::default(),
+    ))
+    .unwrap();
+    let row: Vec<Option<&str>> = (0..9).map(|column| set.cell(0, column).flatten()).collect();
+    assert_eq!(
+        row,
+        [
+            Some("0x01020304"),
+            Some("0x05"),
+            Some("0xFF00"),
+            Some("0x616263"),
+            Some(r#"{"a": 1}"#),
+            Some("héllo"),
+            Some("7"),
+            // Enums and sets are text, even with the binary charset.
+            Some("m"),
+            Some("x,y"),
+        ]
+    );
+    drop_scratch(&writer, &table);
+}
+
+#[test]
+#[ignore = "needs the dev MySQL"]
+fn edits_rows_keyed_by_binary_values() {
+    let writer = session(Access::ReadWrite);
+    let table = binary_scratch(&writer, "edit_binary");
+    let target = EditTarget {
+        table: TableRef::new("shop", table.clone()),
+        columns: ["id", "flag", "data", "payload", "doc", "note", "qty"]
+            .map(String::from)
+            .to_vec(),
+        primary_key: vec!["id".into()],
+        binary_columns: ["id", "flag", "data", "payload"].map(String::from).to_vec(),
+        dialect: &kuery_core::sql::MYSQL,
+    };
+    let key = |value: &str| {
+        vec![KeyValue {
+            column: "id".into(),
+            value: value.into(),
+        }]
+    };
+    let update = |column: &str, old: &str, new: &str| {
+        edit::build(
+            &target,
+            &RowChange::Update {
+                key: key("0x01020304"),
+                cells: vec![CellChange {
+                    column: column.into(),
+                    old: Some(old.into()),
+                    new: Some(new.into()),
+                }],
+            },
+        )
+        .unwrap()
+    };
+    let hex = |column: &str| {
+        scalar(
+            &writer,
+            &format!("select hex(cast({column} as binary)) from {table}"),
+        )
+    };
+    // The row is found by its binary key, and the values shown match.
+    assert_eq!(
+        block_on(writer.apply(vec![update("payload", "0x616263", "0x7A")])),
+        Ok(1)
+    );
+    assert_eq!(hex("payload").as_deref(), Some("7A"));
+    assert_eq!(
+        block_on(writer.apply(vec![update("flag", "0x05", "0x03")])),
+        Ok(1)
+    );
+    assert_eq!(hex("flag").as_deref(), Some("03"));
+    // A value that changed since it was shown changes nothing.
+    assert!(matches!(
+        block_on(writer.apply(vec![update("data", "0x00", "0x01")])),
+        Err(QueryError::RowMismatch { actual: 0, .. })
+    ));
+    // Rows are added and removed by binary values, empty ones included.
+    let insert = edit::build(
+        &target,
+        &RowChange::Insert {
+            values: vec![
+                ("id".into(), Some("0x0A0B0C0D".into())),
+                ("payload".into(), Some("0x".into())),
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(block_on(writer.apply(vec![insert])), Ok(1));
+    let delete = edit::build(
+        &target,
+        &RowChange::Delete {
+            key: key("0x0A0B0C0D"),
+        },
+    )
+    .unwrap();
+    assert_eq!(block_on(writer.apply(vec![delete])), Ok(1));
+    drop_scratch(&writer, &table);
 }

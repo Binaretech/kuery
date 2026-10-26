@@ -17,6 +17,9 @@ pub struct EditTarget {
     pub table: TableRef,
     pub columns: Vec<String>,
     pub primary_key: Vec<String>,
+    /// Columns that hold bytes, shown as `0x` hex; only used where the
+    /// dialect has [`Dialect::binary`].
+    pub binary_columns: Vec<String>,
     pub dialect: &'static Dialect,
 }
 
@@ -76,6 +79,8 @@ pub enum EditError {
     NullKey(String),
     UnknownColumn(String),
     NothingToChange,
+    /// A value for a column that holds bytes is not `0x` hex.
+    NotHex(String),
     Sql(SqlError),
 }
 
@@ -96,6 +101,10 @@ impl fmt::Display for EditError {
                 write!(f, "Column \"{column}\" does not exist in the table")
             }
             EditError::NothingToChange => write!(f, "There is nothing to change"),
+            EditError::NotHex(column) => write!(
+                f,
+                "Column \"{column}\" holds bytes: enter its value in hex, like 0x0A1B"
+            ),
             EditError::Sql(error) => error.fmt(f),
         }
     }
@@ -125,12 +134,12 @@ pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, 
                 let column = column(target, &cell.column)?;
                 assignments.push(format!(
                     "{column} = {}",
-                    dialect.quote_nullable(cell.new.as_deref())?
+                    literal(target, &cell.column, cell.new.as_deref())?
                 ));
                 // Compared as text, which is how the value was shown; this also
                 // works for types without equality (json, point…).
                 unchanged.push(dialect.same(
-                    &dialect.as_text(&column),
+                    &as_shown(target, &cell.column, &column),
                     &dialect.quote_nullable(cell.old.as_deref())?,
                 ));
             }
@@ -152,7 +161,7 @@ pub fn build(target: &EditTarget, change: &RowChange) -> Result<WriteStatement, 
                     .collect::<Result<Vec<_>, _>>()?;
                 let literals = values
                     .iter()
-                    .map(|(_, value)| dialect.quote_nullable(value.as_deref()))
+                    .map(|(name, value)| literal(target, name, value.as_deref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 format!(
                     "insert into {table} ({}) values ({})",
@@ -189,11 +198,38 @@ fn key_condition(target: &EditTarget, key: &[KeyValue]) -> Result<String, EditEr
             Ok(format!(
                 "{} = {}",
                 column(target, &k.column)?,
-                target.dialect.quote_nullable(Some(&k.value))?
+                literal(target, &k.column, Some(&k.value))?
             ))
         })
         .collect::<Result<Vec<_>, EditError>>()?;
     Ok(parts.join(" and "))
+}
+
+/// How the dialect writes bytes, if `name` holds them.
+fn binary<'a>(target: &'a EditTarget, name: &str) -> Option<&'a crate::sql::Binary> {
+    target
+        .dialect
+        .binary
+        .as_ref()
+        .filter(|_| target.binary_columns.iter().any(|c| c == name))
+}
+
+/// `value` for column `name` as a literal: hex for bytes, text otherwise.
+fn literal(target: &EditTarget, name: &str, value: Option<&str>) -> Result<String, EditError> {
+    match (binary(target, name), value) {
+        (Some(binary), Some(value)) => {
+            (binary.literal)(value).ok_or_else(|| EditError::NotHex(name.to_string()))
+        }
+        _ => Ok(target.dialect.quote_nullable(value)?),
+    }
+}
+
+/// Column `name`, quoted as `column`, as text the way its values are shown.
+fn as_shown(target: &EditTarget, name: &str, column: &str) -> String {
+    match binary(target, name) {
+        Some(binary) => (binary.as_text)(column),
+        None => target.dialect.as_text(column),
+    }
 }
 
 fn column(target: &EditTarget, name: &str) -> Result<String, EditError> {
@@ -213,6 +249,7 @@ mod tests {
             table: TableRef::new("public", "orders"),
             columns: vec!["id".into(), "status".into(), "total".into(), "note".into()],
             primary_key: vec!["id".into()],
+            binary_columns: Vec::new(),
             dialect: &crate::sql::POSTGRES,
         }
     }
@@ -262,6 +299,54 @@ mod tests {
             build(&sqlite, &update).unwrap().sql(),
             "update \"main\".\"orders\" set \"status\" = 'paid' where \"id\" = '7' and cast(\"status\" as text) is 'new'"
         );
+    }
+
+    #[test]
+    fn writes_mysql_binary_values_as_hex_literals() {
+        let target = EditTarget {
+            table: TableRef::new("shop", "files"),
+            columns: vec!["id".into(), "data".into(), "name".into()],
+            primary_key: vec!["id".into()],
+            binary_columns: vec!["id".into(), "data".into()],
+            dialect: &crate::sql::MYSQL,
+        };
+        let update = RowChange::Update {
+            key: key("0x0A0B"),
+            cells: vec![
+                cell("data", Some("0xFF00"), Some("0x")),
+                cell("name", Some("a"), Some("b")),
+            ],
+        };
+        assert_eq!(
+            build(&target, &update).unwrap().sql(),
+            "update `shop`.`files` set `data` = x'', `name` = 'b' where `id` = x'0A0B' \
+             and concat('0x', hex(cast(`data` as binary))) <=> '0xFF00' and cast(`name` as char) <=> 'a'"
+        );
+        // A binary value has to be written as hex.
+        let typed = RowChange::Insert {
+            values: vec![("id".into(), Some("abc".into()))],
+        };
+        assert_eq!(
+            build(&target, &typed).unwrap_err().to_string(),
+            "Column \"id\" holds bytes: enter its value in hex, like 0x0A1B"
+        );
+        assert!(build(&target, &RowChange::Delete { key: key("0xABC") }).is_err());
+        // Only MySQL shows bytes as hex: other dialects keep comparing text.
+        assert!(crate::sql::POSTGRES.binary.is_none());
+        let binary = crate::sql::MYSQL.binary.as_ref().unwrap();
+        for data_type in [
+            "binary(16)",
+            "varbinary(8)",
+            "blob",
+            "longblob",
+            "bit(1)",
+            "point",
+        ] {
+            assert!((binary.is_type)(data_type), "{data_type}");
+        }
+        for data_type in ["varchar(20)", "text", "json", "int", "bigint unsigned"] {
+            assert!(!(binary.is_type)(data_type), "{data_type}");
+        }
     }
 
     #[test]

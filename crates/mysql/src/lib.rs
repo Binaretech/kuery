@@ -219,12 +219,14 @@ impl Adapter for Mysql {
                 .iter()
                 .map(|column| kind_of(column.column_type()))
                 .collect();
+            let binary: Vec<bool> = columns.iter().map(is_binary).collect();
             let count = names.len();
             rows.columns(names, Some(kinds))?;
             while let Some(row) = result.next().await.map_err(query_error)? {
                 let values: Vec<Option<String>> = (0..count)
                     .map(|index| match row.as_ref(index) {
                         None | Some(Value::NULL) => None,
+                        Some(Value::Bytes(bytes)) if binary[index] => Some(hex(bytes)),
                         Some(Value::Bytes(bytes)) => {
                             Some(String::from_utf8_lossy(bytes).into_owned())
                         }
@@ -292,6 +294,45 @@ impl Adapter for Mysql {
     fn routine_source(&mut self, routine: &FunctionInfo) -> Result<String, QueryError> {
         catalog::function_definition(self, routine)
     }
+}
+
+/// MySQL's charset number for bytes.
+const BINARY_CHARSET: u16 = 63;
+
+/// Whether a column's values are bytes, shown as hex (see
+/// `kuery_core::sql::Binary`): `BINARY`, `VARBINARY`, the `BLOB`s, `BIT` and
+/// the spatial types. Numbers, dates, JSON, enums and sets can report the
+/// binary charset too, but their values are text.
+fn is_binary(column: &mysql_async::Column) -> bool {
+    use ColumnType::*;
+    use mysql_async::consts::ColumnFlags;
+    if column
+        .flags()
+        .intersects(ColumnFlags::ENUM_FLAG | ColumnFlags::SET_FLAG)
+    {
+        return false;
+    }
+    match column.column_type() {
+        MYSQL_TYPE_BIT | MYSQL_TYPE_GEOMETRY => true,
+        MYSQL_TYPE_STRING
+        | MYSQL_TYPE_VAR_STRING
+        | MYSQL_TYPE_VARCHAR
+        | MYSQL_TYPE_TINY_BLOB
+        | MYSQL_TYPE_MEDIUM_BLOB
+        | MYSQL_TYPE_LONG_BLOB
+        | MYSQL_TYPE_BLOB => column.character_set() == BINARY_CHARSET,
+        _ => false,
+    }
+}
+
+/// Bytes as `0x` and uppercase hex: `0x0A1B`, `0x` when empty.
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("0x");
+    for byte in bytes {
+        text.push_str(&format!("{byte:02X}"));
+    }
+    text
 }
 
 fn kind_of(column_type: ColumnType) -> ColumnKind {

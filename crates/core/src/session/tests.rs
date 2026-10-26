@@ -398,6 +398,7 @@ fn applies_row_changes_checking_each_one() {
         table: TableRef::new("public", "update"),
         columns: vec!["id".into()],
         primary_key: vec!["id".into()],
+        binary_columns: Vec::new(),
         dialect: &POSTGRES,
     };
     let delete = edit::build(
