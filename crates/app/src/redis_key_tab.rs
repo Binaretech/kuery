@@ -651,10 +651,7 @@ impl KeyTab {
         if self.pending.is_empty() || self.applying {
             return;
         }
-        let planned: Vec<Planned> = commands(&self.key, &self.pending)
-            .into_iter()
-            .map(Planned::new)
-            .collect();
+        let planned = plan(&self.key, &self.pending);
         let this = cx.entity().downgrade();
         let db = self.db.clone();
         redis_write::approve(
@@ -700,7 +697,7 @@ impl KeyTab {
                 })
                 .ok();
                 if failed {
-                    failure = Some(format!("{}: {outcome}", command.line));
+                    failure = Some(format!("{}: {outcome}", command.shown));
                     break;
                 }
                 ran += 1;
@@ -1184,6 +1181,33 @@ fn commands(key: &str, pending: &[Edit]) -> Vec<Vec<String>> {
     commands
 }
 
+/// [`commands`] ready to approve; the list item removal is described
+/// rather than shown as its whole script.
+fn plan(key: &str, pending: &[Edit]) -> Vec<Planned> {
+    let removed: Vec<String> = pending
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::RemoveListItem { index, .. } => Some(index.to_string()),
+            Edit::Command { .. } => None,
+        })
+        .collect();
+    commands(key, pending)
+        .into_iter()
+        .enumerate()
+        .map(|(position, args)| {
+            if position == 0 && !removed.is_empty() {
+                let shown = format!(
+                    "EVAL: remove items {} from {key} if they are unchanged",
+                    removed.join(", ")
+                );
+                Planned::described(args, shown)
+            } else {
+                Planned::new(args)
+            }
+        })
+        .collect()
+}
+
 /// The staged changes left after the first `ran` commands ran. The list
 /// item removals ran first, as one command; if it failed, they all stay.
 fn remaining(pending: &[Edit], ran: usize) -> Vec<Edit> {
@@ -1367,6 +1391,14 @@ mod tests {
         assert_eq!(removal[5..], ["2", "b", "5", "e"]);
         let rest: Vec<String> = planned[1..].iter().map(|args| join_command(args)).collect();
         assert_eq!(rest, ["RPUSH q new", "LPUSH q first"]);
+        // The review shows what the script does; the audit log gets all of it.
+        let planned = plan("q", &pending);
+        assert_eq!(
+            planned[0].shown,
+            "EVAL: remove items 2, 5 from q if they are unchanged"
+        );
+        assert!(planned[0].line.starts_with("EVAL \"local k"));
+        assert_eq!(planned[1].shown, "RPUSH q new");
         // The removal and the first push ran: only the last push is left.
         assert_eq!(remaining(&pending, 2), [command(&["LPUSH", "q", "first"])]);
         // The removal failed: everything stays.

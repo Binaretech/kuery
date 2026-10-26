@@ -36,8 +36,11 @@ const MAX_PREVIEWS: usize = 20;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     pub args: Vec<String>,
-    /// The command as one line, for the review and the audit log.
+    /// The command as one line, for the audit log.
     pub line: String,
+    /// What the review and error messages show: the line, or a short
+    /// description of a long command.
+    pub shown: String,
     pub writes: bool,
     /// Why it is risky, if it is.
     pub danger: Option<String>,
@@ -45,11 +48,21 @@ pub struct Planned {
 
 impl Planned {
     pub fn new(args: Vec<String>) -> Self {
+        let line = join_command(&args);
         Self {
-            line: join_command(&args),
+            shown: line.clone(),
+            line,
             writes: classify(&args) == Class::Write,
             danger: danger(&args),
             args,
+        }
+    }
+
+    /// The same command, shown as `shown` rather than in full.
+    pub fn described(args: Vec<String>, shown: String) -> Self {
+        Self {
+            shown,
+            ..Self::new(args)
         }
     }
 }
@@ -124,7 +137,7 @@ fn approve_with(
                             .filter(|key| exists(key))
                             .map(|key| format!("replaces the existing key {key}"));
                         Row {
-                            line: command.line.clone(),
+                            line: command.shown.clone(),
                             writes: command.writes,
                             danger: command.danger.clone().or(overwrite),
                             previews: written_keys(&command.args)
@@ -388,6 +401,8 @@ mod tests {
         let set = planned("SET greeting \"hello world\"");
         assert!(set.writes && set.danger.is_none());
         assert_eq!(set.line, "SET greeting \"hello world\"");
+        // Shown as it runs, unless described otherwise.
+        assert_eq!(set.shown, set.line);
         assert!(!planned("GET greeting").writes);
         assert!(planned("FLUSHDB").danger.is_some());
     }
