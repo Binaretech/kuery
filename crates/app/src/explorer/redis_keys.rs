@@ -41,6 +41,10 @@ pub(super) struct KeyBrowser {
     pattern: Option<String>,
 }
 
+/// Key browsers by connection id and database: an id, not a position, since
+/// connections move.
+pub(super) type KeyBrowsers = HashMap<(String, i64), KeyBrowser>;
+
 /// The filter as a `SCAN` pattern: as typed when it is already a glob,
 /// else "contains", with the glob's special characters escaped.
 fn scan_pattern(filter: &str) -> Option<String> {
@@ -86,6 +90,7 @@ impl Explorer {
         let Some(db) = self.redis_db(index) else {
             return;
         };
+        let spec = self.connections[index].spec.clone();
         if let Some(ConnectionState::RedisReady { keyspace, .. }) =
             self.connections.get_mut(index).map(|n| &mut n.state)
         {
@@ -95,6 +100,9 @@ impl Explorer {
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                let Some(index) = this.place_of(&spec) else {
+                    return;
+                };
                 if let Some(ConnectionState::RedisReady { keyspace, .. }) =
                     this.connections.get_mut(index).map(|n| &mut n.state)
                 {
@@ -107,7 +115,7 @@ impl Explorer {
                 let open: Vec<i64> = this
                     .redis_keys
                     .keys()
-                    .filter(|(i, _)| *i == index)
+                    .filter(|(id, _)| *id == spec.id)
                     .map(|(_, database)| *database)
                     .collect();
                 for database in open {
@@ -121,17 +129,23 @@ impl Explorer {
         cx.notify();
     }
 
-    fn toggle_database(&mut self, index: usize, database: i64, cx: &mut Context<Self>) {
+    pub(super) fn toggle_database(&mut self, index: usize, database: i64, cx: &mut Context<Self>) {
         let key = database_key(index, database);
         if self.expanded.remove(&key) {
             cx.notify();
             return;
         }
         self.expanded.insert(key);
-        if !self.redis_keys.contains_key(&(index, database)) {
+        if self.key_browser(index, database).is_none() {
             self.load_keys(index, database, false, cx);
         }
         cx.notify();
+    }
+
+    /// The keys read so far in a database of the connection at `index`.
+    pub(super) fn key_browser(&self, index: usize, database: i64) -> Option<&KeyBrowser> {
+        let id = self.connections.get(index)?.spec.id.clone();
+        self.redis_keys.get(&(id, database))
     }
 
     /// Reads the first page of keys (or the next one, with `more`).
@@ -140,7 +154,8 @@ impl Explorer {
             return;
         };
         let pattern = scan_pattern(&self.search.read(cx).value());
-        let browser = self.redis_keys.entry((index, database)).or_default();
+        let id = self.connections[index].spec.id.clone();
+        let browser = self.redis_keys.entry((id.clone(), database)).or_default();
         if more {
             if browser.loading.is_some() || browser.cursor == Some(0) {
                 return;
@@ -156,7 +171,7 @@ impl Explorer {
         browser.loading = Some(cx.spawn(async move |this, cx| {
             let result = scan.await;
             this.update(cx, |this, cx| {
-                let Some(browser) = this.redis_keys.get_mut(&(index, database)) else {
+                let Some(browser) = this.redis_keys.get_mut(&(id, database)) else {
                     return;
                 };
                 browser.loading = None;
@@ -181,17 +196,20 @@ impl Explorer {
     /// The filter changed: key lists read with another pattern start over.
     pub(super) fn rescan_redis(&mut self, cx: &mut Context<Self>) {
         let pattern = scan_pattern(&self.search.read(cx).value());
-        let stale: Vec<(usize, i64)> = self
+        let stale: Vec<(String, i64)> = self
             .redis_keys
             .iter()
             .filter(|(_, browser)| browser.pattern != pattern)
-            .map(|(place, _)| *place)
+            .map(|(place, _)| place.clone())
             .collect();
-        for (index, database) in stale {
-            if self.expanded.contains(&database_key(index, database)) {
-                self.load_keys(index, database, false, cx);
-            } else {
-                self.redis_keys.remove(&(index, database));
+        for (id, database) in stale {
+            match self.index_of(&id) {
+                Some(index) if self.expanded.contains(&database_key(index, database)) => {
+                    self.load_keys(index, database, false, cx)
+                }
+                _ => {
+                    self.redis_keys.remove(&(id, database));
+                }
             }
         }
     }
@@ -382,6 +400,7 @@ impl Explorer {
 /// expanded database.
 pub(super) fn redis_rows(
     index: usize,
+    id: &str,
     keyspace: &Keyspace,
     default: i64,
     tree: &Tree,
@@ -403,7 +422,7 @@ pub(super) fn redis_rows(
         .filter(|info| info.keys > 0 || info.index == default)
         .collect();
     for info in &shown {
-        database_rows(index, info, tree, rows);
+        database_rows(index, id, info, tree, rows);
     }
     let empty = databases.len() - shown.len();
     if empty > 0 {
@@ -418,7 +437,7 @@ pub(super) fn redis_rows(
     }
 }
 
-fn database_rows(index: usize, info: &DbInfo, tree: &Tree, rows: &mut Vec<Row>) {
+fn database_rows(index: usize, id: &str, info: &DbInfo, tree: &Tree, rows: &mut Vec<Row>) {
     let database = info.index;
     let expanded = tree.expanded.contains(&database_key(index, database));
     rows.push(Row::RedisDatabase {
@@ -430,7 +449,7 @@ fn database_rows(index: usize, info: &DbInfo, tree: &Tree, rows: &mut Vec<Row>) 
     if !expanded {
         return;
     }
-    let Some(browser) = tree.redis_keys.get(&(index, database)) else {
+    let Some(browser) = tree.redis_keys.get(&(id.to_string(), database)) else {
         rows.push(note(2, "Loading keys…", theme::TEXT_TERTIARY));
         return;
     };
@@ -574,14 +593,17 @@ mod tests {
 
     fn rows(expanded: &[&str], browser: Option<KeyBrowser>) -> Vec<Row> {
         let expanded = expanded.iter().map(|key| key.to_string()).collect();
-        let redis_keys = browser.into_iter().map(|b| ((0, 1), b)).collect();
+        let redis_keys = browser
+            .into_iter()
+            .map(|b| (("cache".to_string(), 1), b))
+            .collect();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
             query: "",
         };
         let mut rows = Vec::new();
-        redis_rows(0, &databases(), 0, &tree, &mut rows);
+        redis_rows(0, "cache", &databases(), 0, &tree, &mut rows);
         rows
     }
 
@@ -635,7 +657,7 @@ mod tests {
             query: "",
         };
         let mut rows = Vec::new();
-        redis_rows(0, &failed, 0, &tree, &mut rows);
+        redis_rows(0, "cache", &failed, 0, &tree, &mut rows);
         assert_eq!(rows, [error_row(1, "NOAUTH")]);
     }
 

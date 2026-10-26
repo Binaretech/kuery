@@ -4,12 +4,12 @@
 //! catalog of thousands of objects. The sidebar keeps the list and builds an
 //! element only for the rows on screen.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use gpui_kit::SharedString;
 use kuery_core::catalog::CatalogOverview;
 
-use super::redis_keys::{self, KeyBrowser, Keyspace};
+use super::redis_keys::{self, KeyBrowsers, Keyspace};
 use super::{CatalogState, ConnectionNode, ConnectionState, Group};
 use crate::theme;
 
@@ -102,6 +102,7 @@ pub(super) enum NodeView<'a> {
     Failed(&'a str),
     Catalog(&'a CatalogState),
     Redis {
+        id: &'a str,
         keyspace: &'a Keyspace,
         default_db: i64,
     },
@@ -115,6 +116,7 @@ impl<'a> NodeView<'a> {
             ConnectionState::Failed(error) => NodeView::Failed(error),
             ConnectionState::Ready { catalog, .. } => NodeView::Catalog(catalog),
             ConnectionState::RedisReady { db, keyspace } => NodeView::Redis {
+                id: &node.spec.id,
                 keyspace,
                 default_db: db.session.default_db(),
             },
@@ -130,7 +132,7 @@ impl<'a> NodeView<'a> {
 pub(super) struct Tree<'a> {
     /// Keys of expanded nodes, as in [`super::Explorer`].
     pub expanded: &'a HashSet<String>,
-    pub redis_keys: &'a HashMap<(usize, i64), KeyBrowser>,
+    pub redis_keys: &'a KeyBrowsers,
     /// The filter, trimmed and lowercased; empty for none.
     pub query: &'a str,
 }
@@ -157,9 +159,10 @@ pub(super) fn tree_rows<'a>(
                 rows.push(Row::EditConnection { index });
             }
             NodeView::Redis {
+                id,
                 keyspace,
                 default_db,
-            } => redis_keys::redis_rows(index, keyspace, default_db, tree, &mut rows),
+            } => redis_keys::redis_rows(index, id, keyspace, default_db, tree, &mut rows),
             NodeView::Catalog(CatalogState::Loading) => {
                 rows.push(note(1, "Loading catalog…", theme::TEXT_TERTIARY))
             }
@@ -314,6 +317,8 @@ impl SchemaObjects {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use kuery_core::catalog::{
         EnumInfo, FunctionInfo, RoutineKind, TableInfo, TableKind, TableRef, TriggerRef,
     };
