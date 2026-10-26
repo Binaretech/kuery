@@ -346,6 +346,29 @@ fn key(id: &str) -> Vec<kuery_core::edit::KeyValue> {
 
 #[test]
 #[ignore = "needs the dev Postgres"]
+fn text_that_is_not_utf8_fails_the_query_and_keeps_the_connection() {
+    let mut adapter = open_postgres(&database_url(), Access::ReadOnly).unwrap();
+    // In Latin-1, chr(233) is the byte 0xE9: not UTF-8, as text from a
+    // SQL_ASCII database can be.
+    adapter
+        .execute("set client_encoding = 'LATIN1'", &mut Discard)
+        .unwrap();
+    let error = adapter
+        .execute("select chr(233) as name", &mut Discard)
+        .unwrap_err();
+    assert!(
+        matches!(&error, QueryError::Database { code, message }
+            if code.is_empty() && message.contains("\"name\"")),
+        "{error:?}"
+    );
+    adapter
+        .execute("set client_encoding = 'UTF8'", &mut Discard)
+        .unwrap();
+    assert_eq!(adapter.execute("select 1", &mut Discard), Ok(0));
+}
+
+#[test]
+#[ignore = "needs the dev Postgres"]
 fn reads_a_schema_for_its_diagram() {
     use kuery_core::catalog::TableRef;
     use kuery_core::diagram::OnDelete;
