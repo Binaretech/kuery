@@ -316,6 +316,47 @@ pub struct ValuePage {
     pub next: Option<Page>,
 }
 
+/// Removes the list items at these indexes from `key`, but only if each
+/// still holds the value it was shown with; otherwise nothing changes and
+/// the reply is an error naming the first item that changed. One atomic
+/// script: the items are set to a placeholder unique to this call, then
+/// removed together, so the other indexes do not move in between and no
+/// placeholder is left behind.
+pub fn remove_list_items(key: &str, items: &[(u64, &str)]) -> Vec<String> {
+    const SCRIPT: &str = "local k, mark = KEYS[1], ARGV[1] \
+        for i = 2, #ARGV, 2 do \
+        if redis.call('LINDEX', k, ARGV[i]) ~= ARGV[i + 1] then \
+        return redis.error_reply('ERR item ' .. ARGV[i] .. ' changed since it was shown; reload and try again') \
+        end end \
+        for i = 2, #ARGV, 2 do redis.call('LSET', k, ARGV[i], mark) end \
+        return redis.call('LREM', k, 0, mark)";
+    let mut args = vec![
+        "EVAL".to_string(),
+        SCRIPT.to_string(),
+        "1".to_string(),
+        key.to_string(),
+        placeholder(),
+    ];
+    for (index, value) in items {
+        args.push(index.to_string());
+        args.push((*value).to_string());
+    }
+    args
+}
+
+/// A value no list item holds in practice: random for each call.
+fn placeholder() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("__kuery_removed__:{:016x}", hasher.finish())
+}
+
 /// An open connection to a server.
 #[derive(Clone)]
 pub struct Session {
@@ -1076,5 +1117,57 @@ mod tests {
         let error =
             block(session.command(0, vec!["HGET".into(), "app:name".into(), "x".into()])).unwrap();
         assert!(matches!(error, Reply::Error(text) if text.contains("WRONGTYPE")));
+    }
+
+    #[test]
+    #[ignore = "needs the dev Redis"]
+    fn removes_list_items_only_while_they_are_unchanged() {
+        let (engine, target) = dev();
+        let session = block(engine.connect(target)).unwrap();
+        let run = |args: Vec<String>| block(session.command(9, args)).unwrap();
+        let key = "kuery-test:list-removal".to_string();
+        let reset = || {
+            run(vec!["DEL".into(), key.clone()]);
+            let mut push = vec!["RPUSH".to_string(), key.clone()];
+            push.extend(["a", "b", "c", "__kuery_removed__", "d"].map(String::from));
+            run(push);
+        };
+        let list = || match run(vec!["LRANGE".into(), key.clone(), "0".into(), "-1".into()]) {
+            Reply::Array(items) => items
+                .into_iter()
+                .map(|item| match item {
+                    Reply::Text(text) => text,
+                    other => panic!("not text: {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("not a list: {other:?}"),
+        };
+
+        // Removes what was shown, and only that: a value that looks like the
+        // placeholder is a value like any other.
+        reset();
+        let removed = run(remove_list_items(&key, &[(1, "b"), (4, "d")]));
+        assert_eq!(removed, Reply::Int(2));
+        assert_eq!(list(), ["a", "c", "__kuery_removed__"]);
+
+        // An item changed since it was shown: nothing is removed.
+        reset();
+        let refused = run(remove_list_items(&key, &[(1, "b"), (2, "x")]));
+        assert!(
+            matches!(&refused, Reply::Error(text) if text.contains("item 2 changed")),
+            "{refused:?}"
+        );
+        assert_eq!(list(), ["a", "b", "c", "__kuery_removed__", "d"]);
+
+        // An item is gone: nothing is removed, no placeholder is left behind.
+        reset();
+        let refused = run(remove_list_items(&key, &[(1, "b"), (9, "z")]));
+        assert!(
+            matches!(&refused, Reply::Error(text) if text.contains("item 9 changed")),
+            "{refused:?}"
+        );
+        assert_eq!(list(), ["a", "b", "c", "__kuery_removed__", "d"]);
+
+        run(vec!["DEL".into(), key.clone()]);
     }
 }

@@ -38,9 +38,6 @@ use crate::ui::{format_bytes, thousands};
 
 /// Entries read per page.
 const PAGE: usize = 500;
-/// List items being removed are first set to this, then removed together
-/// with `LREM`, so the other indexes do not move in between.
-const TOMBSTONE: &str = "__kuery_removed__";
 
 enum Value {
     Loading,
@@ -55,8 +52,7 @@ enum Value {
 enum Edit {
     /// A command that runs in the order it was staged.
     Command { args: Vec<String>, label: String },
-    /// A list item to remove: set to [`TOMBSTONE`] before any push, then
-    /// removed (see [`commands`]).
+    /// A list item to remove, if it still holds `value` (see [`commands`]).
     RemoveListItem { index: u64, value: String },
 }
 
@@ -655,10 +651,7 @@ impl KeyTab {
         if self.pending.is_empty() || self.applying {
             return;
         }
-        let planned: Vec<Planned> = commands(&self.key, &self.pending)
-            .into_iter()
-            .map(Planned::new)
-            .collect();
+        let planned = plan(&self.key, &self.pending);
         let this = cx.entity().downgrade();
         let db = self.db.clone();
         redis_write::approve(
@@ -704,7 +697,7 @@ impl KeyTab {
                 })
                 .ok();
                 if failed {
-                    failure = Some(format!("{}: {outcome}", command.line));
+                    failure = Some(format!("{}: {outcome}", command.shown));
                     break;
                 }
                 ran += 1;
@@ -718,8 +711,8 @@ impl KeyTab {
             this.update(cx, |this, cx| {
                 this.applying = false;
                 if failure.is_some() {
-                    // Keep what did not run; the list items' commands are
-                    // all or nothing, so they stay staged as a whole.
+                    // Keep what did not run; the list items are removed
+                    // by one command, so they stay staged together.
                     let total = planned.len();
                     if ran < total {
                         this.pending = remaining(&this.pending, ran);
@@ -995,7 +988,7 @@ impl KeyTab {
                     let line = match edit {
                         Edit::Command { args, .. } => join_command(args),
                         Edit::RemoveListItem { index, .. } => {
-                            format!("LSET {} {index} {TOMBSTONE} · LREM", self.key)
+                            format!("removes {} item {index} if it is unchanged", self.key)
                         }
                     };
                     h_flex()
@@ -1164,30 +1157,21 @@ impl KeyTab {
     }
 }
 
-/// The staged changes as commands. Command edits keep their order; list
-/// items to remove are first set to [`TOMBSTONE`] (before anything, so
-/// pushes do not move them) and removed together right after.
+/// The staged changes as commands. List items to remove go first, so
+/// pushes do not move them, in one script that removes them only if each
+/// still holds the value shown (see [`kuery_redis::remove_list_items`]);
+/// command edits follow in their order.
 fn commands(key: &str, pending: &[Edit]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
-    let mut removals = false;
-    for edit in pending {
-        if let Edit::RemoveListItem { index, .. } = edit {
-            commands.push(vec![
-                "LSET".to_string(),
-                key.to_string(),
-                index.to_string(),
-                TOMBSTONE.to_string(),
-            ]);
-            removals = true;
-        }
-    }
-    if removals {
-        commands.push(vec![
-            "LREM".to_string(),
-            key.to_string(),
-            "0".to_string(),
-            TOMBSTONE.to_string(),
-        ]);
+    let removals: Vec<(u64, &str)> = pending
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::RemoveListItem { index, value } => Some((*index, value.as_str())),
+            Edit::Command { .. } => None,
+        })
+        .collect();
+    if !removals.is_empty() {
+        commands.push(kuery_redis::remove_list_items(key, &removals));
     }
     for edit in pending {
         if let Edit::Command { args, .. } = edit {
@@ -1197,14 +1181,41 @@ fn commands(key: &str, pending: &[Edit]) -> Vec<Vec<String>> {
     commands
 }
 
-/// The staged changes left after the first `ran` commands ran. List item
-/// removals ran first; if they did not all run, they all stay.
-fn remaining(pending: &[Edit], ran: usize) -> Vec<Edit> {
-    let removals = pending
+/// [`commands`] ready to approve; the list item removal is described
+/// rather than shown as its whole script.
+fn plan(key: &str, pending: &[Edit]) -> Vec<Planned> {
+    let removed: Vec<String> = pending
         .iter()
-        .filter(|edit| matches!(edit, Edit::RemoveListItem { .. }))
-        .count();
-    let removal_commands = if removals > 0 { removals + 1 } else { 0 };
+        .filter_map(|edit| match edit {
+            Edit::RemoveListItem { index, .. } => Some(index.to_string()),
+            Edit::Command { .. } => None,
+        })
+        .collect();
+    commands(key, pending)
+        .into_iter()
+        .enumerate()
+        .map(|(position, args)| {
+            if position == 0 && !removed.is_empty() {
+                let shown = format!(
+                    "EVAL: remove items {} from {key} if they are unchanged",
+                    removed.join(", ")
+                );
+                Planned::described(args, shown)
+            } else {
+                Planned::new(args)
+            }
+        })
+        .collect()
+}
+
+/// The staged changes left after the first `ran` commands ran. The list
+/// item removals ran first, as one command; if it failed, they all stay.
+fn remaining(pending: &[Edit], ran: usize) -> Vec<Edit> {
+    let removal_commands = usize::from(
+        pending
+            .iter()
+            .any(|edit| matches!(edit, Edit::RemoveListItem { .. })),
+    );
     let others: Vec<&Edit> = pending
         .iter()
         .filter(|edit| matches!(edit, Edit::Command { .. }))
@@ -1359,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_list_items_before_pushes_move_them() {
+    fn removes_list_items_in_one_checked_step_before_pushes_move_them() {
         let pending = vec![
             command(&["RPUSH", "q", "new"]),
             Edit::RemoveListItem {
@@ -1372,23 +1383,25 @@ mod tests {
             },
             command(&["LPUSH", "q", "first"]),
         ];
-        let lines: Vec<String> = commands("q", &pending)
-            .iter()
-            .map(|args| join_command(args))
-            .collect();
+        let planned = commands("q", &pending);
+        // One script removes both, checking each still holds what was shown.
+        let removal = &planned[0];
+        assert_eq!(removal[0], "EVAL");
+        assert_eq!(removal[2..4], ["1", "q"]);
+        assert_eq!(removal[5..], ["2", "b", "5", "e"]);
+        let rest: Vec<String> = planned[1..].iter().map(|args| join_command(args)).collect();
+        assert_eq!(rest, ["RPUSH q new", "LPUSH q first"]);
+        // The review shows what the script does; the audit log gets all of it.
+        let planned = plan("q", &pending);
         assert_eq!(
-            lines,
-            [
-                format!("LSET q 2 {TOMBSTONE}"),
-                format!("LSET q 5 {TOMBSTONE}"),
-                format!("LREM q 0 {TOMBSTONE}"),
-                "RPUSH q new".into(),
-                "LPUSH q first".into(),
-            ]
+            planned[0].shown,
+            "EVAL: remove items 2, 5 from q if they are unchanged"
         );
-        // The removals and the first push ran: only the last push is left.
-        assert_eq!(remaining(&pending, 4), [command(&["LPUSH", "q", "first"])]);
-        // A removal failed: everything stays.
-        assert_eq!(remaining(&pending, 1), pending);
+        assert!(planned[0].line.starts_with("EVAL \"local k"));
+        assert_eq!(planned[1].shown, "RPUSH q new");
+        // The removal and the first push ran: only the last push is left.
+        assert_eq!(remaining(&pending, 2), [command(&["LPUSH", "q", "first"])]);
+        // The removal failed: everything stays.
+        assert_eq!(remaining(&pending, 0), pending);
     }
 }
