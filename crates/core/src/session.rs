@@ -652,11 +652,22 @@ impl Worker {
             }
             return outcome;
         }
-        self.exec_all(transactions.begin_read_only)?;
+        if let Err(error) = self.exec_all(transactions.begin_read_only) {
+            // What did begin must not outlive it: an aborted transaction,
+            // SQLite's query_only.
+            self.end_read_only();
+            return Err(error);
+        }
         let outcome = job(self);
-        // There is never anything to keep.
-        let _ = self.exec_all(self.dialect().transactions.end_read_only);
+        self.end_read_only();
         outcome
+    }
+
+    /// Every step, even after one fails: there is never anything to keep.
+    fn end_read_only(&mut self) {
+        for sql in self.dialect().transactions.end_read_only {
+            let _ = self.exec(sql);
+        }
     }
 
     fn catalog<T>(
