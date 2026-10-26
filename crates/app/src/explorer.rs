@@ -2006,6 +2006,23 @@ mod tests {
         )
     }
 
+    /// Runs the UI until `done` holds, or gives up after a few seconds and
+    /// leaves the assertions to say what is wrong. Sessions answer from their
+    /// own threads, so a result can land after the UI first goes idle.
+    fn run_until(
+        cx: &mut TestAppContext,
+        explorer: &Entity<Explorer>,
+        done: impl Fn(&Explorer) -> bool,
+    ) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if explorer.read_with(cx, |explorer, _| done(explorer)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn move_connections(
         cx: &mut TestAppContext,
         model: &Entity<ProjectModel>,
@@ -2033,7 +2050,15 @@ mod tests {
         move_connections(cx, &model, |connections| {
             connections.remove(0);
         });
-        cx.run_until_parked();
+        run_until(cx, &explorer, |explorer| {
+            !matches!(
+                explorer.connections[0].state,
+                ConnectionState::Ready {
+                    catalog: CatalogState::Loading,
+                    ..
+                }
+            )
+        });
         explorer.read_with(cx, |explorer, _| {
             assert_eq!(explorer.connections[0].spec.id, "b");
             assert!(matches!(
@@ -2089,7 +2114,15 @@ mod tests {
         // C's databases are being read when the two swap places.
         explorer.update(cx, |explorer, cx| explorer.load_keyspace(1, cx));
         move_connections(cx, &model, |connections| connections.reverse());
-        cx.run_until_parked();
+        run_until(cx, &explorer, |explorer| {
+            !matches!(
+                explorer.connections[0].state,
+                ConnectionState::RedisReady {
+                    keyspace: redis_keys::Keyspace::Loading,
+                    ..
+                }
+            )
+        });
         explorer.read_with(cx, |explorer, _| {
             let ids: Vec<&str> = explorer
                 .connections
