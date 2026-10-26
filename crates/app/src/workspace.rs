@@ -1212,10 +1212,10 @@ impl WorkspaceView {
                 };
                 match answer {
                     0 => {
-                        // Save; a query without a file asks where, and stays open.
-                        let has_file = query.read(cx).file().is_some();
+                        // Save; a query without a file asks where, and one that
+                        // failed to save shows why. Both stay open.
                         query.update(cx, |query, cx| query.request_save(window, cx));
-                        if has_file {
+                        if !query.read(cx).is_dirty() {
                             this.remove_tab(index, window, cx);
                         }
                     }
@@ -2275,5 +2275,150 @@ impl Render for WorkspaceView {
                         .child(palette),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use futures::executor::block_on;
+    use gpui::TestAppContext;
+    use gpui_kit::{AnyWindowHandle, Bounds, Point, WindowBounds, WindowOptions, size};
+    use kuery_core::session::{Access, Opener, Session};
+
+    use super::*;
+    use crate::project::Project;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kuery-workspace-{name}-{}",
+            crate::project::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn db(dir: &Path) -> Db {
+        let path = dir.join("test.sqlite");
+        std::fs::write(&path, b"").unwrap();
+        let opener: Opener = Arc::new(move |access| kuery_sqlite::open(&path, access));
+        let session = block_on(Session::open(opener, Access::ReadWrite)).unwrap();
+        Db::new(
+            "local".into(),
+            Environment::Development,
+            session,
+            "test.sqlite".into(),
+            None,
+        )
+    }
+
+    /// A project window with one query tab saved to `file`, edited since.
+    fn open_edited_query(
+        cx: &mut TestAppContext,
+        dir: &Path,
+        file: PathBuf,
+    ) -> (AnyWindowHandle, Entity<WorkspaceView>, Entity<QueryTab>) {
+        // The SQLite session answers from its own thread.
+        cx.executor().allow_parking();
+        let db = db(dir);
+        let root = dir.to_path_buf();
+        let (window, workspace) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(cx);
+            let model = cx.new(|_| ProjectModel {
+                project: Project {
+                    root,
+                    name: "shop".into(),
+                    workspace: None,
+                    connections: Vec::new(),
+                },
+            });
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| WorkspaceView::new(model, window, cx)),
+            )
+            .unwrap()
+        });
+        let query = cx
+            .update_window(window, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let tab = workspace.new_query_tab(
+                        db,
+                        None,
+                        Some("select 2;\n".into()),
+                        Some(file),
+                        window,
+                        cx,
+                    );
+                    let Tab::Query(query) = &tab else {
+                        unreachable!()
+                    };
+                    let query = query.clone();
+                    query.update(cx, |query, cx| {
+                        query.restore_saved_text("select 1;\n".into(), cx)
+                    });
+                    workspace.tabs.push(tab);
+                    query
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        (window, workspace, query)
+    }
+
+    fn close_and_save(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        workspace: &Entity<WorkspaceView>,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.close(0, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_query_that_cannot_be_saved_stays_open(cx: &mut TestAppContext) {
+        let dir = temp_dir("unsaved");
+        // A file where the query's folder should be: writing it fails.
+        std::fs::write(dir.join("queries"), b"").unwrap();
+        let file = dir.join("queries").join("monthly.sql");
+        let (window, workspace, query) = open_edited_query(cx, &dir, file);
+
+        close_and_save(cx, window, &workspace);
+
+        cx.update(|cx| {
+            assert_eq!(workspace.read(cx).tabs.len(), 1);
+            let query = query.read(cx);
+            assert!(query.is_dirty());
+            assert_eq!(query.text(cx), "select 2;\n");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_saved_query_closes(cx: &mut TestAppContext) {
+        let dir = temp_dir("saved");
+        let file = dir.join("queries").join("monthly.sql");
+        let (window, workspace, _) = open_edited_query(cx, &dir, file.clone());
+
+        close_and_save(cx, window, &workspace);
+
+        cx.update(|cx| assert!(workspace.read(cx).tabs.is_empty()));
+        assert!(std::fs::read_to_string(file).unwrap().contains("select 2;"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
