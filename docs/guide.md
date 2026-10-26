@@ -474,8 +474,10 @@ deleting the key, and adding entries (+) or changing and removing them from a
 row's menu (hash fields, list items at the head or tail, set and sorted-set
 members and scores, stream entries). The staged list shows each change with
 its command; Apply runs them in order, stops at the first that fails and
-keeps the rest, then reloads the key. Removed list items are first set to a
-marker and removed together, so indexes do not move under the other changes.
+keeps the rest, then reloads the key. Removed list items go first, in one
+script that checks each still holds the value shown and only then removes
+them all, so indexes do not move under the other changes; if another client
+changed one of them, nothing is removed and Apply reports which item changed.
 On production nothing can be staged until writes are allowed ("Allow
 writes…" in the tab).
 
