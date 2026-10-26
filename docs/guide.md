@@ -841,4 +841,6 @@ The version comes from release-plz (`release-plz.toml`): the workflow's last
 job keeps a release pull request open on `main` that raises the version from
 the conventional commits since the last tag (`feat:` minor, other commits
 patch, `!` or `BREAKING CHANGE` major, or minor until 1.0) and adds them to `CHANGELOG.md`.
-Merging it releases that version.
+Merging it releases that version. If a release fails after its tag was
+pushed, later pushes skip it (the tag exists): re-run the failed jobs, or run
+the Release workflow by hand from the tag.
