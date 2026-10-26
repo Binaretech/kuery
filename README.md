@@ -351,15 +351,19 @@ workflow checks its signatures against that file. The secret half is the
 file's contents). Keep a backup of it: without it, no update can be signed for
 the apps already installed.
 
-The app reports the version in `[workspace.package]` of `Cargo.toml`, and the
-release workflow refuses a tag that does not match it. To release, run the
-[Version workflow](.github/workflows/version.yml) (Actions → Version → Run
-workflow) with `patch`, `minor` or `major`, or an exact version. It opens a
-pull request that bumps `Cargo.toml` and `Cargo.lock`; merging it tags
-`vX.Y.Z` and starts the release. Any other change to that version merged into
-`main` is tagged and released the same way. The Version workflow needs
-"Allow GitHub Actions to create and approve pull requests" (Settings →
-Actions → General).
+Releases are versioned from the commit messages, which follow
+[Conventional Commits](https://www.conventionalcommits.org). On every push to
+`main`, [release-plz](https://release-plz.dev) (configured in
+[`release-plz.toml`](release-plz.toml)) keeps a "chore: release X.Y.Z" pull
+request open: since the last `vX.Y.Z` tag, a `feat:` commit raises the minor
+version, `fix:` and the rest the patch, and a `!` or `BREAKING CHANGE` the
+major (the minor until 1.0); the pull request bumps `[workspace.package] version` in `Cargo.toml`
+and `Cargo.lock` and adds the commits to [`CHANGELOG.md`](CHANGELOG.md).
+Merging it makes the [Release workflow](.github/workflows/release.yml) tag
+`vX.Y.Z` and publish it; any version merged into `main` that has no tag yet is
+released the same way. A `v*` tag pushed by hand must match the `Cargo.toml`
+version. Opening the pull request needs "Allow GitHub Actions to create and
+approve pull requests" (Settings → Actions → General).
 
 ### Website
 

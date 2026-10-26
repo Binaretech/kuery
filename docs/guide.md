@@ -829,14 +829,16 @@ The Rust toolchain is pinned in `rust-toolchain.toml` (gpui uses APIs stabilized
 
 `.github/workflows/release.yml` builds release binaries for Linux (x86_64),
 macOS (Apple Silicon and Intel, as an ad-hoc signed `Kuery.app`) and Windows
-(x86_64). A `v*` tag publishes them as a GitHub release with a
-`SHA256SUMS` file. Running the workflow by hand from a branch (Actions →
-Release → Run workflow) only builds the archives and keeps them as workflow
-artifacts.
+(x86_64). When a push to `main` carries a `[workspace.package] version` with
+no `vX.Y.Z` tag yet, it tags that version and publishes the binaries as a
+GitHub release with a `SHA256SUMS` file, in the same run (a tag pushed with
+the workflow's token starts no other run). A `v*` tag pushed by hand is
+released too, if it matches the `Cargo.toml` version. Running the workflow by
+hand from a branch (Actions → Release → Run workflow) only builds the
+archives and keeps them as workflow artifacts.
 
-`.github/workflows/version.yml` makes the tag. Run by hand with `patch`,
-`minor`, `major` or an exact version, it opens a pull request that bumps
-`[workspace.package] version` in `Cargo.toml` and `Cargo.lock`. When a new
-version lands on `main`, it tags `vX.Y.Z` and starts the release from that tag
-(a tag pushed with the workflow's token does not trigger the release by
-itself).
+The version comes from release-plz (`release-plz.toml`): the workflow's last
+job keeps a release pull request open on `main` that raises the version from
+the conventional commits since the last tag (`feat:` minor, other commits
+patch, `!` or `BREAKING CHANGE` major, or minor until 1.0) and adds them to `CHANGELOG.md`.
+Merging it releases that version.

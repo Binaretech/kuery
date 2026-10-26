@@ -1,16 +1,23 @@
 name: Release
 
-# Pushing a tag such as `v0.1.0` builds Kuery for every platform and publishes
-# the archives as a GitHub release; the Version workflow makes that tag and
-# runs this one from it. Running it by hand from a branch only builds them and
-# keeps the archives as workflow artifacts.
+# A push to main whose `[workspace.package] version` has no `v*` tag yet (the
+# merged release-plz pull request) tags that version, builds Kuery for every
+# platform and publishes the archives as a GitHub release. A `v*` tag pushed
+# by hand does the same for that tag. Running it by hand from a branch only
+# builds them and keeps the archives as workflow artifacts. Every push to
+# main also keeps the release pull request up to date (see release-plz.toml).
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,18 +25,26 @@ env:
 
 jobs:
   # The app reports the Cargo.toml version (the macOS bundle and the updater
-  # read it), so a tag must match it: bump `[workspace.package] version`
-  # before tagging.
+  # read it), so the release is tagged from it. Outputs the version, the tag
+  # to publish (empty when nothing is released) and whether to build.
   version:
-    name: Version matches the tag
+    name: Version and tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
-      version: ${{ steps.compare.outputs.version }}
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Compare
-        id: compare
+      # A tag pushed with the workflow's token starts no other run, so this
+      # run goes on to build and publish it.
+      - name: Tag the version
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
           if [[ -z "$version" ]]; then
@@ -37,19 +52,34 @@ jobs:
             exit 1
           fi
           echo "Cargo.toml version: $version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
-            echo "Not a tag push; nothing to compare."
-            exit 0
+          tag="" build=true
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $version; bump [workspace.package] version to ${GITHUB_REF_NAME#v} or tag v$version."
+              exit 1
+            fi
+            tag="$GITHUB_REF_NAME"
+          elif [[ "$EVENT" == push ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+              echo "v$version is already released; nothing to build."
+              build=false
+            else
+              tag="v$version"
+              git tag "$tag" "$GITHUB_SHA"
+              git push origin "$tag"
+              echo "Tagged $tag."
+            fi
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $version; bump [workspace.package] version to ${GITHUB_REF_NAME#v} or tag v$version."
-            exit 1
-          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.target }})
     needs: version
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -91,8 +121,10 @@ jobs:
 
       - name: Archive name
         shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
+          version="${TAG:-${GITHUB_SHA::7}}"
           echo "ARCHIVE=kuery-$version-${{ matrix.target }}" >> "$GITHUB_ENV"
 
       - name: Package (Linux)
@@ -140,7 +172,7 @@ jobs:
   # with lipo into a universal binary, which macOS runs natively on either.
   macos-universal:
     name: macOS universal app
-    needs: build
+    needs: [version, build]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -164,8 +196,10 @@ jobs:
           fi
 
       - name: Archive name
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
+          version="${TAG:-${GITHUB_SHA::7}}"
           echo "ARCHIVE=kuery-$version-universal-apple-darwin" >> "$GITHUB_ENV"
 
       # A minimal app bundle so Finder and the Dock show Kuery with its icon.
@@ -315,9 +349,10 @@ jobs:
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
           VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           if [[ -z "$UPDATE_SIGNING_KEY" ]]; then
-            if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ -n "$TAG" ]]; then
               echo "::error::UPDATE_SIGNING_KEY is not set; a release without signed updates would leave the updater nothing to install."
               exit 1
             fi
@@ -326,7 +361,7 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag="$GITHUB_REF_NAME"; else tag="${GITHUB_SHA::7}"; fi
+          tag="${TAG:-${GITHUB_SHA::7}}"
           key="$RUNNER_TEMP/update.key"
           printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
           chmod 600 "$key"
@@ -343,8 +378,8 @@ jobs:
 
   release:
     name: GitHub release
-    if: github.ref_type == 'tag'
-    needs: [build, macos-universal, update-manifest]
+    if: needs.version.outputs.tag != ''
+    needs: [version, build, macos-universal, update-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -362,10 +397,11 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Kuery $GITHUB_REF_NAME" \
+            --title "Kuery $TAG" \
             --generate-notes
 
       # Point the website's download links at the new release.
@@ -373,3 +409,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
+
+  # Opens or updates the release pull request: the next version from the
+  # conventional commits since the last tag, and their CHANGELOG.md entries.
+  # After the tag, so a version just released is not proposed again.
+  release-pr:
+    name: Release pull request
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

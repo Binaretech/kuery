@@ -1,0 +1,93 @@
+# release-plz keeps a release pull request open on main: it raises the
+# workspace version from the conventional commits since the last `v*` tag
+# and adds them to CHANGELOG.md. Merging it makes the Release workflow tag
+# that version and publish it.
+
+[workspace]
+# Kuery is not on crates.io: the last release is the latest `v*` tag.
+git_only = true
+git_tag_name = "v{{ version }}"
+publish = false
+# The Release workflow tags and publishes the GitHub release.
+git_tag_enable = false
+git_release_enable = false
+# An app, not a library: there is no public API to check.
+semver_check = false
+# Dependencies are updated on purpose, not with each release.
+dependencies_update = false
+# Before 1.0 too, `feat:` raises the minor version and `fix:` the patch.
+features_always_increment_minor = true
+pr_name = "chore: release {{ version }}"
+
+# Every crate shares the workspace version; the changelog is the app's and
+# covers all of them.
+[[package]]
+name = "kuery"
+version_group = "kuery"
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+    "kuery-core",
+    "kuery-files",
+    "kuery-mssql",
+    "kuery-mysql",
+    "kuery-pg",
+    "kuery-redis",
+    "kuery-sqlite",
+    "kuery-update",
+]
+
+[[package]]
+name = "kuery-core"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-files"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-mssql"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-mysql"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-pg"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-redis"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-sqlite"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-update"
+version_group = "kuery"
+changelog_update = false
+
+# Groups the commits by their conventional type; merge commits repeat the
+# pull request's own commits, so they are left out.
+[changelog]
+commit_parsers = [
+    { message = "^Merge pull request", skip = true },
+    { message = "^chore: release", skip = true },
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^docs?", group = "Documentation" },
+    { message = "^revert", group = "Reverted" },
+    { message = "^(test|style|ci)", skip = true },
+    { message = ".*", group = "Other" },
+]
