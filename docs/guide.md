@@ -837,8 +837,9 @@ released too, if it matches the `Cargo.toml` version. Running the workflow by
 hand from a branch (Actions → Release → Run workflow) only builds the
 archives and keeps them as workflow artifacts.
 
-The version comes from release-plz (`release-plz.toml`): the workflow's last
-job keeps a release pull request open on `main` that raises the version from
+The version comes from release-plz (`release-plz.toml`): running the Release
+PR workflow by hand from `main` (`.github/workflows/release-pr.yml`) opens a
+release pull request, or updates the open one, that raises the version from
 the conventional commits since the last tag (`feat:` minor, other commits
 patch, `!` or `BREAKING CHANGE` major, or minor until 1.0) and adds them to `CHANGELOG.md`.
 Merging it releases that version. If a release fails after its tag was
