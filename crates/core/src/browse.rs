@@ -6,7 +6,7 @@
 use std::fmt;
 
 use crate::catalog::TableRef;
-use crate::sql::{Dialect, SqlError, escape_like};
+use crate::sql::{Dialect, SqlError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
@@ -229,8 +229,8 @@ impl Browse {
             FilterOp::GreaterOrEqual => comparison(">="),
             FilterOp::Less => comparison("<"),
             FilterOp::LessOrEqual => comparison("<="),
-            FilterOp::Contains => pattern(format!("%{}%", escape_like(value))),
-            FilterOp::StartsWith => pattern(format!("{}%", escape_like(value))),
+            FilterOp::Contains => pattern(format!("%{}%", dialect.escape_like(value))),
+            FilterOp::StartsWith => pattern(format!("{}%", dialect.escape_like(value))),
             FilterOp::OneOf => {
                 let values = value
                     .split(',')
@@ -363,6 +363,17 @@ mod tests {
         assert_eq!(
             browse.count_sql().unwrap(),
             r#"select count(*) from "public"."orders" where "note"::text ilike E'%50\\%'' or 1=1 --%' escape E'\\'"#
+        );
+        // SQL Server would read `[abc]` as "a, b or c": the bracket is escaped.
+        let mut mssql = orders().in_dialect(&crate::sql::MSSQL);
+        mssql.filters = vec![filter("note", FilterOp::StartsWith, "[abc]")];
+        assert!(
+            mssql
+                .count_sql()
+                .unwrap()
+                .contains(r"like N'\[abc]%' escape N'\'"),
+            "{}",
+            mssql.count_sql().unwrap()
         );
     }
 

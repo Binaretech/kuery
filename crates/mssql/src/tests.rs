@@ -1013,6 +1013,44 @@ fn a_column_named_with_a_bracket_round_trips_through_edits() {
 
 #[test]
 #[ignore = "needs the dev SQL Server"]
+fn contains_and_starts_with_filters_match_brackets_literally() {
+    let _shop = changing_shop();
+    use kuery_core::browse::{Browse, Filter, FilterOp};
+    let table = format!("scratch_like_{}", std::process::id());
+    let mut sa = adapter();
+    run(
+        sa.as_mut(),
+        &format!(
+            "create table dbo.{table} (id int primary key, note nvarchar(20)); \
+             insert into dbo.{table} values (1, N'[abc]'), (2, N'a'), (3, N'b'), \
+                 (4, N'50% off'), (5, N'a_b'), (6, N'axb'), (7, N'[^x]')"
+        ),
+    );
+    let mut count = |op: FilterOp, value: &str| {
+        let mut browse = Browse::new(
+            TableRef::new("dbo", table.clone()),
+            vec!["id".into(), "note".into()],
+        )
+        .in_dialect(&MSSQL);
+        browse.filters = vec![Filter {
+            column: "note".into(),
+            op,
+            value: value.into(),
+        }];
+        scalar(sa.as_mut(), &browse.count_sql().unwrap())
+    };
+    // `[abc]` is the text, not "any of a, b or c".
+    assert_eq!(count(FilterOp::Contains, "[abc]").as_deref(), Some("1"));
+    assert_eq!(count(FilterOp::StartsWith, "[").as_deref(), Some("2"));
+    assert_eq!(count(FilterOp::Contains, "[^x]").as_deref(), Some("1"));
+    assert_eq!(count(FilterOp::Contains, "%").as_deref(), Some("1"));
+    assert_eq!(count(FilterOp::Contains, "_").as_deref(), Some("1"));
+    assert_eq!(count(FilterOp::Contains, "c]").as_deref(), Some("1"));
+    run(sa.as_mut(), &format!("drop table dbo.{table}"));
+}
+
+#[test]
+#[ignore = "needs the dev SQL Server"]
 fn works_like_the_other_drivers() {
     let _shop = changing_shop();
     kuery_core::conformance::run(&kuery_core::conformance::Fixture {

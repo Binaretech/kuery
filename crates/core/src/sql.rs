@@ -41,6 +41,8 @@ pub struct Dialect {
     pub as_text: fn(&str) -> String,
     /// The case-insensitive `LIKE`.
     pub like_ignoring_case: &'static str,
+    /// Whether `[` starts a character class in `LIKE` patterns (SQL Server).
+    pub like_classes: bool,
     /// How sorting puts NULLs last.
     pub nulls_last: NullsLast,
     /// `a` equals `b`, NULL equal to NULL.
@@ -169,6 +171,19 @@ impl Dialect {
         self.like_ignoring_case
     }
 
+    /// Escapes `%`, `_`, `\` and, where it starts a character class, `[`,
+    /// so `value` matches itself inside a LIKE pattern with `ESCAPE '\'`.
+    pub fn escape_like(&self, value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if matches!(ch, '\\' | '%' | '_') || (ch == '[' && self.like_classes) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     /// Sorts by `expr` with NULLs last either way.
     pub fn order_nulls_last(&self, expr: &str, descending: bool) -> String {
         let direction = if descending { "desc" } else { "asc" };
@@ -248,6 +263,7 @@ pub static POSTGRES: Dialect = Dialect {
     literal: quote_literal,
     as_text: |expr| format!("{expr}::text"),
     like_ignoring_case: "ilike",
+    like_classes: false,
     nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is not distinct from {b}"),
     insert_defaults: "insert into {} default values",
@@ -282,6 +298,7 @@ pub static SQLITE: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as text)"),
     like_ignoring_case: "like",
+    like_classes: false,
     nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is {b}"),
     insert_defaults: "insert into {} default values",
@@ -357,6 +374,7 @@ pub static MYSQL: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as char)"),
     like_ignoring_case: "like",
+    like_classes: false,
     nulls_last: NullsLast::IsNullFirst,
     same: |a, b| format!("{a} <=> {b}"),
     insert_defaults: "insert into {} () values ()",
@@ -394,6 +412,7 @@ pub static MSSQL: Dialect = Dialect {
         format!("coalesce(try_convert(nvarchar(max), {expr}, 126), convert(nvarchar(max), {expr}))")
     },
     like_ignoring_case: "like",
+    like_classes: true,
     nulls_last: NullsLast::Case,
     same: |a, b| format!("({a} = {b} or ({a} is null and {b} is null))"),
     insert_defaults: "insert into {} default values",
@@ -450,19 +469,6 @@ pub fn quote_nullable(value: Option<&str>) -> Result<String, SqlError> {
         Some(value) => quote_literal(value),
         None => Ok("NULL".into()),
     }
-}
-
-/// Escapes `%`, `_` and `\` so `value` can be used inside a LIKE pattern with
-/// `ESCAPE '\'`.
-pub fn escape_like(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -558,6 +564,8 @@ mod tests {
 
     #[test]
     fn escapes_like_patterns() {
-        assert_eq!(escape_like("50%_off\\"), "50\\%\\_off\\\\");
+        assert_eq!(POSTGRES.escape_like("50%_off\\[a]"), "50\\%\\_off\\\\[a]");
+        // SQL Server reads `[abc]` as "a, b or c".
+        assert_eq!(MSSQL.escape_like("[abc]_%"), "\\[abc]\\_\\%");
     }
 }
