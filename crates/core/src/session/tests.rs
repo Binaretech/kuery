@@ -509,6 +509,25 @@ fn refuses_what_mysql_would_commit_by_itself() {
 }
 
 #[test]
+fn refuses_on_mysql_what_it_cannot_read() {
+    // Valid MySQL DDL, so it commits by itself, but sqlparser cannot read it.
+    let sql = "create tablespace ts add datafile 'ts.ibd'";
+    assert!(analysis::analyze_in(&MYSQL, sql).is_err());
+    let (session, log) = open_with(&MYSQL, Access::ReadWrite);
+    let (_, refused) = drain(session.run_in_transaction(sql.into(), RunOptions::default()));
+    assert!(
+        matches!(refused, Err(QueryError::Unsupported(_))),
+        "{refused:?}"
+    );
+    let previewed = block_on(session.preview(sql.into(), RunOptions::default()));
+    assert!(
+        matches!(previewed, Err(QueryError::Unsupported(_))),
+        "{previewed:?}"
+    );
+    assert!(log.take().is_empty());
+}
+
+#[test]
 fn a_cancelled_statement_counts_as_cancelled_even_if_it_ends_well() {
     let (session, _) = open(Access::ReadOnly);
     let rx = session.run_read_only("select slow".into(), RunOptions::default());

@@ -608,8 +608,13 @@ impl Worker {
         if !dialect.implicit_commits {
             return Ok(());
         }
+        // What cannot be read may commit by itself too.
         let Ok(analysis) = analysis::analyze_in(dialect, sql) else {
-            return Ok(());
+            return Err(QueryError::Unsupported(format!(
+                "Kuery cannot read this statement to tell whether {} commits it by itself, \
+                 so it cannot run {place}",
+                dialect.name
+            )));
         };
         const COMMITTING: [&str; 7] = [
             "TRUNCATE", "RENAME", "LOCK", "UNLOCK", "ANALYZE", "OPTIMIZE", "REPAIR",
