@@ -21,32 +21,41 @@ pub fn split_command(line: &str) -> Result<Vec<String>, String> {
         match first {
             '"' => {
                 chars.next();
+                // Bytes, so `\xHH` escapes can spell one character together.
+                let mut bytes = Vec::new();
                 loop {
-                    match chars.next() {
+                    let c = match chars.next() {
                         None => return Err("unbalanced double quotes".into()),
                         Some('"') => break,
                         Some('\\') => match chars.next() {
-                            Some('n') => arg.push('\n'),
-                            Some('r') => arg.push('\r'),
-                            Some('t') => arg.push('\t'),
-                            Some('b') => arg.push('\u{8}'),
-                            Some('a') => arg.push('\u{7}'),
+                            Some('n') => '\n',
+                            Some('r') => '\r',
+                            Some('t') => '\t',
+                            Some('b') => '\u{8}',
+                            Some('a') => '\u{7}',
                             Some('x') => {
-                                let hex: String = chars.by_ref().take(2).collect();
-                                match u8::from_str_radix(&hex, 16) {
-                                    Ok(byte) if hex.len() == 2 => arg.push(byte as char),
-                                    _ => {
-                                        arg.push_str("\\x");
-                                        arg.push_str(&hex);
+                                let mut ahead = chars.clone();
+                                let digit = |c: Option<char>| c?.to_digit(16);
+                                match (digit(ahead.next()), digit(ahead.next())) {
+                                    (Some(high), Some(low)) => {
+                                        chars.nth(1);
+                                        bytes.push((high * 16 + low) as u8);
+                                        continue;
                                     }
+                                    // Not two hex digits: redis-cli keeps the x.
+                                    _ => 'x',
                                 }
                             }
-                            Some(other) => arg.push(other),
+                            Some(other) => other,
                             None => return Err("unbalanced double quotes".into()),
                         },
-                        Some(c) => arg.push(c),
-                    }
+                        Some(c) => c,
+                    };
+                    bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
                 }
+                arg = String::from_utf8(bytes).map_err(|_| {
+                    "the \\x escapes are not UTF-8 text, which the console cannot send".to_string()
+                })?;
                 ensure_separated(&mut chars)?;
             }
             '\'' => {
@@ -431,7 +440,11 @@ pub fn join_command(args: &[String]) -> String {
                     '\n' => quoted.push_str("\\n"),
                     '\r' => quoted.push_str("\\r"),
                     '\t' => quoted.push_str("\\t"),
-                    c if c.is_control() => quoted.push_str(&format!("\\x{:02x}", c as u32)),
+                    c if c.is_control() => {
+                        for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                            quoted.push_str(&format!("\\x{byte:02x}"));
+                        }
+                    }
                     c => quoted.push(c),
                 }
             }
@@ -634,6 +647,16 @@ mod tests {
     }
 
     #[test]
+    fn hex_escapes_are_bytes_like_in_redis_cli() {
+        assert_eq!(args(r#"SET k "\xc3\xa9""#), ["SET", "k", "é"]);
+        assert_eq!(args(r#"SET k "caf\xc3\xa9!""#), ["SET", "k", "café!"]);
+        // Without two hex digits, redis-cli keeps the x.
+        assert_eq!(args(r#"SET k "\x4""#), ["SET", "k", "x4"]);
+        // Bytes that are not UTF-8 cannot be sent as text.
+        assert!(split_command(r#"SET k "\xff""#).is_err());
+    }
+
+    #[test]
     fn finds_the_lines_with_commands() {
         let script = "GET a\n\n# a comment\n  // another\nHGETALL user:1\n";
         assert_eq!(command_lines(script), [(0, "GET a"), (4, "HGETALL user:1")]);
@@ -705,6 +728,9 @@ mod tests {
         let joined = join_command(&line);
         assert_eq!(joined, r#"SET "key one" "say \"hi\"\n" "" plain"#);
         assert_eq!(split_command(&joined).unwrap(), line);
+        // Control characters past ASCII take more than one byte.
+        let line = vec!["SET".to_string(), "k".into(), "a\u{1}b\u{85}c".into()];
+        assert_eq!(split_command(&join_command(&line)).unwrap(), line);
     }
 
     #[test]
