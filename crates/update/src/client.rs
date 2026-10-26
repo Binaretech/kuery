@@ -11,6 +11,10 @@ use crate::{Error, Manifest, Update, verify_file};
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// The universal macOS zip is about 100 MB.
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+/// For the whole manifest request.
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// For each read: a download may take long, but not stop coming.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Download progress, for the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,7 @@ pub struct Updater {
     current: Version,
     platform: String,
     max_archive_bytes: u64,
+    manifest_timeout: Duration,
     http: reqwest::blocking::Client,
 }
 
@@ -42,25 +47,20 @@ impl Updater {
         check_secure(manifest_url)?;
         let current = Version::parse(current_version)
             .map_err(|_| Error::InvalidVersion(current_version.to_string()))?;
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(concat!("Kuery/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
-            // Only the archive takes long, and it is read in chunks.
-            .timeout(None)
-            .build()?;
         Ok(Self {
             manifest_url: manifest_url.to_string(),
             public_key: public_key.to_string(),
             current,
             platform: platform.to_string(),
             max_archive_bytes: MAX_ARCHIVE_BYTES,
-            http,
+            manifest_timeout: MANIFEST_TIMEOUT,
+            http: http_client(READ_TIMEOUT)?,
         })
     }
 
     /// The newer release for this platform, if any.
     pub fn check(&self) -> Result<Option<Update>, Error> {
-        let response = self.get(&self.manifest_url)?;
+        let response = self.get(&self.manifest_url, Some(self.manifest_timeout))?;
         let mut json = String::new();
         response
             .take(MAX_MANIFEST_BYTES + 1)
@@ -100,7 +100,7 @@ impl Updater {
         path: &Path,
         mut progress: impl FnMut(Download),
     ) -> Result<(), Error> {
-        let mut response = self.get(url)?;
+        let mut response = self.get(url, None)?;
         let total = response.content_length();
         if total.is_some_and(|total| total > self.max_archive_bytes) {
             return Err(Error::TooLarge(self.max_archive_bytes));
@@ -124,9 +124,18 @@ impl Updater {
         Ok(())
     }
 
-    fn get(&self, url: &str) -> Result<reqwest::blocking::Response, Error> {
+    /// `timeout` bounds the whole request, body included.
+    fn get(
+        &self,
+        url: &str,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::blocking::Response, Error> {
         check_secure(url)?;
-        let response = self.http.get(url).send()?;
+        let mut request = self.http.get(url);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send()?;
         if !response.status().is_success() {
             return Err(Error::Status {
                 status: response.status().as_u16(),
@@ -135,6 +144,15 @@ impl Updater {
         }
         Ok(response)
     }
+}
+
+fn http_client(read_timeout: Duration) -> Result<reqwest::blocking::Client, Error> {
+    Ok(reqwest::blocking::Client::builder()
+        .user_agent(concat!("Kuery/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        // The blocking client applies this to each read, not the whole body.
+        .timeout(read_timeout)
+        .build()?)
 }
 
 /// Updates only come over https; plain http is allowed to this machine, for
@@ -159,8 +177,17 @@ mod tests {
     use super::*;
     use crate::verify::tests::{TestKey, sha256_hex, tempdir};
 
-    /// Path → status and body.
-    type Routes = Arc<Mutex<HashMap<String, (u16, Vec<u8>)>>>;
+    /// How the server answers a path.
+    #[derive(Clone)]
+    enum Reply {
+        Full(u16, Vec<u8>),
+        /// The headers for a body this long, then nothing.
+        Stall(usize),
+        /// The body a byte at a time, this far apart.
+        Trickle(Vec<u8>, Duration),
+    }
+
+    type Routes = Arc<Mutex<HashMap<String, Reply>>>;
 
     /// A tiny HTTP server on 127.0.0.1 answering `routes`; unknown paths get
     /// 404.
@@ -177,46 +204,64 @@ mod tests {
             let served = routes.clone();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { continue };
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request_line = String::new();
-                    reader.read_line(&mut request_line).unwrap();
-                    // Skip the headers.
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).unwrap() > 2 {
-                        line.clear();
-                    }
-                    let path = request_line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_string();
-                    let (status, body) = served
-                        .lock()
-                        .unwrap()
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or((404, Vec::new()));
-                    let head = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&body);
+                    let Ok(stream) = stream else { continue };
+                    let served = served.clone();
+                    std::thread::spawn(move || answer(stream, &served));
                 }
             });
             Self { base, routes }
         }
 
         fn serve(&self, path: &str, status: u16, body: impl Into<Vec<u8>>) {
-            self.routes
-                .lock()
-                .unwrap()
-                .insert(path.into(), (status, body.into()));
+            self.reply(path, Reply::Full(status, body.into()));
+        }
+
+        fn reply(&self, path: &str, reply: Reply) {
+            self.routes.lock().unwrap().insert(path.into(), reply);
         }
 
         fn url(&self, path: &str) -> String {
             format!("{}{path}", self.base)
+        }
+    }
+
+    fn answer(mut stream: std::net::TcpStream, routes: &Routes) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        // Skip the headers.
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 2 {
+            line.clear();
+        }
+        let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+        let reply = routes
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or(Reply::Full(404, Vec::new()));
+        let head = |status: u16, len: usize| {
+            format!("HTTP/1.1 {status} X\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+        };
+        match reply {
+            Reply::Full(status, body) => {
+                let _ = stream.write_all(head(status, body.len()).as_bytes());
+                let _ = stream.write_all(&body);
+            }
+            Reply::Stall(len) => {
+                let _ = stream.write_all(head(200, len).as_bytes());
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            Reply::Trickle(body, gap) => {
+                let _ = stream.write_all(head(200, body.len()).as_bytes());
+                for byte in body {
+                    std::thread::sleep(gap);
+                    if stream.write_all(&[byte]).is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -396,5 +441,77 @@ mod tests {
     fn rejects_an_invalid_current_version() {
         let err = Updater::new("https://example.com/latest.json", "", "dev", "linux-x86_64");
         assert!(matches!(err, Err(Error::InvalidVersion(v)) if v == "dev"));
+    }
+
+    /// Short timeouts, so the tests that wait for one finish quickly.
+    const IMPATIENT: Duration = Duration::from_millis(500);
+
+    fn impatient(mut updater: Updater) -> Updater {
+        updater.manifest_timeout = IMPATIENT;
+        updater.http = http_client(IMPATIENT).unwrap();
+        updater
+    }
+
+    /// Runs `f`, failing the test if it has not returned within a few
+    /// seconds rather than hanging it.
+    fn soon<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("still waiting after 5 seconds")
+    }
+
+    #[test]
+    fn gives_up_on_a_manifest_that_stops_coming() {
+        let key = TestKey::new();
+        let server = Server::start();
+        server.reply("/latest.json", Reply::Stall(100));
+        let updater = impatient(updater(&server, &key, "0.2.1"));
+        assert!(soon(move || updater.check()).is_err());
+    }
+
+    #[test]
+    fn gives_up_on_a_manifest_that_never_finishes() {
+        let key = TestKey::new();
+        let server = Server::start();
+        // Each byte comes in time, but the whole would take a minute.
+        server.reply(
+            "/latest.json",
+            Reply::Trickle(vec![b' '; 600], Duration::from_millis(100)),
+        );
+        let updater = impatient(updater(&server, &key, "0.2.1"));
+        assert!(soon(move || updater.check()).is_err());
+    }
+
+    #[test]
+    fn gives_up_on_a_download_that_stops_coming() {
+        let key = TestKey::new();
+        let server = release(&key, ARCHIVE);
+        let updater = impatient(updater(&server, &key, "0.2.1"));
+        let update = updater.check().unwrap().unwrap();
+        let path = reqwest::Url::parse(&update.asset.url).unwrap();
+        server.reply(path.path(), Reply::Stall(ARCHIVE.len()));
+        let dir = tempdir::Dir::new();
+        let target = dir.path().to_path_buf();
+        let result = soon(move || updater.download(&update, &target, |_| {}));
+        assert!(result.is_err());
+        assert!(files_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_slow_download_that_keeps_coming_finishes() {
+        let key = TestKey::new();
+        let server = release(&key, ARCHIVE);
+        let updater = impatient(updater(&server, &key, "0.2.1"));
+        let update = updater.check().unwrap().unwrap();
+        let path = reqwest::Url::parse(&update.asset.url).unwrap();
+        // Longer in all than the timeout, with no gap as long as it.
+        server.reply(
+            path.path(),
+            Reply::Trickle(ARCHIVE.to_vec(), Duration::from_millis(100)),
+        );
+        let dir = tempdir::Dir::new();
+        let path = updater.download(&update, dir.path(), |_| {}).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), ARCHIVE);
     }
 }
