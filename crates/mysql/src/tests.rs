@@ -24,6 +24,7 @@ fn target() -> Target {
         password: None,
         database: "shop".into(),
         tls: false,
+        server_name: String::new(),
     }
 }
 
@@ -67,6 +68,22 @@ fn scratch(writer: &Session, name: &str) -> String {
 
 fn drop_scratch(writer: &Session, table: &str) {
     drain(writer.run_autocommit(format!("drop table {table}"), RunOptions::default())).unwrap();
+}
+
+#[test]
+fn checks_the_certificate_against_the_server_through_a_tunnel() {
+    let target = Target::from(&ConnectOptions {
+        host: "db.example.com".into(),
+        port: 3306,
+        tls: Some("require".into()),
+        tunnel: Some(40000),
+        ..ConnectOptions::default()
+    });
+    assert_eq!((target.host.as_str(), target.port), ("127.0.0.1", 40000));
+    let opts = target.opts();
+    assert_eq!(opts.ip_or_hostname(), "127.0.0.1");
+    let tls = opts.ssl_opts().expect("TLS is on");
+    assert_eq!(tls.tls_hostname_override(), Some("db.example.com"));
 }
 
 #[test]

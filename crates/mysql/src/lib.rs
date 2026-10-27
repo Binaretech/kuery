@@ -50,6 +50,9 @@ pub struct Target {
     pub database: String,
     /// TLS, checking the server's certificate against the system roots.
     pub tls: bool,
+    /// The name the certificate must carry: the server as named, even
+    /// when `host` is the local end of a tunnel.
+    pub server_name: String,
 }
 
 impl Target {
@@ -65,7 +68,9 @@ impl Target {
             // values changed: a row edit that sets a value it already has
             // still counts as its one row.
             .client_found_rows(true)
-            .ssl_opts(self.tls.then(SslOpts::default));
+            .ssl_opts(self.tls.then(|| {
+                SslOpts::default().with_danger_tls_hostname_override(Some(self.server_name.clone()))
+            }));
         Opts::from(builder)
     }
 }
@@ -104,19 +109,15 @@ pub static DRIVER: SqlDriver = SqlDriver {
 impl From<&ConnectOptions> for Target {
     /// Through the local end of a tunnel when there is one.
     fn from(options: &ConnectOptions) -> Self {
+        let endpoint = options.endpoint();
         Target {
-            host: match options.tunnel {
-                Some(_) => "127.0.0.1".into(),
-                None => options.host.clone(),
-            },
-            port: options.tunnel.unwrap_or(options.port),
+            host: endpoint.host,
+            port: endpoint.port,
             user: options.user.trim().to_string(),
             password: options.password.clone().filter(|p| !p.is_empty()),
             database: options.database.trim().to_string(),
-            tls: options
-                .tls
-                .as_deref()
-                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+            tls: endpoint.tls,
+            server_name: endpoint.server_name,
         }
     }
 }
