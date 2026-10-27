@@ -27,17 +27,18 @@ use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
 use crate::commands::{
-    ClearRecentProjects, CloseTab, FindInSidebar, NewConnection, NewQuery, NextTab,
-    OpenCommandPalette, OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, PreviousTab,
-    QueryDataFiles, ShowServerActivity, ToggleSidebar,
+    ClearRecentProjects, CloseTab, FindInSidebar, NewConnection, NewQuery, OpenCommandPalette,
+    OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, ShowServerActivity,
+    ToggleSidebar,
 };
 use crate::connection::{Db, Environment, RedisDb, WriteKind};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
+use crate::data_file_tabs::DataFileTabs;
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
-use crate::file_query_tab::{self, FileQueryTab};
-use crate::file_tab::{FileTab, data_file_error, no_files_to_query};
+use crate::file_query_tab::FileQueryTab;
+use crate::file_tab::FileTab;
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
@@ -50,7 +51,7 @@ use crate::settings;
 use crate::table_tab::{TableTab, TableView};
 use crate::theme::{self, color};
 
-enum Tab {
+pub(crate) enum Tab {
     Query(Entity<QueryTab>),
     Table(Entity<TableTab>),
     RedisKey(Entity<KeyTab>),
@@ -606,88 +607,6 @@ impl WorkspaceView {
         }
     }
 
-    fn query_data_files(
-        &mut self,
-        _: &QueryDataFiles,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let active = match self.tabs.get(self.active) {
-            Some(Tab::File(active)) => Some(active.read(cx).path().to_path_buf()),
-            _ => None,
-        };
-        let sources = file_query_tab::query_sources(
-            self.tabs.iter().filter_map(|tab| match tab {
-                Tab::File(file) => Some(file.read(cx)),
-                _ => None,
-            }),
-            active.as_deref(),
-        );
-        if sources.is_empty() {
-            no_files_to_query(window, cx);
-            return;
-        }
-        let query = cx.new(|cx| FileQueryTab::new(sources, window, cx));
-        cx.observe(&query, |_, _, cx| cx.notify()).detach();
-        self.tabs.push(Tab::FileQuery(query));
-        self.activate(self.tabs.len() - 1, window, cx);
-    }
-
-    fn open_data_file(&mut self, _: &OpenDataFile, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open data file".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            if let Some(path) = paths.into_iter().next() {
-                this.update_in(cx, |this, window, cx| this.open_data_path(path, window, cx))
-                    .ok();
-            }
-        })
-        .detach();
-    }
-
-    /// Opens the data file at `path` in a tab, or shows its tab if it is
-    /// already open.
-    pub fn open_data_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let source = cx
-                .background_spawn(async move { crate::file_tab::load_source(path) })
-                .await;
-            this.update_in(cx, |this, window, cx| match source {
-                Ok(source) => {
-                    let existing = this.tabs.iter().position(
-                        |tab| matches!(tab, Tab::File(file) if file.read(cx).matches(&source)),
-                    );
-                    let index = existing.unwrap_or_else(|| {
-                        this.tabs.push(this.new_file_tab(source, window, cx));
-                        this.tabs.len() - 1
-                    });
-                    this.activate(index, window, cx);
-                }
-                Err(error) => data_file_error(&error, window, cx),
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn new_file_tab(
-        &self,
-        source: kuery_files::FileSource,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Tab {
-        let file = cx.new(|cx| FileTab::new(source, window, cx));
-        cx.observe(&file, |_, _, cx| cx.notify()).detach();
-        Tab::File(file)
-    }
-
     fn open_query(
         &mut self,
         db: Db,
@@ -1025,33 +944,6 @@ impl WorkspaceView {
         cx.new(|cx| ConsoleTab::new(db, database, project, window, cx))
     }
 
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = index;
-        match self.tabs.get(index) {
-            Some(tab) => tab.focus(window, cx),
-            None => window.focus(&self.focus_handle, cx),
-        }
-        let selection = match self.tabs.get(index) {
-            Some(Tab::Table(table)) => {
-                let table = table.read(cx);
-                Some((table.db().name.clone(), table.info().table.clone()))
-            }
-            _ => None,
-        };
-        let query = match self.tabs.get(index) {
-            Some(Tab::Query(query)) => query.read(cx).file().map(PathBuf::from),
-            _ => None,
-        };
-        let query = query.and_then(|path| self.relative_query(&path, cx));
-        self.explorer
-            .update(cx, |explorer, cx| explorer.reveal_query(query, cx));
-        self.explorer.update(cx, |explorer, cx| match &selection {
-            Some((connection, table)) => explorer.reveal_table(connection, Some(table), cx),
-            None => explorer.reveal_table("", None, cx),
-        });
-        cx.notify();
-    }
-
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(index) {
             // A table with unsaved changes is not closed by accident.
@@ -1259,19 +1151,6 @@ impl WorkspaceView {
         }
     }
 
-    fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.tabs.len() {
-            self.tabs.remove(index);
-        }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if self.active > index {
-            self.active -= 1;
-        }
-        let active = self.active;
-        self.activate(active, window, cx);
-    }
-
     // Commands -------------------------------------------------------------
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1280,22 +1159,6 @@ impl WorkspaceView {
             window.dispatch_action(Box::new(CloseWindow), cx);
         } else {
             self.close(self.active, window, cx);
-        }
-    }
-
-    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
-        }
-    }
-
-    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate(
-                (self.active + self.tabs.len() - 1) % self.tabs.len(),
-                window,
-                cx,
-            );
         }
     }
 
@@ -2179,6 +2042,64 @@ impl WorkspaceView {
                 )
                 .into_any_element(),
         }
+    }
+}
+
+impl DataFileTabs for WorkspaceView {
+    type Tab = Tab;
+
+    fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    fn tabs_mut(&mut self) -> &mut Vec<Tab> {
+        &mut self.tabs
+    }
+
+    fn active(&self) -> usize {
+        self.active
+    }
+
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = index;
+        match self.tabs.get(index) {
+            Some(tab) => tab.focus(window, cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+        let selection = match self.tabs.get(index) {
+            Some(Tab::Table(table)) => {
+                let table = table.read(cx);
+                Some((table.db().name.clone(), table.info().table.clone()))
+            }
+            _ => None,
+        };
+        let query = match self.tabs.get(index) {
+            Some(Tab::Query(query)) => query.read(cx).file().map(PathBuf::from),
+            _ => None,
+        };
+        let query = query.and_then(|path| self.relative_query(&path, cx));
+        self.explorer
+            .update(cx, |explorer, cx| explorer.reveal_query(query, cx));
+        self.explorer.update(cx, |explorer, cx| match &selection {
+            Some((connection, table)) => explorer.reveal_table(connection, Some(table), cx),
+            None => explorer.reveal_table("", None, cx),
+        });
+        cx.notify();
+    }
+
+    fn as_file(tab: &Tab) -> Option<&Entity<FileTab>> {
+        match tab {
+            Tab::File(file) => Some(file),
+            _ => None,
+        }
+    }
+
+    fn file_tab(file: Entity<FileTab>) -> Tab {
+        Tab::File(file)
+    }
+
+    fn query_files_tab(query: Entity<FileQueryTab>) -> Tab {
+        Tab::FileQuery(query)
     }
 }
 

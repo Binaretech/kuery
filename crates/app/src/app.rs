@@ -11,6 +11,7 @@ use gpui_kit::{
 
 use crate::cli::Target;
 use crate::commands::{ClearRecentProjects, OpenProject, OpenRecentProject};
+use crate::data_file_tabs::DataFileTabs as _;
 use crate::file_window::FileWindow;
 use crate::project::{Project, ProjectModel};
 use crate::secrets::SecretStore;
