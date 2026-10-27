@@ -181,24 +181,16 @@ pub fn audit(
     failed: bool,
     cx: &App,
 ) {
-    let record = AuditRecord {
-        at: AuditRecord::now_at(),
-        project: project.display().to_string(),
-        connection: format!("{} (db{database})", db.name),
-        environment: db.environment.label().to_string(),
-        mode: "Redis write".into(),
-        action: AuditAction::Run,
-        sql: line.to_string(),
-        outcome,
-        changed: None,
-        failed,
-    };
-    cx.background_spawn(async move {
-        if let Err(error) = audit::append(&record) {
-            eprintln!("kuery: could not write the audit log: {error}");
-        }
-    })
-    .detach();
+    let record = AuditRecord::new(
+        project,
+        format!("{} (db{database})", db.name),
+        db.environment,
+        "Redis write",
+        AuditAction::Run,
+        line,
+    )
+    .finished(outcome, None, failed);
+    audit::append_in_background(record, cx);
 }
 
 /// One command in the review.

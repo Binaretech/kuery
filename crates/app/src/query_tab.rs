@@ -907,31 +907,22 @@ impl QueryTab {
             WriteState::On(write) => write.kind.label(),
             _ => WriteKind::Transactional.label(),
         };
-        let record = AuditRecord {
-            at: AuditRecord::now_at(),
-            // `<project>/.kuery/queries` → `<project>`.
-            project: self
-                .queries_dir
-                .ancestors()
-                .nth(2)
-                .unwrap_or(&self.queries_dir)
-                .display()
-                .to_string(),
-            connection: self.db.name.to_string(),
-            environment: self.db.environment.label().to_string(),
-            mode: mode.to_string(),
+        // `<project>/.kuery/queries` → `<project>`.
+        let project = self
+            .queries_dir
+            .ancestors()
+            .nth(2)
+            .unwrap_or(&self.queries_dir);
+        let record = AuditRecord::new(
+            project,
+            self.db.name.as_ref(),
+            self.db.environment,
+            mode,
             action,
-            sql: sql.to_string(),
-            outcome: outcome.to_string(),
-            changed,
-            failed,
-        };
-        cx.background_spawn(async move {
-            if let Err(error) = audit::append(&record) {
-                eprintln!("kuery: could not write the audit log: {error}");
-            }
-        })
-        .detach();
+            sql,
+        )
+        .finished(outcome, changed, failed);
+        audit::append_in_background(record, cx);
     }
 
     /// Adds a line to the Output tab for something that is not a script run.

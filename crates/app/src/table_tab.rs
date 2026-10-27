@@ -891,24 +891,16 @@ impl TableTab {
         failed: bool,
         cx: &mut Context<Self>,
     ) {
-        let record = AuditRecord {
-            at: AuditRecord::now_at(),
-            project: self.project.display().to_string(),
-            connection: self.db.name.to_string(),
-            environment: self.db.environment.label().to_string(),
-            mode: "Row edits".into(),
-            action: AuditAction::Apply,
-            sql: sql.to_string(),
-            outcome,
-            changed,
-            failed,
-        };
-        cx.background_spawn(async move {
-            if let Err(error) = audit::append(&record) {
-                eprintln!("kuery: could not write the audit log: {error}");
-            }
-        })
-        .detach();
+        let record = AuditRecord::new(
+            &self.project,
+            self.db.name.as_ref(),
+            self.db.environment,
+            "Row edits",
+            AuditAction::Apply,
+            sql,
+        )
+        .finished(outcome, changed, failed);
+        audit::append_in_background(record, cx);
     }
 
     // Render ---------------------------------------------------------------
