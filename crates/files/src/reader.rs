@@ -8,8 +8,8 @@ use polars::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    Error, FileFingerprint, FileFormat, FileSource, MAX_JSON_BYTES, PreviewRequest, PreviewResult,
-    Result, convert,
+    Error, FileFingerprint, FileFormat, FileSource, MAX_JSON_BYTES, MAX_NDJSON_SQL_BYTES,
+    PreviewRequest, PreviewResult, Result, convert,
 };
 
 /// An opened local source. Each preview creates a fresh typed Polars plan;
@@ -104,6 +104,9 @@ impl FileDataset {
                     },
                 )
                 .map_err(|e| self.source.parse_error(e.to_string()))
+            }
+            FileFormat::NdJson if self.fingerprint.bytes > MAX_NDJSON_SQL_BYTES => {
+                Err(Error::NdJsonTooLarge)
             }
             FileFormat::Json | FileFormat::NdJson => self.read_rows(None).map(DataFrame::lazy),
         }

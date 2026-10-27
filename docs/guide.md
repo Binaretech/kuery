@@ -97,7 +97,8 @@ budget; Profile analyzes that displayed output. Aggregates still cover the
 complete inputs. These output limits do not bound Polars' working memory.
 CSV and Parquet use lazy scans; JSON and JSONL are fully loaded and validated
 before SQL to detect incompatible values rather than silently losing them.
-The existing 32 MiB JSON document/per-JSONL-record limits still apply.
+The existing 32 MiB JSON document/per-JSONL-record limits still apply, and
+SQL refuses a JSONL file over 256 MiB before reading it.
 
 Each SQL tab captures the successfully opened files, their applied read
 options and fingerprints when created. Closing a source tab does not remove
