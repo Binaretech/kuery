@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kuery_core::driver::{DriverInfo, Family};
+use kuery_core::driver::{ConnectOptions, DriverInfo, Family};
 
 use crate::drivers::{self, Driver};
 use serde::{Deserialize, Serialize};
@@ -189,19 +189,22 @@ impl ConnectionSpec {
     /// when `tunnel` gives its port. The password is only ever added here, in
     /// memory.
     pub fn redis_target(&self, password: Option<&str>, tunnel: Option<u16>) -> kuery_redis::Target {
+        let endpoint = ConnectOptions {
+            host: self.host.clone(),
+            port: self.port,
+            tls: self.sslmode.clone(),
+            tunnel,
+            ..ConnectOptions::default()
+        }
+        .endpoint();
         kuery_redis::Target {
-            host: match tunnel {
-                Some(_) => "127.0.0.1".into(),
-                None => self.host.clone(),
-            },
-            port: tunnel.unwrap_or(self.port),
+            host: endpoint.host,
+            port: endpoint.port,
             db: self.redis_db(),
             username: Some(self.user.trim().to_string()).filter(|user| !user.is_empty()),
             password: password.filter(|p| !p.is_empty()).map(str::to_string),
-            tls: self
-                .sslmode
-                .as_deref()
-                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+            tls: endpoint.tls,
+            server_name: endpoint.server_name,
         }
     }
 }
@@ -628,6 +631,8 @@ mod tests {
         );
         let redis = through.redis_target(None, Some(40001));
         assert_eq!((redis.host.as_str(), redis.port), ("127.0.0.1", 40001));
+        // TLS still checks the server's certificate, not the tunnel's address.
+        assert_eq!(redis.server_name, "localhost");
 
         let text = toml::to_string(&through).unwrap();
         assert!(
