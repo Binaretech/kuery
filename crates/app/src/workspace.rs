@@ -739,27 +739,23 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.tabs.iter().position(|tab| match tab {
-            Tab::Table(table) => {
-                let table = table.read(cx);
-                table.db().name == db.name && table.info().table == info.table
-            }
-            _ => false,
-        });
-        let index = match existing {
-            Some(index) => {
-                if let Some(Tab::Table(table)) = self.tabs.get(index) {
-                    table.update(cx, |table, cx| table.set_view(view, cx));
+        let (name, table) = (db.name.clone(), info.table.clone());
+        let index = self.focus_or_open(
+            |tab, cx| match tab {
+                Tab::Table(tab) => {
+                    let tab = tab.read(cx);
+                    tab.db().name == name && tab.info().table == table
                 }
-                index
-            }
-            None => {
-                self.tabs
-                    .push(self.new_table_tab(db, info, view, window, cx));
-                self.tabs.len() - 1
-            }
-        };
-        self.activate(index, window, cx);
+                _ => false,
+            },
+            |this, window, cx| this.new_table_tab(db, info, view, window, cx),
+            window,
+            cx,
+        );
+        // An open table switches to the view asked for.
+        if let Some(Tab::Table(table)) = self.tabs.get(index) {
+            table.update(cx, |table, cx| table.set_view(view, cx));
+        }
     }
 
     fn new_table_tab(
@@ -782,18 +778,19 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.tabs.iter().position(|tab| match tab {
-            Tab::Diagram(tab) => {
-                let tab = tab.read(cx);
-                tab.db().name == db.name && tab.schema() == schema
-            }
-            _ => false,
-        });
-        let index = existing.unwrap_or_else(|| {
-            self.tabs.push(self.new_diagram_tab(db, schema, window, cx));
-            self.tabs.len() - 1
-        });
-        self.activate(index, window, cx);
+        let (name, shown) = (db.name.clone(), schema.clone());
+        self.focus_or_open(
+            |tab, cx| match tab {
+                Tab::Diagram(tab) => {
+                    let tab = tab.read(cx);
+                    tab.db().name == name && tab.schema() == shown
+                }
+                _ => false,
+            },
+            |this, window, cx| this.new_diagram_tab(db, schema, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn new_diagram_tab(
@@ -821,15 +818,13 @@ impl WorkspaceView {
     /// Opens a connection's server activity, or shows the tab it is already
     /// open in.
     fn open_activity(&mut self, db: Db, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = self.tabs.iter().position(|tab| match tab {
-            Tab::Activity(tab) => tab.read(cx).db().name == db.name,
-            _ => false,
-        });
-        let index = existing.unwrap_or_else(|| {
-            self.tabs.push(self.new_activity_tab(db, window, cx));
-            self.tabs.len() - 1
-        });
-        self.activate(index, window, cx);
+        let name = db.name.clone();
+        self.focus_or_open(
+            |tab, cx| matches!(tab, Tab::Activity(tab) if tab.read(cx).db().name == name),
+            |this, window, cx| this.new_activity_tab(db, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn new_activity_tab(&self, db: Db, window: &mut Window, cx: &mut Context<Self>) -> Tab {
@@ -893,19 +888,19 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.tabs.iter().position(|tab| match tab {
-            Tab::RedisKey(tab) => {
-                let tab = tab.read(cx);
-                tab.db().name == db.name && tab.database() == database && tab.key() == key
-            }
-            _ => false,
-        });
-        let index = existing.unwrap_or_else(|| {
-            self.tabs
-                .push(self.new_redis_key_tab(db, database, key, window, cx));
-            self.tabs.len() - 1
-        });
-        self.activate(index, window, cx);
+        let (name, shown) = (db.name.clone(), key.clone());
+        self.focus_or_open(
+            |tab, cx| match tab {
+                Tab::RedisKey(tab) => {
+                    let tab = tab.read(cx);
+                    tab.db().name == name && tab.database() == database && tab.key() == shown
+                }
+                _ => false,
+            },
+            |this, window, cx| this.new_redis_key_tab(db, database, key, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn new_redis_key_tab(
