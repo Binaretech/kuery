@@ -273,7 +273,7 @@ with **Open Keymap File**, then apply edits with **Reload Keymap**.
   Parquet use lazy scans; JSON and JSONL are fully loaded and validated for
   SQL. CSV float inference receives an additional precision check before SQL.
 - **JSON:** regular JSON documents are limited to 32 MiB; JSONL/NDJSON has a
-  32 MiB limit per record. Schema conflicts and unsupported integer ranges
+  32 MiB limit per record and, for File SQL, 256 MiB per file. Schema conflicts and unsupported integer ranges
   produce errors rather than silently discarding values.
 - **Statistics:** Profile analyzes the current displayed result. Numeric
   statistics use f64; temporal grouping reads timestamp hours as written.

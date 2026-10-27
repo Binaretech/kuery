@@ -1,4 +1,7 @@
-use kuery_files::{FileDataset, FileSource, PreviewRequest, PreviewScope, SqlFile, query_files};
+use kuery_files::{
+    Error, FileDataset, FileSource, MAX_NDJSON_SQL_BYTES, PreviewRequest, PreviewScope, SqlFile,
+    query_files,
+};
 use polars::prelude::*;
 use std::fs::{self, File};
 use tempfile::TempDir;
@@ -51,6 +54,23 @@ fn aggregates_read_beyond_preview_and_output_limit() {
         result.scope,
         PreviewScope::PrefixLimited { loaded_rows: 2, .. }
     ));
+}
+#[test]
+fn sql_refuses_jsonl_over_its_size_limit_before_reading() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("large.jsonl");
+    // Sparse: as large as the limit allows plus one, without the disk space.
+    File::create(&path)
+        .unwrap()
+        .set_len(MAX_NDJSON_SQL_BYTES + 1)
+        .unwrap();
+    let file = binding(&path, "large");
+    let result = query_files(&[file], "SELECT * FROM large", PreviewRequest::default());
+    assert!(
+        matches!(result, Err(Error::NdJsonTooLarge)),
+        "{:?}",
+        result.err()
+    );
 }
 #[test]
 fn formats_join_cte_nulls_and_csv_options() {
