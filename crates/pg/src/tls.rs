@@ -150,10 +150,15 @@ impl Target {
     }
 }
 
-/// Extracts `sslmode` and `sslrootcert` from the query of a `postgres://` URL.
+/// Extracts `sslmode` and `sslrootcert` from the query of a `postgres://`
+/// URL, or `sslmode` from a `key=value` string.
 fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
     let is_url = url.starts_with("postgres://") || url.starts_with("postgresql://");
-    let Some((base, query)) = url.split_once('?').filter(|_| is_url) else {
+    if !is_url {
+        let (rest, ssl_mode) = take_key_value(url, "sslmode");
+        return (rest, ssl_mode, None);
+    }
+    let Some((base, query)) = url.split_once('?') else {
         return (url.to_owned(), None, None);
     };
     let (mut ssl_mode, mut root_cert, mut rest) = (None, None, Vec::new());
@@ -171,6 +176,71 @@ fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
         format!("{base}?{}", rest.join("&"))
     };
     (url, ssl_mode, root_cert)
+}
+
+/// Takes the `key` pair out of a libpq `key=value` string: blanks may
+/// surround `=`, and a value in single quotes escapes `'` and `\\` with a
+/// backslash. Anything it cannot read is left for tokio-postgres to report.
+fn take_key_value(conninfo: &str, key: &str) -> (String, Option<String>) {
+    let (mut kept, mut value, mut rest) = (String::new(), None, conninfo);
+    while let Some((pair, found, after)) = next_pair(rest) {
+        match found {
+            Some((name, found)) if name == key => value = Some(found),
+            _ => kept.push_str(pair),
+        }
+        rest = after;
+    }
+    kept.push_str(rest);
+    (kept, value)
+}
+
+/// A pair of a `key=value` string: its text with the blanks before it, its
+/// key and value (`None` if malformed), and what follows.
+type Pair<'a> = (&'a str, Option<(&'a str, String)>, &'a str);
+
+fn next_pair(text: &str) -> Option<Pair<'_>> {
+    let start = text.len() - text.trim_start().len();
+    let body = &text[start..];
+    if body.is_empty() {
+        return None;
+    }
+    let key_end = body
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(body.len());
+    let after_key = body[key_end..].trim_start();
+    let Some(after_equals) = after_key.strip_prefix('=') else {
+        return Some((text, None, ""));
+    };
+    let value_text = after_equals.trim_start();
+    let (value, after) = match value_text.strip_prefix('\'') {
+        Some(quoted) => {
+            let mut value = String::new();
+            let mut chars = quoted.char_indices();
+            let mut end = None;
+            while let Some((index, c)) = chars.next() {
+                match c {
+                    '\\' => value.extend(chars.next().map(|(_, escaped)| escaped)),
+                    '\'' => {
+                        end = Some(index + 1);
+                        break;
+                    }
+                    c => value.push(c),
+                }
+            }
+            let Some(end) = end else {
+                return Some((text, None, ""));
+            };
+            (value, &quoted[end..])
+        }
+        None => {
+            let end = value_text
+                .find(char::is_whitespace)
+                .unwrap_or(value_text.len());
+            (value_text[..end].to_owned(), &value_text[end..])
+        }
+    };
+    let length = text.len() - after.len();
+    Some((&text[..length], Some((&body[..key_end], value)), after))
 }
 
 fn percent_decode(value: &str) -> String {
@@ -419,6 +489,45 @@ mod tests {
             Mode::Disable
         );
         assert_eq!(mode("host=localhost user=u"), Mode::Disable);
+    }
+
+    #[test]
+    fn every_mode_of_the_connection_form_connects() {
+        for (tls, expected) in [
+            ("disable", Mode::Disable),
+            ("prefer", Mode::Prefer),
+            ("require", Mode::Require),
+            ("verify-ca", Mode::VerifyCa),
+            ("verify-full", Mode::VerifyFull),
+        ] {
+            let options = kuery_core::driver::ConnectOptions {
+                host: "db.example.com".into(),
+                port: 5432,
+                database: "shop".into(),
+                user: "o'brien".into(),
+                password: Some(r"p\ss".into()),
+                tls: Some(tls.into()),
+                tunnel: None,
+            };
+            let target = Target::parse(&crate::conninfo(&options)).unwrap();
+            assert_eq!(target.mode, expected, "{tls}");
+            assert_eq!(target.config.get_user(), Some("o'brien"));
+            assert_eq!(target.config.get_password(), Some(&br"p\ss"[..]));
+        }
+    }
+
+    #[test]
+    fn key_value_strings_read_every_libpq_mode() {
+        assert_eq!(
+            mode("host=db.example.com user=u sslmode=verify-full"),
+            Mode::VerifyFull
+        );
+        assert_eq!(
+            mode("host=db.example.com sslmode = 'verify-ca' user=u"),
+            Mode::VerifyCa
+        );
+        assert_eq!(mode("host=db.example.com sslmode=allow"), Mode::Prefer);
+        assert_eq!(mode("host=localhost sslmode='require'"), Mode::Require);
     }
 
     #[test]
