@@ -127,10 +127,7 @@ fn update(path: &Path, change: impl FnOnce(&mut Vec<PathBuf>)) -> std::io::Resul
 
 fn write(path: &Path, projects: Vec<PathBuf>) -> std::io::Result<()> {
     let text = toml::to_string(&File { projects }).map_err(std::io::Error::other)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, text)
+    crate::paths::write_atomic(path, text)
 }
 
 fn read(path: &Path) -> Vec<PathBuf> {
