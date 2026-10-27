@@ -786,9 +786,9 @@ row. Views and tables without a primary key are read-only.
 
 ## TLS
 
-The URL's `sslmode` follows libpq semantics (`disable`, `allow`, `prefer`,
-`require`, `verify-ca`, `verify-full`), with `sslrootcert` for a PEM file of
-root certificates; without it the system ones are used. Without `sslmode`, a
+`sslmode` follows libpq semantics (`disable`, `allow`, `prefer`, `require`,
+`verify-ca`, `verify-full`), in a URL or a `key=value` string; the chain is
+verified against the system root certificates. Without `sslmode`, a
 local database (`localhost`, `127.0.0.1`, `::1` or a Unix socket) connects
 without TLS and everything else uses `prefer`. Details in `crates/pg/src/tls.rs`.
 

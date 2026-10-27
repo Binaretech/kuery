@@ -176,8 +176,8 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// Connects with a libpq connection string or URL (`sslmode` and
-/// `sslrootcert` honoured, see [`tls`]).
+/// Connects with a libpq connection string or URL (`sslmode` honoured, see
+/// [`tls`]).
 pub fn open(conninfo: &str, access: Access) -> Result<Box<dyn Adapter>, String> {
     open_postgres(conninfo, access)
         .map(|postgres| Box::new(postgres) as Box<dyn Adapter>)

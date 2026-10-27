@@ -4,31 +4,26 @@
 //! |-------------------|-------------------------|-----------------------------|-------------------|
 //! | `disable`         | no                      | —                           | —                 |
 //! | `allow`, `prefer` | if the server accepts   | no                          | no                |
-//! | `require`         | yes                     | only with `sslrootcert`     | no                |
+//! | `require`         | yes                     | no                          | no                |
 //! | `verify-ca`       | yes                     | yes                         | no                |
 //! | `verify-full`     | yes                     | yes                         | yes               |
 //!
 //! Without `sslmode`, a local database (`localhost`, `127.0.0.1`, `::1` or a
 //! Unix socket) connects without TLS, like the Postgres in `dev/compose.yaml`;
 //! everything else uses `prefer`, libpq's default. The chain is verified
-//! against the system root certificates or, if the URL has `sslrootcert`,
-//! against the ones in that PEM file.
+//! against the system root certificates.
 //!
-//! tokio-postgres only understands `disable`, `prefer` and `require` and
-//! rejects `sslrootcert`, so those two parameters are read here and stripped
-//! from the URL before handing it over. They are only interpreted in URLs
-//! (`postgres://…`); in the `key=value` format the string reaches
-//! tokio-postgres as is.
+//! tokio-postgres only understands `disable`, `prefer` and `require`, so
+//! `sslmode` is read here and taken out of the URL or `key=value` string
+//! before handing it over.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
@@ -72,17 +67,13 @@ impl Mode {
 pub(crate) struct Target {
     pub config: Config,
     pub mode: Mode,
-    pub root_cert: Option<PathBuf>,
 }
 
 impl Target {
     pub fn parse(url: &str) -> Result<Self, ConnectError> {
-        let (url, ssl_mode, root_cert) = take_tls_params(url);
+        let (url, ssl_mode) = take_ssl_mode(url);
         let mut config = Config::from_str(&url)?;
-        let root_cert = root_cert.map(PathBuf::from);
         let mode = match ssl_mode.as_deref().map(Mode::parse).transpose()? {
-            // Like libpq: with a root certificate file, `require` also verifies the chain.
-            Some(Mode::Require) if root_cert.is_some() => Mode::VerifyCa,
             Some(mode) => mode,
             None if is_local(&config) => Mode::Disable,
             None => match config.get_ssl_mode() {
@@ -97,11 +88,7 @@ impl Target {
             Mode::Prefer => SslMode::Prefer,
             Mode::Require | Mode::VerifyCa | Mode::VerifyFull => SslMode::Require,
         });
-        Ok(Self {
-            config,
-            mode,
-            root_cert,
-        })
+        Ok(Self { config, mode })
     }
 
     pub fn connector(&self) -> Result<Connector, ConnectError> {
@@ -126,19 +113,7 @@ impl Target {
         provider: &Arc<CryptoProvider>,
     ) -> Result<Arc<WebPkiServerVerifier>, ConnectError> {
         let mut roots = RootCertStore::empty();
-        match &self.root_cert {
-            Some(path) => {
-                let certs = CertificateDer::pem_file_iter(path)
-                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-                    .map_err(|error| {
-                        ConnectError::Tls(format!("could not read {}: {error}", path.display()))
-                    })?;
-                roots.add_parsable_certificates(certs);
-            }
-            None => {
-                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-            }
-        }
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         if roots.is_empty() {
             return Err(ConnectError::Tls(
                 "there are no root certificates to verify the server with".into(),
@@ -150,18 +125,20 @@ impl Target {
     }
 }
 
-/// Extracts `sslmode` and `sslrootcert` from the query of a `postgres://` URL.
-fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
+/// Takes `sslmode` out of a `postgres://` URL's query or a `key=value`
+/// string.
+fn take_ssl_mode(url: &str) -> (String, Option<String>) {
     let is_url = url.starts_with("postgres://") || url.starts_with("postgresql://");
-    let Some((base, query)) = url.split_once('?').filter(|_| is_url) else {
-        return (url.to_owned(), None, None);
+    if !is_url {
+        return take_key_value(url, "sslmode");
+    }
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_owned(), None);
     };
-    let (mut ssl_mode, mut root_cert, mut rest) = (None, None, Vec::new());
+    let (mut ssl_mode, mut rest) = (None, Vec::new());
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
-            "sslmode" => ssl_mode = Some(percent_decode(value)),
-            "sslrootcert" => root_cert = Some(percent_decode(value)),
+        match pair.split_once('=') {
+            Some(("sslmode", value)) => ssl_mode = Some(value.to_owned()),
             _ => rest.push(pair),
         }
     }
@@ -170,30 +147,72 @@ fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
     } else {
         format!("{base}?{}", rest.join("&"))
     };
-    (url, ssl_mode, root_cert)
+    (url, ssl_mode)
 }
 
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match (bytes[index], hex) {
-            (b'%', Some(byte)) => {
-                out.push(byte);
-                index += 3;
-            }
-            (byte, _) => {
-                out.push(byte);
-                index += 1;
-            }
+/// Takes the `key` pair out of a libpq `key=value` string: blanks may
+/// surround `=`, and a value in single quotes escapes `'` and `\\` with a
+/// backslash. Anything it cannot read is left for tokio-postgres to report.
+fn take_key_value(conninfo: &str, key: &str) -> (String, Option<String>) {
+    let (mut kept, mut value, mut rest) = (String::new(), None, conninfo);
+    while let Some((pair, found, after)) = next_pair(rest) {
+        match found {
+            Some((name, found)) if name == key => value = Some(found),
+            _ => kept.push_str(pair),
         }
+        rest = after;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    kept.push_str(rest);
+    (kept, value)
+}
+
+/// A pair of a `key=value` string: its text with the blanks before it, its
+/// key and value (`None` if malformed), and what follows.
+type Pair<'a> = (&'a str, Option<(&'a str, String)>, &'a str);
+
+fn next_pair(text: &str) -> Option<Pair<'_>> {
+    let start = text.len() - text.trim_start().len();
+    let body = &text[start..];
+    if body.is_empty() {
+        return None;
+    }
+    let key_end = body
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(body.len());
+    let after_key = body[key_end..].trim_start();
+    let Some(after_equals) = after_key.strip_prefix('=') else {
+        return Some((text, None, ""));
+    };
+    let value_text = after_equals.trim_start();
+    let (value, after) = match value_text.strip_prefix('\'') {
+        Some(quoted) => {
+            let mut value = String::new();
+            let mut chars = quoted.char_indices();
+            let mut end = None;
+            while let Some((index, c)) = chars.next() {
+                match c {
+                    '\\' => value.extend(chars.next().map(|(_, escaped)| escaped)),
+                    '\'' => {
+                        end = Some(index + 1);
+                        break;
+                    }
+                    c => value.push(c),
+                }
+            }
+            let Some(end) = end else {
+                return Some((text, None, ""));
+            };
+            (value, &quoted[end..])
+        }
+        None => {
+            let end = value_text
+                .find(char::is_whitespace)
+                .unwrap_or(value_text.len());
+            (value_text[..end].to_owned(), &value_text[end..])
+        }
+    };
+    let length = text.len() - after.len();
+    Some((&text[..length], Some((&body[..key_end], value)), after))
 }
 
 fn is_local(config: &Config) -> bool {
@@ -422,13 +441,42 @@ mod tests {
     }
 
     #[test]
-    fn a_root_certificate_makes_require_verify_the_chain() {
-        let target =
-            Target::parse("postgres://u:p@h/db?sslmode=require&sslrootcert=%2Ftmp%2Fca%20dev.pem")
-                .unwrap();
-        assert_eq!(target.mode, Mode::VerifyCa);
-        assert_eq!(target.root_cert, Some(PathBuf::from("/tmp/ca dev.pem")));
-        assert!(matches!(target.connector(), Err(ConnectError::Tls(_))));
+    fn every_mode_of_the_connection_form_connects() {
+        for (tls, expected) in [
+            ("disable", Mode::Disable),
+            ("prefer", Mode::Prefer),
+            ("require", Mode::Require),
+            ("verify-ca", Mode::VerifyCa),
+            ("verify-full", Mode::VerifyFull),
+        ] {
+            let options = kuery_core::driver::ConnectOptions {
+                host: "db.example.com".into(),
+                port: 5432,
+                database: "shop".into(),
+                user: "o'brien".into(),
+                password: Some(r"p\ss".into()),
+                tls: Some(tls.into()),
+                tunnel: None,
+            };
+            let target = Target::parse(&crate::conninfo(&options)).unwrap();
+            assert_eq!(target.mode, expected, "{tls}");
+            assert_eq!(target.config.get_user(), Some("o'brien"));
+            assert_eq!(target.config.get_password(), Some(&br"p\ss"[..]));
+        }
+    }
+
+    #[test]
+    fn key_value_strings_read_every_libpq_mode() {
+        assert_eq!(
+            mode("host=db.example.com user=u sslmode=verify-full"),
+            Mode::VerifyFull
+        );
+        assert_eq!(
+            mode("host=db.example.com sslmode = 'verify-ca' user=u"),
+            Mode::VerifyCa
+        );
+        assert_eq!(mode("host=db.example.com sslmode=allow"), Mode::Prefer);
+        assert_eq!(mode("host=localhost sslmode='require'"), Mode::Require);
     }
 
     #[test]
