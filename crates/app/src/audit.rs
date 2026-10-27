@@ -4,11 +4,15 @@
 //! which may be committed).
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui_kit::{App, actions};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::{App, AppContext as _, actions};
 use kuery_core::export::json_string;
+
+use crate::connection::Environment;
 
 actions!(kuery, [OpenAuditLog]);
 
@@ -55,10 +59,44 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    pub fn now_at() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
+    /// `action` on a connection of the project in `project`, stamped now;
+    /// [`finished`](Self::finished) adds how it went.
+    pub fn new(
+        project: &Path,
+        connection: impl Into<String>,
+        environment: Environment,
+        mode: &str,
+        action: AuditAction,
+        sql: impl Into<String>,
+    ) -> Self {
+        AuditRecord {
+            at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            project: project.display().to_string(),
+            connection: connection.into(),
+            environment: environment.label().to_string(),
+            mode: mode.to_string(),
+            action,
+            sql: sql.into(),
+            outcome: String::new(),
+            changed: None,
+            failed: false,
+        }
+    }
+
+    pub fn finished(
+        self,
+        outcome: impl Into<String>,
+        changed: Option<(usize, u64)>,
+        failed: bool,
+    ) -> Self {
+        AuditRecord {
+            outcome: outcome.into(),
+            changed,
+            failed,
+            ..self
+        }
     }
 
     /// The record as one line of JSON (without the line break).
@@ -88,9 +126,47 @@ pub fn path() -> PathBuf {
     crate::paths::config_dir().join("audit.jsonl")
 }
 
-/// Appends `record` to the log. Called off the UI thread.
-pub fn append(record: &AuditRecord) -> std::io::Result<()> {
-    append_to(&path(), record)
+/// Appends `record` to the log, off the UI thread. A log that cannot be
+/// written is shown once, and again only after it worked in between: writes
+/// still run, but are no longer recorded.
+pub fn append_in_background(record: AuditRecord, cx: &App) {
+    let written = cx.background_spawn(async move { append_to(&path(), &record) });
+    cx.spawn(async move |cx| {
+        let result = written.await;
+        let report = FAILURES.should_report(&result);
+        if let Err(error) = result {
+            eprintln!("kuery: could not write the audit log: {error}");
+            if report {
+                let note = Notification::error(format!(
+                    "Couldn't write the audit log ({}): {error}. Writes still run, \
+                     but are not being recorded.",
+                    path().display()
+                ));
+                cx.update(|cx| crate::ui::notify(note, cx));
+            }
+        }
+    })
+    .detach();
+}
+
+static FAILURES: Failures = Failures {
+    failing: AtomicBool::new(false),
+};
+
+/// Whether the log is failing, so a failure is shown when it starts and not
+/// on every write.
+#[derive(Default)]
+struct Failures {
+    failing: AtomicBool,
+}
+
+impl Failures {
+    /// Whether `result` is the first failure since the log last worked.
+    fn should_report(&self, result: &std::io::Result<()>) -> bool {
+        let failing = result.is_err();
+        let was_failing = self.failing.swap(failing, Ordering::Relaxed);
+        failing && !was_failing
+    }
 }
 
 fn append_to(path: &std::path::Path, record: &AuditRecord) -> std::io::Result<()> {
@@ -167,6 +243,37 @@ mod tests {
                 .to_json()
                 .contains("\"statements\": null, \"rows\": null")
         );
+    }
+
+    #[test]
+    fn builds_records_for_a_connection() {
+        let built = AuditRecord::new(
+            Path::new("/work/shop"),
+            "prod",
+            Environment::Production,
+            "Write",
+            AuditAction::Run,
+            "update orders set note = 'a \"b\"'\nwhere id = 1",
+        )
+        .finished("1 statement · 1 row changed", Some((1, 1)), false);
+        assert!(built.at > 1_700_000_000);
+        assert_eq!(
+            built,
+            AuditRecord {
+                at: built.at,
+                ..record()
+            }
+        );
+    }
+
+    #[test]
+    fn reports_a_failing_log_once_until_it_works_again() {
+        let failures = Failures::default();
+        let failed = || Err(std::io::Error::other("disk full"));
+        assert!(failures.should_report(&failed()));
+        assert!(!failures.should_report(&failed()));
+        assert!(!failures.should_report(&Ok(())));
+        assert!(failures.should_report(&failed()));
     }
 
     #[test]

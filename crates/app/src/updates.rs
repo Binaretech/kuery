@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{
@@ -19,6 +18,7 @@ use kuery_update::{Installation, Update, Updater};
 
 use crate::settings;
 use crate::theme::{self, color};
+use crate::ui::notify;
 
 actions!(
     kuery,
@@ -398,14 +398,6 @@ fn report(manual: bool, message: String, cx: &mut App) {
     } else {
         eprintln!("kuery: {message}");
     }
-}
-
-/// Shows `note` in the active window (or any open one).
-fn notify(note: Notification, cx: &mut App) {
-    let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
-        return;
-    };
-    let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
 }
 
 #[cfg(test)]

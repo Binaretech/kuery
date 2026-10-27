@@ -99,6 +99,8 @@ fn osascript_outcome(success: bool, stderr: &str) -> Result<bool, String> {
 fn install(cx: &mut App) {
     use gpui_kit::component::notification::Notification;
 
+    use crate::ui::notify;
+
     let link = Path::new(LINK);
     let exe = match std::env::current_exe().and_then(|exe| exe.canonicalize()) {
         Ok(exe) => exe,
@@ -176,17 +178,6 @@ fn make_link(link: &Path, exe: &Path) -> Result<bool, String> {
         }
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Shows `note` in the active window (or any open one).
-#[cfg(target_os = "macos")]
-fn notify(note: gpui_kit::component::notification::Notification, cx: &mut App) {
-    use gpui_kit::component::WindowExt as _;
-
-    let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
-        return;
-    };
-    let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
 }
 
 #[cfg(test)]
