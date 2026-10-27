@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::button::Button;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{Icon, IconName, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -15,6 +16,7 @@ use gpui_kit::{
 
 use crate::assets::AppIcon;
 use crate::commands::{CloseTab, NextTab, OpenDataFile, PreviousTab, QueryDataFiles};
+use crate::context_menus::{copy, item, reveal};
 use crate::file_query_tab::{self, FileQueryTab};
 use crate::file_tab::{FileTab, data_file_error, no_files_to_query};
 use crate::menus::CloseWindow;
@@ -215,6 +217,18 @@ impl FileWindow {
         self.activate(self.active, window, cx);
     }
 
+    /// Closes the tabs `close` picks.
+    fn close_tabs(
+        &mut self,
+        close: impl Fn(usize) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for index in (0..self.tabs.len()).rev().filter(|index| close(*index)) {
+            self.close(index, window, cx);
+        }
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             window.dispatch_action(Box::new(CloseWindow), cx);
@@ -311,7 +325,50 @@ impl FileWindow {
                     })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
-                    ),
+                    )
+                    .context_menu({
+                        let this = cx.entity().downgrade();
+                        let count = self.tabs.len();
+                        let file = match tab {
+                            Tab::File(file) => Some(file.read(cx).path().to_path_buf()),
+                            Tab::Query(_) => None,
+                        };
+                        move |menu, _, _| {
+                            let mut menu = menu
+                                .item(
+                                    item("Close", &this, move |this, window, cx| {
+                                        this.close(index, window, cx)
+                                    })
+                                    .icon(IconName::Close),
+                                )
+                                .item(
+                                    item("Close Others", &this, move |this, window, cx| {
+                                        this.close_tabs(|i| i != index, window, cx)
+                                    })
+                                    .disabled(count < 2),
+                                )
+                                .item(
+                                    item(
+                                        "Close Tabs to the Right",
+                                        &this,
+                                        move |this, window, cx| {
+                                            this.close_tabs(|i| i > index, window, cx)
+                                        },
+                                    )
+                                    .disabled(index + 1 >= count),
+                                )
+                                .item(item("Close All", &this, |this, window, cx| {
+                                    this.close_tabs(|_| true, window, cx)
+                                }));
+                            if let Some(file) = &file {
+                                menu = menu
+                                    .separator()
+                                    .item(reveal(file.clone()))
+                                    .item(copy("Copy Path", file.display().to_string()));
+                            }
+                            menu
+                        }
+                    }),
             );
         }
         strip
