@@ -4,31 +4,26 @@
 //! |-------------------|-------------------------|-----------------------------|-------------------|
 //! | `disable`         | no                      | —                           | —                 |
 //! | `allow`, `prefer` | if the server accepts   | no                          | no                |
-//! | `require`         | yes                     | only with `sslrootcert`     | no                |
+//! | `require`         | yes                     | no                          | no                |
 //! | `verify-ca`       | yes                     | yes                         | no                |
 //! | `verify-full`     | yes                     | yes                         | yes               |
 //!
 //! Without `sslmode`, a local database (`localhost`, `127.0.0.1`, `::1` or a
 //! Unix socket) connects without TLS, like the Postgres in `dev/compose.yaml`;
 //! everything else uses `prefer`, libpq's default. The chain is verified
-//! against the system root certificates or, if the URL has `sslrootcert`,
-//! against the ones in that PEM file.
+//! against the system root certificates.
 //!
-//! tokio-postgres only understands `disable`, `prefer` and `require` and
-//! rejects `sslrootcert`, so those two parameters are read here and stripped
-//! from the URL before handing it over. They are only interpreted in URLs
-//! (`postgres://…`); in the `key=value` format the string reaches
-//! tokio-postgres as is.
+//! tokio-postgres only understands `disable`, `prefer` and `require`, so
+//! `sslmode` is read here and taken out of the URL or `key=value` string
+//! before handing it over.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
@@ -72,17 +67,13 @@ impl Mode {
 pub(crate) struct Target {
     pub config: Config,
     pub mode: Mode,
-    pub root_cert: Option<PathBuf>,
 }
 
 impl Target {
     pub fn parse(url: &str) -> Result<Self, ConnectError> {
-        let (url, ssl_mode, root_cert) = take_tls_params(url);
+        let (url, ssl_mode) = take_ssl_mode(url);
         let mut config = Config::from_str(&url)?;
-        let root_cert = root_cert.map(PathBuf::from);
         let mode = match ssl_mode.as_deref().map(Mode::parse).transpose()? {
-            // Like libpq: with a root certificate file, `require` also verifies the chain.
-            Some(Mode::Require) if root_cert.is_some() => Mode::VerifyCa,
             Some(mode) => mode,
             None if is_local(&config) => Mode::Disable,
             None => match config.get_ssl_mode() {
@@ -97,11 +88,7 @@ impl Target {
             Mode::Prefer => SslMode::Prefer,
             Mode::Require | Mode::VerifyCa | Mode::VerifyFull => SslMode::Require,
         });
-        Ok(Self {
-            config,
-            mode,
-            root_cert,
-        })
+        Ok(Self { config, mode })
     }
 
     pub fn connector(&self) -> Result<Connector, ConnectError> {
@@ -126,19 +113,7 @@ impl Target {
         provider: &Arc<CryptoProvider>,
     ) -> Result<Arc<WebPkiServerVerifier>, ConnectError> {
         let mut roots = RootCertStore::empty();
-        match &self.root_cert {
-            Some(path) => {
-                let certs = CertificateDer::pem_file_iter(path)
-                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-                    .map_err(|error| {
-                        ConnectError::Tls(format!("could not read {}: {error}", path.display()))
-                    })?;
-                roots.add_parsable_certificates(certs);
-            }
-            None => {
-                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-            }
-        }
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         if roots.is_empty() {
             return Err(ConnectError::Tls(
                 "there are no root certificates to verify the server with".into(),
@@ -150,23 +125,20 @@ impl Target {
     }
 }
 
-/// Extracts `sslmode` and `sslrootcert` from the query of a `postgres://`
-/// URL, or `sslmode` from a `key=value` string.
-fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
+/// Takes `sslmode` out of a `postgres://` URL's query or a `key=value`
+/// string.
+fn take_ssl_mode(url: &str) -> (String, Option<String>) {
     let is_url = url.starts_with("postgres://") || url.starts_with("postgresql://");
     if !is_url {
-        let (rest, ssl_mode) = take_key_value(url, "sslmode");
-        return (rest, ssl_mode, None);
+        return take_key_value(url, "sslmode");
     }
     let Some((base, query)) = url.split_once('?') else {
-        return (url.to_owned(), None, None);
+        return (url.to_owned(), None);
     };
-    let (mut ssl_mode, mut root_cert, mut rest) = (None, None, Vec::new());
+    let (mut ssl_mode, mut rest) = (None, Vec::new());
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
-            "sslmode" => ssl_mode = Some(percent_decode(value)),
-            "sslrootcert" => root_cert = Some(percent_decode(value)),
+        match pair.split_once('=') {
+            Some(("sslmode", value)) => ssl_mode = Some(value.to_owned()),
             _ => rest.push(pair),
         }
     }
@@ -175,7 +147,7 @@ fn take_tls_params(url: &str) -> (String, Option<String>, Option<String>) {
     } else {
         format!("{base}?{}", rest.join("&"))
     };
-    (url, ssl_mode, root_cert)
+    (url, ssl_mode)
 }
 
 /// Takes the `key` pair out of a libpq `key=value` string: blanks may
@@ -241,29 +213,6 @@ fn next_pair(text: &str) -> Option<Pair<'_>> {
     };
     let length = text.len() - after.len();
     Some((&text[..length], Some((&body[..key_end], value)), after))
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match (bytes[index], hex) {
-            (b'%', Some(byte)) => {
-                out.push(byte);
-                index += 3;
-            }
-            (byte, _) => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn is_local(config: &Config) -> bool {
@@ -528,16 +477,6 @@ mod tests {
         );
         assert_eq!(mode("host=db.example.com sslmode=allow"), Mode::Prefer);
         assert_eq!(mode("host=localhost sslmode='require'"), Mode::Require);
-    }
-
-    #[test]
-    fn a_root_certificate_makes_require_verify_the_chain() {
-        let target =
-            Target::parse("postgres://u:p@h/db?sslmode=require&sslrootcert=%2Ftmp%2Fca%20dev.pem")
-                .unwrap();
-        assert_eq!(target.mode, Mode::VerifyCa);
-        assert_eq!(target.root_cert, Some(PathBuf::from("/tmp/ca dev.pem")));
-        assert!(matches!(target.connector(), Err(ConnectError::Tls(_))));
     }
 
     #[test]
