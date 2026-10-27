@@ -252,6 +252,10 @@ impl FileWindow {
                 Tab::File(_) => AppIcon::Table,
                 Tab::Query(_) => AppIcon::Code,
             };
+            let tooltip: SharedString = match tab {
+                Tab::File(file) => file.read(cx).path().display().to_string().into(),
+                Tab::Query(_) => tab.title(cx),
+            };
             let group = SharedString::from(format!("tab-{index}"));
             strip = strip.child(
                 h_flex()
@@ -301,6 +305,10 @@ impl FileWindow {
                                 this.close(index, window, cx);
                             })),
                     )
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
+                            .build(window, cx)
+                    })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
                     ),
