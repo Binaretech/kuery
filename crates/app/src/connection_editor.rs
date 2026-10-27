@@ -22,6 +22,7 @@ use gpui_kit::{
 use kuery_core::driver::{self, DriverInfo, Family};
 
 use crate::app;
+use crate::connection::Environment;
 use crate::drivers::{self, family_icon};
 use crate::project::{ConnectionSpec, ProjectModel, SshSpec, new_id};
 use crate::secrets::SecretStore;
@@ -31,7 +32,20 @@ use crate::ui::muted;
 type TextSelect = SelectState<SearchableVec<SharedString>>;
 type DriverSelect = SelectState<SearchableVec<SearchableGroup<DriverItem>>>;
 
-const ENVIRONMENTS: [&str; 4] = ["detect from host", "development", "staging", "production"];
+const ENVIRONMENTS: [&str; 4] = [
+    "detect from host",
+    Environment::Development.name(),
+    Environment::Staging.name(),
+    Environment::Production.name(),
+];
+
+/// The entry of [`ENVIRONMENTS`] for the environment the project file names.
+fn environment_index(stored: Option<&str>) -> usize {
+    stored
+        .map(|name| Environment::parse(name).name())
+        .and_then(|name| ENVIRONMENTS.iter().position(|m| *m == name))
+        .unwrap_or(0)
+}
 
 /// A driver in the searchable list: its icon and name; found by name,
 /// alias or family.
@@ -228,11 +242,8 @@ impl ConnectionEditor {
             .tls
             .index(spec.as_ref().and_then(|s| s.sslmode.as_deref()));
         let tls = select(info.tls.options(), tls_index, window, cx);
-        let environment_index = spec
-            .as_ref()
-            .and_then(|s| s.environment.as_deref())
-            .and_then(|e| ENVIRONMENTS.iter().position(|m| *m == e))
-            .unwrap_or(0);
+        let environment_index =
+            environment_index(spec.as_ref().and_then(|s| s.environment.as_deref()));
         let environment = select(ENVIRONMENTS.to_vec(), environment_index, window, cx);
 
         let driver_select = cx.new(|cx| {
@@ -717,5 +728,34 @@ impl Render for ConnectionEditor {
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saving_keeps_the_environment_the_file_names() {
+        let local = "postgres://localhost/";
+        assert_eq!(environment_index(None), 0);
+        for stored in [
+            "production",
+            "prod",
+            "PRODUCTION",
+            "Dev",
+            "local",
+            "stage",
+            "qa?",
+        ] {
+            // The first entry, detect from host, saves no environment.
+            let index = environment_index(Some(stored));
+            let saved = (index > 0).then(|| ENVIRONMENTS[index]);
+            assert_eq!(
+                Environment::detect(local, saved),
+                Environment::detect(local, Some(stored)),
+                "{stored} saved as {saved:?}"
+            );
+        }
     }
 }
