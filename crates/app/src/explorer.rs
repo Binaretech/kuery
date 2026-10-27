@@ -32,7 +32,7 @@ use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
 use kuery_core::driver::Family;
-use kuery_core::sql::{Dialect, quote_qualified};
+use kuery_core::sql::{Dialect, POSTGRES};
 
 use crate::app;
 use crate::assets::AppIcon;
@@ -705,7 +705,7 @@ impl Explorer {
             "-- Values of the enum {}.{}, in order.\nselect unnest(enum_range(null::{})) as value;\n",
             info.schema,
             info.name,
-            quote_qualified(&info.schema, &info.name)
+            POSTGRES.quote_qualified(&info.schema, &info.name)
         );
         cx.emit(ExplorerEvent::OpenQuery {
             db,
@@ -1255,6 +1255,7 @@ impl Explorer {
         );
         let selected = self.selected.as_deref() == Some(key.as_str());
         let function = function.clone();
+        let dialect = self.dialect_at(index);
         tree_row(SharedString::from(key), 3, None, selected)
             .child(icon(AppIcon::Code, 0xc49bff, selected))
             .child(
@@ -1275,22 +1276,13 @@ impl Explorer {
                 let this = cx.entity().downgrade();
                 move |menu, _, _| {
                     let open = function.clone();
+                    let (name, signature) = function_copies(dialect, &function);
                     menu.item(item("Open Definition", &this, move |this, _, cx| {
                         this.open_function(index, open.clone(), cx)
                     }))
                     .separator()
-                    .item(copy(
-                        "Copy Name",
-                        quote_qualified(&function.schema, &function.name),
-                    ))
-                    .item(copy(
-                        "Copy Signature",
-                        format!(
-                            "{}({})",
-                            quote_qualified(&function.schema, &function.name),
-                            function.arguments
-                        ),
-                    ))
+                    .item(copy("Copy Name", name))
+                    .item(copy("Copy Signature", signature))
                 }
             })
             .into_any_element()
@@ -1353,19 +1345,26 @@ impl Explorer {
                         this.open_enum(index, open.clone(), cx)
                     }))
                     .separator()
-                    .item(copy("Copy Name", quote_qualified(&info.schema, &info.name)))
+                    .item(copy(
+                        "Copy Name",
+                        POSTGRES.quote_qualified(&info.schema, &info.name),
+                    ))
                     .item(copy("Copy Values", info.values.join(", ")))
                 }
             })
             .into_any_element()
     }
 
-    fn table_row(&self, index: usize, info: &TableInfo, cx: &mut Context<Self>) -> AnyElement {
-        let dialect = self
-            .connections
+    /// The SQL the connection at `index` speaks, Postgres if none.
+    fn dialect_at(&self, index: usize) -> &'static Dialect {
+        self.connections
             .get(index)
             .and_then(|node| node.spec.dialect())
-            .unwrap_or(&kuery_core::sql::POSTGRES);
+            .unwrap_or(&kuery_core::sql::POSTGRES)
+    }
+
+    fn table_row(&self, index: usize, info: &TableInfo, cx: &mut Context<Self>) -> AnyElement {
+        let dialect = self.dialect_at(index);
         let key = format!("{index}/{}/table/{}", info.table.schema, info.table.name);
         let selected = self.selected.as_deref() == Some(key.as_str());
         let editable = info.kind.is_editable();
@@ -1916,6 +1915,13 @@ impl Render for Explorer {
     }
 }
 
+/// What Copy Name and Copy Signature copy for a function.
+fn function_copies(dialect: &Dialect, function: &FunctionInfo) -> (String, String) {
+    let name = dialect.quote_qualified(&function.schema, &function.name);
+    let signature = format!("{name}({})", function.arguments);
+    (name, signature)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2145,6 +2151,27 @@ mod tests {
         });
         let root = model.read_with(cx, |model, _| model.project.root.clone());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copies_function_names_quoted_for_their_database() {
+        let function = FunctionInfo {
+            schema: "shop".into(),
+            name: "total".into(),
+            arguments: "p_id int".into(),
+            result: "int".into(),
+            kind: kuery_core::catalog::RoutineKind::Function,
+            language: "sql".into(),
+            oid: 1,
+        };
+        assert_eq!(
+            function_copies(&kuery_core::sql::MYSQL, &function),
+            ("`shop`.`total`".into(), "`shop`.`total`(p_id int)".into())
+        );
+        assert_eq!(
+            function_copies(&kuery_core::sql::POSTGRES, &function).0,
+            "\"shop\".\"total\""
+        );
     }
 
     #[test]

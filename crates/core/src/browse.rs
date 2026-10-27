@@ -217,7 +217,7 @@ impl Browse {
             Ok(format!(
                 "{} {} {} escape {}",
                 dialect.as_text(&column),
-                dialect.like_ignoring_case(),
+                dialect.like_ignoring_case,
                 dialect.quote_literal(&pattern)?,
                 dialect.quote_literal("\\")?
             ))

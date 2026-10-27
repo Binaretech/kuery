@@ -1005,10 +1005,7 @@ fn save_layout(path: &Path, positions: &HashMap<String, (f32, f32)>) -> std::io:
             .collect(),
     };
     let text = toml::to_string(&saved).map_err(std::io::Error::other)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(
+    crate::paths::write_atomic(
         path,
         format!("# Kuery diagram layout: where each table's card was moved.\n\n{text}"),
     )

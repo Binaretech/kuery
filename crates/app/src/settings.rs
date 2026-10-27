@@ -128,16 +128,9 @@ fn read(path: &Path) -> File {
         .unwrap_or_default()
 }
 
-/// Writes through a file next to it and a rename, so a crash midway never
-/// leaves half a file.
 fn write(path: &Path, table: &toml::Table) -> std::io::Result<()> {
     let text = toml::to_string(table).map_err(std::io::Error::other)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let temp = path.with_extension("toml.tmp");
-    std::fs::write(&temp, text)?;
-    std::fs::rename(&temp, path)
+    crate::paths::write_atomic(path, text)
 }
 
 #[cfg(test)]

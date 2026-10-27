@@ -305,7 +305,7 @@ impl Project {
         }
     }
 
-    /// Writes `project.toml` atomically (temporary file, then rename).
+    /// Writes `project.toml` atomically.
     pub fn save(&self) -> Result<(), String> {
         let file = File {
             project: ProjectSection {
@@ -316,10 +316,7 @@ impl Project {
         };
         let text = toml::to_string_pretty(&file).map_err(|error| error.to_string())?;
         let path = self.dir().join(FILE);
-        let temporary = self.dir().join(format!("{FILE}.tmp"));
-        std::fs::create_dir_all(self.dir())
-            .and_then(|_| std::fs::write(&temporary, format!("{HEADER}{text}")))
-            .and_then(|_| std::fs::rename(&temporary, &path))
+        crate::paths::write_atomic(&path, format!("{HEADER}{text}"))
             .map_err(|error| format!("Could not save {}: {error}", path.display()))
     }
 

@@ -68,13 +68,7 @@ fn write(path: &Path, root: &Path, entries: &[HistoryEntry]) -> std::io::Result<
         entries: entries.iter().take(LIMIT).cloned().collect(),
     };
     let text = toml::to_string(&file).map_err(std::io::Error::other)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Written aside and renamed, so a crash never leaves half a file.
-    let partial = path.with_extension("toml.partial");
-    std::fs::write(&partial, text)?;
-    std::fs::rename(&partial, path)
+    crate::paths::write_atomic(path, text)
 }
 
 fn file_for(root: &Path) -> PathBuf {

@@ -230,7 +230,8 @@ impl Adapter for Mysql {
                         Some(Value::Bytes(bytes)) => {
                             Some(String::from_utf8_lossy(bytes).into_owned())
                         }
-                        Some(other) => Some(other.as_sql(true).trim_matches('\'').to_string()),
+                        // The text protocol sends every value as bytes.
+                        Some(other) => unreachable!("a text protocol row held {other:?}"),
                     })
                     .collect();
                 let borrowed: Vec<Option<&str>> = values.iter().map(Option::as_deref).collect();
