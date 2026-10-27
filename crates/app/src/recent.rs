@@ -73,39 +73,64 @@ fn entry(path: PathBuf) -> RecentProject {
 
 /// Moves `project` to the top of the list.
 pub fn add(project: &Path) {
-    add_in(&path(), project);
+    report(add_in(&path(), project));
 }
 
 /// Takes `project` off the list. The folder itself is left alone.
 pub fn remove(project: &Path) {
-    remove_in(&path(), project);
+    report(remove_in(&path(), project));
 }
 
-fn add_in(file: &Path, project: &Path) {
+fn add_in(file: &Path, project: &Path) -> std::io::Result<()> {
     update(file, |projects| {
         projects.retain(|p| p != project);
         projects.insert(0, project.to_path_buf());
         projects.truncate(LIMIT);
-    });
+    })
 }
 
-fn remove_in(file: &Path, project: &Path) {
-    update(file, |projects| projects.retain(|p| p != project));
+fn remove_in(file: &Path, project: &Path) -> std::io::Result<()> {
+    update(file, |projects| projects.retain(|p| p != project))
 }
 
 /// Empties the list.
 pub fn clear() {
-    update(&path(), Vec::clear);
+    report(write(&path(), Vec::new()));
 }
 
-fn update(path: &Path, change: impl FnOnce(&mut Vec<PathBuf>)) {
-    let mut projects = read(path);
-    change(&mut projects);
-    let text = toml::to_string(&File { projects }).unwrap_or_default();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+fn report(result: std::io::Result<()>) {
+    if let Err(error) = result {
+        eprintln!("kuery: could not update the recent projects: {error}");
     }
-    let _ = std::fs::write(path, text);
+}
+
+/// A file that cannot be read as the list is left alone rather than
+/// replaced by what the change makes of an empty list.
+fn update(path: &Path, change: impl FnOnce(&mut Vec<PathBuf>)) -> std::io::Result<()> {
+    let mut projects = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            toml::from_str::<File>(&text)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{} is not valid TOML: {}", path.display(), error.message()),
+                    )
+                })?
+                .projects
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    change(&mut projects);
+    write(path, projects)
+}
+
+fn write(path: &Path, projects: Vec<PathBuf>) -> std::io::Result<()> {
+    let text = toml::to_string(&File { projects }).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, text)
 }
 
 fn read(path: &Path) -> Vec<PathBuf> {
@@ -130,7 +155,7 @@ mod tests {
     fn newest_first_without_duplicates() {
         let file = temp_file("order");
         for project in ["/a", "/b", "/a"] {
-            add_in(&file, Path::new(project));
+            add_in(&file, Path::new(project)).unwrap();
         }
         assert_eq!(read(&file), [PathBuf::from("/a"), PathBuf::from("/b")]);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
@@ -140,12 +165,26 @@ mod tests {
     fn remove_and_clear() {
         let file = temp_file("remove");
         for project in ["/c", "/b", "/a"] {
-            add_in(&file, Path::new(project));
+            add_in(&file, Path::new(project)).unwrap();
         }
-        remove_in(&file, Path::new("/b"));
+        remove_in(&file, Path::new("/b")).unwrap();
         assert_eq!(read(&file), [PathBuf::from("/a"), PathBuf::from("/c")]);
-        update(&file, Vec::clear);
+        update(&file, Vec::clear).unwrap();
         assert!(read(&file).is_empty());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_left_alone() {
+        let file = temp_file("broken");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "projects = [\"/a\", ").unwrap();
+        assert!(add_in(&file, Path::new("/b")).is_err());
+        assert!(remove_in(&file, Path::new("/a")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "projects = [\"/a\", "
+        );
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
