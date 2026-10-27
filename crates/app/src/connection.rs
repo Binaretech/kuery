@@ -27,17 +27,32 @@ impl Environment {
     /// also counts as production.
     pub fn detect(url: &str, explicit: Option<&str>) -> Self {
         if let Some(name) = explicit {
-            return match name.trim().to_lowercase().as_str() {
-                "development" | "dev" | "local" => Environment::Development,
-                "staging" | "stage" => Environment::Staging,
-                _ => Environment::Production,
-            };
+            return Self::parse(name);
         }
         match host(url).as_str() {
             "localhost" | "127.0.0.1" | "::1" | "[::1]" | "host.docker.internal" => {
                 Environment::Development
             }
             _ => Environment::Production,
+        }
+    }
+
+    /// The environment a project file names, with its aliases (`dev`,
+    /// `stage`) in any case; an unknown name is production.
+    pub fn parse(name: &str) -> Self {
+        match name.trim().to_lowercase().as_str() {
+            "development" | "dev" | "local" => Environment::Development,
+            "staging" | "stage" => Environment::Staging,
+            _ => Environment::Production,
+        }
+    }
+
+    /// The name written to the project file.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Environment::Development => "development",
+            Environment::Staging => "staging",
+            Environment::Production => "production",
         }
     }
 

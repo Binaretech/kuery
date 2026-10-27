@@ -8,7 +8,7 @@ use kuery_core::catalog::{
     TableKind, TableRef, TriggerInfo, TriggerRef,
 };
 use kuery_core::diagram::OnDelete;
-use kuery_core::sql::{quote_literal, quote_qualified};
+use kuery_core::sql::{POSTGRES, quote_literal};
 
 use crate::{Postgres, QueryError};
 
@@ -202,7 +202,7 @@ pub(crate) fn definition(
     table: &TableRef,
 ) -> Result<TableDefinition, QueryError> {
     let relation =
-        quote_literal(&quote_qualified(&table.schema, &table.name)).map_err(|error| {
+        quote_literal(&POSTGRES.quote_qualified(&table.schema, &table.name)).map_err(|error| {
             QueryError::Database {
                 code: "22021".into(),
                 message: error.to_string(),

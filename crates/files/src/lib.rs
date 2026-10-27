@@ -15,7 +15,8 @@ use std::path::PathBuf;
 pub use preview::{ColumnSchema, FileFingerprint, LimitReason, PreviewResult, PreviewScope};
 pub use reader::FileDataset;
 pub use source::{
-    CsvOptions, FileFormat, FileSource, MAX_JSON_BYTES, MAX_PREVIEW_ROWS, PreviewRequest,
+    CsvOptions, FileFormat, FileSource, MAX_JSON_BYTES, MAX_NDJSON_SQL_BYTES, MAX_PREVIEW_ROWS,
+    PreviewRequest,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,8 +40,17 @@ pub enum Error {
         format: FileFormat,
         message: String,
     },
-    #[error("JSON file exceeds the {MAX_JSON_BYTES}-byte limit; use JSONL or Parquet")]
+    #[error(
+        "JSON file exceeds the {} MiB limit; use Parquet, or JSONL up to {} MiB",
+        MAX_JSON_BYTES / (1024 * 1024),
+        MAX_NDJSON_SQL_BYTES / (1024 * 1024)
+    )]
     JsonTooLarge,
+    #[error(
+        "JSONL file exceeds the {} MiB limit for SQL; use Parquet",
+        MAX_NDJSON_SQL_BYTES / (1024 * 1024)
+    )]
+    NdJsonTooLarge,
     #[error("File changed while reading: {0}; reload it")]
     FileChanged(PathBuf),
     #[error("A row cannot fit in the preview byte budget ({0} bytes)")]

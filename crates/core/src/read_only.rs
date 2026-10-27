@@ -155,6 +155,7 @@ impl std::error::Error for Rejection {}
 
 /// Checks that `sql` is exactly one PostgreSQL statement that only reads
 /// data.
+#[cfg(test)]
 pub fn check(sql: &str) -> Result<(), Rejection> {
     check_in(&crate::sql::POSTGRES, sql)
 }

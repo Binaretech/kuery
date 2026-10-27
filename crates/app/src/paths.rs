@@ -2,7 +2,7 @@
 //! it can throw away (downloaded updates).
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The folder's name before the app was called Kuery.
 const LEGACY_NAME: &str = "dbadmin";
@@ -71,9 +71,37 @@ fn config_dir_named(name: &str) -> PathBuf {
     }
 }
 
+/// Writes `contents` to `path`, creating its folder, through a file beside
+/// it and a rename, so a crash midway never leaves half a file.
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(&temporary, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_whole_files_through_a_rename() {
+        let dir = std::env::temp_dir().join(format!("kuery-atomic-{}", crate::project::new_id()));
+        let path = dir.join("nested").join("recent.toml");
+        write_atomic(&path, "first").unwrap();
+        write_atomic(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        // Nothing is left beside it.
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["recent.toml"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {

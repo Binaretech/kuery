@@ -167,10 +167,6 @@ impl Dialect {
         (self.as_text)(expr)
     }
 
-    pub fn like_ignoring_case(&self) -> &'static str {
-        self.like_ignoring_case
-    }
-
     /// Escapes `%`, `_`, `\` and, where it starts a character class, `[`,
     /// so `value` matches itself inside a LIKE pattern with `ESCAPE '\'`.
     pub fn escape_like(&self, value: &str) -> String {
@@ -438,17 +434,6 @@ pub static MSSQL: Dialect = Dialect {
     binary: None,
 };
 
-/// `orders` → `"orders"`, `a"b` → `"a""b"`. Always quoted, so uppercase
-/// letters and reserved words are preserved.
-pub fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// `"public"."orders"`.
-pub fn quote_qualified(schema: &str, name: &str) -> String {
-    format!("{}.{}", quote_ident(schema), quote_ident(name))
-}
-
 /// Text literal. Uses `E'…'` when there are backslashes so the result is the
 /// same under any value of `standard_conforming_strings`.
 pub fn quote_literal(value: &str) -> Result<String, SqlError> {
@@ -477,10 +462,13 @@ mod tests {
 
     #[test]
     fn quotes_identifiers() {
-        assert_eq!(quote_ident("orders"), "\"orders\"");
-        assert_eq!(quote_ident("Order Items"), "\"Order Items\"");
-        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
-        assert_eq!(quote_qualified("public", "orders"), "\"public\".\"orders\"");
+        assert_eq!(POSTGRES.quote_ident("orders"), "\"orders\"");
+        assert_eq!(POSTGRES.quote_ident("Order Items"), "\"Order Items\"");
+        assert_eq!(POSTGRES.quote_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(
+            POSTGRES.quote_qualified("public", "orders"),
+            "\"public\".\"orders\""
+        );
     }
 
     #[test]

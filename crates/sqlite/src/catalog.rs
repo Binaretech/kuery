@@ -10,7 +10,7 @@ use kuery_core::catalog::{
 };
 use kuery_core::diagram::OnDelete;
 use kuery_core::session::QueryError;
-use kuery_core::sql::quote_ident;
+use kuery_core::sql::SQLITE;
 use rusqlite::Connection;
 
 /// A column as `pragma_table_xinfo` describes it.
@@ -68,7 +68,7 @@ fn objects(connection: &Connection, schema: &str) -> Result<Vec<(String, TableKi
         "select name, type from {}.sqlite_master \
          where type in ('table', 'view') and name not like 'sqlite\\_%' escape '\\' \
          order by name",
-        quote_ident(schema)
+        SQLITE.quote_ident(schema)
     );
     let mut statement = connection.prepare(&sql).map_err(failed)?;
     statement
@@ -195,7 +195,7 @@ pub(crate) fn overview(connection: &Connection) -> Result<CatalogOverview, Query
         }
         let sql = format!(
             "select tbl_name, name from {}.sqlite_master where type = 'trigger' order by 1, 2",
-            quote_ident(schema)
+            SQLITE.quote_ident(schema)
         );
         let mut statement = connection.prepare(&sql).map_err(failed)?;
         let triggers = statement
@@ -250,7 +250,7 @@ pub(crate) fn definition(
                 "PRIMARY KEY ({})",
                 primary
                     .iter()
-                    .map(|c| quote_ident(c))
+                    .map(|c| SQLITE.quote_ident(c))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -258,12 +258,12 @@ pub(crate) fn definition(
     }
     for group in &groups {
         let to = referenced(connection, &table.schema, group)?;
-        let from: Vec<String> = group.iter().map(|k| quote_ident(&k.from)).collect();
-        let to: Vec<String> = to.iter().map(|c| quote_ident(c)).collect();
+        let from: Vec<String> = group.iter().map(|k| SQLITE.quote_ident(&k.from)).collect();
+        let to: Vec<String> = to.iter().map(|c| SQLITE.quote_ident(c)).collect();
         let mut text = format!(
             "FOREIGN KEY ({}) REFERENCES {} ({})",
             from.join(", "),
-            quote_ident(&group[0].table),
+            SQLITE.quote_ident(&group[0].table),
             to.join(", ")
         );
         for (event, rule) in [
@@ -313,7 +313,7 @@ pub(crate) fn definition(
             .collect::<Result<Vec<_>, _>>()
             .map_err(failed)?
             .into_iter()
-            .map(|c| c.map_or_else(|| "(expression)".into(), |c| quote_ident(&c)))
+            .map(|c| c.map_or_else(|| "(expression)".into(), |c| SQLITE.quote_ident(&c)))
             .collect::<Vec<_>>()
             .join(", ");
         let definition_text = sql.unwrap_or_else(|| {
@@ -345,7 +345,7 @@ pub(crate) fn definition(
     let sql = format!(
         "select name, sql from {}.sqlite_master where type = 'trigger' and tbl_name = ?1 \
          order by name",
-        quote_ident(&table.schema)
+        SQLITE.quote_ident(&table.schema)
     );
     let mut statement = connection.prepare(&sql).map_err(failed)?;
     definition.triggers = statement

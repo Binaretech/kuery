@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::{Error, Result};
 
 pub const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
+/// SQL reads a JSONL file whole, unlike its preview.
+pub const MAX_NDJSON_SQL_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PREVIEW_ROWS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
