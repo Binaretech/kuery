@@ -364,16 +364,17 @@ mod tests {
             browse.count_sql().unwrap(),
             r#"select count(*) from "public"."orders" where "note"::text ilike E'%50\\%'' or 1=1 --%' escape E'\\'"#
         );
-        // SQL Server would read `[abc]` as "a, b or c": the bracket is escaped.
-        let mut mssql = orders().in_dialect(&crate::sql::MSSQL);
-        mssql.filters = vec![filter("note", FilterOp::StartsWith, "[abc]")];
-        assert!(
-            mssql
-                .count_sql()
-                .unwrap()
-                .contains(r"like N'\[abc]%' escape N'\'"),
-            "{}",
-            mssql.count_sql().unwrap()
+    }
+
+    #[test]
+    fn matches_brackets_literally_in_t_sql() {
+        let mut browse = Browse::new(TableRef::new("dbo", "orders"), vec!["note".into()])
+            .in_dialect(&crate::sql::MSSQL);
+        browse.filters = vec![filter("note", FilterOp::Contains, "[abc]")];
+        assert_eq!(
+            browse.count_sql().unwrap(),
+            "select count(*) from [dbo].[orders] where coalesce(try_convert(nvarchar(max), [note], 126), \
+             convert(nvarchar(max), [note])) like N'%\\[abc]%' escape N'\\'"
         );
     }
 

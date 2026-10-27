@@ -16,8 +16,8 @@ use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::activity::Signal;
@@ -288,19 +288,14 @@ impl ActivityTab {
             return;
         };
         let sent = session.signal(pid, signal);
-        let record = |outcome: String, failed: bool| AuditRecord {
-            at: AuditRecord::now_at(),
-            project: self.project.display().to_string(),
-            connection: self.db.name.to_string(),
-            environment: self.db.environment.label().to_string(),
-            mode: "Server activity".into(),
-            action: AuditAction::Run,
-            sql: signal.describe(pid),
-            outcome,
-            changed: None,
-            failed,
-        };
-        let pending = record(String::new(), false);
+        let pending = AuditRecord::new(
+            &self.project,
+            self.db.name.as_ref(),
+            self.db.environment,
+            "Server activity",
+            AuditAction::Run,
+            signal.describe(pid),
+        );
         cx.spawn(async move |this, cx| {
             let result = sent.await;
             let (message, tone, failed) = match (&result, signal) {
@@ -323,17 +318,8 @@ impl ActivityTab {
                 Err(error) => crate::query_tab::describe_error(error),
                 Ok(_) => message,
             };
-            let record = AuditRecord {
-                outcome: message.clone(),
-                failed,
-                ..pending
-            };
-            cx.background_spawn(async move {
-                if let Err(error) = audit::append(&record) {
-                    eprintln!("kuery: could not write the audit log: {error}");
-                }
-            })
-            .detach();
+            let record = pending.finished(message.clone(), None, failed);
+            cx.update(|cx| audit::append_in_background(record, cx));
             this.update(cx, |this, cx| {
                 this.notice = Some((message, tone));
                 this.refresh(cx);

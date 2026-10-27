@@ -3,14 +3,23 @@
 
 use std::time::Duration;
 
-use gpui_kit::component::h_flex;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{WindowExt as _, h_flex};
 use gpui_kit::{
     AnyElement, AnyView, App, Div, FontWeight, IntoElement, ParentElement as _, SharedString,
     Styled as _, Window, div, px,
 };
 
 use crate::theme::{self, color};
+
+/// Shows `note` in the active window (or any open one).
+pub fn notify(note: Notification, cx: &mut App) {
+    let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
+}
 
 /// `1000000` → `1,000,000`.
 pub fn thousands(n: u64) -> String {

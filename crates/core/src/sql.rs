@@ -41,8 +41,8 @@ pub struct Dialect {
     pub as_text: fn(&str) -> String,
     /// The case-insensitive `LIKE`.
     pub like_ignoring_case: &'static str,
-    /// Whether `[` starts a character class in `LIKE` patterns (SQL Server).
-    pub like_classes: bool,
+    /// What a `LIKE` pattern reads as other than itself, besides `\`.
+    pub like_wildcards: &'static [char],
     /// How sorting puts NULLs last.
     pub nulls_last: NullsLast,
     /// `a` equals `b`, NULL equal to NULL.
@@ -167,12 +167,12 @@ impl Dialect {
         (self.as_text)(expr)
     }
 
-    /// Escapes `%`, `_`, `\` and, where it starts a character class, `[`,
-    /// so `value` matches itself inside a LIKE pattern with `ESCAPE '\'`.
+    /// Escapes the wildcards and `\` so `value` can be used inside a LIKE
+    /// pattern with `ESCAPE '\'`.
     pub fn escape_like(&self, value: &str) -> String {
         let mut out = String::with_capacity(value.len());
         for ch in value.chars() {
-            if matches!(ch, '\\' | '%' | '_') || (ch == '[' && self.like_classes) {
+            if ch == '\\' || self.like_wildcards.contains(&ch) {
                 out.push('\\');
             }
             out.push(ch);
@@ -259,7 +259,7 @@ pub static POSTGRES: Dialect = Dialect {
     literal: quote_literal,
     as_text: |expr| format!("{expr}::text"),
     like_ignoring_case: "ilike",
-    like_classes: false,
+    like_wildcards: &['%', '_'],
     nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is not distinct from {b}"),
     insert_defaults: "insert into {} default values",
@@ -294,7 +294,7 @@ pub static SQLITE: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as text)"),
     like_ignoring_case: "like",
-    like_classes: false,
+    like_wildcards: &['%', '_'],
     nulls_last: NullsLast::Keyword,
     same: |a, b| format!("{a} is {b}"),
     insert_defaults: "insert into {} default values",
@@ -370,7 +370,7 @@ pub static MYSQL: Dialect = Dialect {
     },
     as_text: |expr| format!("cast({expr} as char)"),
     like_ignoring_case: "like",
-    like_classes: false,
+    like_wildcards: &['%', '_'],
     nulls_last: NullsLast::IsNullFirst,
     same: |a, b| format!("{a} <=> {b}"),
     insert_defaults: "insert into {} () values ()",
@@ -408,7 +408,8 @@ pub static MSSQL: Dialect = Dialect {
         format!("coalesce(try_convert(nvarchar(max), {expr}, 126), convert(nvarchar(max), {expr}))")
     },
     like_ignoring_case: "like",
-    like_classes: true,
+    // `[a-c]` and `[^a]` are character classes.
+    like_wildcards: &['%', '_', '['],
     nulls_last: NullsLast::Case,
     same: |a, b| format!("({a} = {b} or ({a} is null and {b} is null))"),
     insert_defaults: "insert into {} default values",
@@ -552,8 +553,9 @@ mod tests {
 
     #[test]
     fn escapes_like_patterns() {
-        assert_eq!(POSTGRES.escape_like("50%_off\\[a]"), "50\\%\\_off\\\\[a]");
-        // SQL Server reads `[abc]` as "a, b or c".
-        assert_eq!(MSSQL.escape_like("[abc]_%"), "\\[abc]\\_\\%");
+        assert_eq!(POSTGRES.escape_like("50%_off\\"), "50\\%\\_off\\\\");
+        assert_eq!(MYSQL.escape_like("[abc]"), "[abc]");
+        // `[abc]` is a character class in T-SQL's LIKE.
+        assert_eq!(MSSQL.escape_like("[abc]"), "\\[abc]");
     }
 }
