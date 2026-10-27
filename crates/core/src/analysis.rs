@@ -93,6 +93,7 @@ impl Analysis {
 }
 
 /// Analyses a PostgreSQL script of one or more statements.
+#[cfg(test)]
 pub fn analyze(sql: &str) -> Result<Analysis, Rejection> {
     analyze_in(&crate::sql::POSTGRES, sql)
 }

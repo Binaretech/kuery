@@ -32,7 +32,7 @@ use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
 use kuery_core::driver::Family;
-use kuery_core::sql::{Dialect, quote_qualified};
+use kuery_core::sql::{Dialect, POSTGRES};
 
 use crate::app;
 use crate::assets::AppIcon;
@@ -705,7 +705,7 @@ impl Explorer {
             "-- Values of the enum {}.{}, in order.\nselect unnest(enum_range(null::{})) as value;\n",
             info.schema,
             info.name,
-            quote_qualified(&info.schema, &info.name)
+            POSTGRES.quote_qualified(&info.schema, &info.name)
         );
         cx.emit(ExplorerEvent::OpenQuery {
             db,
@@ -1345,7 +1345,10 @@ impl Explorer {
                         this.open_enum(index, open.clone(), cx)
                     }))
                     .separator()
-                    .item(copy("Copy Name", quote_qualified(&info.schema, &info.name)))
+                    .item(copy(
+                        "Copy Name",
+                        POSTGRES.quote_qualified(&info.schema, &info.name),
+                    ))
                     .item(copy("Copy Values", info.values.join(", ")))
                 }
             })
