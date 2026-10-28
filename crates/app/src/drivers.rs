@@ -121,7 +121,10 @@ impl Driver {
                     let tunnel = tunnel::open_for(&spec).await?;
                     let target = spec
                         .redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-                    let session = engine.connect(target).await.map_err(|e| e.to_string())?;
+                    let session = engine
+                        .connect(target, Access::ReadOnly)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let server = session.server();
                     Ok(format!(
                         "Connected{} · Redis {} · {}",
@@ -161,7 +164,11 @@ impl Driver {
                     let tunnel = tunnel::open_for(&spec).await?;
                     let target = spec
                         .redis_target(password.as_deref(), tunnel.as_ref().map(|t| t.local_port()));
-                    let session = engine.connect(target).await.map_err(|e| e.to_string())?;
+                    let access = spec.environment().access();
+                    let session = engine
+                        .connect(target, access)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(Connection::KeyValue(RedisDb::new(
                         spec.name.clone().into(),
                         spec.environment(),

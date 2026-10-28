@@ -8,7 +8,9 @@
 //! The explorer and the key viewer only ever send commands that read
 //! (`INFO`, `SCAN`, `TYPE`, `HSCAN`, `LRANGE`…). Commands typed in the
 //! console go through [`Session::command`]; deciding which of those may run
-//! is the console's job (see `kuery_core::redis::classify`).
+//! is the console's job (see `kuery_core::redis::classify`). A read-only
+//! session refuses the ones that may write as well, until writes are allowed
+//! for it ([`Session::allow_writes`]).
 
 mod reply;
 
@@ -20,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kuery_core::redis::{Class, classify};
+use kuery_core::session::Access;
 use redis::aio::{
     ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection,
 };
@@ -58,11 +62,12 @@ impl Engine {
         Ok(Self { runtime })
     }
 
-    /// Connects and reads the server's version. The returned future can be
-    /// awaited from any executor, including the UI one.
+    /// Connects with `access` and reads the server's version. The returned
+    /// future can be awaited from any executor, including the UI one.
     pub fn connect(
         &self,
         target: Target,
+        access: Access,
     ) -> impl Future<Output = Result<Session, Error>> + Send + use<> {
         let handle = self.runtime.handle().clone();
         run(&handle.clone(), async move {
@@ -74,6 +79,8 @@ impl Engine {
                 handle,
                 connections: Mutex::new(HashMap::new()),
                 server: ServerInfo::default(),
+                access,
+                writes_allowed: AtomicBool::new(false),
             };
             let mut connection = inner.connection(target.db).await?;
             let text: String = redis::cmd("INFO")
@@ -280,6 +287,11 @@ pub enum Error {
     Redis(String),
     #[error("the connection runtime failed: {0}")]
     Runtime(String),
+    /// A command that may write, on a read-only session.
+    #[error(
+        "{0} was not run: this connection is read-only until writes are allowed for the session"
+    )]
+    ReadOnly(String),
 }
 
 impl From<redis::RedisError> for Error {
@@ -477,9 +489,27 @@ struct Inner {
     handle: tokio::runtime::Handle,
     connections: Mutex<HashMap<i64, Link>>,
     server: ServerInfo,
+    access: Access,
+    /// Read-only sessions: writes were allowed for this connection session.
+    writes_allowed: AtomicBool,
 }
 
 impl Inner {
+    fn allows_writes(&self) -> bool {
+        self.access == Access::ReadWrite || self.writes_allowed.load(Ordering::SeqCst)
+    }
+
+    /// Refuses a command that may write unless writes are allowed: only the
+    /// commands Kuery knows to read run on a read-only session, so an unknown
+    /// one counts as a write.
+    fn check(&self, args: &[String]) -> Result<(), Error> {
+        if self.allows_writes() || matches!(classify(args), Class::Read | Class::Heavy) {
+            return Ok(());
+        }
+        let name = args.first().map(|a| a.to_ascii_uppercase());
+        Err(Error::ReadOnly(name.unwrap_or_default()))
+    }
+
     /// The connection to database `db`, opened on first use.
     async fn connection(&self, db: i64) -> Result<Link, Error> {
         let mut connections = self.connections.lock().await;
@@ -522,6 +552,22 @@ impl Session {
     /// The database the connection settings name.
     pub fn default_db(&self) -> i64 {
         self.inner.default_db
+    }
+
+    /// Whether [`Self::command`] runs commands that write: always on a
+    /// read-write session, on a read-only one once writes are allowed.
+    pub fn allows_writes(&self) -> bool {
+        self.inner.allows_writes()
+    }
+
+    /// Lets a read-only session run commands that write, for every clone of
+    /// it, until [`Self::revoke_writes`].
+    pub fn allow_writes(&self) {
+        self.inner.writes_allowed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn revoke_writes(&self) {
+        self.inner.writes_allowed.store(false, Ordering::SeqCst);
     }
 
     fn spawn<T, F, J>(&self, job: J) -> impl Future<Output = Result<T, Error>> + Send + use<T, F, J>
@@ -822,17 +868,20 @@ impl Session {
         })
     }
 
-    /// Runs a command as typed (the first argument is its name).
+    /// Runs a command as typed (the first argument is its name). On a
+    /// read-only session, one that may write is refused unless writes are
+    /// allowed (see [`Self::allows_writes`]).
     pub fn command(
         &self,
         db: i64,
         args: Vec<String>,
     ) -> impl Future<Output = Result<Reply, Error>> + Send + use<> {
         self.spawn(move |inner| async move {
-            let mut connection = inner.connection(db).await?;
             let Some((name, rest)) = args.split_first() else {
                 return Err(Error::Redis("empty command".into()));
             };
+            inner.check(&args)?;
+            let mut connection = inner.connection(db).await?;
             let mut command = redis::cmd(name);
             for arg in rest {
                 command.arg(arg);
@@ -1086,7 +1135,7 @@ mod tests {
             let _ = sent.send(hello);
         });
         let engine = Engine::new().unwrap();
-        assert!(block(engine.connect(target)).is_err());
+        assert!(block(engine.connect(target, Access::ReadOnly)).is_err());
         let hello = hello
             .recv_timeout(Duration::from_secs(5))
             .expect("connects to the tunnel");
@@ -1097,6 +1146,103 @@ mod tests {
                 .any(|w| w == b"cache.example.com"),
             "{hello:?}"
         );
+    }
+
+    /// A server that answers `+OK` to every command and says which commands
+    /// reached it, one line each.
+    fn fake_server() -> (Target, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read as _, Write as _};
+        fn header(stream: &mut impl BufRead) -> std::io::Result<usize> {
+            let mut line = String::new();
+            if stream.read_line(&mut line)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            line[1..].trim_end().parse().map_err(std::io::Error::other)
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let sent = sent.clone();
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    let mut reply = stream.try_clone()?;
+                    let mut stream = BufReader::new(stream);
+                    loop {
+                        let mut args = Vec::new();
+                        for _ in 0..header(&mut stream)? {
+                            let mut arg = vec![0; header(&mut stream)? + 2];
+                            stream.read_exact(&mut arg)?;
+                            arg.truncate(arg.len() - 2);
+                            args.push(String::from_utf8_lossy(&arg).into_owned());
+                        }
+                        let _ = sent.send(args.join(" "));
+                        reply.write_all(b"+OK\r\n")?;
+                    }
+                });
+            }
+        });
+        let target = Target {
+            host: "127.0.0.1".into(),
+            port,
+            db: 0,
+            username: None,
+            password: None,
+            tls: false,
+            server_name: "127.0.0.1".into(),
+        };
+        (target, received)
+    }
+
+    #[test]
+    fn a_read_only_session_refuses_writes_until_they_are_allowed() {
+        let (target, received) = fake_server();
+        let engine = Engine::new().unwrap();
+        let run = |session: &Session, line: &str| {
+            block(session.command(0, line.split(' ').map(String::from).collect()))
+        };
+        let reached = || received.try_iter().collect::<Vec<_>>();
+
+        let session = block(engine.connect(target.clone(), Access::ReadOnly)).unwrap();
+        reached();
+        assert!(!session.allows_writes());
+        assert_eq!(run(&session, "GET k").unwrap(), Reply::Status("OK".into()));
+        run(&session, "KEYS *").unwrap();
+        // Writes, unknown commands and the ones that hold the connection
+        // never reach the server, whatever the caller checked.
+        for line in [
+            "SET k v",
+            "flushall",
+            "EVAL return 0",
+            "MADEUP k",
+            "BLPOP k 0",
+        ] {
+            let refused = run(&session, line).unwrap_err();
+            assert!(matches!(refused, Error::ReadOnly(_)), "{line}: {refused}");
+        }
+        assert_eq!(reached(), ["GET k", "KEYS *"]);
+        assert!(
+            run(&session, "FLUSHALL")
+                .unwrap_err()
+                .to_string()
+                .starts_with("FLUSHALL was not run")
+        );
+
+        // Allowed for the session, by any clone of it, until revoked.
+        session.clone().allow_writes();
+        assert!(session.allows_writes());
+        run(&session, "SET k v").unwrap();
+        session.revoke_writes();
+        assert!(matches!(run(&session, "DEL k"), Err(Error::ReadOnly(_))));
+        assert_eq!(reached(), ["SET k v"]);
+
+        // A read-write session runs them as it always did.
+        let session = block(engine.connect(target, Access::ReadWrite)).unwrap();
+        reached();
+        assert!(session.allows_writes());
+        run(&session, "SET k v").unwrap();
+        run(&session, "MADEUP k").unwrap();
+        assert_eq!(reached(), ["SET k v", "MADEUP k"]);
     }
 
     // Against the dev Redis (`docker compose -p kuery-dev -f dev/compose.yaml up -d redis`).
@@ -1125,7 +1271,8 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn connects_and_lists_databases() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).expect("connects to the dev Redis");
+        let session =
+            block(engine.connect(target, Access::ReadOnly)).expect("connects to the dev Redis");
         assert!(session.server().version.starts_with('7'));
         let dbs = block(session.keyspace()).unwrap();
         assert!(dbs.len() >= 16);
@@ -1138,7 +1285,7 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn scans_keys_page_by_page() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).unwrap();
+        let session = block(engine.connect(target, Access::ReadOnly)).unwrap();
         let mut cursor = 0;
         let mut all = Vec::new();
         loop {
@@ -1161,7 +1308,7 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn reads_every_kind_of_value() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).unwrap();
+        let session = block(engine.connect(target, Access::ReadOnly)).unwrap();
         let info = |key: &str| block(session.key_info(0, key.into())).unwrap();
         let read = |key: &str, kind, page, limit| {
             block(session.read_value(0, key.into(), kind, page, limit)).unwrap()
@@ -1250,7 +1397,7 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn writes_and_previews_keys() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).unwrap();
+        let session = block(engine.connect(target, Access::ReadWrite)).unwrap();
         // Keys of its own, removed at the end, in database 2 (empty in the seed).
         let run = |line: &[&str]| {
             block(session.command(2, line.iter().map(|a| a.to_string()).collect())).unwrap()
@@ -1302,7 +1449,7 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn runs_commands_and_reports_error_replies() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).unwrap();
+        let session = block(engine.connect(target, Access::ReadOnly)).unwrap();
         let reply =
             block(session.command(0, vec!["HGET".into(), "user:1".into(), "plan".into()])).unwrap();
         assert_eq!(reply, Reply::Text("pro".into()));
@@ -1319,7 +1466,7 @@ mod tests {
     #[ignore = "needs the dev Redis"]
     fn removes_list_items_only_while_they_are_unchanged() {
         let (engine, target) = dev();
-        let session = block(engine.connect(target)).unwrap();
+        let session = block(engine.connect(target, Access::ReadWrite)).unwrap();
         let run = |args: Vec<String>| block(session.command(9, args)).unwrap();
         let key = "kuery-test:list-removal".to_string();
         let reset = || {
@@ -1365,5 +1512,28 @@ mod tests {
         assert_eq!(list(), ["a", "b", "c", "__kuery_removed__", "d"]);
 
         run(vec!["DEL".into(), key.clone()]);
+    }
+    #[test]
+    #[ignore = "needs the dev Redis"]
+    fn a_read_only_session_writes_only_once_allowed() {
+        let (engine, target) = dev();
+        let session = block(engine.connect(target, Access::ReadOnly)).unwrap();
+        let key = "kuery-test:read-only";
+        let run =
+            |args: &[&str]| block(session.command(2, args.iter().map(|a| a.to_string()).collect()));
+        session.allow_writes();
+        run(&["DEL", key]).unwrap();
+        session.revoke_writes();
+
+        assert!(matches!(run(&["SET", key, "x"]), Err(Error::ReadOnly(name)) if name == "SET"));
+        assert_eq!(run(&["EXISTS", key]).unwrap(), Reply::Int(0));
+        session.allow_writes();
+        assert_eq!(run(&["SET", key, "x"]).unwrap(), Reply::Status("OK".into()));
+        session.revoke_writes();
+        assert!(matches!(run(&["DEL", key]), Err(Error::ReadOnly(_))));
+        assert_eq!(run(&["EXISTS", key]).unwrap(), Reply::Int(1));
+
+        session.allow_writes();
+        assert_eq!(run(&["DEL", key]).unwrap(), Reply::Int(1));
     }
 }
