@@ -2097,7 +2097,7 @@ mod tests {
                     tls: false,
                     server_name: "127.0.0.1".into(),
                 };
-                let session = block_on(engine.connect(target)).unwrap();
+                let session = block_on(engine.connect(target, Access::ReadWrite)).unwrap();
                 let db = RedisDb::new(
                     name.into(),
                     Environment::Development,
