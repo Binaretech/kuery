@@ -834,8 +834,10 @@ fatal `panic` event tagged with the release (`kuery@<version>`), `os` and
 
 Before sending, the message has its home folder (`HOME`, or `USERPROFILE`
 on Windows, with either slash and in any case) replaced by `~`, and text in
-double quotes (or in single quotes that start a word), `password=`/`pwd=`
-values and `user:password@` in URLs replaced by `<redacted>`. Text outside
+double quotes (or in single quotes that start a word), the value after
+`password`, `passwd`, `pwd`, `secret`, `token`, `api_key`, `apikey`,
+`access_key` or `access_token` and `=` or `:`, and everything between `://`
+and the last `@` before a space in URLs replaced by `<redacted>`. Text outside
 quotes stays, so a value a message prints without quotes is sent as is. The
 backtrace keeps its function names, with the home folder replaced. The panic hook's own
 frames are dropped, so the trace ends where the panic happened. Sending goes

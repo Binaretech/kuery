@@ -159,9 +159,8 @@ fn redact_url_credentials(text: &str) -> String {
     while let Some(start) = rest.find("://") {
         let (before, after) = rest.split_at(start + 3);
         out.push_str(before);
-        let end = after
-            .find(|c: char| c.is_whitespace() || c == '/')
-            .unwrap_or(after.len());
+        // Up to the last `@` before a space: a password may hold a `/`.
+        let end = after.find(char::is_whitespace).unwrap_or(after.len());
         match after[..end].rfind('@') {
             Some(at) => {
                 out.push_str(REDACTED);
@@ -174,13 +173,28 @@ fn redact_url_credentials(text: &str) -> String {
     out
 }
 
-/// The value after `password=` or `pwd=`, as connection strings write it.
+/// Keys whose value is a secret, as connection strings and options write
+/// them.
+const SECRET_KEYS: [&str; 9] = [
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "access_key",
+    "access_token",
+];
+
+/// The value after one of the [`SECRET_KEYS`] and `=` or `:`, as connection
+/// strings and messages write it.
 fn redact_passwords(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut from = 0;
-    while let Some(found) = ["password", "pwd"]
+    while let Some(found) = SECRET_KEYS
         .iter()
         .filter_map(|key| lower[from..].find(key).map(|at| (from + at, key.len())))
         .min()
@@ -193,7 +207,7 @@ fn redact_passwords(text: &str) -> String {
             .is_some_and(|c| c.is_alphanumeric() || c == '_');
         let after = &text[from..];
         let spaced = after.trim_start();
-        let Some(value) = spaced.strip_prefix('=') else {
+        let Some(value) = spaced.strip_prefix(['=', ':']) else {
             continue;
         };
         if !starts_word {
@@ -478,6 +492,32 @@ mod tests {
     }
 
     #[test]
+    fn other_secret_keys_and_colons_are_redacted() {
+        assert_eq!(
+            scrub(
+                "passwd=a1 secret=b2 token=c3 api_key=d4 apikey=e5 access_key=f6",
+                None
+            ),
+            "passwd=<redacted> secret=<redacted> token=<redacted> api_key=<redacted> \
+             apikey=<redacted> access_key=<redacted>"
+        );
+        assert_eq!(
+            scrub("auth failed, password: hunter2", None),
+            "auth failed, password: <redacted>"
+        );
+        // A key that only starts a longer word stays.
+        assert_eq!(scrub("tokens: 5", None), "tokens: 5");
+    }
+
+    #[test]
+    fn a_url_password_with_a_slash_is_redacted() {
+        assert_eq!(
+            scrub("connect postgres://admin:pa/ss@db:5432/shop failed", None),
+            "connect postgres://<redacted>@db:5432/shop failed"
+        );
+    }
+
+    #[test]
     fn a_quoted_password_is_removed_whole() {
         assert_eq!(
             scrub(r#"Server=db;Password="my pass";User=sa"#, None),
@@ -612,12 +652,16 @@ mod tests {
         assert!(!text.contains("4111"), "{text}");
     }
 
-    #[test]
-    fn send_posts_the_event_to_the_projects_envelope_endpoint() {
+    /// Answers one request with `response`, after reading all of it (an
+    /// unread body could reset the connection before the client sees the
+    /// answer), and returns its header lines and body.
+    fn serve_once(
+        response: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<(Vec<String>, String)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut head = Vec::new();
             let mut length = 0;
@@ -634,13 +678,15 @@ mod tests {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            let mut stream = stream;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
-                .unwrap();
+            stream.write_all(response).unwrap();
             (head, String::from_utf8(body).unwrap())
         });
+        (port, server)
+    }
 
+    #[test]
+    fn send_posts_the_event_to_the_projects_envelope_endpoint() {
+        let (port, server) = serve_once(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
         let dsn = format!("http://publickey@127.0.0.1:{port}/42");
         send(&dsn, &report(r#"bad "secret""#)).unwrap();
 
@@ -664,16 +710,7 @@ mod tests {
 
     #[test]
     fn send_reports_a_rejected_report() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0; 8192];
-            let _ = stream.read(&mut buffer);
-            stream
-                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
-                .unwrap();
-        });
+        let (port, server) = serve_once(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n");
         let result = send(
             &format!("http://publickey@127.0.0.1:{port}/42"),
             &report("boom"),
