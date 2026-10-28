@@ -2095,6 +2095,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: false,
+                    server_name: "127.0.0.1".into(),
                 };
                 let session = block_on(engine.connect(target)).unwrap();
                 let db = RedisDb::new(

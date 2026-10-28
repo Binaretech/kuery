@@ -170,6 +170,39 @@ impl std::fmt::Debug for ConnectOptions {
     }
 }
 
+impl ConnectOptions {
+    /// Where to open the connection and which name TLS checks: through the
+    /// local end of a tunnel when there is one, still checking the
+    /// certificate against the server as named.
+    pub fn endpoint(&self) -> Endpoint {
+        let server_name = self.host.trim().to_string();
+        Endpoint {
+            host: match self.tunnel {
+                Some(_) => "127.0.0.1".into(),
+                None => server_name.clone(),
+            },
+            port: self.tunnel.unwrap_or(self.port),
+            server_name,
+            tls: self
+                .tls
+                .as_deref()
+                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+        }
+    }
+}
+
+/// See [`ConnectOptions::endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    /// The host to dial.
+    pub host: String,
+    pub port: u16,
+    /// The name the server's certificate must carry.
+    pub server_name: String,
+    /// Whether the stored choice turns TLS on, for drivers with a toggle.
+    pub tls: bool,
+}
+
 /// Opens a connection with a driver.
 pub type Open =
     fn(&ConnectOptions, crate::session::Access) -> Result<Box<dyn crate::adapter::Adapter>, String>;
@@ -299,5 +332,44 @@ mod tests {
         assert_eq!(toggle.options(), ["disabled", "enabled"]);
         assert_eq!(toggle.stored(1).as_deref(), Some("require"));
         assert_eq!((toggle.index(Some("require")), toggle.index(None)), (1, 0));
+    }
+
+    #[test]
+    fn dials_the_tunnel_and_checks_the_certificate_against_the_server() {
+        let options = ConnectOptions {
+            host: " db.example.com ".into(),
+            port: 3306,
+            tls: Some("require".into()),
+            ..ConnectOptions::default()
+        };
+        assert_eq!(
+            options.endpoint(),
+            Endpoint {
+                host: "db.example.com".into(),
+                port: 3306,
+                server_name: "db.example.com".into(),
+                tls: true,
+            }
+        );
+        let tunnelled = ConnectOptions {
+            tunnel: Some(40000),
+            ..options.clone()
+        };
+        assert_eq!(
+            tunnelled.endpoint(),
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: 40000,
+                server_name: "db.example.com".into(),
+                tls: true,
+            }
+        );
+        for (stored, tls) in [(None, false), (Some(""), false), (Some("disable"), false)] {
+            let options = ConnectOptions {
+                tls: stored.map(str::to_string),
+                ..tunnelled.clone()
+            };
+            assert_eq!(options.endpoint().tls, tls, "{stored:?}");
+        }
     }
 }

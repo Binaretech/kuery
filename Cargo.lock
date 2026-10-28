@@ -4178,6 +4178,7 @@ name = "kuery-redis"
 version = "0.4.4"
 dependencies = [
  "redis",
+ "rustls",
  "thiserror 2.0.21",
  "tokio",
 ]

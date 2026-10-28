@@ -12,8 +12,10 @@ use kuery_core::session::{Opener, Session};
 use super::*;
 
 fn target() -> Target {
+    let host = std::env::var("KUERY_MSSQL_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     Target {
-        host: std::env::var("KUERY_MSSQL_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        server_name: host.clone(),
+        host,
         port: std::env::var("KUERY_MSSQL_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -126,6 +128,7 @@ fn reads_targets_from_connection_options() {
     };
     let target = Target::from(&options);
     assert_eq!(target.host, "db.example.com");
+    assert_eq!(target.server_name, "db.example.com");
     assert_eq!(target.instance.as_deref(), Some("SQLEXPRESS"));
     assert_eq!(
         (target.user.as_str(), target.database.as_str()),
@@ -143,6 +146,8 @@ fn reads_targets_from_connection_options() {
         (tunnelled.host.as_str(), tunnelled.port, tunnelled.instance),
         ("127.0.0.1", 40000, None)
     );
+    // The certificate still names the server, not the tunnel.
+    assert_eq!(tunnelled.server_name, "db.example.com");
     assert_eq!(tunnelled.tls, TlsMode::Default);
     for (stored, mode) in [
         ("", TlsMode::Default),

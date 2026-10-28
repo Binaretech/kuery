@@ -2,8 +2,8 @@
 //!
 //! Runs on its own tokio runtime, separate from the UI thread, like the
 //! Postgres driver. Redis picks the database per connection, so a session
-//! keeps one connection per database it has used; each reconnects by itself
-//! if the server drops it.
+//! keeps one connection per database it has used; each reconnects if the
+//! server drops it.
 //!
 //! The explorer and the key viewer only ever send commands that read
 //! (`INFO`, `SCAN`, `TYPE`, `HSCAN`, `LRANGE`…). Commands typed in the
@@ -15,11 +15,19 @@ mod reply;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo as _, RedisConnectionInfo, Value};
+use redis::aio::{
+    ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection,
+};
+use redis::io::AsyncDNSResolver;
+use redis::{
+    AsyncConnectionConfig, Cmd, ConnectionAddr, ConnectionInfo, IntoConnectionInfo as _, Pipeline,
+    RedisConnectionInfo, RedisFuture, RedisResult, Value,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
@@ -61,6 +69,7 @@ impl Engine {
             let info = target.connection_info()?;
             let mut inner = Inner {
                 info,
+                dial: target.dial(),
                 default_db: target.db,
                 handle,
                 connections: Mutex::new(HashMap::new()),
@@ -129,13 +138,16 @@ pub struct Target {
     pub password: Option<String>,
     /// TLS, verifying the server's certificate against the system's roots.
     pub tls: bool,
+    /// The name the certificate must carry: the server as named, even
+    /// when `host` is the local end of a tunnel.
+    pub server_name: String,
 }
 
 impl Target {
     fn connection_info(&self) -> Result<ConnectionInfo, Error> {
         let addr = if self.tls {
             ConnectionAddr::TcpTls {
-                host: self.host.clone(),
+                host: self.server_name.clone(),
                 port: self.port,
                 insecure: false,
                 tls_params: None,
@@ -153,6 +165,99 @@ impl Target {
         }
         Ok(addr.into_connection_info()?.set_redis_settings(redis))
     }
+
+    /// Where to connect when it isn't the name TLS checks: through a
+    /// tunnel.
+    fn dial(&self) -> Option<Dial> {
+        (self.tls && self.host != self.server_name).then(|| Dial {
+            host: self.host.clone(),
+            port: self.port,
+        })
+    }
+}
+
+/// Resolves any name to one address, so TLS checks the server's name
+/// while the connection goes to the local end of a tunnel.
+#[derive(Clone)]
+struct Dial {
+    host: String,
+    port: u16,
+}
+
+impl AsyncDNSResolver for Dial {
+    fn resolve<'a, 'b: 'a>(
+        &'a self,
+        _host: &'b str,
+        _port: u16,
+    ) -> RedisFuture<'a, Box<dyn Iterator<Item = SocketAddr> + Send + 'a>> {
+        Box::pin(async move {
+            let found: Vec<_> = tokio::net::lookup_host((self.host.as_str(), self.port))
+                .await?
+                .collect();
+            Ok(Box::new(found.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+        })
+    }
+}
+
+/// One database's connection. A [`ConnectionManager`] reconnects by itself
+/// but always dials the name TLS checks; through a tunnel with TLS the
+/// connection is a plain multiplexed one instead, opened again on next use
+/// once it drops.
+#[derive(Clone)]
+enum Link {
+    Managed(ConnectionManager),
+    Dialled(MultiplexedConnection, Arc<AtomicBool>),
+}
+
+impl Link {
+    fn dropped(&self) -> bool {
+        matches!(self, Link::Dialled(_, dropped) if dropped.load(Ordering::Relaxed))
+    }
+}
+
+/// Marks the link dropped when `result` says the connection is gone.
+fn watch<T>(dropped: &AtomicBool, result: RedisResult<T>) -> RedisResult<T> {
+    if let Err(error) = &result
+        && (error.is_connection_dropped() || error.is_unrecoverable_error())
+    {
+        dropped.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+impl ConnectionLike for Link {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        match self {
+            Link::Managed(connection) => connection.req_packed_command(cmd),
+            Link::Dialled(connection, dropped) => {
+                Box::pin(async move { watch(dropped, connection.req_packed_command(cmd).await) })
+            }
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        match self {
+            Link::Managed(connection) => connection.req_packed_commands(pipeline, offset, count),
+            Link::Dialled(connection, dropped) => Box::pin(async move {
+                let result = connection
+                    .req_packed_commands(pipeline, offset, count)
+                    .await;
+                watch(dropped, result)
+            }),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Link::Managed(connection) => connection.get_db(),
+            Link::Dialled(connection, _) => connection.get_db(),
+        }
+    }
 }
 
 impl fmt::Debug for Target {
@@ -164,6 +269,7 @@ impl fmt::Debug for Target {
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "…"))
             .field("tls", &self.tls)
+            .field("server_name", &self.server_name)
             .finish()
     }
 }
@@ -365,26 +471,44 @@ pub struct Session {
 
 struct Inner {
     info: ConnectionInfo,
+    /// Where to connect when TLS checks another name; see [`Target::dial`].
+    dial: Option<Dial>,
     default_db: i64,
     handle: tokio::runtime::Handle,
-    connections: Mutex<HashMap<i64, ConnectionManager>>,
+    connections: Mutex<HashMap<i64, Link>>,
     server: ServerInfo,
 }
 
 impl Inner {
     /// The connection to database `db`, opened on first use.
-    async fn connection(&self, db: i64) -> Result<ConnectionManager, Error> {
+    async fn connection(&self, db: i64) -> Result<Link, Error> {
         let mut connections = self.connections.lock().await;
-        if let Some(connection) = connections.get(&db) {
+        if let Some(connection) = connections.get(&db)
+            && !connection.dropped()
+        {
             return Ok(connection.clone());
         }
         let settings = self.info.redis_settings().clone().set_db(db);
         let client = redis::Client::open(self.info.clone().set_redis_settings(settings))?;
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(CONNECT_TIMEOUT))
-            .set_response_timeout(Some(RESPONSE_TIMEOUT))
-            .set_number_of_retries(2);
-        let connection = client.get_connection_manager_with_config(config).await?;
+        let connection = match &self.dial {
+            None => {
+                let config = ConnectionManagerConfig::new()
+                    .set_connection_timeout(Some(CONNECT_TIMEOUT))
+                    .set_response_timeout(Some(RESPONSE_TIMEOUT))
+                    .set_number_of_retries(2);
+                Link::Managed(client.get_connection_manager_with_config(config).await?)
+            }
+            Some(dial) => {
+                let config = AsyncConnectionConfig::new()
+                    .set_connection_timeout(Some(CONNECT_TIMEOUT))
+                    .set_response_timeout(Some(RESPONSE_TIMEOUT))
+                    .set_dns_resolver(dial.clone());
+                let connection = client
+                    .get_multiplexed_async_connection_with_config(&config)
+                    .await?;
+                Link::Dialled(connection, Arc::default())
+            }
+        };
         connections.insert(db, connection.clone());
         Ok(connection)
     }
@@ -723,7 +847,7 @@ impl Session {
     }
 }
 
-async fn preview(connection: &mut ConnectionManager, key: String) -> Result<KeyPreview, Error> {
+async fn preview(connection: &mut Link, key: String) -> Result<KeyPreview, Error> {
     let type_name: String = redis::cmd("TYPE").arg(&key).query_async(connection).await?;
     let kind = KeyKind::parse(&type_name);
     let ttl: i64 = redis::cmd("PTTL").arg(&key).query_async(connection).await?;
@@ -900,8 +1024,79 @@ mod tests {
             username: None,
             password: Some("secret".into()),
             tls: false,
+            server_name: "localhost".into(),
         };
         assert!(!format!("{target:?}").contains("secret"));
+    }
+
+    fn tunnelled(tls: bool) -> Target {
+        Target {
+            host: "127.0.0.1".into(),
+            port: 40001,
+            db: 0,
+            username: None,
+            password: None,
+            tls,
+            server_name: "cache.example.com".into(),
+        }
+    }
+
+    #[test]
+    fn names_the_server_for_tls_and_dials_the_tunnel() {
+        let tls = tunnelled(true);
+        assert!(matches!(
+            tls.connection_info().unwrap().addr(),
+            ConnectionAddr::TcpTls { host, port: 40001, .. } if host == "cache.example.com"
+        ));
+        let dial = tls.dial().expect("dials the tunnel, not the name");
+        let found: Vec<_> = block(dial.resolve("cache.example.com", 40001))
+            .unwrap()
+            .collect();
+        assert_eq!(found, ["127.0.0.1:40001".parse().unwrap()]);
+
+        // Without TLS there is no name to check: it dials the tunnel directly.
+        let plain = tunnelled(false);
+        assert!(matches!(
+            plain.connection_info().unwrap().addr(),
+            ConnectionAddr::Tcp(host, 40001) if host == "127.0.0.1"
+        ));
+        assert!(plain.dial().is_none());
+        let direct = Target {
+            host: "cache.example.com".into(),
+            ..tls.clone()
+        };
+        assert!(direct.dial().is_none());
+    }
+
+    #[test]
+    fn asks_the_tunnel_for_the_servers_certificate() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = Target {
+            port: listener.local_addr().unwrap().port(),
+            ..tunnelled(true)
+        };
+        let (sent, hello) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut hello = vec![0; 2048];
+            let read = stream.read(&mut hello).unwrap();
+            hello.truncate(read);
+            let _ = sent.send(hello);
+        });
+        let engine = Engine::new().unwrap();
+        assert!(block(engine.connect(target)).is_err());
+        let hello = hello
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connects to the tunnel");
+        // The ClientHello's server name: what the certificate is checked against.
+        assert!(
+            hello
+                .windows(b"cache.example.com".len())
+                .any(|w| w == b"cache.example.com"),
+            "{hello:?}"
+        );
     }
 
     // Against the dev Redis (`docker compose -p kuery-dev -f dev/compose.yaml up -d redis`).
@@ -914,6 +1109,7 @@ mod tests {
             username: None,
             password: None,
             tls: false,
+            server_name: "127.0.0.1".into(),
         };
         (Engine::new().unwrap(), target)
     }

@@ -80,6 +80,9 @@ pub struct Target {
     /// The database to start in; empty for the login's default.
     pub database: String,
     pub tls: TlsMode,
+    /// The name the certificate must carry: the server as named, even
+    /// when `host` is the local end of a tunnel.
+    pub server_name: String,
 }
 
 impl Target {
@@ -87,6 +90,7 @@ impl Target {
         let mut config = Config::new();
         config.host(&self.host);
         config.port(self.port);
+        config.hostname_in_certificate(&self.server_name);
         if let Some(instance) = &self.instance {
             config.instance_name(instance);
         }
@@ -155,17 +159,18 @@ impl From<&ConnectOptions> for Target {
     /// `HOST\INSTANCE` names an instance. Through the local end of a tunnel
     /// when there is one, which reaches one port: no instance lookup.
     fn from(options: &ConnectOptions) -> Self {
-        let (host, instance) = match options.host.split_once('\\') {
-            Some((host, instance)) => (host, Some(instance.trim().to_string())),
-            None => (options.host.as_str(), None),
+        let endpoint = options.endpoint();
+        let (server_name, instance) = match endpoint.server_name.split_once('\\') {
+            Some((host, instance)) => (host.trim().to_string(), Some(instance.trim().to_string())),
+            None => (endpoint.server_name.clone(), None),
         };
         let tunnelled = options.tunnel.is_some();
         Target {
             host: match tunnelled {
-                true => "127.0.0.1".into(),
-                false => host.trim().to_string(),
+                true => endpoint.host,
+                false => server_name.clone(),
             },
-            port: options.tunnel.unwrap_or(options.port),
+            port: endpoint.port,
             instance: instance.filter(|i| !i.is_empty() && !tunnelled),
             user: options.user.trim().to_string(),
             password: options.password.clone().filter(|p| !p.is_empty()),
@@ -176,6 +181,7 @@ impl From<&ConnectOptions> for Target {
                 Some("trust server certificate") => TlsMode::TrustServerCertificate,
                 _ => TlsMode::Default,
             },
+            server_name,
         }
     }
 }

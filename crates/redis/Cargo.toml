@@ -8,3 +8,7 @@ license.workspace = true
 redis.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# The provider the app installs at startup, for the TLS handshake tests.
+rustls.workspace = true
