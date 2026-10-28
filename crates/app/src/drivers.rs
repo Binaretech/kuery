@@ -8,6 +8,7 @@
 //! extra connections write mode opens all go through [`Driver`] the same
 //! way for every one. Redis is the key-value family, with its own session.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,6 +84,7 @@ pub fn family_icon(family: Family) -> Icon {
     match family {
         Family::Sql => Icon::from(AppIcon::Database),
         Family::KeyValue => Icon::from(IconName::MemoryStick),
+        Family::Document => Icon::from(IconName::FileText),
     }
 }
 
@@ -193,6 +195,7 @@ fn open_sql(
         password: password.filter(|p| !p.is_empty()),
         tls: spec.sslmode.clone(),
         tunnel: tunnel.map(Tunnel::local_port),
+        options: BTreeMap::new(),
     };
     let opener: Opener = Arc::new(move |access| (sql.open)(&options, access));
     Session::open(opener, access)

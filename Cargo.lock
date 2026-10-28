@@ -4111,6 +4111,7 @@ version = "0.4.5"
 dependencies = [
  "arrow-array",
  "async-channel",
+ "base64 0.22.1",
  "futures",
  "roxmltree 0.21.1",
  "serde_json",

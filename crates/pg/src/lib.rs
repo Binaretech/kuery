@@ -143,6 +143,7 @@ pub static DRIVER: SqlDriver = SqlDriver {
         production_note: "Production connections always open read-only and cannot edit rows.",
         file: false,
         host_help: None,
+        options: &[],
     },
     dialect: &POSTGRES,
     open: |options, access| open(&conninfo(options), access),

@@ -48,7 +48,12 @@ fn numeric(kind: ColumnKind) -> bool {
 fn categorical(kind: ColumnKind) -> bool {
     matches!(
         kind,
-        ColumnKind::Text | ColumnKind::Boolean | ColumnKind::Integer | ColumnKind::Unknown
+        ColumnKind::Text
+            | ColumnKind::Json
+            | ColumnKind::Id
+            | ColumnKind::Boolean
+            | ColumnKind::Integer
+            | ColumnKind::Unknown
     )
 }
 

@@ -101,6 +101,7 @@ pub static DRIVER: SqlDriver = SqlDriver {
         production_note: "Production connections always open read-only and cannot edit rows.",
         file: false,
         host_help: None,
+        options: &[],
     },
     dialect: &MYSQL,
     open: |options, access| open(&Target::from(options), access),

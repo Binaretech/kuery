@@ -23,6 +23,8 @@ polars = { version = "=0.55.2", default-features = false, features = ["lazy", "c
 anyhow = "1"
 arrow-array = "60"
 async-channel = "2"
+# Binary values in exported documents (Extended JSON).
+base64 = "0.22"
 futures = "0.3"
 keyring = "4"
 # SQL Server's showplan XML, read into plans.

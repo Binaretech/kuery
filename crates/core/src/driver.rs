@@ -7,6 +7,13 @@
 //! Adding a driver starts here: a [`DriverInfo`] in [`ALL`], then the
 //! implementation registered in the app.
 
+use std::collections::BTreeMap;
+use std::ops::Range;
+
+use crate::document::adapter::DocumentAdapter;
+use crate::document::language::{Language, ParseError};
+use crate::session::Access;
+
 /// Which tools a driver gets: the sidebar tree and the tabs it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -14,6 +21,9 @@ pub enum Family {
     Sql,
     /// Databases and keys, key tabs, a command console.
     KeyValue,
+    /// Databases and collections, collection tabs, a console in the
+    /// engine's own language.
+    Document,
 }
 
 impl Family {
@@ -21,6 +31,7 @@ impl Family {
         match self {
             Family::Sql => "SQL",
             Family::KeyValue => "Key-value",
+            Family::Document => "Document",
         }
     }
 }
@@ -81,6 +92,31 @@ impl Tls {
     }
 }
 
+/// A setting of the connection form beyond host, database, user and TLS,
+/// stored in the connection's `options` under `key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionField {
+    /// The name the driver reads it by (`authSource`).
+    pub key: &'static str,
+    pub label: &'static str,
+    pub kind: OptionKind,
+    pub placeholder: &'static str,
+    /// A line under the field.
+    pub help: Option<&'static str>,
+}
+
+/// How the form asks for an option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionKind {
+    Text,
+    /// On or off, stored as `true` or `false`.
+    Toggle,
+    /// One of these values.
+    Choice(&'static [&'static str]),
+    /// A file's path, picked or typed.
+    File,
+}
+
 /// Everything the app needs to know about a driver before talking to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverInfo {
@@ -101,6 +137,10 @@ pub struct DriverInfo {
     pub file: bool,
     /// A line under the host field, for hosts that take more than a name.
     pub host_help: Option<&'static str>,
+    /// Its other settings, in the form's order. Only these keys are ever
+    /// stored, so nothing else (a password in a pasted string, say) reaches
+    /// the project file.
+    pub options: &'static [OptionField],
 }
 
 impl DriverInfo {
@@ -155,6 +195,8 @@ pub struct ConnectOptions {
     /// The local port of an SSH tunnel to connect to instead of
     /// `host:port`.
     pub tunnel: Option<u16>,
+    /// The driver's other settings by key (see [`DriverInfo::options`]).
+    pub options: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for ConnectOptions {
@@ -166,6 +208,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("user", &self.user)
             .field("tls", &self.tls)
             .field("tunnel", &self.tunnel)
+            .field("options", &self.options)
             .finish_non_exhaustive()
     }
 }
@@ -216,6 +259,38 @@ pub struct SqlDriver {
     pub open: Open,
 }
 
+/// Opens a connection with a document driver.
+pub type OpenDocument = fn(&ConnectOptions, Access) -> Result<Box<dyn DocumentAdapter>, String>;
+
+/// A document database driver, which its crate exports as `DRIVER`: what
+/// the app shows for it, the language its console speaks, the other
+/// languages it can translate from, and how it opens a connection (on the
+/// session's thread; see [`crate::document::session::DocumentSession::open`]).
+pub struct DocumentDriver {
+    pub info: DriverInfo,
+    pub language: &'static Language,
+    /// Languages the console offers besides [`Self::language`].
+    pub frontends: &'static [QueryFrontend],
+    pub open: OpenDocument,
+}
+
+/// Another language a document console accepts (read-only SQL, say). It
+/// never runs by itself: each statement is translated into the driver's own
+/// language first, and that text is what the session checks and runs.
+pub struct QueryFrontend {
+    pub name: &'static str,
+    /// The editor's highlighting (`"sql"`).
+    pub editor: &'static str,
+    /// Where each statement of a script is, without reading it further.
+    pub split: fn(&str) -> Vec<Range<usize>>,
+    /// The native statement a statement stands for; `None` while the
+    /// driver cannot translate yet.
+    pub translate: Option<Translate>,
+}
+
+/// Translates a statement of a [`QueryFrontend`] into the native one.
+pub type Translate = fn(&str) -> Result<String, ParseError>;
+
 pub const REDIS: DriverInfo = DriverInfo {
     id: "redis",
     name: "Redis",
@@ -240,6 +315,7 @@ pub const REDIS: DriverInfo = DriverInfo {
     production_note: "Production connections only write once writes are allowed for the session.",
     file: false,
     host_help: None,
+    options: &[],
 };
 
 #[cfg(test)]
@@ -270,6 +346,7 @@ mod tests {
         production_note: "",
         file: false,
         host_help: None,
+        options: &[],
     };
 
     /// A database file, like SQLite.
@@ -294,6 +371,11 @@ mod tests {
         assert!(SERVER.matches("PG"));
         assert!(SERVER.matches("sql"));
         assert!(REDIS.matches("key-value"));
+        let documents = DriverInfo {
+            family: Family::Document,
+            ..SERVER
+        };
+        assert!(documents.matches("document"));
         assert!(REDIS.matches(""));
         assert!(!REDIS.matches("server"));
     }
