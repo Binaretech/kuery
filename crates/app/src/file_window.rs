@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::button::Button;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{Icon, IconName, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -14,13 +15,15 @@ use gpui_kit::{
 };
 
 use crate::assets::AppIcon;
-use crate::commands::{CloseTab, NextTab, OpenDataFile, PreviousTab, QueryDataFiles};
-use crate::file_query_tab::{self, FileQueryTab};
-use crate::file_tab::{FileTab, data_file_error, no_files_to_query};
+use crate::commands::{CloseTab, OpenDataFile};
+use crate::context_menus::{copy, item, reveal};
+use crate::data_file_tabs::DataFileTabs;
+use crate::file_query_tab::FileQueryTab;
+use crate::file_tab::FileTab;
 use crate::menus::CloseWindow;
 use crate::theme::{self, color};
 
-enum Tab {
+pub(crate) enum Tab {
     File(Entity<FileTab>),
     Query(Entity<FileQueryTab>),
 }
@@ -55,33 +58,6 @@ impl FileWindow {
             active: 0,
             focus_handle: cx.focus_handle(),
         }
-    }
-
-    /// Opens the data file at `path` in a tab, or shows its tab if it is
-    /// already open.
-    pub fn open_data_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let source = cx
-                .background_spawn(async move { crate::file_tab::load_source(path) })
-                .await;
-            this.update_in(cx, |this, window, cx| match source {
-                Ok(source) => {
-                    let existing = this.tabs.iter().position(
-                        |tab| matches!(tab, Tab::File(file) if file.read(cx).matches(&source)),
-                    );
-                    let index = existing.unwrap_or_else(|| {
-                        let file = cx.new(|cx| FileTab::new(source, window, cx));
-                        cx.observe(&file, |_, _, cx| cx.notify()).detach();
-                        this.tabs.push(Tab::File(file));
-                        this.tabs.len() - 1
-                    });
-                    this.activate(index, window, cx);
-                }
-                Err(error) => data_file_error(&error, window, cx),
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// The open data files and the index of the active one among them, to
@@ -129,9 +105,8 @@ impl FileWindow {
                 let mut shown = None;
                 for (index, source) in sources.into_iter().enumerate() {
                     let Ok(source) = source else { continue };
-                    let file = cx.new(|cx| FileTab::new(source, window, cx));
-                    cx.observe(&file, |_, _, cx| cx.notify()).detach();
-                    this.tabs.push(Tab::File(file));
+                    let tab = this.new_file_tab(source, window, cx);
+                    this.tabs.push(tab);
                     if index <= active {
                         shown = Some(this.tabs.len() - 1);
                     }
@@ -145,94 +120,25 @@ impl FileWindow {
         .detach();
     }
 
-    fn open_data_file(&mut self, _: &OpenDataFile, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open data file".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            if let Some(path) = paths.into_iter().next() {
-                this.update_in(cx, |this, window, cx| this.open_data_path(path, window, cx))
-                    .ok();
-            }
-        })
-        .detach();
-    }
-
-    fn query_data_files(
+    /// Closes the tabs `close` picks. Like project windows close these
+    /// tabs, without asking: a data file has nothing to save, and a Query
+    /// files tab's SQL is not kept.
+    fn close_tabs(
         &mut self,
-        _: &QueryDataFiles,
+        close: impl Fn(usize) -> bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let active = match self.tabs.get(self.active) {
-            Some(Tab::File(active)) => Some(active.read(cx).path().to_path_buf()),
-            _ => None,
-        };
-        let sources = file_query_tab::query_sources(
-            self.tabs.iter().filter_map(|tab| match tab {
-                Tab::File(file) => Some(file.read(cx)),
-                Tab::Query(_) => None,
-            }),
-            active.as_deref(),
-        );
-        if sources.is_empty() {
-            no_files_to_query(window, cx);
-            return;
+        for index in (0..self.tabs.len()).rev().filter(|index| close(*index)) {
+            self.remove_tab(index, window, cx);
         }
-        let query = cx.new(|cx| FileQueryTab::new(sources, window, cx));
-        cx.observe(&query, |_, _, cx| cx.notify()).detach();
-        self.tabs.push(Tab::Query(query));
-        self.activate(self.tabs.len() - 1, window, cx);
-    }
-
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = index;
-        let handle = match self.tabs.get(index) {
-            Some(tab) => tab.focus_handle(cx),
-            None => self.focus_handle.clone(),
-        };
-        window.focus(&handle, cx);
-        cx.notify();
-    }
-
-    /// Closes without asking, as project windows close these tabs: a data
-    /// file has nothing to save, and a Query files tab's SQL is not kept.
-    fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.tabs.len() {
-            self.tabs.remove(index);
-        }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if self.active > index {
-            self.active -= 1;
-        }
-        self.activate(self.active, window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             window.dispatch_action(Box::new(CloseWindow), cx);
         } else {
-            self.close(self.active, window, cx);
-        }
-    }
-
-    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
-        }
-    }
-
-    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let len = self.tabs.len();
-            self.activate((self.active + len - 1) % len, window, cx);
+            self.remove_tab(self.active, window, cx);
         }
     }
 
@@ -251,6 +157,10 @@ impl FileWindow {
             let icon = match tab {
                 Tab::File(_) => AppIcon::Table,
                 Tab::Query(_) => AppIcon::Code,
+            };
+            let tooltip: SharedString = match tab {
+                Tab::File(file) => file.read(cx).path().display().to_string().into(),
+                Tab::Query(_) => tab.title(cx),
             };
             let group = SharedString::from(format!("tab-{index}"));
             strip = strip.child(
@@ -298,12 +208,59 @@ impl FileWindow {
                             .child(Icon::new(IconName::Close).size(px(11.)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.close(index, window, cx);
+                                this.remove_tab(index, window, cx);
                             })),
                     )
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
+                            .build(window, cx)
+                    })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
-                    ),
+                    )
+                    .context_menu({
+                        let this = cx.entity().downgrade();
+                        let count = self.tabs.len();
+                        let file = match tab {
+                            Tab::File(file) => Some(file.read(cx).path().to_path_buf()),
+                            Tab::Query(_) => None,
+                        };
+                        move |menu, _, _| {
+                            let mut menu = menu
+                                .item(
+                                    item("Close", &this, move |this, window, cx| {
+                                        this.remove_tab(index, window, cx)
+                                    })
+                                    .icon(IconName::Close),
+                                )
+                                .item(
+                                    item("Close Others", &this, move |this, window, cx| {
+                                        this.close_tabs(|i| i != index, window, cx)
+                                    })
+                                    .disabled(count < 2),
+                                )
+                                .item(
+                                    item(
+                                        "Close Tabs to the Right",
+                                        &this,
+                                        move |this, window, cx| {
+                                            this.close_tabs(|i| i > index, window, cx)
+                                        },
+                                    )
+                                    .disabled(index + 1 >= count),
+                                )
+                                .item(item("Close All", &this, |this, window, cx| {
+                                    this.close_tabs(|_| true, window, cx)
+                                }));
+                            if let Some(file) = &file {
+                                menu = menu
+                                    .separator()
+                                    .item(reveal(file.clone()))
+                                    .item(copy("Copy Path", file.display().to_string()));
+                            }
+                            menu
+                        }
+                    }),
             );
         }
         strip
@@ -349,6 +306,47 @@ impl FileWindow {
             .child(div().flex_1().min_w_0().child("Data files · read only"))
             .children(status)
             .child(crate::updates::status_item(cx))
+    }
+}
+
+impl DataFileTabs for FileWindow {
+    type Tab = Tab;
+
+    fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    fn tabs_mut(&mut self) -> &mut Vec<Tab> {
+        &mut self.tabs
+    }
+
+    fn active(&self) -> usize {
+        self.active
+    }
+
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = index;
+        let handle = match self.tabs.get(index) {
+            Some(tab) => tab.focus_handle(cx),
+            None => self.focus_handle.clone(),
+        };
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn as_file(tab: &Tab) -> Option<&Entity<FileTab>> {
+        match tab {
+            Tab::File(file) => Some(file),
+            Tab::Query(_) => None,
+        }
+    }
+
+    fn file_tab(file: Entity<FileTab>) -> Tab {
+        Tab::File(file)
+    }
+
+    fn query_files_tab(query: Entity<FileQueryTab>) -> Tab {
+        Tab::Query(query)
     }
 }
 

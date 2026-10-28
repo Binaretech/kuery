@@ -19,6 +19,7 @@ mod completion;
 mod connection;
 mod connection_editor;
 mod context_menus;
+mod data_file_tabs;
 mod definition;
 mod diagram_tab;
 mod drivers;
