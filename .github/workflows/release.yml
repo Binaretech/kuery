@@ -117,6 +117,10 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
+        env:
+          # Where crash reports go, after the user agrees; empty in forks,
+          # whose builds then never send one.
+          KUERY_SENTRY_DSN: ${{ secrets.KUERY_SENTRY_DSN }}
         run: cargo build --release --locked -p kuery --target ${{ matrix.target }}
 
       - name: Archive name
