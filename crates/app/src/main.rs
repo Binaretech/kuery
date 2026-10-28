@@ -19,6 +19,7 @@ mod completion;
 mod connection;
 mod connection_editor;
 mod context_menus;
+mod crash_report;
 mod data_file_tabs;
 mod definition;
 mod diagram_tab;
@@ -139,6 +140,7 @@ fn main() {
                 app::restore_session(restored, cx);
             }
             open(&targets, cx);
+            crash_report::offer(cx);
         });
 }
 
@@ -197,13 +199,25 @@ fn detach() -> bool {
 
 /// Appends every panic, with its backtrace, to `panic.log` in the config
 /// folder: a panic on a gpui thread ends the app, and an app opened from the
-/// Finder or the Start menu has nowhere else to say why.
+/// Finder or the Start menu has nowhere else to say why. It also leaves a
+/// crash report that the next start offers to send.
 fn log_panics() {
     let log = paths::config_dir().join("panic.log");
+    let pending = crash_report::pending_path();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
         let thread = std::thread::current();
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        let report = crash_report::Report::new(
+            info.payload_as_str().unwrap_or("Box<dyn Any>"),
+            info.location().map(ToString::to_string),
+            thread.name().unwrap_or("unnamed"),
+            &backtrace,
+        );
+        if let Err(error) = crash_report::record(&pending, &report) {
+            eprintln!("kuery: could not write {}: {error}", pending.display());
+        }
         let entry = format!(
             "--- Kuery {}, Unix time {}, thread '{}'\n{info}\n{}\n",
             env!("CARGO_PKG_VERSION"),
@@ -211,7 +225,7 @@ fn log_panics() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
             thread.name().unwrap_or("unnamed"),
-            std::backtrace::Backtrace::force_capture(),
+            backtrace,
         );
         let written = log
             .parent()

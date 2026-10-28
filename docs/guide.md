@@ -821,6 +821,37 @@ startup. The icons missing from gpui-kit's default set (lock, database, table,
 key, link, funnel, sort, trash, code, pencil, refresh, bottom panel) come from Lucide (ISC, `crates/app/assets/icons/LICENSE-LUCIDE`) and are served
 by `AppAssets`, which delegates the rest to `gpui_kit::assets::Assets`.
 
+## Crash reports
+
+A panic writes its message and backtrace to `panic.log` in the user config
+directory and keeps the latest one in `crash-report.json` next to it
+(`crates/app/src/crash_report.rs`). Once the windows of the next start are
+open, Kuery asks "Kuery closed unexpectedly. Send a report?" in the active
+window; the report file is removed either way, so it is offered once. Only
+**Send Report** sends it, to the Sentry project `binaretech/kuery`, as a
+fatal `panic` event tagged with the release (`kuery@<version>`), `os` and
+`arch`.
+
+Before sending, the message has its home folder (`HOME`, or `USERPROFILE`
+on Windows, with either slash and in any case) replaced by `~`, and text in
+double quotes (or in single quotes that start a word), the value after
+`password`, `passwd`, `pwd`, `secret`, `token`, `api_key`, `apikey`,
+`access_key` or `access_token` and `=` or `:`, and everything between `://`
+and the last `@` before a space in URLs replaced by `<redacted>`. Text outside
+quotes stays, so a value a message prints without quotes is sent as is. The
+backtrace keeps its function names, with the home folder replaced. The panic hook's own
+frames are dropped, so the trace ends where the panic happened. Sending goes
+through the workspace `reqwest`; the `sentry` crate is only used for the
+event types and backtrace parsing.
+
+The DSN is compiled in from `KUERY_SENTRY_DSN` (`option_env!`). The Release
+workflow sets it from the repository secret of the same name; builds without
+it, or with it empty, never send and drop the report on the next start. To
+try it locally, build with `KUERY_SENTRY_DSN=<dsn> cargo build -p kuery`.
+
+Release builds keep their symbol table but not debug info, so reports name
+the functions but not file and line yet.
+
 ## CI
 
 `.github/workflows/ci.yml` runs `cargo fmt`, `clippy -D warnings` and
@@ -830,7 +861,8 @@ The Rust toolchain is pinned in `rust-toolchain.toml` (gpui uses APIs stabilized
 
 `.github/workflows/release.yml` builds release binaries for Linux (x86_64),
 macOS (Apple Silicon and Intel, as an ad-hoc signed `Kuery.app`) and Windows
-(x86_64). When a push to `main` carries a `[workspace.package] version` with
+(x86_64), with the `KUERY_SENTRY_DSN` secret compiled in for crash reports
+(see [Crash reports](#crash-reports)). When a push to `main` carries a `[workspace.package] version` with
 no `vX.Y.Z` tag yet, it tags that version and publishes the binaries as a
 GitHub release with a `SHA256SUMS` file, in the same run (a tag pushed with
 the workflow's token starts no other run). A `v*` tag pushed by hand is
