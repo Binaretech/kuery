@@ -58,6 +58,7 @@ mod updates;
 mod welcome;
 mod workspace;
 mod write_mode;
+mod write_review;
 
 use std::sync::Arc;
 
