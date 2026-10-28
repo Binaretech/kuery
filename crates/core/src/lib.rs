@@ -28,3 +28,4 @@ pub mod script;
 pub mod session;
 pub mod sql;
 pub mod stats;
+pub(crate) mod worker;

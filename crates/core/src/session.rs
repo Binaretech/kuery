@@ -4,15 +4,12 @@
 
 use std::cell::Cell;
 use std::future::Future;
-use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use futures::channel::oneshot;
-
 use crate::activity::{Activity, Signal};
-use crate::adapter::{Adapter, Canceller, Discard, RowSink, Rows};
+use crate::adapter::{Adapter, Discard, RowSink, Rows};
 use crate::analysis::{self, StatementKind};
 use crate::catalog::{CatalogOverview, FunctionInfo, TableDefinition, TableRef};
 use crate::completion;
@@ -22,6 +19,7 @@ use crate::read_only::{self, Rejection};
 use crate::result_set::{Batch, BatchBuilder, ColumnKind, ResultSet};
 use crate::script;
 use crate::sql::Dialect;
+use crate::worker::{Handle, Streamed, Worker};
 
 /// What a connection allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,8 +137,6 @@ pub async fn collect(rx: async_channel::Receiver<Event>) -> Result<ResultSet, Qu
 /// again for each [`Session::reopen`].
 pub type Opener = Arc<dyn Fn(Access) -> Result<Box<dyn Adapter>, String> + Send + Sync>;
 
-type Job = Box<dyn FnOnce(&mut Worker) + Send>;
-
 /// An open connection to a SQL database, whichever its driver. Cheap to
 /// clone; runs one job at a time on a thread of its own, which ends (and
 /// closes the connection) when the last clone is dropped.
@@ -157,42 +153,19 @@ type Job = Box<dyn FnOnce(&mut Worker) + Send>;
 /// wherever an undo is promised.
 #[derive(Clone)]
 pub struct Session {
+    handle: Handle<dyn Adapter>,
     shared: Arc<Shared>,
 }
 
+/// What the adapter said about itself when it opened, with the access it
+/// was opened for and the way to open it again.
 struct Shared {
-    jobs: mpsc::Sender<Job>,
     dialect: &'static Dialect,
     server: String,
     access: Access,
     has_activity: bool,
     notice: Option<String>,
-    canceller: Canceller,
-    state: Arc<State>,
     opener: Opener,
-}
-
-/// What the session's thread and its handles both see.
-#[derive(Default)]
-struct State {
-    /// A transaction opened by `run_in_transaction` waits for a commit or a
-    /// rollback.
-    in_transaction: AtomicBool,
-    /// A statement runs: cancelling keeps at it until this goes false.
-    running: AtomicBool,
-    /// Which run it is, so a cancel's retries never reach the next one.
-    run: AtomicU64,
-    /// A cancel came: some databases let a stopped statement end as if
-    /// nothing happened, so the run checks this too.
-    cancelled: AtomicBool,
-}
-
-/// The adapter, on the session's thread, and the rules it is driven by.
-struct Worker {
-    adapter: Box<dyn Adapter>,
-    access: Access,
-    state: Arc<State>,
-    canceller: Canceller,
 }
 
 impl Session {
@@ -201,60 +174,25 @@ impl Session {
         opener: Opener,
         access: Access,
     ) -> impl Future<Output = Result<Session, String>> + Send + 'static {
-        let (sent, received) = oneshot::channel();
-        let spawned = std::thread::Builder::new()
-            .name("kuery-session".into())
-            .spawn(move || {
-                let adapter = match opener(access) {
-                    Ok(adapter) => adapter,
-                    Err(error) => {
-                        let _ = sent.send(Err(error));
-                        return;
-                    }
-                };
-                let (jobs, queue) = mpsc::channel::<Job>();
-                let state = Arc::new(State::default());
-                let canceller = adapter.canceller();
-                let session = Session {
-                    shared: Arc::new(Shared {
-                        jobs,
-                        dialect: adapter.dialect(),
-                        server: adapter.server(),
-                        access,
-                        has_activity: adapter.has_activity(),
-                        notice: adapter.notice(),
-                        canceller: canceller.clone(),
-                        state: state.clone(),
-                        opener: opener.clone(),
-                    }),
-                };
-                if sent.send(Ok(session)).is_err() {
-                    return;
-                }
-                let mut worker = Worker {
-                    adapter,
-                    access,
-                    state,
-                    canceller,
-                };
-                while let Ok(job) = queue.recv() {
-                    if panic::catch_unwind(AssertUnwindSafe(|| job(&mut worker))).is_err() {
-                        // The adapter may have stopped anywhere: drop it, which
-                        // closes the connection (rolling back its transaction),
-                        // and refuse what comes next.
-                        worker.abandon();
-                        break;
-                    }
-                }
-            })
-            .is_ok();
+        let reopen = opener.clone();
+        let opened = Handle::open(
+            access,
+            move || opener(access),
+            move |adapter: &dyn Adapter| Shared {
+                dialect: adapter.dialect(),
+                server: adapter.server(),
+                access,
+                has_activity: adapter.has_activity(),
+                notice: adapter.notice(),
+                opener: reopen,
+            },
+        );
         async move {
-            if !spawned {
-                return Err("Could not start the connection's thread".into());
-            }
-            received
-                .await
-                .unwrap_or_else(|_| Err("The connection's thread stopped while opening".into()))
+            let (handle, shared) = opened.await?;
+            Ok(Session {
+                handle,
+                shared: Arc::new(shared),
+            })
         }
     }
 
@@ -296,7 +234,7 @@ impl Session {
     }
 
     pub fn in_transaction(&self) -> bool {
-        self.shared.state.in_transaction.load(Ordering::SeqCst)
+        self.handle.in_transaction()
     }
 
     /// Runs `job` on the session's thread.
@@ -306,53 +244,22 @@ impl Session {
     ) -> impl Future<Output = Result<T, QueryError>> + Send + 'static + use<T, F>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Worker) -> Result<T, QueryError> + Send + 'static,
+        F: FnOnce(&mut Worker<dyn Adapter>) -> Result<T, QueryError> + Send + 'static,
     {
-        let (sent, received) = oneshot::channel();
-        let queued = self.shared.jobs.send(Box::new(move |worker: &mut Worker| {
-            let outcome = match panic::catch_unwind(AssertUnwindSafe(|| job(worker))) {
-                Ok(outcome) => outcome,
-                Err(payload) => {
-                    worker.abandon();
-                    let _ = sent.send(Err(internal_error()));
-                    panic::resume_unwind(payload);
-                }
-            };
-            let _ = sent.send(outcome);
-        }));
-        async move {
-            queued.map_err(|_| QueryError::Connection("the connection is closed".into()))?;
-            received
-                .await
-                .unwrap_or_else(|_| Err(QueryError::Connection("the connection is closed".into())))
-        }
+        self.handle.call(job)
     }
 
     /// Runs `job` on the session's thread, streaming its events.
     fn stream<F>(&self, job: F) -> async_channel::Receiver<Event>
     where
-        F: FnOnce(&mut Worker, &async_channel::Sender<Event>) -> Result<Summary, QueryError>
+        F: FnOnce(
+                &mut Worker<dyn Adapter>,
+                &async_channel::Sender<Event>,
+            ) -> Result<Summary, QueryError>
             + Send
             + 'static,
     {
-        let (tx, rx) = async_channel::bounded(4);
-        let unrun = Unrun(Some(tx.clone()));
-        // Not queued, or dropped from the queue when the session ends: `unrun`
-        // still ends the stream.
-        let _ = self.shared.jobs.send(Box::new(move |worker: &mut Worker| {
-            unrun.disarm();
-            let event = match panic::catch_unwind(AssertUnwindSafe(|| job(worker, &tx))) {
-                Ok(Ok(summary)) => Event::Finished(summary),
-                Ok(Err(error)) => Event::Failed(error),
-                Err(payload) => {
-                    worker.abandon();
-                    let _ = tx.send_blocking(Event::Failed(internal_error()));
-                    panic::resume_unwind(payload);
-                }
-            };
-            let _ = tx.send_blocking(event);
-        }));
-        rx
+        self.handle.stream(job)
     }
 
     /// Runs one read-only statement and returns its events. Dropping the
@@ -452,26 +359,7 @@ impl Session {
     /// Stops the running statement, if any: now, and again every quarter
     /// second while it goes on.
     pub fn cancel(&self) {
-        let state = self.shared.state.clone();
-        if !state.running.load(Ordering::SeqCst) {
-            return;
-        }
-        state.cancelled.store(true, Ordering::SeqCst);
-        let run = state.run.load(Ordering::SeqCst);
-        let canceller = self.shared.canceller.clone();
-        let _ = std::thread::Builder::new()
-            .name("kuery-cancel".into())
-            .spawn(move || {
-                for _ in 0..40 {
-                    if !state.running.load(Ordering::SeqCst)
-                        || state.run.load(Ordering::SeqCst) != run
-                    {
-                        break;
-                    }
-                    canceller();
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            });
+        self.handle.cancel();
     }
 
     pub fn overview(
@@ -550,7 +438,8 @@ const READ: &str = "kuery_read";
 const RUN: &str = "kuery_run";
 const PREVIEW: &str = "kuery_preview";
 
-impl Worker {
+/// The rules a SQL adapter is driven by, on the session's thread.
+impl Worker<dyn Adapter> {
     fn dialect(&self) -> &'static Dialect {
         self.adapter.dialect()
     }
@@ -570,36 +459,6 @@ impl Worker {
 
     fn exec_all(&mut self, statements: &[&str]) -> Result<(), QueryError> {
         statements.iter().try_for_each(|sql| self.exec(sql))
-    }
-
-    fn writable(&self) -> Result<(), QueryError> {
-        match self.access {
-            Access::ReadWrite => Ok(()),
-            Access::ReadOnly => Err(QueryError::WritesDisabled),
-        }
-    }
-
-    /// After a panic: nothing runs, and the transaction goes with the
-    /// connection the session is about to drop.
-    fn abandon(&mut self) {
-        self.state.running.store(false, Ordering::SeqCst);
-        self.state.in_transaction.store(false, Ordering::SeqCst);
-    }
-
-    /// A statement is running, for [`Session::cancel`].
-    fn begin_run(&mut self) {
-        self.state.run.fetch_add(1, Ordering::SeqCst);
-        self.state.cancelled.store(false, Ordering::SeqCst);
-        self.state.running.store(true, Ordering::SeqCst);
-    }
-
-    /// The run's outcome, as cancelled if a cancel came while it ran.
-    fn end_run<T>(&mut self, outcome: Result<T, QueryError>) -> Result<T, QueryError> {
-        self.state.running.store(false, Ordering::SeqCst);
-        if self.state.cancelled.swap(false, Ordering::SeqCst) && outcome.is_ok() {
-            return Err(QueryError::Cancelled);
-        }
-        outcome
     }
 
     /// Statements the dialect commits by itself, which nothing could undo.
@@ -989,30 +848,16 @@ impl Worker {
     }
 }
 
-/// A streamed job's channel, failing its stream if the job never runs.
-struct Unrun(Option<async_channel::Sender<Event>>);
+impl Streamed for Event {
+    type Summary = Summary;
 
-impl Unrun {
-    fn disarm(mut self) {
-        self.0 = None;
+    fn finished(summary: Summary) -> Self {
+        Event::Finished(summary)
     }
-}
 
-impl Drop for Unrun {
-    fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.try_send(Event::Failed(QueryError::Connection(
-                "the connection is closed".into(),
-            )));
-        }
+    fn failed(error: QueryError) -> Self {
+        Event::Failed(error)
     }
-}
-
-/// What a job that panicked reports. The session ends with it.
-fn internal_error() -> QueryError {
-    QueryError::Connection(
-        "the connection stopped after an internal error; reconnect to go on".into(),
-    )
 }
 
 /// The statements of a script, in order; the whole text when it cannot be
@@ -1123,6 +968,11 @@ impl RowSink for Counter {
         Ok(())
     }
 }
+
+// The tests' fake adapter reaches these through `super::*`, as it did when
+// the session ran its own thread.
+#[cfg(test)]
+use {crate::adapter::Canceller, std::sync::atomic::AtomicBool};
 
 #[cfg(test)]
 mod tests;
