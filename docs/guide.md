@@ -832,10 +832,12 @@ window; the report file is removed either way, so it is offered once. Only
 fatal `panic` event tagged with the release (`kuery@<version>`), `os` and
 `arch`.
 
-Before sending, the message has its home folder replaced by `~` and text in
+Before sending, the message has its home folder (`HOME`, or `USERPROFILE`
+on Windows, with either slash and in any case) replaced by `~`, and text in
 double quotes (or in single quotes that start a word), `password=`/`pwd=`
-values and `user:password@` in URLs replaced by `<redacted>`; the backtrace
-keeps its function names, with the home folder replaced. The panic hook's own
+values and `user:password@` in URLs replaced by `<redacted>`. Text outside
+quotes stays, so a value a message prints without quotes is sent as is. The
+backtrace keeps its function names, with the home folder replaced. The panic hook's own
 frames are dropped, so the trace ends where the panic happened. Sending goes
 through the workspace `reqwest`; the `sentry` crate is only used for the
 event types and backtrace parsing.

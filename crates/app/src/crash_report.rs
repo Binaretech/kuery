@@ -19,7 +19,8 @@ pub const DSN: Option<&str> = option_env!("KUERY_SENTRY_DSN");
 
 const QUESTION: &str = "Kuery closed unexpectedly. Send a report?";
 const DETAIL: &str = "The report has the error and where in Kuery's code it happened, \
-     with the version and platform. Queries, values, passwords and file paths are left out.";
+     with the version and platform. Quoted text such as queries and values, passwords and \
+     your home folder are left out.";
 
 /// What a panic leaves for the next start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,21 +87,69 @@ fn accepts(answer: Option<usize>) -> bool {
 
 /// `text` without what could identify the user or their data: the home
 /// folder becomes `~`; quoted text, URL credentials and passwords become
-/// `<redacted>`.
+/// `<redacted>`. Text outside quotes is kept, so an unquoted value stays.
 pub fn scrub(text: &str, home: Option<&Path>) -> String {
     let text = scrub_home(text, home);
+    // Quotes first, so a quoted password goes whole.
+    let text = redact_quoted(&text);
     let text = redact_url_credentials(&text);
-    let text = redact_passwords(&text);
-    redact_quoted(&text)
+    redact_passwords(&text)
 }
 
 const REDACTED: &str = "<redacted>";
 
+/// The user's home folder: `HOME`, or `USERPROFILE` on Windows, where
+/// `HOME` is usually unset.
+fn home_in(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(env)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The home folder becomes `~`, written with either slash and in any case
+/// (Windows and macOS paths ignore it), but not as the start of a longer
+/// name: `/Users/someone2` stays.
 fn scrub_home(text: &str, home: Option<&Path>) -> String {
-    match home.map(|home| home.to_string_lossy()) {
-        Some(home) if home.len() > 1 => text.replace(home.as_ref(), "~"),
-        _ => text.to_string(),
+    let Some(home) = home.map(|home| home.to_string_lossy()) else {
+        return text.to_string();
+    };
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.len() < 2 {
+        return text.to_string();
     }
+    let mut text = text.to_string();
+    for home in [home.replace('\\', "/"), home.replace('/', "\\")] {
+        text = replace_folder(&text, &home.to_ascii_lowercase());
+    }
+    text
+}
+
+/// `text` with every `folder` (lowercase) replaced by `~`, ignoring ASCII
+/// case. Lowercasing ASCII keeps byte offsets, so they index `text` too.
+fn replace_folder(text: &str, folder: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(folder) {
+        let start = from + at;
+        let end = start + folder.len();
+        from = end;
+        let continues = text[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if continues {
+            continue;
+        }
+        out.push_str(&text[copied..start]);
+        out.push('~');
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// `scheme://user:password@host` becomes `scheme://<redacted>@host`.
@@ -275,7 +324,7 @@ pub fn send(dsn: &str, report: &Report) -> Result<(), String> {
     let dsn: Dsn = dsn
         .parse()
         .map_err(|error| format!("invalid DSN: {error}"))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home_in(|name| std::env::var_os(name));
     let envelope = Envelope::from(event(report, home.as_deref()));
     let mut body = Vec::new();
     envelope
@@ -404,6 +453,56 @@ mod tests {
         assert!(accepts(Some(0)));
         assert!(!accepts(Some(1)));
         assert!(!accepts(None));
+    }
+
+    #[test]
+    fn scrub_removes_a_windows_home_folder_in_either_slash_and_case() {
+        let home = Path::new(r"C:\Users\Name");
+        assert_eq!(
+            scrub(r"could not read C:\Users\Name\data\x.csv", Some(home)),
+            r"could not read ~\data\x.csv"
+        );
+        assert_eq!(
+            scrub("could not read c:/users/name/data/x.csv", Some(home)),
+            "could not read ~/data/x.csv"
+        );
+    }
+
+    #[test]
+    fn scrub_only_replaces_the_whole_home_folder() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(
+            scrub("/Users/someone2/x and /Users/someone", Some(home)),
+            "/Users/someone2/x and ~"
+        );
+    }
+
+    #[test]
+    fn a_quoted_password_is_removed_whole() {
+        assert_eq!(
+            scrub(r#"Server=db;Password="my pass";User=sa"#, None),
+            r#"Server=db;Password=<redacted>;User=sa"#
+        );
+    }
+
+    #[test]
+    fn the_home_folder_comes_from_home_or_userprofile() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        };
+        assert_eq!(
+            home_in(env(&[("HOME", "/Users/a"), ("USERPROFILE", r"C:\Users\b")])),
+            Some(PathBuf::from("/Users/a"))
+        );
+        assert_eq!(
+            home_in(env(&[("USERPROFILE", r"C:\Users\b")])),
+            Some(PathBuf::from(r"C:\Users\b"))
+        );
+        assert_eq!(home_in(env(&[("HOME", "")])), None);
     }
 
     #[test]
