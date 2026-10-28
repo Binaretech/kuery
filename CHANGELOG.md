@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/Binaretech/kuery/compare/v0.4.4...v0.4.5) - 2026-10-28
+
+### Changed
+
+- *(app)* open table, diagram, activity and Redis key tabs through focus_or_open
+- *(app)* share data file tabs between the project and Data files windows
+- quote identifiers only through the SQL dialect
+- *(core)* give drivers one place that decides the tunnel address and TLS host name
+- *(mysql)* drop the conversion for values the text protocol never returns
+- *(pg)* drop the sslrootcert support no connection could use
+
+### Fixed
+
+- check the Redis server certificate against its host name through an SSH tunnel
+- *(app)* add the tab right-click menu to the Data files window
+- *(app)* show a data file's path when hovering its tab in the Data files window
+- *(app)* say when the audit log can't be written instead of failing silently
+- *(app)* save recent projects and diagram layouts without risking half-written files
+- *(app)* keep the recent projects list when its file cannot be read
+- *(app)* copy MySQL and SQL Server function names with their own quotes
+- *(app)* keep a hand-written environment when saving a connection
+- *(core)* match square brackets literally in SQL Server table filters
+- *(core)* send the bytes Redis console hex escapes spell
+- *(files)* refuse JSONL files over 256 MiB in File SQL instead of running out of memory
+- *(mssql)* check the server certificate against its host name through an SSH tunnel
+- *(core)* match brackets literally in SQL Server table filters
+- *(mysql)* check the server certificate against its host name through an SSH tunnel
+- *(pg)* connect with verify-ca and verify-full chosen in the connection form
+
 ## [0.4.4](https://github.com/Binaretech/kuery/compare/v0.4.3...v0.4.4) - 2026-10-26
 
 ### Fixed
