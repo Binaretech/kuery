@@ -41,7 +41,14 @@ impl Mongo {
             }
             reply => {
                 let answer = self.command(&database, command)?;
-                failed(&answer)?;
+                if let Err(error) = failed(&answer) {
+                    // What it did before the failure stays where nothing
+                    // undoes it.
+                    if let Reply::Write(write) = reply {
+                        sink.changed(written(write, &answer));
+                    }
+                    return Err(error);
+                }
                 match reply {
                     Reply::Write(write) => Ok(written(write, &answer)),
                     Reply::FindAndModify => {
@@ -105,7 +112,8 @@ pub(crate) fn documents(reply: &Reply, mut answer: BsonDocument) -> Vec<BsonDocu
 }
 
 /// A write the server answered `ok` to can still have failed, document by
-/// document: the first failure is the error.
+/// document: the first failure is the error. Its counts still say what it
+/// did before then.
 pub(crate) fn failed(answer: &BsonDocument) -> Result<(), QueryError> {
     let first = answer
         .get_array("writeErrors")

@@ -75,6 +75,9 @@ pub struct Request {
     pub planned: Rc<Vec<Planned>>,
     /// Details for each planned step, fetched off the UI thread.
     pub preview: FetchPreview,
+    /// Whether the user stopped the preview: once it ends, nothing more
+    /// happens, neither the review nor the run.
+    pub stopped: Rc<dyn Fn() -> bool>,
 }
 
 /// Calls `approved` once the steps may run, asking first what the
@@ -114,6 +117,9 @@ fn preview(request: Request, window: &mut Window, cx: &mut App, approved: Approv
     window
         .spawn(cx, async move |cx| {
             let details = fetch.await;
+            if (request.stopped)() {
+                return;
+            }
             cx.update(|window, cx| {
                 let rows = rows(&request.planned, details.as_deref().ok());
                 let dangerous = rows.iter().any(|row| row.danger.is_some());

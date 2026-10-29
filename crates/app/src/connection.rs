@@ -322,6 +322,9 @@ pub struct DocDb {
     /// The container the form names (`["shop"]`), where a console starts;
     /// empty for the driver's own default.
     pub home: Vec<String>,
+    /// Production only: whether writes were allowed for this connection
+    /// session. Shared by every tab on it, gone when it disconnects.
+    writes_allowed: Arc<AtomicBool>,
     /// The SSH tunnel the connection goes through, open while any clone is.
     _tunnel: Option<Arc<Tunnel>>,
 }
@@ -341,8 +344,23 @@ impl DocDb {
             catalog,
             target,
             home,
+            writes_allowed: Arc::new(AtomicBool::new(false)),
             _tunnel: tunnel,
         }
+    }
+
+    /// Whether writes can run without allowing them first.
+    pub fn allows_writes(&self) -> bool {
+        self.environment.write_policy() != WritePolicy::SessionUnlock
+            || self.writes_allowed.load(Ordering::SeqCst)
+    }
+
+    pub fn allow_writes(&self) {
+        self.writes_allowed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn revoke_writes(&self) {
+        self.writes_allowed.store(false, Ordering::SeqCst);
     }
 
     /// What the status bar, tab tooltips and the production stripe show.

@@ -13,10 +13,19 @@
 //! documents the grid holds, and Export All runs it again, in the database
 //! it ran in, to write every one of them into a file.
 //!
-//! The console only reads for now: statements that write are refused
-//! before they reach the server. It has its own key context
-//! (`DocumentConsole`), so the query tab's Save, Format, Explain and Commit
-//! are not bound here to do nothing.
+//! The console reads unless it is switched to Write, through a session
+//! that may only read: in Read-only, a statement that writes is refused
+//! before it reaches the server. In Write, the console runs on a session of
+//! its own that may write (on production once writes are allowed for the
+//! connection), and a script that writes runs once the write review
+//! approves it, with a preview of what each statement would change (see
+//! [`document_write`]): in one transaction where the server has them, else
+//! stopping at the first failure. One script is on its way at a time: Run
+//! waits while a script is read, previewed or run, and Cancel stops each.
+//! Every write, every one refused or failed, and every preview goes to the
+//! audit log. Scripts are read off the UI thread. It has its own key
+//! context (`DocumentConsole`), so the query tab's Save, Format, Explain
+//! and Commit are not bound here to do nothing.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -41,11 +50,13 @@ use gpui_kit::{
 use kuery_core::document::adapter::Outcome;
 use kuery_core::document::export::{Ejson, document_ejson};
 use kuery_core::document::language::{Language, ParseError, Statement, Style};
-use kuery_core::document::session::{DocEvent, DocumentSession, Heavy, RunMode};
+use kuery_core::document::session::{DocEvent, DocumentSession, Heavy, Left, RunMode};
 use kuery_core::document::value::{Document, Value};
-use kuery_core::session::{QueryError, RunOptions};
+use kuery_core::read_only::Rejection;
+use kuery_core::session::{Access, QueryError, RunOptions};
 
 use crate::assets::AppIcon;
+use crate::audit::{self, AuditAction, AuditRecord};
 use crate::chrome;
 use crate::collection_tab::{open_export, plural_documents, write_batch};
 use crate::completion::{DocumentCompletions, SharedNames};
@@ -53,6 +64,7 @@ use crate::connection::{DocDb, Environment};
 use crate::context_menus::{Cell, copy, item};
 use crate::document_detail::{DetailEvent, DocumentDetail};
 use crate::document_grid::{DocumentRows, Flattened};
+use crate::document_write::{self, Reviewing, Script};
 use crate::grid::BrowseDelegate;
 use crate::query_tab::{CancelQuery, RunAll, RunQuery, describe_error};
 use crate::theme::{self, color};
@@ -109,6 +121,14 @@ enum SessionState {
     Failed(String),
 }
 
+/// Whether the console writes, and the session it writes through.
+enum Writing {
+    Off,
+    /// Its session that may write is opening.
+    Connecting,
+    On(DocumentSession),
+}
+
 enum Status {
     Idle,
     Running,
@@ -146,6 +166,15 @@ pub struct DocumentConsole {
     /// The containers the toolbar offers, as the catalog lists them.
     containers: Vec<String>,
     session: SessionState,
+    writing: Writing,
+    /// The session the running script runs on, so Cancel stops it there.
+    run_session: Option<DocumentSession>,
+    /// Reads the script Run was asked for, off the UI thread, before it
+    /// runs or goes to the review.
+    checking: Option<Task<()>>,
+    /// The last script that went to the review; Run waits while its
+    /// preview runs.
+    reviewing: Option<Rc<Reviewing>>,
     editor: Entity<EditorState>,
     /// Reads the editor's text for errors once typing pauses.
     check_task: Option<Task<()>>,
@@ -167,6 +196,9 @@ pub struct DocumentConsole {
     export_session: Option<DocumentSession>,
     export_task: Option<Task<()>>,
     focus_handle: FocusHandle,
+    /// What the audit log was given, for the tests.
+    #[cfg(test)]
+    audited: Vec<crate::audit::AuditRecord>,
 }
 
 impl DocumentConsole {
@@ -235,7 +267,9 @@ impl DocumentConsole {
         })
         .detach();
 
-        let opening = db.catalog.reopen(db.catalog.access());
+        // Write mode has a session of its own: this one only ever reads,
+        // and the protocol guard checks each command it sends.
+        let opening = db.catalog.reopen(Access::ReadOnly);
         cx.spawn(async move |this, cx| {
             let result = opening.await;
             this.update(cx, |this, cx| {
@@ -271,6 +305,10 @@ impl DocumentConsole {
             path: Vec::new(),
             containers: Vec::new(),
             session: SessionState::Connecting,
+            writing: Writing::Off,
+            run_session: None,
+            checking: None,
+            reviewing: None,
             editor,
             check_task: None,
             names,
@@ -288,6 +326,8 @@ impl DocumentConsole {
             export_session: None,
             export_task: None,
             focus_handle: cx.focus_handle(),
+            #[cfg(test)]
+            audited: Vec::new(),
         };
         console.set_path(path, cx);
         console
@@ -332,6 +372,12 @@ impl DocumentConsole {
                 plural_documents(*documents as u64)
             );
         }
+        if matches!(self.writing, Writing::Connecting) && matches!(self.status, Status::Idle) {
+            return "Opening a session that may write…".into();
+        }
+        if self.previewing() {
+            return "Previewing what the script would change…".into();
+        }
         match (&self.session, &self.status) {
             (SessionState::Connecting, _) => "Connecting…".into(),
             (SessionState::Failed(error), _) => error.clone(),
@@ -354,6 +400,85 @@ impl DocumentConsole {
 
     fn language(&self) -> &'static Language {
         self.db.catalog.language()
+    }
+
+    /// Whether statements that write may run (once reviewed).
+    pub fn is_writing(&self) -> bool {
+        !matches!(self.writing, Writing::Off)
+    }
+
+    /// Whether the preview of a script on its way to the review runs.
+    fn previewing(&self) -> bool {
+        self.reviewing
+            .as_ref()
+            .is_some_and(|reviewing| reviewing.previewing())
+    }
+
+    /// Whether a script is on its way: read, previewed for its review, or
+    /// run. Run waits for it, and Cancel stops it.
+    fn busy(&self) -> bool {
+        self.run_task.is_some() || self.checking.is_some() || self.previewing()
+    }
+
+    /// Switches to Write (allowing writes for the connection session first
+    /// on production) or back to Read-only. Write opens a session of its
+    /// own that may write; Read-only drops it.
+    fn set_writing(&mut self, writing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !writing {
+            self.writing = Writing::Off;
+            cx.notify();
+            return;
+        }
+        if self.is_writing() {
+            return;
+        }
+        if !self.db.allows_writes() {
+            let this = cx.entity().downgrade();
+            crate::write_mode::allow_document_writes(
+                self.db.clone(),
+                window,
+                cx,
+                move |window, cx| {
+                    let this = this.clone();
+                    window.defer(cx, move |window, cx| {
+                        this.update(cx, |this, cx| this.set_writing(true, window, cx))
+                            .ok();
+                    });
+                },
+            );
+            return;
+        }
+        self.writing = Writing::Connecting;
+        cx.notify();
+        let opening = self.db.catalog.reopen(Access::ReadWrite);
+        cx.spawn(async move |this, cx| {
+            let opened = opening.await;
+            this.update(cx, |this, cx| {
+                if !matches!(this.writing, Writing::Connecting) {
+                    return;
+                }
+                match opened {
+                    Ok(session) => this.writing = Writing::On(session),
+                    Err(error) => {
+                        this.writing = Writing::Off;
+                        this.status = Status::Failed(format!(
+                            "Could not open a session that may write: {error}"
+                        ));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Production: stops allowing writes on the connection, for every tab,
+    /// and goes back to Read-only.
+    pub fn stop_allowing_writes(&mut self, cx: &mut Context<Self>) {
+        self.db.revoke_writes();
+        self.writing = Writing::Off;
+        cx.notify();
     }
 
     /// Work the language marks heavy runs on development connections only.
@@ -443,34 +568,66 @@ impl DocumentConsole {
         });
     }
 
-    fn run_query(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+    /// Runs the selection, or the statement under the cursor, found off the
+    /// UI thread: finding it reads the whole text.
+    fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         let editor = self.editor.read(cx);
         let text = editor.text().to_string();
         let selected = editor.selected_range();
-        let range = match selected.is_empty() {
-            false => selected.start.min(text.len())..selected.end.min(text.len()),
-            true => match statement_at(self.language(), &text, editor.cursor()) {
-                Some(range) => range,
-                None => return,
-            },
-        };
-        let script = text[range].to_string();
-        self.run(script, cx);
+        if !selected.is_empty() {
+            let script =
+                text[selected.start.min(text.len())..selected.end.min(text.len())].to_string();
+            self.run(script, window, cx);
+            return;
+        }
+        let cursor = editor.cursor();
+        let language = self.language();
+        self.checking = Some(cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    statement_at(language, &text, cursor).map(|range| text[range].to_string())
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.checking = None;
+                match found {
+                    Some(script) => this.run(script, window, cx),
+                    None => cx.notify(),
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
-    fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).text().to_string();
-        self.run(text, cx);
+        self.run(text, window, cx);
     }
 
     fn cancel(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
         self.cancel_now(cx);
     }
 
-    /// Stops what runs: on the server, or before it gets there.
+    /// Stops what is on its way: reading the script, its preview, or its
+    /// run (on the server, or before it gets there).
     fn cancel_now(&mut self, cx: &mut Context<Self>) {
+        if self.checking.take().is_some() {
+            self.status = Status::Failed(QueryError::Cancelled.to_string());
+            cx.notify();
+            return;
+        }
+        if let Some(reviewing) = self.reviewing.as_ref().filter(|r| r.previewing()) {
+            reviewing.stop();
+            self.status = Status::Failed("Preview cancelled: nothing ran".into());
+            cx.notify();
+            return;
+        }
         if self.run_task.is_some()
-            && let SessionState::Ready(session) = &self.session
+            && let Some(session) = &self.run_session
         {
             self.cancelled = true;
             session.cancel();
@@ -478,59 +635,238 @@ impl DocumentConsole {
         }
     }
 
-    /// Reads the script first: what the language cannot read is logged and
-    /// nothing runs. Then each run starts in the toolbar's database, and
-    /// the documents and outcomes stream in.
-    fn run(&mut self, script: String, cx: &mut Context<Self>) {
-        let SessionState::Ready(session) = &self.session else {
+    /// Reads the script first, off the UI thread: what the language cannot
+    /// read is logged and nothing runs, and what the run may not do is
+    /// refused (and audited when it writes). A script that writes, in
+    /// Write, runs once the write review approves it; anything else runs
+    /// right away.
+    fn run(&mut self, script: String, window: &mut Window, cx: &mut Context<Self>) {
+        let SessionState::Ready(reader) = &self.session else {
             return;
         };
-        if self.run_task.is_some() || script.trim().is_empty() {
+        if self.busy() || script.trim().is_empty() {
             return;
         }
-        let session = session.clone();
-        let statements = match (self.language().analyze)(&script) {
-            Ok(statements) if statements.is_empty() => return,
-            Ok(statements) => statements,
-            Err(error) => {
-                let message = error.located(&script);
-                self.push_output(script.trim(), message.clone(), true, None);
-                self.status = Status::Failed(message);
-                self.panel = Panel::Output;
-                cx.notify();
-                return;
-            }
+        let reader = reader.clone();
+        let writer = match &self.writing {
+            Writing::On(writer) => Some(writer.clone()),
+            Writing::Off | Writing::Connecting => None,
         };
+        let opening = matches!(self.writing, Writing::Connecting);
         // The toolbar's database, or the connection's own entered again: a
         // `use` from an earlier run does not last.
         let start = match self.path.is_empty() {
-            true => session.home().to_vec(),
+            true => reader.home().to_vec(),
             false => self.path.clone(),
         };
-        let enter = (self.language().enter)(&start);
         let heavy = self.heavy();
+        let analyze = self.language().analyze;
+        self.status = Status::Running;
+        self.checking = Some(cx.spawn_in(window, async move |this, cx| {
+            let checked = cx
+                .background_spawn(async move {
+                    let place = Place {
+                        start,
+                        heavy,
+                        reader,
+                        writer,
+                        opening,
+                    };
+                    check_script(analyze, script, place)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.checking = None;
+                this.checked(checked, window, cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Goes on with a script once read: logs or refuses it, runs it, or
+    /// hands it to the review.
+    fn checked(&mut self, checked: Checked, window: &mut Window, cx: &mut Context<Self>) {
+        match checked {
+            Checked::Empty => {
+                self.status = Status::Idle;
+                cx.notify();
+            }
+            Checked::Unreadable { text, message } => {
+                self.push_output(text.trim(), message.clone(), true, None);
+                self.status = Status::Failed(message);
+                self.panel = Panel::Output;
+                cx.notify();
+            }
+            Checked::Refused {
+                script,
+                mode,
+                error,
+            } => self.refused(&script, mode, error, cx),
+            Checked::Opening(script) => {
+                let message = "The session that may write is still opening: nothing ran";
+                self.audit(&script, format!("Refused: {message}"), None, true, cx);
+                self.push_output(script.text.trim(), message.into(), true, None);
+                self.status = Status::Failed(message.into());
+                self.panel = Panel::Output;
+                cx.notify();
+            }
+            Checked::Ready {
+                script,
+                session,
+                mode: RunMode::Read,
+            } => self.start(script, session, RunMode::Read, cx),
+            Checked::Ready {
+                script,
+                session,
+                mode: RunMode::Write,
+            } => self.review(script, session, window, cx),
+        }
+    }
+
+    /// Hands a script that writes to the review, which previews it on
+    /// `session` first: Run waits for that preview, and Cancel stops it.
+    fn review(
+        &mut self,
+        script: Script,
+        session: DocumentSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().downgrade();
+        let reviewing = Rc::new(Reviewing::new(session.clone(), {
+            let this = this.clone();
+            move |record, cx| {
+                this.update(cx, |this, cx| {
+                    this.append(record, cx);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+        self.reviewing = Some(reviewing.clone());
+        self.status = Status::Idle;
+        let approved = {
+            let (script, session) = (script.clone(), session.clone());
+            move |_: &mut Window, cx: &mut App| {
+                let (script, session) = (script.clone(), session.clone());
+                this.update(cx, |this, cx| {
+                    this.start(script, session, RunMode::Write, cx)
+                })
+                .ok();
+            }
+        };
+        let (db, project) = (self.db.clone(), self.project.clone());
+        document_write::approve(&db, &project, script, reviewing, window, cx, approved);
+        cx.notify();
+    }
+
+    /// Logs why a script may not run; one that writes goes to the audit
+    /// log too.
+    fn refused(
+        &mut self,
+        script: &Script,
+        mode: RunMode,
+        error: QueryError,
+        cx: &mut Context<Self>,
+    ) {
+        let read_only = matches!(error, QueryError::Rejected(Rejection::Statement(_)));
+        let mut message = describe_error(error);
+        if read_only && mode == RunMode::Read && script.writes() {
+            message.push_str(". Switch the console to Write to run it");
+        }
+        self.push_output(script.text.trim(), message.clone(), true, None);
+        if script.writes() {
+            self.audit(script, format!("Refused: {message}"), None, true, cx);
+        }
+        self.status = Status::Failed(message);
+        self.panel = Panel::Output;
+        cx.notify();
+    }
+
+    /// Writes a record of a script that writes to the audit log.
+    fn audit(
+        &mut self,
+        script: &Script,
+        outcome: String,
+        changed: Option<(usize, u64)>,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let record = document_write::record(
+            &self.db,
+            &self.project,
+            script,
+            AuditAction::Run,
+            outcome,
+            changed,
+            failed,
+        );
+        self.append(record, cx);
+    }
+
+    /// Adds a record to the audit log.
+    fn append(&mut self, record: AuditRecord, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.audited.push(record.clone());
+        audit::append_in_background(record, cx);
+    }
+
+    /// Runs a checked script on `session`: each run starts in the
+    /// toolbar's database, entered in the same job, and the documents and
+    /// outcomes stream in.
+    fn start(
+        &mut self,
+        script: Script,
+        session: DocumentSession,
+        mode: RunMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.run_task.is_some() {
+            // One script runs at a time: this one never ran.
+            let message = "Another script was running: this one did not run".to_string();
+            if script.writes() {
+                self.audit(&script, format!("Refused: {message}"), None, true, cx);
+            }
+            self.push_output(script.text.trim(), message, true, None);
+            self.panel = Panel::Output;
+            cx.notify();
+            return;
+        }
+        // Writes were turned off, or no longer allowed, while the review
+        // was open.
+        let writes =
+            matches!(&self.writing, Writing::On(writer) if writer.access() == Access::ReadWrite);
+        if mode == RunMode::Write && !(writes && self.db.allows_writes()) {
+            let message = "Writes were turned off before the script ran: nothing ran".to_string();
+            self.audit(&script, format!("Refused: {message}"), None, true, cx);
+            self.push_output(script.text.trim(), message.clone(), true, None);
+            self.status = Status::Failed(message);
+            self.panel = Panel::Output;
+            cx.notify();
+            return;
+        }
+        let heavy = script.heavy;
         let render = self.language().render;
         self.clear_grid(cx);
         self.shown = None;
         self.cancelled = false;
         self.status = Status::Running;
+        self.run_session = Some(session.clone());
         self.run_task = Some(cx.spawn(async move |this, cx| {
             let started = Instant::now();
-            let entered = match enter {
-                Some(enter) => {
-                    drain(session.run(enter, RunMode::Read, heavy, RunOptions::default()))
-                        .await
-                        .map_err(describe_error)
-                }
-                None => Ok(()),
-            };
-            // A cancel that came before the statements found nothing to stop.
-            let entered = entered.and_then(|()| match this.update(cx, |this, _| this.cancelled) {
-                Ok(false) => Ok(()),
-                _ => Err(QueryError::Cancelled.to_string()),
-            });
-            if let Err(error) = entered {
-                this.update(cx, |this, cx| this.run_failed(error, cx)).ok();
+            // A cancel that came before the run reached the session found
+            // nothing to stop there.
+            if !matches!(this.update(cx, |this, _| this.cancelled), Ok(false)) {
+                this.update(cx, |this, cx| {
+                    let error = QueryError::Cancelled.to_string();
+                    if script.writes() {
+                        let outcome = format!("{error} · nothing ran");
+                        this.audit(&script, outcome, Some((0, 0)), true, cx);
+                    }
+                    this.run_failed(error, cx)
+                })
+                .ok();
                 return;
             }
             // One past what the grid holds, to tell that there were more.
@@ -538,10 +874,16 @@ impl DocumentConsole {
                 max_documents: Some(SHOWN + 1),
                 ..RunOptions::default()
             };
-            let events = session.run(script.clone(), RunMode::Read, heavy, options);
-            let mut run = Run::new(script, statements, start);
+            let events = session.run_in(&script.start, script.text.clone(), mode, heavy, options);
+            let mut run = Run::new(
+                script.text.clone(),
+                script.statements.clone(),
+                script.start.clone(),
+            );
             let mut columns: Vec<String> = Vec::new();
             let mut statement_started = Instant::now();
+            // What the run said it left, if it fails.
+            let mut left = None;
             while let Ok(event) = events.recv().await {
                 match event {
                     DocEvent::Documents(batch) => {
@@ -585,8 +927,23 @@ impl DocumentConsole {
                         })
                         .ok();
                     }
+                    DocEvent::Left(said) => left = Some(said),
                     DocEvent::Finished(summary) => {
                         this.update(cx, |this, cx| {
+                            if script.writes() {
+                                let outcome = format!(
+                                    "{} · {} · {}",
+                                    plural_statements(summary.statements),
+                                    document_write::counts(summary.outcome)
+                                        .unwrap_or_else(|| "nothing changed".into()),
+                                    format_duration(started.elapsed())
+                                );
+                                let changed = Some((
+                                    summary.statements,
+                                    document_write::changed(summary.outcome),
+                                ));
+                                this.audit(&script, outcome, changed, false, cx);
+                            }
                             this.run_task = None;
                             this.status = Status::Done {
                                 statements: summary.statements,
@@ -606,9 +963,18 @@ impl DocumentConsole {
                         return;
                     }
                     DocEvent::Failed(error) => {
-                        let error = describe_error(error);
+                        let mut error = describe_error(error);
+                        let mut changed = None;
+                        if mode == RunMode::Write {
+                            let (note, kept) = kept(left, run.ended, &run.outcome);
+                            error.push_str(&note);
+                            changed = kept;
+                        }
                         let statement = run.current();
                         this.update(cx, |this, cx| {
+                            if script.writes() {
+                                this.audit(&script, error.clone(), changed, true, cx);
+                            }
                             this.push_output(&statement, error.clone(), true, None);
                             this.run_failed(error, cx);
                         })
@@ -617,8 +983,13 @@ impl DocumentConsole {
                     }
                 }
             }
-            this.update(cx, |this, cx| this.run_failed("The run stopped".into(), cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                if script.writes() {
+                    this.audit(&script, "The run stopped".into(), None, true, cx);
+                }
+                this.run_failed("The run stopped".into(), cx)
+            })
+            .ok();
         }));
         cx.notify();
     }
@@ -724,8 +1095,7 @@ impl DocumentConsole {
     /// database it ran in, and writes all its documents to `path` as they
     /// stream, off the UI thread.
     fn export_to(&mut self, shown: Shown, path: PathBuf, cx: &mut Context<Self>) {
-        let opening = self.db.catalog.reopen(self.db.catalog.access());
-        let enter = (self.language().enter)(&shown.path);
+        let opening = self.db.catalog.reopen(Access::ReadOnly);
         let heavy = self.heavy();
         self.export = Some(ExportState::Running { documents: 0 });
         cx.notify();
@@ -751,16 +1121,8 @@ impl DocumentConsole {
                 statement_timeout: EXPORT_TIME,
                 ..RunOptions::default()
             };
-            if let Some(enter) = enter
-                && let Err(error) =
-                    drain(session.run(enter, RunMode::Read, heavy, options.clone())).await
-            {
-                let error = failed(describe_error(error));
-                this.update(cx, |this, cx| this.export_ended(Err(error), cx))
-                    .ok();
-                return;
-            }
-            let events = session.run(shown.statement, RunMode::Read, heavy, options);
+            let events =
+                session.run_in(&shown.path, shown.statement, RunMode::Read, heavy, options);
             let target = path.clone();
             let opened = cx
                 .background_spawn(async move { open_export(&target) })
@@ -796,7 +1158,7 @@ impl DocumentConsole {
                         })
                         .ok();
                     }
-                    Ok(DocEvent::Outcome(_)) => {}
+                    Ok(DocEvent::Outcome(_) | DocEvent::Left(_)) => {}
                     Ok(DocEvent::Finished(_)) => {
                         break cx
                             .background_spawn(async move { writer.finish() })
@@ -851,7 +1213,7 @@ impl DocumentConsole {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = matches!(self.session, SessionState::Ready(_));
-        let running = self.run_task.is_some();
+        let running = self.busy();
         let weak = cx.entity().downgrade();
         let containers = self.containers.clone();
         let current = self.path.clone();
@@ -956,10 +1318,19 @@ impl DocumentConsole {
             })
             .child(div().flex_1())
             .child(
-                chrome::pill()
-                    .gap(px(5.))
-                    .child(Icon::new(AppIcon::Lock).size(px(11.)))
-                    .child("Read-only"),
+                chrome::segmented().children(
+                    [
+                        ("doc-console-read", AppIcon::Lock, "Read-only", false),
+                        ("doc-console-write", AppIcon::Pencil, "Write", true),
+                    ]
+                    .map(|(id, icon, label, writing)| {
+                        chrome::segment(id, icon, label, self.is_writing() == writing).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.set_writing(writing, window, cx)
+                            }),
+                        )
+                    }),
+                ),
             )
             .child(
                 chrome::pill()
@@ -1066,7 +1437,7 @@ impl DocumentConsole {
                 .into_any_element(),
         };
         let exporting = matches!(self.export, Some(ExportState::Running { .. }));
-        let can_export = self.shown.is_some() && !exporting && self.run_task.is_none();
+        let can_export = self.shown.is_some() && !exporting && !self.busy();
         let export_note = match &self.export {
             Some(ExportState::Done(done)) => Some((done.clone(), theme::TEXT_TERTIARY)),
             Some(ExportState::Failed(error)) => Some((error.clone(), theme::RED)),
@@ -1129,17 +1500,79 @@ impl DocumentConsole {
     }
 }
 
-/// Drains a run that returns nothing worth showing, such as entering a
-/// database.
-async fn drain(events: async_channel::Receiver<DocEvent>) -> Result<(), QueryError> {
-    while let Ok(event) = events.recv().await {
-        match event {
-            DocEvent::Finished(_) => return Ok(()),
-            DocEvent::Failed(error) => return Err(error),
-            DocEvent::Documents(_) | DocEvent::Outcome(_) => {}
+/// Where a script runs, for reading it off the UI thread.
+struct Place {
+    /// The container it starts in.
+    start: Vec<String>,
+    heavy: Heavy,
+    /// The console's session that reads.
+    reader: DocumentSession,
+    /// Its session that may write, in Write.
+    writer: Option<DocumentSession>,
+    /// The session that may write is still opening.
+    opening: bool,
+}
+
+/// A script as the console read it, and what comes of it.
+enum Checked {
+    /// Only comments: nothing to run.
+    Empty,
+    /// The language cannot read it.
+    Unreadable { text: String, message: String },
+    /// It may not run as it is.
+    Refused {
+        script: Script,
+        mode: RunMode,
+        error: QueryError,
+    },
+    /// It writes, and the session that may write is still opening.
+    Opening(Script),
+    /// It may run on `session`; a write once reviewed.
+    Ready {
+        script: Script,
+        session: DocumentSession,
+        mode: RunMode,
+    },
+}
+
+/// Reads a script once, picks the session it runs on, and checks it may
+/// run there. Slow for a long script: off the UI thread.
+fn check_script(
+    analyze: fn(&str) -> Result<Vec<Statement>, ParseError>,
+    text: String,
+    place: Place,
+) -> Checked {
+    let statements = match analyze(&text) {
+        Ok(statements) if statements.is_empty() => return Checked::Empty,
+        Ok(statements) => statements,
+        Err(error) => {
+            let message = error.located(&text);
+            return Checked::Unreadable { text, message };
         }
+    };
+    let script = Script {
+        start: place.start,
+        text,
+        statements,
+        heavy: place.heavy,
+    };
+    let (session, mode) = match (place.writer, script.writes()) {
+        (Some(writer), true) => (writer, RunMode::Write),
+        (None, true) if place.opening => return Checked::Opening(script),
+        _ => (place.reader, RunMode::Read),
+    };
+    match session.check_statements(&script.statements, mode, script.heavy) {
+        Ok(()) => Checked::Ready {
+            script,
+            session,
+            mode,
+        },
+        Err(error) => Checked::Refused {
+            script,
+            mode,
+            error,
+        },
     }
-    Err(QueryError::Cancelled)
 }
 
 /// A run under way: its statements, which one the next events are about,
@@ -1154,6 +1587,8 @@ struct Run {
     ended: usize,
     /// Documents of the statement that runs now.
     documents: usize,
+    /// What the statements that ended changed, added up.
+    outcome: Outcome,
 }
 
 impl Run {
@@ -1164,6 +1599,7 @@ impl Run {
             place: start,
             ended: 0,
             documents: 0,
+            outcome: Outcome::default(),
         }
     }
 
@@ -1200,6 +1636,7 @@ impl Run {
             self.place = entered;
         }
         let text = describe_outcome(outcome, self.documents);
+        self.outcome.add(outcome);
         self.ended += 1;
         self.documents = 0;
         (statement, text)
@@ -1221,21 +1658,68 @@ fn describe_outcome(outcome: Outcome, documents: usize) -> String {
     if returned > 0 {
         return plural_documents(returned as u64);
     }
-    let counts = [
-        ("matched", outcome.matched),
-        ("modified", outcome.modified),
-        ("inserted", outcome.inserted),
-        ("deleted", outcome.deleted),
-        ("upserted", outcome.upserted),
-    ];
-    let parts: Vec<String> = counts
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(what, n)| format!("{what} {}", thousands(*n)))
-        .collect();
-    match parts.is_empty() {
-        true => "Done".into(),
-        false => parts.join(" · "),
+    document_write::counts(outcome).unwrap_or_else(|| "Done".into())
+}
+
+/// What a write script that failed left, as the run said: for its message,
+/// and for the audit log's statements and documents changed (`None` when
+/// unknown). Without a transaction, the statements that ended before the
+/// failure stay, and so does what the one that failed changed before it
+/// did.
+fn kept(left: Option<Left>, ended: usize, outcome: &Outcome) -> (String, Option<(usize, u64)>) {
+    let partial = match left {
+        Some(Left::Undone) => {
+            return (
+                " · the transaction was undone: nothing was applied".into(),
+                Some((0, 0)),
+            );
+        }
+        Some(Left::Unknown) => {
+            return (
+                " · the commit's result is unknown: check the data".into(),
+                None,
+            );
+        }
+        None => {
+            return (" · what it changed is unknown: check the data".into(), None);
+        }
+        Some(Left::Kept { partial }) => partial,
+    };
+    let mut notes = Vec::new();
+    if ended > 0 {
+        notes.push(format!(
+            "the {} before it {} applied ({})",
+            plural_statements(ended),
+            if ended == 1 { "was" } else { "were" },
+            document_write::counts(*outcome).unwrap_or_else(|| "nothing changed".into())
+        ));
+    }
+    match partial.and_then(document_write::counts) {
+        _ if partial.is_none() => {
+            notes.push("the statement that failed may have changed documents: unknown".into())
+        }
+        Some(counts) => notes.push(format!(
+            "the statement that failed applied part of it first ({counts})"
+        )),
+        None => {}
+    }
+    if notes.is_empty() {
+        notes.push("nothing was applied".into());
+    }
+    let changed = partial.map(|partial| {
+        let failed = document_write::changed(partial);
+        (
+            ended + usize::from(failed > 0),
+            document_write::changed(*outcome) + failed,
+        )
+    });
+    (format!(" · {}", notes.join(" · ")), changed)
+}
+
+fn plural_statements(n: usize) -> String {
+    match n {
+        1 => "1 statement".into(),
+        n => format!("{n} statements"),
     }
 }
 
@@ -1373,6 +1857,8 @@ impl Render for DocumentConsole {
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::component::WindowExt as _;
+
     use super::*;
 
     fn at(text: &str, cursor: usize) -> Option<&str> {
@@ -1459,6 +1945,78 @@ mod tests {
         assert_eq!(
             (shown.path, shown.collection),
             (vec!["sales".into()], "c".into())
+        );
+    }
+
+    #[test]
+    fn says_what_a_failed_write_script_left() {
+        let nothing = Some(Outcome::default());
+        assert_eq!(
+            kept(Some(Left::Undone), 2, &Outcome::default()),
+            (
+                " · the transaction was undone: nothing was applied".into(),
+                Some((0, 0))
+            )
+        );
+        // A commit without an answer is never said to be undone.
+        assert_eq!(
+            kept(Some(Left::Unknown), 2, &Outcome::default()),
+            (
+                " · the commit's result is unknown: check the data".into(),
+                None
+            )
+        );
+        let inserted = Outcome {
+            inserted: 2,
+            ..Outcome::default()
+        };
+        assert_eq!(
+            kept(Some(Left::Kept { partial: nothing }), 2, &inserted),
+            (
+                " · the 2 statements before it were applied (inserted 2)".into(),
+                Some((2, 2))
+            )
+        );
+        // What the statement that failed changed before it did stays too.
+        let modified = Outcome {
+            matched: 3,
+            modified: 3,
+            ..Outcome::default()
+        };
+        assert_eq!(
+            kept(
+                Some(Left::Kept {
+                    partial: Some(modified)
+                }),
+                1,
+                &inserted
+            ),
+            (
+                " · the 1 statement before it was applied (inserted 2) · the statement that \
+                 failed applied part of it first (matched 3 · modified 3)"
+                    .into(),
+                Some((2, 5))
+            )
+        );
+        // Unknown when it was stopped halfway: never nothing.
+        assert_eq!(
+            kept(Some(Left::Kept { partial: None }), 0, &Outcome::default()),
+            (
+                " · the statement that failed may have changed documents: unknown".into(),
+                None
+            )
+        );
+        assert_eq!(
+            kept(
+                Some(Left::Kept { partial: nothing }),
+                0,
+                &Outcome::default()
+            ),
+            (" · nothing was applied".into(), Some((0, 0)))
+        );
+        assert_eq!(
+            kept(None, 0, &Outcome::default()),
+            (" · what it changed is unknown: check the data".into(), None)
         );
     }
 
@@ -1562,19 +2120,55 @@ mod tests {
         panic!("the console never got there");
     }
 
+    /// Calls `f` on the console in its window.
+    fn in_window<R>(
+        cx: &mut gpui::TestAppContext,
+        console: &Entity<DocumentConsole>,
+        f: impl FnOnce(&mut DocumentConsole, &mut Window, &mut Context<DocumentConsole>) -> R,
+    ) -> R {
+        let window = cx.update(|cx| cx.windows()[0]);
+        cx.update_window(window, |_, window, cx| {
+            console.update(cx, |console, cx| f(console, window, cx))
+        })
+        .unwrap()
+    }
+
     fn ended(console: &DocumentConsole) -> bool {
-        console.run_task.is_none() && !matches!(console.status, Status::Idle)
+        !console.busy() && !matches!(console.status, Status::Idle)
+    }
+
+    /// What the audit log was given for `action`.
+    fn audited(console: &DocumentConsole, action: AuditAction) -> Vec<AuditRecord> {
+        console
+            .audited
+            .iter()
+            .filter(|record| record.action == action)
+            .cloned()
+            .collect()
     }
 
     #[gpui::test]
     #[ignore = "needs the dev MongoDB"]
     fn runs_a_script_in_its_database_and_shows_the_last_documents(cx: &mut gpui::TestAppContext) {
         let console = open_console(cx, Environment::Development, &["shop"]);
-        console.update(cx, |console, cx| {
+        // Even on development, the console reads through a session that may
+        // only read; `use` and the rest run through it.
+        console.read_with(cx, |console, _| {
+            assert!(matches!(
+                &console.session,
+                SessionState::Ready(reader) if reader.access() == Access::ReadOnly
+            ));
+        });
+        in_window(cx, &console, |console, window, cx| {
             console.run(
                 "db.orders.find({status: 'paid'}).sort({number: 1}).limit(3)\ndb.orders.countDocuments({status: 'paid'})\nuse admin".into(),
+                window,
                 cx,
-            )
+            );
+            // Read off the UI thread: nothing is known of it yet, and Run
+            // waits.
+            assert!(console.checking.is_some() && console.busy());
+            assert!(console.output.is_empty());
         });
         run_until(cx, &console, ended);
         console.read_with(cx, |console, cx| {
@@ -1617,8 +2211,8 @@ mod tests {
             assert!(names.fields["orders"].contains("count"));
         });
         // `use admin` changed nothing for the next run: it starts in shop.
-        console.update(cx, |console, cx| {
-            console.run("db.orders.estimatedDocumentCount()".into(), cx)
+        in_window(cx, &console, |console, window, cx| {
+            console.run("db.orders.estimatedDocumentCount()".into(), window, cx)
         });
         run_until(cx, &console, ended);
         console.read_with(cx, |console, _| {
@@ -1639,8 +2233,12 @@ mod tests {
         // A millisecond for each of big's 20 000 documents: 20 s to read
         // them all, against the 30 s limit.
         let started = Instant::now();
-        console.update(cx, |console, cx| {
-            console.run(r#"db.big.find({$where: "sleep(1) || true"})"#.into(), cx)
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                r#"db.big.find({$where: "sleep(1) || true"})"#.into(),
+                window,
+                cx,
+            )
         });
         run_until(cx, &console, ended);
         assert!(
@@ -1674,7 +2272,9 @@ mod tests {
         let console = open_console(cx, Environment::Development, &[]);
         let run = |cx: &mut gpui::TestAppContext, script: &str| {
             let script = script.to_string();
-            console.update(cx, |console, cx| console.run(script, cx));
+            in_window(cx, &console, |console, window, cx| {
+                console.run(script, window, cx)
+            });
             run_until(cx, &console, ended);
         };
         run(cx, "use shop");
@@ -1772,9 +2372,10 @@ mod tests {
     #[ignore = "needs the dev MongoDB"]
     fn refuses_writes_and_javascript_before_they_run(cx: &mut gpui::TestAppContext) {
         let console = open_console(cx, Environment::Development, &["shop"]);
-        console.update(cx, |console, cx| {
+        in_window(cx, &console, |console, window, cx| {
             console.run(
                 "db.orders.find().limit(1)\ndb.orders.deleteMany({})".into(),
+                window,
                 cx,
             )
         });
@@ -1784,11 +2385,19 @@ mod tests {
                 panic!("ran: {}", console.status());
             };
             assert!(error.contains("deleteMany"), "{error}");
+            assert!(error.contains("Switch the console to Write"), "{error}");
             assert_eq!(console.panel, Panel::Output);
+            // A refused write is audited too.
+            let [refused] = console.audited.as_slice() else {
+                panic!("{:?}", console.audited);
+            };
+            assert!(refused.failed && refused.outcome.starts_with("Refused"));
+            assert_eq!(refused.mode, "Document write");
         });
-        console.update(cx, |console, cx| {
-            console.run("let x = db.orders.find()".into(), cx)
+        in_window(cx, &console, |console, window, cx| {
+            console.run("let x = db.orders.find()".into(), window, cx)
         });
+        run_until(cx, &console, ended);
         console.read_with(cx, |console, _| {
             let Status::Failed(error) = &console.status else {
                 panic!("ran: {}", console.status());
@@ -1796,8 +2405,8 @@ mod tests {
             assert!(error.contains("not JavaScript"), "{error}");
         });
         // Nothing was deleted.
-        console.update(cx, |console, cx| {
-            console.run("db.orders.estimatedDocumentCount()".into(), cx)
+        in_window(cx, &console, |console, window, cx| {
+            console.run("db.orders.estimatedDocumentCount()".into(), window, cx)
         });
         run_until(cx, &console, ended);
         console.read_with(cx, |console, _| {
@@ -1815,8 +2424,12 @@ mod tests {
     #[ignore = "needs the dev MongoDB"]
     fn a_cancel_before_the_statements_run_stops_the_run(cx: &mut gpui::TestAppContext) {
         let console = open_console(cx, Environment::Development, &["shop"]);
-        console.update(cx, |console, cx| {
-            console.run(r#"db.big.find({$where: "sleep(100) || true"})"#.into(), cx);
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                r#"db.big.find({$where: "sleep(100) || true"})"#.into(),
+                window,
+                cx,
+            );
             console.cancel_now(cx);
         });
         run_until(cx, &console, ended);
@@ -1833,8 +2446,12 @@ mod tests {
     #[ignore = "needs the dev MongoDB"]
     fn cancels_a_slow_statement(cx: &mut gpui::TestAppContext) {
         let console = open_console(cx, Environment::Development, &["shop"]);
-        console.update(cx, |console, cx| {
-            console.run(r#"db.big.find({$where: "sleep(100) || true"})"#.into(), cx)
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                r#"db.big.find({$where: "sleep(100) || true"})"#.into(),
+                window,
+                cx,
+            )
         });
         // Past entering the database, into the slow statement.
         for _ in 0..50 {
@@ -1855,6 +2472,370 @@ mod tests {
                 "{}",
                 console.status()
             );
+        });
+    }
+
+    /// A database the write tests may change, dropped when they start and
+    /// again when they end, even when they fail.
+    struct Scratch(&'static str);
+
+    impl Scratch {
+        fn new(name: &'static str) -> Scratch {
+            let scratch = Scratch(name);
+            scratch.drop_database();
+            scratch
+        }
+
+        fn drop_database(&self) {
+            use std::sync::Arc;
+
+            use futures::executor::block_on;
+            use kuery_core::document::session::DocumentOpener;
+
+            let options = kuery_core::driver::ConnectOptions {
+                host: "127.0.0.1".into(),
+                port: 27019,
+                user: "kuery".into(),
+                password: Some("kuery".into()),
+                options: [("authSource".to_string(), "admin".to_string())].into(),
+                ..Default::default()
+            };
+            let opener: DocumentOpener =
+                Arc::new(move |access| (kuery_mongo::DRIVER.open)(&options, access));
+            let session = block_on(DocumentSession::open(opener, Access::ReadWrite)).unwrap();
+            let dropped = session.run(
+                format!("db.getSiblingDB({:?}).dropDatabase()", self.0),
+                RunMode::Write,
+                Heavy::Refuse,
+                RunOptions::default(),
+            );
+            block_on(async {
+                while let Ok(event) = dropped.recv().await {
+                    match event {
+                        DocEvent::Finished(_) => return,
+                        DocEvent::Failed(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            self.drop_database();
+        }
+    }
+
+    fn writing(console: &DocumentConsole) -> bool {
+        matches!(&console.writing, Writing::On(session) if session.access() == Access::ReadWrite)
+    }
+
+    fn count(cx: &mut gpui::TestAppContext, console: &Entity<DocumentConsole>) -> Option<Value> {
+        let audited = console.read_with(cx, |console, _| console.audited.len());
+        in_window(cx, console, |console, window, cx| {
+            console.run("db.notes.countDocuments({})".into(), window, cx)
+        });
+        run_until(cx, console, |console| {
+            ended(console)
+                && console
+                    .output
+                    .last()
+                    .is_some_and(|entry| entry.statement.contains("countDocuments"))
+        });
+        // A read is never audited.
+        assert_eq!(
+            console.read_with(cx, |console, _| console.audited.len()),
+            audited
+        );
+        console.read_with(cx, |console, _| {
+            console
+                .rows
+                .borrow()
+                .document(0)
+                .and_then(|document| document.get("count"))
+                .cloned()
+        })
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn writes_once_switched_to_write_and_audits_each_write(cx: &mut gpui::TestAppContext) {
+        let _scratch = Scratch::new("kuery_console_writes");
+        let console = open_console(cx, Environment::Development, &["kuery_console_writes"]);
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(true, window, cx)
+        });
+        run_until(cx, &console, writing);
+        assert!(console.read_with(cx, |console, _| console.is_writing()));
+        let runs = |console: &DocumentConsole| audited(console, AuditAction::Run);
+        // Development reviews only risky writes: these run once previewed.
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                "db.notes.insertOne({_id: 1})\ndb.notes.insertOne({_id: 2})".into(),
+                window,
+                cx,
+            )
+        });
+        run_until(cx, &console, |console| {
+            runs(console).len() == 1 && ended(console)
+        });
+        console.read_with(cx, |console, _| {
+            let record = &runs(console)[0];
+            assert!(!record.failed, "{record:?}");
+            assert_eq!(record.mode, "Document write");
+            assert_eq!(record.connection, "local (kuery_console_writes)");
+            assert_eq!(record.changed, Some((2, 2)));
+            assert!(record.sql.contains("insertOne({_id: 2})"));
+            // Its preview is audited too.
+            let previews = audited(console, AuditAction::Preview);
+            assert_eq!(
+                previews
+                    .iter()
+                    .map(|record| (record.outcome.as_str(), record.failed))
+                    .collect::<Vec<_>>(),
+                [("Previewed in a transaction and undone: inserted 2", false)]
+            );
+        });
+        assert_eq!(count(cx, &console), Some(Value::Int32(2)));
+        // A script that fails halfway is undone, and audited as failed.
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                "db.notes.insertOne({_id: 3})\ndb.notes.insertOne({_id: 1})".into(),
+                window,
+                cx,
+            )
+        });
+        run_until(cx, &console, |console| {
+            runs(console).len() == 2 && ended(console)
+        });
+        console.read_with(cx, |console, _| {
+            let record = &runs(console)[1];
+            assert!(record.failed, "{record:?}");
+            assert!(
+                record
+                    .outcome
+                    .contains("the transaction was undone: nothing was applied"),
+                "{}",
+                record.outcome
+            );
+            assert_eq!(record.changed, Some((0, 0)));
+        });
+        assert_eq!(count(cx, &console), Some(Value::Int32(2)));
+        // So is one statement that fails halfway, as its preview showed.
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                "db.notes.insertMany([{_id: 4}, {_id: 1}])".into(),
+                window,
+                cx,
+            )
+        });
+        run_until(cx, &console, |console| {
+            runs(console).len() == 3 && ended(console)
+        });
+        console.read_with(cx, |console, _| {
+            let record = &runs(console)[2];
+            assert!(
+                record.failed && record.outcome.contains("the transaction was undone"),
+                "{record:?}"
+            );
+        });
+        assert_eq!(count(cx, &console), Some(Value::Int32(2)));
+        // A risky one waits for the review, and nothing runs meanwhile.
+        in_window(cx, &console, |console, window, cx| {
+            console.run("db.notes.deleteMany({})".into(), window, cx)
+        });
+        let reviewing = |cx: &mut gpui::TestAppContext| {
+            in_window(cx, &console, |_, window, cx| window.has_active_dialog(cx))
+        };
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if reviewing(cx) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reviewing(cx), "the review never opened");
+        in_window(cx, &console, |_, window, cx| window.close_dialog(cx));
+        assert_eq!(console.read_with(cx, |console, _| runs(console).len()), 3);
+        assert_eq!(count(cx, &console), Some(Value::Int32(2)));
+        // Back to Read-only: a write is refused, and audited.
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(false, window, cx)
+        });
+        assert!(!console.read_with(cx, |console, _| console.is_writing()));
+        in_window(cx, &console, |console, window, cx| {
+            console.run("db.notes.insertOne({_id: 9})".into(), window, cx)
+        });
+        run_until(cx, &console, |console| runs(console).len() == 4);
+        console.read_with(cx, |console, _| {
+            let record = &runs(console)[3];
+            assert!(
+                record.failed && record.outcome.starts_with("Refused"),
+                "{record:?}"
+            );
+        });
+        assert_eq!(count(cx, &console), Some(Value::Int32(2)));
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn run_waits_for_a_preview_and_cancel_stops_it(cx: &mut gpui::TestAppContext) {
+        let _scratch = Scratch::new("kuery_console_preview");
+        let console = open_console(cx, Environment::Development, &["kuery_console_preview"]);
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(true, window, cx)
+        });
+        run_until(cx, &console, writing);
+        let notes: Vec<String> = (0..40).map(|n| format!("{{_id: {n}}}")).collect();
+        let script = format!("db.notes.insertMany([{}])", notes.join(", "));
+        in_window(cx, &console, |console, window, cx| {
+            console.run(script, window, cx)
+        });
+        run_until(cx, &console, |console| {
+            audited(console, AuditAction::Run).len() == 1 && ended(console)
+        });
+        // A tenth of a second for each of the 40 notes: its preview takes 4 s.
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                r#"db.notes.updateMany({$where: "sleep(100) || true"}, {$set: {x: 1}})"#.into(),
+                window,
+                cx,
+            )
+        });
+        run_until(cx, &console, |console| console.previewing());
+        // Run waits: a second script neither runs nor goes to the review.
+        let reviewing = console.read_with(cx, |console, _| console.reviewing.clone().unwrap());
+        in_window(cx, &console, |console, window, cx| {
+            assert!(console.busy());
+            console.run("db.notes.deleteMany({})".into(), window, cx);
+            assert!(console.checking.is_none());
+        });
+        let started = Instant::now();
+        console.update(cx, |console, cx| console.cancel_now(cx));
+        run_until(cx, &console, |console| {
+            audited(console, AuditAction::Preview).len() == 2
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        console.read_with(cx, |console, _| {
+            assert!(Rc::ptr_eq(console.reviewing.as_ref().unwrap(), &reviewing));
+            assert!(!console.busy());
+            let stopped = &audited(console, AuditAction::Preview)[1];
+            assert!(
+                stopped.failed && stopped.outcome.starts_with("Preview failed"),
+                "{stopped:?}"
+            );
+            assert_eq!(audited(console, AuditAction::Run).len(), 1);
+        });
+        // Neither the review nor the run follows a stopped preview.
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!in_window(cx, &console, |_, window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            console.read_with(cx, |console, _| audited(console, AuditAction::Run).len()),
+            1
+        );
+        assert_eq!(count(cx, &console), Some(Value::Int32(40)));
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn audits_the_writes_that_never_ran(cx: &mut gpui::TestAppContext) {
+        let console = open_console(cx, Environment::Development, &["kuery_console_never"]);
+        // The session that may write is still opening.
+        console.update(cx, |console, _| console.writing = Writing::Connecting);
+        in_window(cx, &console, |console, window, cx| {
+            console.run("db.notes.insertOne({_id: 1})".into(), window, cx)
+        });
+        run_until(cx, &console, |console| console.audited.len() == 1);
+        console.read_with(cx, |console, _| {
+            let record = &console.audited[0];
+            assert!(
+                record.failed
+                    && record.outcome
+                        == "Refused: The session that may write is still opening: nothing ran",
+                "{record:?}"
+            );
+        });
+        // An approval that comes while another script runs is dropped, and
+        // audited.
+        let reader = console.read_with(cx, |console, _| match &console.session {
+            SessionState::Ready(reader) => reader.clone(),
+            _ => unreachable!(),
+        });
+        let text = "db.notes.insertOne({_id: 2})";
+        let script = Script {
+            start: vec!["kuery_console_never".into()],
+            text: text.into(),
+            statements: (kuery_mongo::LANGUAGE.analyze)(text).unwrap(),
+            heavy: Heavy::Refuse,
+        };
+        console.update(cx, |console, cx| {
+            console.run_task = Some(Task::ready(()));
+            console.start(script, reader, RunMode::Write, cx);
+            console.run_task = None;
+        });
+        console.read_with(cx, |console, _| {
+            let record = &console.audited[1];
+            assert!(
+                record.failed
+                    && record.outcome
+                        == "Refused: Another script was running: this one did not run",
+                "{record:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn on_production_writes_only_once_allowed(cx: &mut gpui::TestAppContext) {
+        let _scratch = Scratch::new("kuery_console_production");
+        let console = open_console(cx, Environment::Production, &["kuery_console_production"]);
+        // Writes are not allowed yet: Write asks to type the name first.
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!console.read_with(cx, |console, _| console.is_writing()));
+        assert!(in_window(cx, &console, |_, window, cx| window.has_active_dialog(cx)));
+        in_window(cx, &console, |_, window, cx| window.close_dialog(cx));
+        // As typing the name would.
+        console.read_with(cx, |console, _| console.db.allow_writes());
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(true, window, cx)
+        });
+        run_until(cx, &console, writing);
+        // Heavy work is refused on production, before any review.
+        in_window(cx, &console, |console, window, cx| {
+            console.run(
+                r#"db.notes.updateMany({$where: "true"}, {$set: {a: 1}})"#.into(),
+                window,
+                cx,
+            )
+        });
+        run_until(cx, &console, |console| !console.audited.is_empty());
+        console.read_with(cx, |console, _| {
+            let [record] = console.audited.as_slice() else {
+                panic!("{:?}", console.audited);
+            };
+            assert!(
+                record.failed && record.outcome.starts_with("Refused"),
+                "{record:?}"
+            );
+            assert_eq!(record.environment, "PRODUCTION");
+        });
+        assert!(!in_window(cx, &console, |_, window, cx| window.has_active_dialog(cx)));
+        // Stop allowing writes: back to Read-only, for the whole connection.
+        console.update(cx, |console, cx| console.stop_allowing_writes(cx));
+        console.read_with(cx, |console, _| {
+            assert!(!console.is_writing());
+            assert!(!console.db.allows_writes());
         });
     }
 }

@@ -20,6 +20,7 @@ pub mod classify;
 mod command;
 pub mod convert;
 mod detect;
+mod estimate;
 mod execute;
 pub mod literal;
 mod run;
@@ -38,7 +39,7 @@ use std::time::Duration;
 use bson::{Bson, Document as BsonDocument, doc};
 
 use kuery_core::adapter::Canceller;
-use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome};
+use kuery_core::document::adapter::{CommitError, DocumentAdapter, DocumentSink, Outcome};
 use kuery_core::document::capabilities::Capabilities;
 use kuery_core::document::catalog::{CollectionInfo, Container};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
@@ -49,13 +50,13 @@ use kuery_core::driver::{
 };
 use kuery_core::read_only::Rejection;
 use kuery_core::session::{Access, QueryError, RunOptions};
-use mongodb::Client;
-use mongodb::error::{ErrorKind, WriteFailure};
+use mongodb::error::{ErrorKind, UNKNOWN_TRANSACTION_COMMIT_RESULT, WriteFailure};
 use mongodb::options::{AuthMechanism, ClientOptions, Credential, Socks5Proxy};
+use mongodb::{Client, ClientSession};
 use tokio::runtime::Runtime;
 
 use crate::detect::{Detected, Facts};
-use crate::run::{Stop, Tag, Wants};
+use crate::run::{Reading, Stop, Tag, Wants};
 use crate::shell::Op;
 
 pub use uri::{OPTIONS, parse as parse_uri};
@@ -479,6 +480,7 @@ pub static LANGUAGE: Language = Language {
     },
     collection_ref: shell::collection_ref,
     key: literal::key,
+    key_name: "_id",
     methods: METHODS,
     operators: OPERATORS,
     stages: STAGES,
@@ -649,6 +651,21 @@ struct Mongo {
     database: String,
     /// The one it opened in: the connection's own, or mongosh's `test`.
     home: String,
+    /// The transaction a script or a preview runs in, while it does: every
+    /// command goes in its session.
+    transaction: Option<Transaction>,
+}
+
+/// A transaction's session, which a command holds while it runs.
+type Transaction = Arc<tokio::sync::Mutex<ClientSession>>;
+
+impl Drop for Mongo {
+    /// A transaction still open goes with its session, which aborts it on
+    /// the runtime.
+    fn drop(&mut self) {
+        let _runtime = runtime().enter();
+        drop(self.transaction.take());
+    }
 }
 
 /// What [`DocumentAdapter::limit`] set for what runs next.
@@ -726,6 +743,7 @@ fn connect(target: &Target, access: Access) -> Result<Mongo, String> {
         limits: Limits::from(&RunOptions::default()),
         database: home.clone(),
         home,
+        transaction: None,
     })
 }
 
@@ -777,13 +795,34 @@ impl Mongo {
     ) -> Result<BsonDocument, QueryError> {
         let (command, tag) = self.prepare(command)?;
         let db = self.pool.client.database(database);
+        let transaction = self.transaction.clone();
         run::wait(
             &self.pool.client,
             &tag,
             &self.stop,
             self.patience(),
-            async move { db.run_command(command).await },
+            async move {
+                match transaction {
+                    Some(session) => {
+                        let mut session = session.lock_owned().await;
+                        db.run_command(command).session(&mut *session).await
+                    }
+                    None => db.run_command(command).await,
+                }
+            },
         )
+    }
+
+    /// Runs what must end once begun, such as ending a transaction: a
+    /// cancel does not stop it, and it has as long as a server has to
+    /// answer, and the grace after that (see [`run::wait`]).
+    fn settle<T: Send + 'static>(
+        &mut self,
+        op: impl std::future::Future<Output = mongodb::error::Result<T>> + Send + 'static,
+    ) -> Result<T, QueryError> {
+        self.commands += 1;
+        let tag = Tag::new(self.id, self.commands);
+        run::wait(&self.pool.client, &tag, &Stop::default(), Some(ANSWER), op)
     }
 
     /// Runs a command that answers with a cursor; its documents go to
@@ -826,6 +865,7 @@ impl Mongo {
         let db = self.pool.client.database(database);
         let comment = Bson::String(tag.as_str().into());
         let batch = u32::try_from(self.limits.max_batch).unwrap_or(u32::MAX);
+        let transaction = self.transaction.clone();
         run::stream(
             &self.pool.client,
             &tag,
@@ -833,10 +873,18 @@ impl Mongo {
             self.patience(),
             self.limits.first_batch,
             async move {
-                db.run_cursor_command(command)
+                let command = db
+                    .run_cursor_command(command)
                     .batch_size(batch)
-                    .comment(comment)
-                    .await
+                    .comment(comment);
+                match transaction {
+                    Some(session) => {
+                        let mut session = session.lock_owned().await;
+                        let cursor = command.session(&mut *session).await?;
+                        Ok(Reading::InSession(cursor, session))
+                    }
+                    None => command.await.map(Reading::Alone),
+                }
             },
             sink,
         )
@@ -891,33 +939,90 @@ impl DocumentAdapter for Mongo {
     }
 
     /// Reads the statement again and runs it as one command; `use` only
-    /// changes the database the next ones work in.
+    /// changes the database the next ones work in. While a script's
+    /// transaction is open, a command that would end it or its session is
+    /// refused, whatever the session checked.
     fn execute(
         &mut self,
         statement: &str,
         sink: &mut dyn DocumentSink,
     ) -> Result<Outcome, QueryError> {
-        let mut statements = shell::statements(statement)
-            .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(statement))))?;
-        let op = match statements.len() {
-            0 => return Err(QueryError::Rejected(Rejection::Empty)),
-            1 => statements.remove(0).1,
-            n => return Err(QueryError::Rejected(Rejection::MultipleStatements(n))),
-        };
+        let op = one(statement)?;
         if let Op::Use(database) = op {
             self.database = database;
             return Ok(Outcome::default());
         }
-        match command::build(&op, &self.database)? {
-            Some(built) => self.run_built(built, sink),
-            None => Ok(Outcome::default()),
+        let Some(built) = command::build(&op, &self.database)? else {
+            return Ok(Outcome::default());
+        };
+        let name = run::name(&built.command);
+        if self.transaction.is_some() && classify::TRANSACTION_COMMANDS.contains(&name) {
+            sink.changed(Outcome::default());
+            return Err(QueryError::Unsupported(format!(
+                "Kuery runs each script's transaction itself, so {name} cannot run in it"
+            )));
         }
+        self.run_built(built, sink)
     }
 
     /// Refused on a read-only connection whatever the session checked.
     fn begin(&mut self) -> Result<(), QueryError> {
         self.writable()?;
-        later()
+        if self.transaction.is_some() {
+            return Err(QueryError::Unsupported(
+                "A transaction is already open".into(),
+            ));
+        }
+        let client = self.pool.client.clone();
+        let session = self.settle(async move {
+            let mut session = client.start_session().await?;
+            session.start_transaction().await?;
+            Ok(session)
+        })?;
+        self.transaction = Some(Arc::new(tokio::sync::Mutex::new(session)));
+        Ok(())
+    }
+
+    /// Ends the transaction, which is gone whether or not it commits. A
+    /// commit out of time, or one the server or the driver marks
+    /// `UnknownTransactionCommitResult`, may have applied.
+    fn commit(&mut self) -> Result<(), CommitError> {
+        let session = self.transaction.take().ok_or_else(|| {
+            CommitError::Undone(QueryError::Unsupported("No transaction is open".into()))
+        })?;
+        let committed = self.settle(async move {
+            let committed = session.lock_owned().await.commit_transaction().await;
+            Ok(committed.map_err(|error| {
+                let unknown = error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT);
+                (unknown, run::error(error))
+            }))
+        });
+        match committed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err((unknown, error))) if unknown || run::out_of_time(&error) => {
+                Err(CommitError::Unknown(error))
+            }
+            Ok(Err((_, error))) => Err(CommitError::Undone(error)),
+            // Waiting for the answer stopped: it may still apply.
+            Err(error) => Err(CommitError::Unknown(error)),
+        }
+    }
+
+    /// Undoes the transaction, if one is open; it is gone either way.
+    fn abort(&mut self) -> Result<(), QueryError> {
+        let Some(session) = self.transaction.take() else {
+            return Ok(());
+        };
+        self.settle(async move { session.lock_owned().await.abort_transaction().await })
+    }
+
+    fn estimate(
+        &mut self,
+        statement: &str,
+        sample: &mut dyn DocumentSink,
+    ) -> Result<Option<Count>, QueryError> {
+        self.writable()?;
+        self.estimate_statement(statement, sample)
     }
 
     fn children(&mut self, parent: &[String]) -> Result<Vec<Container>, QueryError> {
@@ -1009,6 +1114,17 @@ impl DocumentAdapter for Mongo {
     ) -> Result<Outcome, QueryError> {
         self.writable()?;
         later()
+    }
+}
+
+/// Reads a statement the session handed over: one, exactly.
+fn one(statement: &str) -> Result<Op, QueryError> {
+    let mut statements = shell::statements(statement)
+        .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(statement))))?;
+    match statements.len() {
+        0 => Err(QueryError::Rejected(Rejection::Empty)),
+        1 => Ok(statements.remove(0).1),
+        n => Err(QueryError::Rejected(Rejection::MultipleStatements(n))),
     }
 }
 

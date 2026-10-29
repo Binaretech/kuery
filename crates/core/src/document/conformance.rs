@@ -4,8 +4,8 @@
 //! a way to open it and a collection of a few documents it may read;
 //! passing them is what "works like any document database" means.
 //!
-//! Nothing here writes: the checks that change documents come with the
-//! drivers that can make them.
+//! The checks that write do it only where the fixture says they may
+//! ([`Writes`]), and leave nothing behind there.
 //!
 //! [`DocumentAdapter`]: crate::document::adapter::DocumentAdapter
 
@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
 
-use crate::document::capabilities::Enforcement;
-use crate::document::change::{BrowseSpec, DocChange};
+use crate::document::capabilities::{Enforcement, Preview, Transactions};
+use crate::document::change::{BrowseSpec, Count, DocChange};
 use crate::document::session::{
-    ApplyFailure, DocEvent, DocSummary, DocumentOpener, DocumentSession, Heavy, RunMode,
+    ApplyFailure, DocEvent, DocSummary, DocumentOpener, DocumentSession, Estimate, Heavy, Left,
+    RunMode,
 };
 use crate::document::value::{CollectionRef, Document, Value};
 use crate::session::{Access, QueryError, RunOptions};
@@ -35,6 +36,23 @@ pub struct Fixture {
     /// A read of the engine's language that runs for 20 seconds or more,
     /// for the cancel check. It may be heavy.
     pub slow: String,
+    /// Where the checks that write may write; `None` skips them.
+    pub writes: Option<Writes>,
+}
+
+/// A place the write checks may change, as statements of the engine's
+/// language.
+pub struct Writes {
+    /// The collection they write to, in a database of its own.
+    pub collection: CollectionRef,
+    /// Removes what they wrote, with the database itself: run before and
+    /// after each check.
+    pub clear: String,
+    /// Adds one document to the collection.
+    pub insert: String,
+    /// Two statements: the first adds a document to the collection, the
+    /// second fails.
+    pub half_failing: String,
 }
 
 /// Runs every check.
@@ -46,6 +64,8 @@ pub fn run(fixture: &Fixture) {
     keeps_its_types(fixture);
     says_who_keeps_it_read_only(fixture);
     cancels_the_slow_statement(fixture);
+    applies_all_or_nothing(fixture);
+    previews_change_nothing(fixture);
 }
 
 fn open(fixture: &Fixture, access: Access) -> DocumentSession {
@@ -58,7 +78,7 @@ fn drain(rx: async_channel::Receiver<DocEvent>) -> (Vec<Document>, Result<DocSum
         while let Ok(event) = rx.recv().await {
             match event {
                 DocEvent::Documents(batch) => documents.extend(batch),
-                DocEvent::Outcome(_) => {}
+                DocEvent::Outcome(_) | DocEvent::Left(_) => {}
                 DocEvent::Finished(summary) => return (documents, Ok(summary)),
                 DocEvent::Failed(error) => return (documents, Err(error)),
             }
@@ -284,4 +304,100 @@ pub fn cancels_the_slow_statement(fixture: &Fixture) {
         1,
         "the session stopped working after a cancel"
     );
+}
+
+/// Runs a write script, for the checks that write.
+fn write(session: &DocumentSession, text: &str) -> Result<DocSummary, QueryError> {
+    drain(session.run(
+        text.into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    ))
+    .1
+}
+
+/// Runs a write script that fails, and says what it said it left.
+fn write_failing(session: &DocumentSession, text: &str) -> (Result<(), QueryError>, Vec<Left>) {
+    let rx = session.run(
+        text.into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    block_on(async {
+        let mut left = Vec::new();
+        while let Ok(event) = rx.recv().await {
+            match event {
+                DocEvent::Left(said) => left.push(said),
+                DocEvent::Finished(_) => return (Ok(()), left),
+                DocEvent::Failed(error) => return (Err(error), left),
+                DocEvent::Documents(_) | DocEvent::Outcome(_) => {}
+            }
+        }
+        (Err(QueryError::Cancelled), left)
+    })
+}
+
+/// How many documents the write checks' collection holds.
+fn held(session: &DocumentSession, writes: &Writes) -> Count {
+    block_on(session.count(writes.collection.clone(), None, 0, Heavy::Refuse))
+        .expect("counts the written collection")
+}
+
+/// A script that fails halfway keeps none of it where the engine has
+/// transactions, and what ran before the failure where it has none, and
+/// says which.
+pub fn applies_all_or_nothing(fixture: &Fixture) {
+    let Some(writes) = &fixture.writes else {
+        return;
+    };
+    let session = open(fixture, Access::ReadWrite);
+    write(&session, &writes.clear).expect("clears the written collection");
+    let (failed, left) = write_failing(&session, &writes.half_failing);
+    assert!(failed.is_err(), "the second statement did not fail");
+    let kept = held(&session, writes);
+    write(&session, &writes.clear).expect("clears the written collection");
+    let (expected, said) = match session.capabilities().transactions {
+        Transactions::Multi { .. } => (0, matches!(left[..], [Left::Undone])),
+        Transactions::None => (1, matches!(left[..], [Left::Kept { .. }])),
+    };
+    assert_eq!(
+        kept,
+        Count::Exact(expected),
+        "a script that failed halfway kept the wrong part"
+    );
+    assert!(said, "a script that failed halfway said it left {left:?}");
+}
+
+/// A preview says what a write would do and keeps none of it.
+pub fn previews_change_nothing(fixture: &Fixture) {
+    let Some(writes) = &fixture.writes else {
+        return;
+    };
+    let session = open(fixture, Access::ReadWrite);
+    write(&session, &writes.clear).expect("clears the written collection");
+    let preview = |text: &str| {
+        block_on(session.preview(text.into(), Heavy::Refuse, RunOptions::default()))
+            .expect("previews the script")
+    };
+    let inserted = preview(&writes.insert);
+    let half = preview(&writes.half_failing);
+    let kept = held(&session, writes);
+    write(&session, &writes.clear).expect("clears the written collection");
+    assert_eq!(kept, Count::Exact(0), "a preview kept what it previewed");
+    assert_eq!(inserted.len(), 1);
+    assert_eq!(half.len(), 2);
+    let estimate = &inserted[0].estimate;
+    match session.capabilities().preview {
+        Preview::Undone => assert!(
+            matches!(estimate, Estimate::Exact(outcome) if outcome.inserted == 1),
+            "{estimate:?}"
+        ),
+        Preview::Estimated => assert!(
+            matches!(estimate, Estimate::Estimated(_) | Estimate::Unknown),
+            "{estimate:?}"
+        ),
+        Preview::None => assert_eq!(estimate, &Estimate::Unknown),
+    }
 }
