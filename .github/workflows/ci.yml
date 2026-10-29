@@ -72,6 +72,22 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # MongoDB's driver speaks TLS through rustls with ring alone; nothing
+      # in the workspace may bring in OpenSSL.
+      - name: Only ring for TLS
+        if: runner.os == 'Linux'
+        run: |
+          tree=$(cargo tree --locked -p kuery-mongo -e normal --prefix none)
+          grep -q '^ring ' <<< "$tree"
+          if grep -q '^aws-lc-rs ' <<< "$tree"; then
+            echo "kuery-mongo brings in aws-lc-rs"
+            exit 1
+          fi
+          if cargo tree --locked -i openssl-sys > /dev/null 2>&1; then
+            echo "something brings in OpenSSL"
+            exit 1
+          fi
+
       # In the Dev Drive copy on Windows, the checkout elsewhere.
       - name: Tests
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
@@ -205,3 +221,51 @@ jobs:
 
       - name: Ignored kuery-mssql tests
         run: cargo test -p kuery-mssql --locked -- --ignored
+
+  mongo:
+    name: kuery-mongo tests against a MongoDB replica set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The dev services: a seeded single-node replica set with
+      # authentication, and a standalone server without it for what a
+      # standalone lacks. Services cannot take their commands, so compose
+      # starts them. The job waits for the replica set's healthcheck, then
+      # for the seed's last collection on both, which is still filling when
+      # the healthcheck first passes.
+      - name: MongoDB
+        run: |
+          docker compose -f dev/compose.yaml --profile standalone up -d mongo mongo-standalone
+          for _ in $(seq 90); do
+            health=$(docker compose -f dev/compose.yaml ps --format json mongo | jq -r '.Health')
+            if [ "$health" = healthy ]; then
+              seeded=$(docker compose -f dev/compose.yaml exec -T mongo \
+                mongosh --port 27019 -u kuery -p kuery --authenticationDatabase admin --quiet \
+                --eval 'db.getSiblingDB("shop").big.countDocuments()' 2> /dev/null || true)
+              standalone=$(docker compose -f dev/compose.yaml exec -T mongo-standalone \
+                mongosh --quiet \
+                --eval 'db.getSiblingDB("shop").big.countDocuments()' 2> /dev/null || true)
+              if [ "$seeded" = 20000 ] && [ "$standalone" = 20000 ]; then
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          docker compose -f dev/compose.yaml logs mongo mongo-standalone
+          exit 1
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # One at a time: the capped count runs JavaScript over the big
+      # collection against a 5-second limit, which other tests can push past.
+      # The standalone checks fail rather than skip when it is missing.
+      - name: Ignored kuery-mongo tests
+        env:
+          KUERY_MONGO_STANDALONE: required
+        run: cargo test -p kuery-mongo --locked -- --ignored --test-threads=1
