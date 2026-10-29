@@ -162,6 +162,9 @@ pub struct Language {
     /// A field's name as a document's key: bare where it reads so, quoted
     /// otherwise (`status`, `"ship.city"`).
     pub key: fn(&str) -> String,
+    /// What the engine calls a document's identity
+    /// ([`crate::document::value::Document::key`]), for the review: `_id`.
+    pub key_name: &'static str,
     pub methods: &'static [&'static str],
     pub operators: &'static [&'static str],
     pub stages: &'static [&'static str],

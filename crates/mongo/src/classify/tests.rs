@@ -64,14 +64,29 @@ fn finds_writing_stages_at_any_depth() {
         "db.orders.aggregate([{$facet: {a: [{$match: {}}], b: [{$out: 'copy'}]}}])",
         "db.orders.aggregate([{$lookup: {from: 'c', as: 'c', pipeline: [{$merge: 'copy'}]}}])",
         "db.orders.aggregate([{$unionWith: {coll: 'c', pipeline: [{$out: 'copy'}]}}])",
-        // Explained, it is still the write it explains.
+    ] {
+        // No transaction holds them: they run on their own.
+        assert_eq!(kind(text), Schema, "{text}");
+    }
+    // Explained, it still counts as a write, of a kind no transaction takes.
+    for text in [
         "db.orders.explain().aggregate([{$out: 'copy'}])",
         "db.orders.aggregate([{$out: 'copy'}]).explain('executionStats')",
+        "db.orders.explain().deleteMany({a: 1})",
     ] {
-        assert_eq!(kind(text), Data, "{text}");
+        assert_eq!(kind(text), Other, "{text}");
     }
     assert_eq!(kind("db.orders.find().explain()"), Read);
-    assert_eq!(kind("db.orders.explain().deleteMany({a: 1})"), Data);
+}
+
+#[test]
+fn commands_that_end_a_transaction_or_a_session_are_kuery_s_own() {
+    for name in TRANSACTION_COMMANDS {
+        for runner in ["runCommand", "adminCommand"] {
+            let text = format!("db.{runner}({{{name}: 1}})");
+            assert_eq!(kind(&text), Transaction, "{text}");
+        }
+    }
 }
 
 #[test]
@@ -204,5 +219,5 @@ fn nesting_too_deep_is_an_error_not_a_crash() {
         "{$facet: {a: [".repeat(60),
         "]}}".repeat(60)
     );
-    assert_eq!(kind(&pipeline), Data);
+    assert_eq!(kind(&pipeline), Schema);
 }

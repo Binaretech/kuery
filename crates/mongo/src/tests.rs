@@ -8,6 +8,9 @@
 use kuery_core::browse::Direction;
 use kuery_core::document::capabilities::{Enforcement, Preview, Transactions};
 use kuery_core::document::language::Style;
+use kuery_core::document::session::{
+    DocEvent, DocSummary, DocumentSession, Estimate, Heavy, Impact, Left, RunMode,
+};
 use kuery_core::document::value::{FieldPath, Value};
 use kuery_core::driver::ConnectOptions;
 
@@ -1049,6 +1052,14 @@ fn works_like_any_document_database() {
         types: shop("types"),
         reader: Some(Arc::new(|access| open(&reader(), access))),
         slow: r#"db.big.find({$where: "sleep(100) || true"})"#.into(),
+        writes: Some(kuery_core::document::conformance::Writes {
+            collection: CollectionRef::new(&["kuery_conformance", "notes"]),
+            clear: r#"db.getSiblingDB("kuery_conformance").dropDatabase()"#.into(),
+            insert: r#"db.getSiblingDB("kuery_conformance").notes.insertOne({_id: 1})"#.into(),
+            half_failing: r#"db.getSiblingDB("kuery_conformance").notes.insertOne({_id: 1})
+db.getSiblingDB("kuery_conformance").notes.insertOne({_id: 1})"#
+                .into(),
+        }),
     });
 }
 
@@ -1242,4 +1253,516 @@ fn cancels_a_sleeping_command_and_keeps_working() {
     canceller.join().unwrap();
     nothing_left_behind(&mut mongo);
     console(&mut mongo, "db.runCommand({ping: 1})").unwrap();
+}
+
+/// A database the write tests may change, dropped before they start and
+/// again when they end, even when they fail.
+struct Scratch {
+    target: Target,
+    name: &'static str,
+}
+
+impl Scratch {
+    fn new(target: Target, name: &'static str) -> Scratch {
+        let scratch = Scratch { target, name };
+        scratch.drop_database();
+        scratch
+    }
+
+    fn drop_database(&self) {
+        let mut mongo = connect(&self.target, Access::ReadWrite).unwrap();
+        console(
+            &mut mongo,
+            &format!("db.getSiblingDB({:?}).dropDatabase()", self.name),
+        )
+        .unwrap();
+    }
+
+    /// A session that may write, working in the scratch database.
+    fn session(&self) -> DocumentSession {
+        let target = Target {
+            database: self.name.into(),
+            ..self.target.clone()
+        };
+        futures::executor::block_on(DocumentSession::open(
+            Arc::new(move |access| open(&target, access)),
+            Access::ReadWrite,
+        ))
+        .unwrap()
+    }
+
+    fn notes(&self) -> CollectionRef {
+        CollectionRef::new(&[self.name, "notes"])
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.drop_database();
+    }
+}
+
+fn write_script(session: &DocumentSession, text: &str) -> Result<(), QueryError> {
+    let events = session.run(
+        text.into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    futures::executor::block_on(async {
+        while let Ok(event) = events.recv().await {
+            match event {
+                DocEvent::Finished(_) => return Ok(()),
+                DocEvent::Failed(error) => return Err(error),
+                DocEvent::Documents(_) | DocEvent::Outcome(_) | DocEvent::Left(_) => {}
+            }
+        }
+        Err(QueryError::Cancelled)
+    })
+}
+
+fn notes_held(session: &DocumentSession, scratch: &Scratch) -> Count {
+    futures::executor::block_on(session.count(scratch.notes(), None, 0, Heavy::Refuse)).unwrap()
+}
+
+fn previewed(session: &DocumentSession, text: &str) -> Vec<Impact> {
+    futures::executor::block_on(session.preview(text.into(), Heavy::Refuse, RunOptions::default()))
+        .unwrap_or_else(|error| panic!("{text}: {error}"))
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_script_is_all_or_nothing_on_a_replica_set() {
+    let scratch = Scratch::new(target(), "kuery_atomic");
+    let session = scratch.session();
+    write_script(
+        &session,
+        "db.notes.insertOne({_id: 1})\ndb.notes.insertOne({_id: 2})",
+    )
+    .unwrap();
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(2));
+    // The third goes in, the duplicate fails: neither is kept.
+    let failed = write_script(
+        &session,
+        "db.notes.insertOne({_id: 3})\ndb.notes.insertOne({_id: 1})",
+    );
+    assert!(
+        matches!(&failed, Err(QueryError::Database { code, .. }) if code == "11000"),
+        "{failed:?}"
+    );
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(2));
+    // A read in the script sees what the script wrote before it.
+    let events = session.run(
+        "db.notes.insertOne({_id: 4})\ndb.notes.find({_id: 4})".into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    let found = futures::executor::block_on(async {
+        let mut found = Vec::new();
+        while let Ok(event) = events.recv().await {
+            match event {
+                DocEvent::Documents(batch) => found.extend(batch),
+                DocEvent::Finished(_) => break,
+                DocEvent::Failed(error) => panic!("{error}"),
+                DocEvent::Outcome(_) | DocEvent::Left(_) => {}
+            }
+        }
+        found
+    });
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_preview_on_a_replica_set_is_exact_and_changes_nothing() {
+    let scratch = Scratch::new(target(), "kuery_preview");
+    let session = scratch.session();
+    write_script(
+        &session,
+        "db.notes.insertMany([{_id: 1, a: 1}, {_id: 2, a: 2}, {_id: 3, a: 3}])",
+    )
+    .unwrap();
+    let impacts = previewed(
+        &session,
+        "db.notes.insertOne({_id: 4, a: 4})
+db.notes.find({a: {$gte: 3}})
+db.notes.updateMany({a: {$gte: 2}}, {$set: {b: 1}})
+db.notes.deleteMany({})",
+    );
+    let estimates: Vec<Estimate> = impacts
+        .iter()
+        .map(|impact| impact.estimate.clone())
+        .collect();
+    assert_eq!(
+        estimates,
+        [
+            Estimate::Exact(Outcome {
+                inserted: 1,
+                ..Outcome::default()
+            }),
+            Estimate::Reads,
+            Estimate::Exact(Outcome {
+                matched: 3,
+                modified: 3,
+                ..Outcome::default()
+            }),
+            Estimate::Exact(Outcome {
+                deleted: 4,
+                ..Outcome::default()
+            }),
+        ]
+    );
+    // The read saw the insert before it, in the transaction.
+    assert_eq!(impacts[1].sample.len(), 2);
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+    // What cannot run in a transaction is counted instead, or unknown.
+    let impacts = previewed(
+        &session,
+        "db.notes.aggregate([{$match: {}}, {$out: 'copy'}])",
+    );
+    assert_eq!(impacts[0].estimate, Estimate::Unknown);
+    let impacts = previewed(&session, "db.notes.drop()");
+    assert_eq!(impacts[0].estimate, Estimate::Unknown);
+    let mut mongo = connect(&target(), Access::ReadWrite).unwrap();
+    let (collections, _) = console(&mut mongo, "use kuery_preview")
+        .and_then(|_| console(&mut mongo, "show collections"))
+        .unwrap();
+    assert_eq!(collections.len(), 1, "{collections:?}");
+    // The session goes on, with no transaction left open.
+    write_script(&session, "db.notes.deleteOne({_id: 1})").unwrap();
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(2));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_preview_on_a_standalone_server_is_estimated() {
+    let Some(standalone) = standalone() else {
+        return;
+    };
+    let scratch = Scratch::new(standalone, "kuery_estimate");
+    let session = scratch.session();
+    assert_eq!(session.capabilities().preview, Preview::Estimated);
+    write_script(
+        &session,
+        "db.notes.insertMany([{_id: 1, a: 1}, {_id: 2, a: 2}, {_id: 3, a: 3}])",
+    )
+    .unwrap();
+    let impacts = previewed(
+        &session,
+        "db.notes.insertMany([{_id: 4}, {_id: 5}])
+db.notes.updateMany({a: {$gte: 2}}, {$set: {b: 1}})
+db.notes.updateOne({_id: 9}, {$set: {a: 9}}, {upsert: true})
+db.notes.deleteOne({a: {$gte: 1}})
+db.notes.find()
+db.notes.drop()",
+    );
+    let estimates: Vec<Estimate> = impacts
+        .iter()
+        .map(|impact| impact.estimate.clone())
+        .collect();
+    assert_eq!(
+        estimates,
+        [
+            Estimate::Estimated(Count::Exact(2)),
+            Estimate::Estimated(Count::Exact(2)),
+            Estimate::Estimated(Count::Exact(1)),
+            Estimate::Estimated(Count::Exact(1)),
+            Estimate::Reads,
+            Estimate::Unknown,
+        ]
+    );
+    assert_eq!(impacts[1].sample.len(), 2);
+    assert_eq!(impacts[3].sample.len(), 1);
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+    // Without transactions, a script stops at its first failure and keeps
+    // what ran before it.
+    let failed = write_script(
+        &session,
+        "db.notes.insertOne({_id: 4})\ndb.notes.insertOne({_id: 1})\ndb.notes.insertOne({_id: 5})",
+    );
+    assert!(failed.is_err());
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(4));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn counts_a_write_where_the_user_may_not_explain_it() {
+    // The read-only user, on a connection Kuery lets write: the server
+    // refuses the explain of a write, so the filter is counted instead.
+    let mut mongo = connect(&reader(), Access::ReadWrite).unwrap();
+    let mut sample = Vec::new();
+    let counted = DocumentAdapter::estimate(
+        &mut mongo,
+        r#"db.orders.deleteMany({status: "paid"})"#,
+        &mut sample,
+    )
+    .unwrap();
+    assert_eq!(counted, Some(Count::Exact(125)));
+    assert_eq!(sample.len(), 20);
+    // As root, the server explains it.
+    let mut root = connect(&target(), Access::ReadWrite).unwrap();
+    let explained = root.explain_write(
+        &command::build(
+            &one(r#"db.orders.updateMany({status: "paid"}, {$set: {status: "paid"}})"#).unwrap(),
+            "shop",
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(explained, Ok(Some(Count::Exact(125))));
+    let (count, _) = console(&mut root, r#"db.orders.countDocuments({status: "paid"})"#).unwrap();
+    assert_eq!(count_of(&count), 125);
+    // Estimating is a write's business: refused on a read-only connection.
+    let mut reading = connect(&target(), Access::ReadOnly).unwrap();
+    assert_eq!(
+        DocumentAdapter::estimate(&mut reading, "db.orders.deleteMany({})", &mut Vec::new()),
+        Err(QueryError::WritesDisabled)
+    );
+}
+
+/// What a run sent: the outcomes of the statements that ended, what a
+/// failed write run said it left, and how it ended.
+struct Ran {
+    outcomes: Vec<Outcome>,
+    left: Vec<Left>,
+    end: Result<DocSummary, QueryError>,
+}
+
+fn ran(events: async_channel::Receiver<DocEvent>) -> Ran {
+    futures::executor::block_on(async {
+        let mut ran = Ran {
+            outcomes: Vec::new(),
+            left: Vec::new(),
+            end: Err(QueryError::Cancelled),
+        };
+        while let Ok(event) = events.recv().await {
+            match event {
+                DocEvent::Outcome(outcome) => ran.outcomes.push(outcome),
+                DocEvent::Left(left) => ran.left.push(left),
+                DocEvent::Finished(summary) => {
+                    ran.end = Ok(summary);
+                    break;
+                }
+                DocEvent::Failed(error) => {
+                    ran.end = Err(error);
+                    break;
+                }
+                DocEvent::Documents(_) => {}
+            }
+        }
+        ran
+    })
+}
+
+fn write(session: &DocumentSession, text: &str, heavy: Heavy) -> async_channel::Receiver<DocEvent> {
+    session.run(text.into(), RunMode::Write, heavy, RunOptions::default())
+}
+
+/// A `failCommand` fail point on the dev replica set, turned off when it
+/// goes, even when the test fails.
+struct FailPoint;
+
+impl FailPoint {
+    fn set(data: &str) -> FailPoint {
+        FailPoint::configure(&format!("mode: {{times: 1}}, data: {data}"));
+        FailPoint
+    }
+
+    fn configure(how: &str) {
+        let mut admin = connect(&target(), Access::ReadWrite).unwrap();
+        let command = format!(r#"db.adminCommand({{configureFailPoint: "failCommand", {how}}})"#);
+        console(&mut admin, &command).unwrap_or_else(|error| panic!("{command}: {error}"));
+    }
+}
+
+impl Drop for FailPoint {
+    fn drop(&mut self) {
+        FailPoint::configure(r#"mode: "off""#);
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_commit_that_answers_late_is_kept_and_says_so() {
+    let scratch = Scratch::new(target(), "kuery_late_commit");
+    let session = scratch.session();
+    write_script(&session, "db.notes.insertOne({_id: 0})").unwrap();
+    // Past the 10 s a commit waits, inside the grace after them.
+    let blocked = FailPoint::set(
+        r#"{failCommands: ["commitTransaction"], blockConnection: true, blockTimeMS: 12000}"#,
+    );
+    let late = ran(write(
+        &session,
+        "db.notes.insertOne({_id: 1})\ndb.notes.insertOne({_id: 2})",
+        Heavy::Refuse,
+    ));
+    drop(blocked);
+    assert!(late.end.is_ok(), "{:?}", late.end);
+    assert!(late.left.is_empty(), "{:?}", late.left);
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_commit_without_a_known_result_is_unknown_not_undone() {
+    let scratch = Scratch::new(target(), "kuery_unknown_commit");
+    let session = scratch.session();
+    // The driver marks a commit out of time UnknownTransactionCommitResult.
+    let failing = FailPoint::set(r#"{failCommands: ["commitTransaction"], errorCode: 50}"#);
+    let unknown = ran(write(
+        &session,
+        "db.notes.insertOne({_id: 1})\ndb.notes.insertOne({_id: 2})",
+        Heavy::Refuse,
+    ));
+    drop(failing);
+    assert!(unknown.end.is_err(), "{:?}", unknown.end);
+    assert_eq!(unknown.left, [Left::Unknown]);
+    // The transaction the commit left open goes, so the scratch database
+    // can be dropped.
+    let mut admin = connect(&target(), Access::ReadWrite).unwrap();
+    console(&mut admin, "db.adminCommand({killAllSessions: []})").unwrap();
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_script_cannot_end_the_transaction_kuery_runs_it_in() {
+    let scratch = Scratch::new(target(), "kuery_inner_commit");
+    let session = scratch.session();
+    for script in [
+        "db.notes.insertOne({_id: 1})\ndb.adminCommand({commitTransaction: 1})\ndb.notes.insertOne({_id: 1})",
+        "db.notes.insertOne({_id: 2})\ndb.adminCommand({abortTransaction: 1})\ndb.notes.insertOne({_id: 3})",
+        "db.notes.insertOne({_id: 4})\ndb.adminCommand({endSessions: []})",
+    ] {
+        let refused = write_script(&session, script);
+        assert!(
+            matches!(&refused, Err(QueryError::Unsupported(message)) if message.starts_with("Kuery runs each script's transaction itself")),
+            "{script}: {refused:?}"
+        );
+        let previewed = futures::executor::block_on(session.preview(
+            script.into(),
+            Heavy::Refuse,
+            RunOptions::default(),
+        ));
+        assert!(previewed.is_err(), "{script}: {previewed:?}");
+    }
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(0));
+    // The adapter refuses them too while its transaction is open, whatever
+    // the session checked.
+    let mut mongo = connect(&scratch.target, Access::ReadWrite).unwrap();
+    console(&mut mongo, "use kuery_inner_commit").unwrap();
+    mongo.begin().unwrap();
+    console(&mut mongo, "db.notes.insertOne({_id: 5})").unwrap();
+    for command in ["commitTransaction", "abortTransaction", "killSessions"] {
+        let refused = console(&mut mongo, &format!("db.adminCommand({{{command}: 1}})"));
+        assert!(
+            matches!(&refused, Err(QueryError::Unsupported(_))),
+            "{command}: {refused:?}"
+        );
+    }
+    mongo.abort().unwrap();
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(0));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_one_statement_write_runs_in_a_transaction_as_its_preview_did() {
+    let scratch = Scratch::new(target(), "kuery_one_statement");
+    let session = scratch.session();
+    let script = "db.notes.insertMany([{_id: 1}, {_id: 2}, {_id: 1}, {_id: 3}])";
+    let statements = (LANGUAGE.analyze)(script).unwrap();
+    assert!(session.all_or_nothing(&statements));
+    let failed = ran(write(&session, script, Heavy::Refuse));
+    assert!(failed.end.is_err(), "{:?}", failed.end);
+    assert_eq!(failed.left, [Left::Undone]);
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(0));
+    // What no transaction holds runs on its own, and the run says so.
+    write_script(&session, "db.notes.insertOne({_id: 1})").unwrap();
+    let out = "db.notes.aggregate([{$match: {}}, {$out: 'copy'}])";
+    assert!(!session.all_or_nothing(&(LANGUAGE.analyze)(out).unwrap()));
+    write_script(&session, out).unwrap();
+    let copied = futures::executor::block_on(session.count(
+        CollectionRef::new(&[scratch.name, "copy"]),
+        None,
+        0,
+        Heavy::Refuse,
+    ));
+    assert_eq!(copied, Ok(Count::Exact(1)));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_cancelled_write_in_a_transaction_is_undone_even_when_it_ended() {
+    let scratch = Scratch::new(target(), "kuery_cancel_undone");
+    let session = scratch.session();
+    write_script(&session, "db.notes.insertOne({_id: 0})").unwrap();
+    let blocked =
+        FailPoint::set(r#"{failCommands: ["insert"], blockConnection: true, blockTimeMS: 2000}"#);
+    let events = write(&session, "db.notes.insertOne({_id: 1})", Heavy::Refuse);
+    std::thread::sleep(Duration::from_millis(500));
+    session.cancel();
+    let cancelled = ran(events);
+    drop(blocked);
+    assert_eq!(cancelled.end.err(), Some(QueryError::Cancelled));
+    assert_eq!(cancelled.left, [Left::Undone]);
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(1));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_failed_write_says_what_it_changed_before_it_failed() {
+    let Some(standalone) = standalone() else {
+        return;
+    };
+    let scratch = Scratch::new(standalone, "kuery_partial");
+    let session = scratch.session();
+    // Two go in before the duplicate fails, and nothing undoes them.
+    let partial = ran(write(
+        &session,
+        "db.notes.insertMany([{_id: 1}, {_id: 2}, {_id: 1}, {_id: 3}])",
+        Heavy::Refuse,
+    ));
+    assert!(
+        matches!(&partial.end, Err(QueryError::Database { code, .. }) if code == "11000"),
+        "{:?}",
+        partial.end
+    );
+    assert_eq!(
+        partial.left,
+        [Left::Kept {
+            partial: Some(Outcome {
+                inserted: 2,
+                ..Outcome::default()
+            })
+        }]
+    );
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(2));
+    // Stopped halfway, what it changed is unknown: never nothing.
+    let many: Vec<String> = (10..1010).map(|n| format!("{{_id: {n}}}")).collect();
+    write_script(
+        &session,
+        &format!("db.notes.insertMany([{}])", many.join(",")),
+    )
+    .unwrap();
+    let events = write(
+        &session,
+        r#"db.notes.updateMany({$where: "sleep(2) || true"}, {$set: {x: 1}})"#,
+        Heavy::Allow,
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    session.cancel();
+    let cancelled = ran(events);
+    assert_eq!(cancelled.end.err(), Some(QueryError::Cancelled));
+    assert_eq!(cancelled.left, [Left::Kept { partial: None }]);
+    let changed = futures::executor::block_on(session.count(
+        scratch.notes(),
+        Some("{x: 1}".into()),
+        0,
+        Heavy::Refuse,
+    ));
+    assert!(
+        matches!(changed, Ok(Count::Exact(n)) if n > 0),
+        "{changed:?}"
+    );
 }

@@ -27,7 +27,7 @@ use kuery_core::session::StatementImpact;
 use kuery_core::sql::Dialect;
 
 use crate::assets::AppIcon;
-use crate::connection::{Db, Environment, RedisDb, WriteKind, WritePolicy};
+use crate::connection::{Db, DocDb, Environment, RedisDb, WriteKind, WritePolicy};
 use crate::theme::{self, color};
 use crate::ui::thousands;
 
@@ -244,6 +244,29 @@ pub fn allow_redis_writes(
     };
     open_allow(subject, window, cx, allowed);
 }
+
+/// The same for a document connection: its consoles and collection tabs
+/// may write until it disconnects or the app quits.
+pub fn allow_document_writes(
+    db: DocDb,
+    window: &mut Window,
+    cx: &mut App,
+    allowed: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let subject = Subject {
+        name: db.name.clone(),
+        target: db.target.clone(),
+        scope: DOCUMENT_SCOPE,
+        allow: Rc::new(move || db.allow_writes()),
+    };
+    open_allow(subject, window, cx, allowed);
+}
+
+/// What allowing writes on a document connection allows.
+const DOCUMENT_SCOPE: Scope = Scope::NoTransactions {
+    tabs: "Consoles and collection tabs",
+    note: "Each script is applied as soon as it runs; there is no Roll Back.",
+};
 
 fn open_allow(
     subject: Subject,
@@ -996,6 +1019,13 @@ mod tests {
         );
         assert_eq!(confirmed, "Every change is confirmed before it runs");
         assert_eq!(button, "Allow Writes");
+        let (_, title, description, _, _) = allow_texts(&DOCUMENT_SCOPE, "prod", "h:27017/shop");
+        assert_eq!(title, "Allow writes on production?");
+        assert_eq!(
+            description,
+            "Consoles and collection tabs on prod (h:27017/shop) will be able to change data. \
+             Each script is applied as soon as it runs; there is no Roll Back."
+        );
         let (_, _, full, _, _) = allow_texts(&Scope::Postgres(WriteKind::Full), "prod", "h/db");
         assert_eq!(
             full,

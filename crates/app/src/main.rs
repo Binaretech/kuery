@@ -26,6 +26,7 @@ mod diagram_tab;
 mod document_console;
 mod document_detail;
 mod document_grid;
+mod document_write;
 mod drivers;
 mod explorer;
 mod file_jobs;

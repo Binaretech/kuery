@@ -5,8 +5,9 @@
 //! thread waits for its task. A cancel or a timeout does not drop it: the
 //! operation is stopped on the server (`killOp` on the operation carrying
 //! its comment tag) and its task is still awaited, for a grace period,
-//! until it ends with `Interrupted`. Only when the grace runs out is the
-//! task left to finish on its own, and the error says so.
+//! until it ends with `Interrupted`. One that ends well in that time
+//! succeeded, and says so. Only when the grace runs out is the task left
+//! to finish on its own, and the error says so.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -16,8 +17,8 @@ use std::time::Duration;
 use bson::{Document, doc};
 use kuery_core::session::QueryError;
 use mongodb::error::{ErrorKind, WriteFailure};
-use mongodb::{Client, Cursor};
-use tokio::sync::{Notify, mpsc};
+use mongodb::{Client, ClientSession, Cursor, SessionCursor};
+use tokio::sync::{Notify, OwnedMutexGuard, mpsc};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 
@@ -131,9 +132,16 @@ fn timed_out() -> QueryError {
     }
 }
 
+/// Whether an error says the operation ran out of time.
+pub(crate) fn out_of_time(error: &QueryError) -> bool {
+    matches!(error, QueryError::Database { code, .. } if code == "50")
+}
+
 /// Runs `op` on the runtime and waits for it from the session's thread.
 /// A stop or `timeout` kills the operation on the server by its tag and
-/// keeps waiting for the task (see [`GRACE`]) before leaving it.
+/// keeps waiting for the task (see [`GRACE`]) before leaving it: what it
+/// ends with is what it did, so one that ended well in that time is not
+/// reported as stopped.
 pub(crate) fn wait<T: Send + 'static>(
     client: &Client,
     tag: &Tag,
@@ -149,10 +157,33 @@ pub(crate) fn wait<T: Send + 'static>(
             () = stop.requested() => Stopped::Cancelled,
             () = elapse(timeout) => Stopped::TimedOut,
         };
-        Err(halt(client, tag, task, stopped).await)
+        halt(client, tag, task, stopped).await
     });
     stop.end();
     ended
+}
+
+/// A cursor being read: on its own, or in the session of the transaction
+/// that runs, held for as long as the cursor is read.
+pub(crate) enum Reading {
+    Alone(Cursor<Document>),
+    InSession(SessionCursor<Document>, OwnedMutexGuard<ClientSession>),
+}
+
+impl Reading {
+    async fn advance(&mut self) -> mongodb::error::Result<bool> {
+        match self {
+            Reading::Alone(cursor) => cursor.advance().await,
+            Reading::InSession(cursor, session) => cursor.advance(session).await,
+        }
+    }
+
+    fn current(&self) -> mongodb::error::Result<Document> {
+        match self {
+            Reading::Alone(cursor) => cursor.deserialize_current(),
+            Reading::InSession(cursor, _) => cursor.deserialize_current(),
+        }
+    }
 }
 
 /// What a cursor's reader says after each batch.
@@ -175,7 +206,7 @@ pub(crate) fn stream(
     stop: &Stop,
     timeout: Option<Duration>,
     flush: usize,
-    open: impl Future<Output = mongodb::error::Result<Cursor<Document>>> + Send + 'static,
+    open: impl Future<Output = mongodb::error::Result<Reading>> + Send + 'static,
     sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     stop.start();
@@ -190,7 +221,7 @@ fn stream_on(
     stop: &Stop,
     timeout: Option<Duration>,
     flush: usize,
-    open: impl Future<Output = mongodb::error::Result<Cursor<Document>>> + Send + 'static,
+    open: impl Future<Output = mongodb::error::Result<Reading>> + Send + 'static,
     sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     let (tx, mut rx) = mpsc::channel(1);
@@ -218,7 +249,7 @@ fn stream_on(
                     }
                     Err(error) => {
                         drop(rx);
-                        runtime().block_on(halt(client, tag, task, Stopped::Cancelled));
+                        let _ = runtime().block_on(halt(client, tag, task, Stopped::Cancelled));
                         return Err(error);
                     }
                 }
@@ -229,9 +260,12 @@ fn stream_on(
                     .block_on(async { joined_result((&mut task).await) })
                     .map(|_| given);
             }
+            // The read stopped before the cursor's end, however its task
+            // ended.
             Err(stopped) => {
                 drop(rx);
-                return Err(runtime().block_on(halt(client, tag, task, stopped)));
+                let halted = runtime().block_on(halt(client, tag, task, stopped));
+                return Err(halted.err().unwrap_or_else(|| stopped.error()));
             }
         }
     }
@@ -241,7 +275,7 @@ fn stream_on(
 /// or sooner when the next read keeps them waiting. The read in flight is
 /// never dropped: a reader that went away is noticed after it.
 async fn read(
-    open: impl Future<Output = mongodb::error::Result<Cursor<Document>>> + Send,
+    open: impl Future<Output = mongodb::error::Result<Reading>> + Send,
     flush: usize,
     tx: mpsc::Sender<Vec<Document>>,
 ) -> mongodb::error::Result<u64> {
@@ -268,7 +302,7 @@ async fn read(
         if !more {
             break;
         }
-        pending.push(cursor.deserialize_current()?);
+        pending.push(cursor.current()?);
         read += 1;
         if pending.len() >= flush && tx.send(std::mem::take(&mut pending)).await.is_err() {
             return Ok(read);
@@ -288,20 +322,21 @@ async fn close(client: &Client, tag: &Tag, mut task: JoinHandle<mongodb::error::
     tokio::select! {
         _ = &mut task => {}
         () = tokio::time::sleep(KILL_AGAIN) => {
-            halt(client, tag, task, Stopped::Cancelled).await;
+            let _ = halt(client, tag, task, Stopped::Cancelled).await;
         }
     }
 }
 
 /// Stops an operation whose wait ended early: kills it on the server, and
 /// again every [`KILL_AGAIN`] until its task ends, for the grace period at
-/// most, however long the server takes to answer. What the caller reports.
+/// most, however long the server takes to answer. What it ended with (see
+/// [`ended`]).
 async fn halt<T: Send + 'static>(
     client: &Client,
     tag: &Tag,
     mut task: JoinHandle<mongodb::error::Result<T>>,
     stopped: Stopped,
-) -> QueryError {
+) -> Result<T, QueryError> {
     let deadline = Instant::now() + GRACE;
     loop {
         let again = Instant::now() + KILL_AGAIN;
@@ -315,19 +350,23 @@ async fn halt<T: Send + 'static>(
             // Dropping the handles leaves the tasks running: neither is
             // dropped.
             () = tokio::time::sleep_until(deadline) => {
-                return QueryError::Unsupported(DETACHED.into());
+                return Err(QueryError::Unsupported(DETACHED.into()));
             }
         }
     }
 }
 
-/// What a stopped operation reports once its task ended: the stop, when
-/// the server interrupted it or it finished anyway; its own error
-/// otherwise, such as a connection that broke.
-fn ended<T>(joined: Result<mongodb::error::Result<T>, JoinError>, stopped: Stopped) -> QueryError {
+/// What a stopped operation reports once its task ended: what it did, when
+/// it finished anyway (a write that ended is kept); the stop, when the
+/// server interrupted it; its own error otherwise, such as a connection
+/// that broke.
+fn ended<T>(
+    joined: Result<mongodb::error::Result<T>, JoinError>,
+    stopped: Stopped,
+) -> Result<T, QueryError> {
     match joined_result(joined) {
-        Ok(_) | Err(QueryError::Cancelled) => stopped.error(),
-        Err(error) => error,
+        Err(QueryError::Cancelled) => Err(stopped.error()),
+        ended => ended,
     }
 }
 
@@ -496,15 +535,16 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_operation_reports_the_stop_or_its_own_failure() {
+    fn a_stopped_operation_reports_what_it_did_the_stop_or_its_own_failure() {
         let interrupted = || Ok(Err::<(), _>(server(11601, "operation was interrupted")));
         assert_eq!(
             ended(interrupted(), Stopped::Cancelled),
-            QueryError::Cancelled
+            Err(QueryError::Cancelled)
         );
-        assert_eq!(ended(interrupted(), Stopped::TimedOut), timed_out());
-        // It finished just as it was stopped.
-        assert_eq!(ended(Ok(Ok(())), Stopped::Cancelled), QueryError::Cancelled);
+        assert_eq!(ended(interrupted(), Stopped::TimedOut), Err(timed_out()));
+        // It finished as it was stopped, or once out of time: it did.
+        assert_eq!(ended(Ok(Ok(7)), Stopped::Cancelled), Ok(7));
+        assert_eq!(ended(Ok(Ok(7)), Stopped::TimedOut), Ok(7));
         // Nothing was killed: the connection broke under it.
         let broken = Error::from(ErrorKind::Io(std::sync::Arc::new(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
@@ -512,7 +552,7 @@ mod tests {
         ))));
         assert_eq!(
             ended(Ok(Err::<(), _>(broken)), Stopped::Cancelled),
-            QueryError::Connection("connection reset".into())
+            Err(QueryError::Connection("connection reset".into()))
         );
     }
 

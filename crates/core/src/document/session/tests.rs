@@ -7,9 +7,13 @@
 //! anywhere is a parse error. `read slow` runs until cancelled and then
 //! ends as if nothing happened, `read interrupted` runs until cancelled and
 //! fails as cancelled, `read endless` streams until the reader goes away,
-//! `read panic` and `write panic` panic, and `write fail` fails. The fake
-//! holds documents with keys 1 to 3: changes to other keys find nothing,
-//! and an insert of `{_id: 0}` inserts nothing.
+//! `read panic` and `write panic` panic, and `write fail` fails. `write
+//! partial` changes two documents and then fails, saying so; `write cut`
+//! fails as a lost connection, without saying what it changed; after
+//! `write lost`, the commit does not say whether it applied. Entering a
+//! container runs `enter <name>`. The fake holds documents with keys 1 to
+//! 3: changes to other keys find nothing, and an insert of `{_id: 0}`
+//! inserts nothing.
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -103,20 +107,21 @@ static FAKE: Language = Language {
     render,
     field_filter: |_, _| None,
     context: |_, _| CompletionContext::Nothing,
-    enter: |_| None,
+    enter: |path| path.first().map(|name| format!("enter {name}")),
     collection_ref: |name| name.to_string(),
     key: |name| name.to_string(),
+    key_name: "_id",
     methods: &[],
     operators: &[],
     stages: &[],
 };
 
-fn capabilities(transactions: Transactions) -> Capabilities {
+fn capabilities(transactions: Transactions, preview: Preview) -> Capabilities {
     Capabilities {
         levels: &["Database", "Collection"],
         transactions,
         read_only: Enforcement::ClientOnly("it is a fake"),
-        preview: Preview::None,
+        preview,
         explain: None,
         activity: false,
         kill: false,
@@ -133,6 +138,9 @@ struct FakeDocs {
     log: Log,
     stop: Arc<AtomicBool>,
     transactions: Transactions,
+    preview: Preview,
+    /// The commit will not say whether it applied.
+    lost: bool,
 }
 
 fn numbered(range: std::ops::Range<usize>) -> Vec<Document> {
@@ -163,7 +171,7 @@ impl DocumentAdapter for FakeDocs {
     }
 
     fn capabilities(&self) -> Capabilities {
-        capabilities(self.transactions)
+        capabilities(self.transactions, self.preview)
     }
 
     fn notice(&self) -> Option<String> {
@@ -199,6 +207,21 @@ impl DocumentAdapter for FakeDocs {
                 code: "11000".into(),
                 message: "failed on purpose".into(),
             }),
+            ["write", "partial"] => {
+                sink.changed(Outcome {
+                    inserted: 2,
+                    ..Outcome::default()
+                });
+                Err(QueryError::Database {
+                    code: "11000".into(),
+                    message: "failed halfway".into(),
+                })
+            }
+            ["write", "cut"] => Err(QueryError::Connection("cut off".into())),
+            ["write", "lost"] => {
+                self.lost = true;
+                Ok(Outcome::default())
+            }
             ["read", "slow"] => {
                 self.until_stopped();
                 sink.documents(numbered(0..1))?;
@@ -244,14 +267,42 @@ impl DocumentAdapter for FakeDocs {
         }
     }
 
+    /// `write N` touches N documents, `write fail` cannot be counted, and
+    /// nothing else can be told.
+    fn estimate(
+        &mut self,
+        statement: &str,
+        sample: &mut dyn DocumentSink,
+    ) -> Result<Option<Count>, QueryError> {
+        self.log.push(format!("estimate {statement}"));
+        match statement.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["write", "fail"] => Err(QueryError::Database {
+                code: "13".into(),
+                message: "not allowed to count".into(),
+            }),
+            ["write", n] => {
+                let n: usize = n.parse().unwrap_or(0);
+                // More than a preview keeps.
+                sink_all(sample, numbered(0..n * 10))?;
+                Ok(Some(Count::Exact(n as u64)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn begin(&mut self) -> Result<(), QueryError> {
         self.log.push("begin");
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), QueryError> {
+    fn commit(&mut self) -> Result<(), CommitError> {
         self.log.push("commit");
-        Ok(())
+        match std::mem::take(&mut self.lost) {
+            true => Err(CommitError::Unknown(QueryError::Connection(
+                "no answer".into(),
+            ))),
+            false => Ok(()),
+        }
     }
 
     fn abort(&mut self) -> Result<(), QueryError> {
@@ -341,7 +392,30 @@ impl DocumentAdapter for FakeDocs {
     }
 }
 
+/// Gives a sink documents in small chunks, until it holds all it takes.
+fn sink_all(sink: &mut dyn DocumentSink, documents: Vec<Document>) -> Result<(), QueryError> {
+    for chunk in documents.chunks(5) {
+        if sink.full() {
+            break;
+        }
+        sink.documents(chunk.to_vec())?;
+    }
+    Ok(())
+}
+
 fn open_with(transactions: Transactions, access: Access) -> (DocumentSession, Log) {
+    let preview = match transactions {
+        Transactions::Multi { .. } => Preview::Undone,
+        Transactions::None => Preview::Estimated,
+    };
+    open_previewing(transactions, preview, access)
+}
+
+fn open_previewing(
+    transactions: Transactions,
+    preview: Preview,
+    access: Access,
+) -> (DocumentSession, Log) {
     let log = Log::default();
     let opener_log = log.clone();
     let opener: DocumentOpener = Arc::new(move |_| {
@@ -349,6 +423,8 @@ fn open_with(transactions: Transactions, access: Access) -> (DocumentSession, Lo
             log: opener_log.clone(),
             stop: Arc::new(AtomicBool::new(false)),
             transactions,
+            preview,
+            lost: false,
         }))
     });
     (
@@ -366,6 +442,8 @@ fn open(access: Access) -> (DocumentSession, Log) {
 struct Drained {
     batches: Vec<usize>,
     outcomes: Vec<Outcome>,
+    /// What a write run that failed said it left.
+    left: Vec<Left>,
     end: Result<DocSummary, QueryError>,
 }
 
@@ -374,12 +452,14 @@ fn drain(rx: async_channel::Receiver<DocEvent>) -> Drained {
         let mut drained = Drained {
             batches: Vec::new(),
             outcomes: Vec::new(),
+            left: Vec::new(),
             end: Err(QueryError::Cancelled),
         };
         while let Ok(event) = rx.recv().await {
             match event {
                 DocEvent::Documents(batch) => drained.batches.push(batch.len()),
                 DocEvent::Outcome(outcome) => drained.outcomes.push(outcome),
+                DocEvent::Left(left) => drained.left.push(left),
                 DocEvent::Finished(summary) => {
                     drained.end = Ok(summary);
                     break;
@@ -667,12 +747,20 @@ fn a_write_script_runs_in_one_transaction_where_there_are_transactions() {
 
     let failed = run(&session, "write 1; write fail", RunMode::Write);
     assert!(matches!(failed.end, Err(QueryError::Database { .. })));
+    assert_eq!(failed.left, [Left::Undone]);
     assert_eq!(log.take(), ["begin", "write 1", "write fail", "abort"]);
 
-    // A single statement needs no transaction, and reads take none.
+    // A single statement that changes documents takes one too, as its
+    // preview did; a lone schema change and reads take none.
     run(&session, "write 1", RunMode::Write).end.unwrap();
+    assert_eq!(log.take(), ["begin", "write 1", "commit"]);
+    let partial = run(&session, "write partial", RunMode::Write);
+    assert_eq!(partial.left, [Left::Undone]);
+    run(&session, "ddl x", RunMode::Write).end.unwrap();
     run(&session, "read 1; read 2", RunMode::Read).end.unwrap();
-    assert_eq!(log.take(), ["write 1", "read 1", "read 2"]);
+    let logged = log.take();
+    assert_eq!(logged[..3], ["begin", "write partial", "abort"]);
+    assert_eq!(logged[3..], ["ddl x", "read 1", "read 2"]);
 
     // Cancelled halfway: undone.
     let rx = session.run(
@@ -714,7 +802,101 @@ fn a_write_script_stops_at_the_first_failure_without_transactions() {
     let cancelled = drain(rx);
     assert!(matches!(cancelled.end, Err(QueryError::Cancelled)));
     assert_eq!(cancelled.outcomes.len(), 2);
+    // It stopped between statements: the one it stopped in changed nothing.
+    assert_eq!(cancelled.left, [Left::NOTHING]);
     assert_eq!(log.take(), ["write 1", "read slow", "cancel"]);
+}
+
+#[test]
+fn a_write_run_that_fails_says_what_it_left() {
+    let (session, _) = open(Access::ReadWrite);
+    let inserted = Outcome {
+        inserted: 2,
+        ..Outcome::default()
+    };
+    // What the statement that failed changed, as the engine told.
+    let partial = run(&session, "write 1; write partial", RunMode::Write);
+    assert_eq!(partial.outcomes.len(), 1);
+    assert_eq!(
+        partial.left,
+        [Left::Kept {
+            partial: Some(inserted)
+        }]
+    );
+    // Unknown when the engine did not tell, never nothing.
+    for failed in ["write 1; write cut", "write fail"] {
+        let failed = run(&session, failed, RunMode::Write);
+        assert_eq!(failed.left, [Left::Kept { partial: None }]);
+    }
+    // A script refused before it ran changed nothing.
+    let refused = run(&session, "write 1; write !", RunMode::Write);
+    assert_eq!(refused.left, [Left::NOTHING]);
+    // A run that ends well, or a read run, says nothing of it.
+    assert!(run(&session, "write 1", RunMode::Write).left.is_empty());
+    let read = run(&session, "read 1; frobnicate", RunMode::Read);
+    assert!(read.end.is_err() && read.left.is_empty());
+
+    // In a transaction: undone, or unknown when the commit does not answer.
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let partial = run(&session, "write 1; write partial", RunMode::Write);
+    assert_eq!(partial.left, [Left::Undone]);
+    log.take();
+    let lost = run(&session, "write 1; write lost", RunMode::Write);
+    assert_eq!(lost.left, [Left::Unknown]);
+    assert_eq!(lost.end, Err(QueryError::Connection("no answer".into())));
+    assert_eq!(
+        log.take(),
+        ["begin", "write 1", "write lost", "commit", "abort"]
+    );
+}
+
+#[test]
+fn a_run_enters_where_it_starts_in_the_same_job() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let start = ["sales".to_string()];
+    drain(session.run_in(
+        &start,
+        "read 1".into(),
+        RunMode::Read,
+        Heavy::Refuse,
+        RunOptions::default(),
+    ))
+    .end
+    .unwrap();
+    assert_eq!(log.take(), ["enter sales", "read 1"]);
+    block_on(session.preview_in(
+        &start,
+        "write 1".into(),
+        Heavy::Refuse,
+        RunOptions::default(),
+    ))
+    .unwrap();
+    assert_eq!(log.take(), ["enter sales", "begin", "write 1", "abort"]);
+    // Without a start, where the last run left off.
+    run(&session, "read 1", RunMode::Read).end.unwrap();
+    assert_eq!(log.take(), ["read 1"]);
+}
+
+#[test]
+fn says_which_write_runs_are_all_or_nothing() {
+    let statements = |text: &str| analyze(text).unwrap();
+    let (multi, _) = open_with(MULTI, Access::ReadWrite);
+    assert!(multi.all_or_nothing(&statements("write 1")));
+    assert!(multi.all_or_nothing(&statements("read 1; write 1")));
+    assert!(!multi.all_or_nothing(&statements("ddl x")));
+    let (standalone, _) = open(Access::ReadWrite);
+    assert!(!standalone.all_or_nothing(&statements("write 1; write 2")));
+    // Checked without reading the script again.
+    assert_eq!(
+        multi.check_statements(&statements("begin"), RunMode::Write, Heavy::Refuse),
+        Err(QueryError::Unsupported(
+            "Kuery runs each script's transaction itself, so begin cannot run here".into()
+        ))
+    );
+    assert!(matches!(
+        standalone.check_statements(&statements("write 1"), RunMode::Read, Heavy::Refuse),
+        Err(QueryError::Rejected(Rejection::Statement(_)))
+    ));
 }
 
 #[test]
@@ -915,4 +1097,168 @@ fn reopens_another_session_alike() {
     assert_eq!(other.capabilities().transactions, MULTI);
     let refused = run(&other, "write 1", RunMode::Write).end;
     assert!(matches!(refused, Err(QueryError::WritesDisabled)));
+}
+
+fn preview(session: &DocumentSession, text: &str) -> Result<Vec<Impact>, QueryError> {
+    block_on(session.preview(text.into(), Heavy::Refuse, RunOptions::default()))
+}
+
+fn estimates(impacts: &[Impact]) -> Vec<Estimate> {
+    impacts
+        .iter()
+        .map(|impact| impact.estimate.clone())
+        .collect()
+}
+
+fn changed(n: u64) -> Estimate {
+    Estimate::Exact(Outcome {
+        matched: n,
+        modified: n,
+        ..Outcome::default()
+    })
+}
+
+#[test]
+fn a_preview_runs_the_script_in_a_transaction_it_always_undoes() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let impacts = preview(&session, "write 2; read 30; write 3").unwrap();
+    assert_eq!(
+        estimates(&impacts),
+        [changed(2), Estimate::Reads, changed(3)]
+    );
+    assert_eq!(impacts[0].summary, "write 2");
+    // What a statement returned, up to what a preview keeps.
+    assert_eq!(impacts[1].sample.len(), PREVIEW_SAMPLE);
+    assert!(impacts.iter().all(|impact| impact.note.is_none()));
+    assert_eq!(
+        log.take(),
+        ["begin", "write 2", "read 30", "write 3", "abort"]
+    );
+    // One statement too, which a run would not put in a transaction.
+    preview(&session, "write 1").unwrap();
+    assert_eq!(log.take(), ["begin", "write 1", "abort"]);
+}
+
+#[test]
+fn a_statement_that_fails_in_the_preview_is_counted_with_the_ones_after_it() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let impacts = preview(&session, "write 1; write fail; write 2").unwrap();
+    assert_eq!(
+        estimates(&impacts),
+        [
+            changed(1),
+            Estimate::Unknown,
+            Estimate::Estimated(Count::Exact(2))
+        ]
+    );
+    let note = impacts[1].note.as_deref().unwrap();
+    assert!(
+        note.contains("failed on purpose") && note.contains("not allowed to count"),
+        "{note}"
+    );
+    assert_eq!(impacts[2].sample.len(), PREVIEW_SAMPLE);
+    assert_eq!(
+        log.take(),
+        [
+            "begin",
+            "write 1",
+            "write fail",
+            "abort",
+            "estimate write fail",
+            "estimate write 2"
+        ]
+    );
+    // A schema change never runs in the transaction: it is counted, here
+    // not at all.
+    let impacts = preview(&session, "ddl x").unwrap();
+    assert_eq!(estimates(&impacts), [Estimate::Unknown]);
+    assert_eq!(log.take(), ["estimate ddl x"]);
+}
+
+#[test]
+fn a_preview_never_leaves_its_transaction_open() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let cancel_soon = || {
+        let canceller = session.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            canceller.cancel();
+        })
+    };
+    // A statement the engine reports as cancelled.
+    let cancelling = cancel_soon();
+    let interrupted = preview(&session, "write 1; read interrupted");
+    assert_eq!(interrupted, Err(QueryError::Cancelled));
+    let logged = log.take();
+    cancelling.join().unwrap();
+    assert_eq!(logged.first().map(String::as_str), Some("begin"));
+    assert_eq!(logged.last().map(String::as_str), Some("abort"));
+    // One that ends as if nothing happened once cancelled: the preview
+    // still stops, undone.
+    let cancelling = cancel_soon();
+    let slow = preview(&session, "read slow; write 1");
+    cancelling.join().unwrap();
+    assert_eq!(slow, Err(QueryError::Cancelled));
+    let logged = log.take();
+    assert!(!logged.iter().any(|entry| entry == "write 1"), "{logged:?}");
+    assert_eq!(logged.last().map(String::as_str), Some("abort"));
+    // The session goes on, with no transaction left behind.
+    preview(&session, "write 1").unwrap();
+    assert_eq!(log.take(), ["begin", "write 1", "abort"]);
+}
+
+#[test]
+fn without_transactions_a_preview_counts_and_runs_nothing() {
+    let (session, log) = open(Access::ReadWrite);
+    let impacts = preview(&session, "read 5; write 4; ddl x").unwrap();
+    assert_eq!(
+        estimates(&impacts),
+        [
+            Estimate::Reads,
+            Estimate::Estimated(Count::Exact(4)),
+            Estimate::Unknown
+        ]
+    );
+    assert_eq!(impacts[1].sample.len(), PREVIEW_SAMPLE);
+    assert!(impacts[0].sample.is_empty());
+    assert_eq!(log.take(), ["estimate write 4", "estimate ddl x"]);
+}
+
+#[test]
+fn an_engine_that_cannot_preview_says_unknown() {
+    let (session, log) = open_previewing(Transactions::None, Preview::None, Access::ReadWrite);
+    let impacts = preview(&session, "read 1; write 4").unwrap();
+    assert_eq!(estimates(&impacts), [Estimate::Reads, Estimate::Unknown]);
+    assert!(log.take().is_empty());
+}
+
+#[test]
+fn a_preview_is_checked_like_a_write_run() {
+    let (reader, log) = open(Access::ReadOnly);
+    assert_eq!(preview(&reader, "write 1"), Err(QueryError::WritesDisabled));
+    let (session, _) = open_with(MULTI, Access::ReadWrite);
+    assert!(matches!(
+        preview(&session, "heavy; write 1"),
+        Err(QueryError::Rejected(Rejection::Heavy(_)))
+    ));
+    assert!(matches!(
+        preview(&session, "write 1; ddl x"),
+        Err(QueryError::Unsupported(_))
+    ));
+    assert!(log.take().is_empty());
+    // What check reads, without running anything.
+    let statements = session
+        .check("read 1; write 2", RunMode::Write, Heavy::Refuse)
+        .unwrap();
+    assert_eq!(
+        statements
+            .iter()
+            .map(|statement| statement.info.kind)
+            .collect::<Vec<_>>(),
+        [StatementKind::Read, StatementKind::Data]
+    );
+    assert_eq!(
+        session.check("write 1", RunMode::Read, Heavy::Refuse),
+        Err(QueryError::Rejected(Rejection::Statement("write 1".into())))
+    );
 }

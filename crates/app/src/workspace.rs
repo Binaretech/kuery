@@ -1863,20 +1863,7 @@ impl WorkspaceView {
             }
             Some(Tab::RedisConsole(console)) => {
                 let tab = console.read(cx);
-                let writing = tab.is_writing();
-                left = left.child(
-                    h_flex()
-                        .gap(px(5.))
-                        .child(
-                            Icon::new(if writing {
-                                AppIcon::Pencil
-                            } else {
-                                AppIcon::Lock
-                            })
-                            .size(px(11.)),
-                        )
-                        .child(if writing { "Write" } else { "Read-only" }),
-                );
+                left = left.child(mode_item(tab.is_writing()));
                 if tab.db().environment == Environment::Production && tab.db().allows_writes() {
                     let console = console.clone();
                     left = left.child(
@@ -1950,12 +1937,20 @@ impl WorkspaceView {
             }
             Some(Tab::DocumentConsole(console)) => {
                 let tab = console.read(cx);
-                left = left.child(
-                    h_flex()
-                        .gap(px(5.))
-                        .child(Icon::new(AppIcon::Lock).size(px(11.)))
-                        .child("Read-only"),
-                );
+                left = left.child(mode_item(tab.is_writing()));
+                if tab.db().environment == Environment::Production && tab.db().allows_writes() {
+                    let console = console.clone();
+                    left = left.child(
+                        div()
+                            .id("stop-allowing-document-writes")
+                            .text_color(color(0xc7c7cc))
+                            .hover(|s| s.text_color(color(theme::TEXT)))
+                            .child("Stop allowing writes")
+                            .on_click(move |_, _, cx| {
+                                console.update(cx, |console, cx| console.stop_allowing_writes(cx))
+                            }),
+                    );
+                }
                 right = h_flex()
                     .gap_4()
                     .flex_shrink_0()
@@ -2300,6 +2295,22 @@ fn notice_item(connection: &ConnMeta) -> Option<gpui_kit::Div> {
         .map(|notice| div().text_color(color(theme::AMBER)).child(notice))
 }
 
+/// A console's mode, for the status bar: whether it writes.
+fn mode_item(writing: bool) -> gpui_kit::Div {
+    let (icon, label) = mode_label(writing);
+    h_flex()
+        .gap(px(5.))
+        .child(Icon::new(icon).size(px(11.)))
+        .child(label)
+}
+
+fn mode_label(writing: bool) -> (AppIcon, &'static str) {
+    match writing {
+        true => (AppIcon::Pencil, "Write"),
+        false => (AppIcon::Lock, "Read-only"),
+    }
+}
+
 fn recent_projects_except(root: &std::path::Path) -> Vec<RecentProject> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     recent::available()
@@ -2501,6 +2512,12 @@ mod tests {
         assert!(cx.has_pending_prompt());
         cx.simulate_prompt_answer("Save");
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn the_status_bar_says_whether_a_console_writes() {
+        assert_eq!(mode_label(true).1, "Write");
+        assert_eq!(mode_label(false).1, "Read-only");
     }
 
     #[gpui::test]

@@ -35,6 +35,14 @@ pub trait DocumentSink {
     fn full(&self) -> bool {
         false
     }
+
+    /// What the statement that runs changed before it failed, when the
+    /// engine said so: an adapter tells it just before it returns the
+    /// statement's error. Without it, what a failed write changed is
+    /// unknown.
+    fn changed(&mut self, outcome: Outcome) {
+        let _ = outcome;
+    }
 }
 
 /// Collects documents, for an adapter's own reads and for samples.
@@ -70,6 +78,25 @@ impl Outcome {
         self.deleted += other.deleted;
         self.upserted += other.upserted;
         self.returned += other.returned;
+    }
+}
+
+/// Why a transaction did not commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitError {
+    /// It was not applied: nothing of it was kept.
+    Undone(QueryError),
+    /// The engine did not say whether it was applied, as when the commit
+    /// ran out of time or its connection broke.
+    Unknown(QueryError),
+}
+
+impl CommitError {
+    /// The error, whatever the commit left.
+    pub fn error(self) -> QueryError {
+        match self {
+            CommitError::Undone(error) | CommitError::Unknown(error) => error,
+        }
     }
 }
 
@@ -120,8 +147,9 @@ pub trait DocumentAdapter: Send + 'static {
         unsupported("transactions")
     }
 
-    fn commit(&mut self) -> Result<(), QueryError> {
-        unsupported("transactions")
+    /// Ends the transaction, applying it; it is gone either way.
+    fn commit(&mut self) -> Result<(), CommitError> {
+        unsupported("transactions").map_err(CommitError::Undone)
     }
 
     fn abort(&mut self) -> Result<(), QueryError> {
@@ -170,10 +198,16 @@ pub trait DocumentAdapter: Send + 'static {
         change: &DocChange,
     ) -> Result<Outcome, QueryError>;
 
-    /// How many documents a write would touch, without running it, when
-    /// the engine can tell.
-    fn estimate(&mut self, statement: &str) -> Result<Option<Count>, QueryError> {
-        let _ = statement;
+    /// How many documents a write would touch, without running it and
+    /// without changing anything, when the engine can tell; the first of
+    /// them go to `sample`, which says when it holds enough. `None` when
+    /// the engine cannot count what the statement touches.
+    fn estimate(
+        &mut self,
+        statement: &str,
+        sample: &mut dyn DocumentSink,
+    ) -> Result<Option<Count>, QueryError> {
+        let _ = (statement, sample);
         Ok(None)
     }
 

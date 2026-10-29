@@ -534,7 +534,7 @@ impl CollectionTab {
                             return;
                         }
                     }
-                    DocEvent::Outcome(_) => {}
+                    DocEvent::Outcome(_) | DocEvent::Left(_) => {}
                     DocEvent::Finished(summary) => {
                         this.update(cx, |this, cx| this.page_loaded(summary, cx))
                             .ok();
@@ -746,7 +746,7 @@ impl CollectionTab {
                         this.update(cx, |this, cx| this.export_progress(written, cx))
                             .ok();
                     }
-                    Ok(DocEvent::Outcome(_)) => {}
+                    Ok(DocEvent::Outcome(_) | DocEvent::Left(_)) => {}
                     Ok(DocEvent::Finished(_)) => {
                         break cx
                             .background_spawn(async move { writer.finish() })

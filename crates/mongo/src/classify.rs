@@ -60,6 +60,18 @@ const SCHEMA_COMMANDS: &[&str] = &[
     "convertToCapped",
 ];
 
+/// Commands that end a transaction or a session: Kuery runs each script's
+/// transaction itself.
+pub(crate) const TRANSACTION_COMMANDS: &[&str] = &[
+    "commitTransaction",
+    "abortTransaction",
+    "startTransaction",
+    "endSessions",
+    "killSessions",
+    "killAllSessions",
+    "killAllSessionsByPattern",
+];
+
 /// Commands that change who may do what.
 const USER_COMMANDS: &[&str] = &[
     "createUser",
@@ -116,6 +128,8 @@ pub fn classify(op: &Op) -> OpInfo {
                 StatementKind::Data
             } else if SCHEMA_COMMANDS.contains(&name) {
                 StatementKind::Schema
+            } else if TRANSACTION_COMMANDS.contains(&name) {
+                StatementKind::Transaction
             } else {
                 StatementKind::Other
             };
@@ -165,7 +179,9 @@ fn collection(
         | Distinct
         | GetIndexes
         | Stats => StatementKind::Read,
-        Aggregate if args.iter().any(writes) => StatementKind::Data,
+        // `$out` and `$merge` fill or replace a whole collection, which no
+        // transaction can hold: like a schema change, they run on their own.
+        Aggregate if args.iter().any(writes) => StatementKind::Schema,
         Aggregate => StatementKind::Read,
         InsertOne | InsertMany | UpdateOne | UpdateMany | ReplaceOne | DeleteOne | DeleteMany
         | FindOneAndUpdate | FindOneAndReplace | FindOneAndDelete | BulkWrite => {
@@ -214,6 +230,12 @@ fn collection(
         _ => {}
     }
     let explained = chain.iter().any(|(cursor, _)| *cursor == Cursor::Explain);
+    // Explaining a write runs nothing, but Kuery still counts it as one;
+    // it cannot run in a transaction either.
+    let kind = match (explained, kind) {
+        (true, StatementKind::Data | StatementKind::Schema) => StatementKind::Other,
+        (_, kind) => kind,
+    };
     let summary = match explained {
         true => format!("explain {} {name}", method.name()),
         false => format!("{} {name}", method.name()),
