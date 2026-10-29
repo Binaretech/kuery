@@ -34,7 +34,7 @@ use crate::completion::RedisCompletions;
 use crate::connection::{Environment, RedisDb};
 use crate::context_menus::item;
 use crate::query_tab::{RunAll, RunQuery};
-use crate::redis_write::{self, Planned};
+use crate::redis_write::{self, Command};
 use crate::results::ResultsDelegate;
 use crate::theme::{self, color};
 use crate::ui::format_duration;
@@ -242,7 +242,7 @@ impl ConsoleTab {
                         self.push_output(line, reason.clone(), true, None);
                         refused = Some(reason);
                     }
-                    None => planned.push(Planned::new(args)),
+                    None => planned.push(Command::new(args)),
                 },
                 Err(error) => {
                     self.push_output(line, error.clone(), true, None);
@@ -258,7 +258,7 @@ impl ConsoleTab {
             cx.notify();
             return;
         }
-        if planned.iter().any(|command| command.writes) {
+        if planned.iter().any(|command| command.planned.writes) {
             let this = cx.entity().downgrade();
             let commands = planned.clone();
             redis_write::approve(
@@ -279,7 +279,7 @@ impl ConsoleTab {
 
     /// Runs the commands one after another; a failed one is logged and the
     /// rest still run. Writes go to the audit log.
-    fn execute(&mut self, commands: Vec<Planned>, cx: &mut Context<Self>) {
+    fn execute(&mut self, commands: Vec<Command>, cx: &mut Context<Self>) {
         if self.task.is_some() {
             return;
         }
@@ -587,25 +587,25 @@ fn refusal(args: &[String], development: bool, writing: bool) -> Option<String> 
 fn log(
     this: &gpui_kit::WeakEntity<ConsoleTab>,
     cx: &mut gpui_kit::AsyncApp,
-    command: &Planned,
+    command: &Command,
     text: String,
     failed: bool,
     elapsed: Option<Duration>,
 ) {
     this.update(cx, |this, cx| {
-        if command.writes {
+        if command.planned.writes {
             let outcome = text.lines().next().unwrap_or_default().to_string();
             redis_write::audit(
                 &this.db,
                 &this.project,
                 this.database,
-                &command.line,
+                &command.planned.line,
                 outcome,
                 failed,
                 cx,
             );
         }
-        this.push_output(&command.line, text, failed, elapsed);
+        this.push_output(&command.planned.line, text, failed, elapsed);
         cx.notify();
     })
     .ok();

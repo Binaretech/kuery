@@ -31,7 +31,7 @@ use crate::commands::{
     OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, ShowServerActivity,
     ToggleSidebar,
 };
-use crate::connection::{Db, Environment, RedisDb, WriteKind};
+use crate::connection::{ConnMeta, Db, Environment, RedisDb, WriteKind, status_tone};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
@@ -76,17 +76,17 @@ impl Tab {
         }
     }
 
-    /// The Redis connection of a Redis tab.
-    fn redis(&self, cx: &App) -> Option<RedisDb> {
+    /// What the chrome shows about the tab's connection, whichever its
+    /// family. File tabs have none.
+    fn connection(&self, cx: &App) -> Option<ConnMeta> {
         match self {
-            Tab::RedisKey(key) => Some(key.read(cx).db().clone()),
-            Tab::RedisConsole(console) => Some(console.read(cx).db().clone()),
-            Tab::Query(_)
-            | Tab::Table(_)
-            | Tab::Diagram(_)
-            | Tab::Activity(_)
-            | Tab::File(_)
-            | Tab::FileQuery(_) => None,
+            Tab::Query(query) => Some(query.read(cx).db().meta()),
+            Tab::Table(table) => Some(table.read(cx).db().meta()),
+            Tab::Diagram(diagram) => Some(diagram.read(cx).db().meta()),
+            Tab::Activity(activity) => Some(activity.read(cx).db().meta()),
+            Tab::RedisKey(key) => Some(key.read(cx).db().meta()),
+            Tab::RedisConsole(console) => Some(console.read(cx).db().meta()),
+            Tab::File(_) | Tab::FileQuery(_) => None,
         }
     }
 
@@ -178,6 +178,7 @@ impl Tab {
         })
     }
 
+    /// The SQL connection of a SQL tab.
     fn db(&self, cx: &App) -> Option<Db> {
         match self {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
@@ -1281,6 +1282,21 @@ impl WorkspaceView {
             .or_else(|| self.explorer.read(cx).current_db())
     }
 
+    /// What the chrome shows about the active tab's connection, or about
+    /// the sidebar's when the tab has none of its own.
+    fn active_connection(&self, cx: &App) -> Option<ConnMeta> {
+        if matches!(
+            self.tabs.get(self.active),
+            Some(Tab::File(_) | Tab::FileQuery(_))
+        ) {
+            return None;
+        }
+        self.tabs
+            .get(self.active)
+            .and_then(|tab| tab.connection(cx))
+            .or_else(|| self.explorer.read(cx).current_db().map(|db| db.meta()))
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let project = self.model.read(cx).project.clone();
         let project_name: SharedString = project.name.clone().into();
@@ -1598,69 +1614,38 @@ impl WorkspaceView {
     /// The bottom bar: the active connection and mode on the left, the last
     /// run and the cursor on the right.
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let redis = self.tabs.get(self.active).and_then(|tab| tab.redis(cx));
-        let db = if redis.is_some() {
-            None
-        } else {
-            self.active_db(cx)
-        };
+        let connection = self.active_connection(cx);
         let mut left = h_flex().gap_4().min_w_0();
         let mut right = h_flex().gap_4().flex_shrink_0();
-        match &db {
-            Some(db) => {
+        match &connection {
+            Some(connection) => {
                 left = left
                     .child(
                         h_flex()
                             .gap(px(6.))
-                            .text_color(color(if db.environment == Environment::Production {
-                                0xffcf7f
-                            } else {
-                                0xc7c7cc
-                            }))
-                            .child(chrome::dot(db.environment.color()))
+                            .text_color(color(status_tone(connection.environment)))
+                            .child(chrome::dot(connection.environment.color()))
                             .child(format!(
                                 "{} · {}",
-                                db.name,
-                                db.environment.label().to_lowercase()
+                                connection.name,
+                                connection.environment.label().to_lowercase()
                             )),
                     )
-                    .child(div().child(db.target.clone()));
+                    .child(div().child(connection.target.clone()));
                 right = right
-                    .children(db.session.notice().map(|notice| {
-                        div()
-                            .text_color(color(theme::AMBER))
-                            .child(notice.to_string())
-                    }))
-                    .child(db.session.server_label().to_string());
+                    .children(
+                        connection
+                            .notice
+                            .clone()
+                            .map(|notice| div().text_color(color(theme::AMBER)).child(notice)),
+                    )
+                    .child(connection.server.clone());
             }
-            None => match &redis {
-                Some(redis) => {
-                    left = left
-                        .child(
-                            h_flex()
-                                .gap(px(6.))
-                                .text_color(color(
-                                    if redis.environment == Environment::Production {
-                                        0xffcf7f
-                                    } else {
-                                        0xc7c7cc
-                                    },
-                                ))
-                                .child(chrome::dot(redis.environment.color()))
-                                .child(format!(
-                                    "{} · {}",
-                                    redis.name,
-                                    redis.environment.label().to_lowercase()
-                                )),
-                        )
-                        .child(div().child(redis.target.clone()));
-                }
-                None => left = left.child("No open connection"),
-            },
+            None => left = left.child("No open connection"),
         }
-        let redis_version = redis
+        let server = connection
             .as_ref()
-            .map(|redis| format!("Redis {}", redis.session.server().version));
+            .map(|connection| connection.server.clone());
         match self.tabs.get(self.active) {
             Some(Tab::FileQuery(query)) => {
                 left = h_flex().gap_4().min_w_0().child("Polars SQL · read only");
@@ -1681,7 +1666,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
+                    .children(server.clone());
             }
             Some(Tab::Activity(activity)) => {
                 let tab = activity.read(cx);
@@ -1690,7 +1675,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
+                    .children(server.clone());
             }
             Some(Tab::RedisKey(key)) => {
                 let tab = key.read(cx);
@@ -1703,7 +1688,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .children(tab.status())
-                    .children(redis_version);
+                    .children(server.clone());
             }
             Some(Tab::RedisConsole(console)) => {
                 let tab = console.read(cx);
@@ -1721,10 +1706,7 @@ impl WorkspaceView {
                         )
                         .child(if writing { "Write" } else { "Read-only" }),
                 );
-                if let Some(redis) = &redis
-                    && redis.environment == Environment::Production
-                    && redis.allows_writes()
-                {
+                if tab.db().environment == Environment::Production && tab.db().allows_writes() {
                     let console = console.clone();
                     left = left.child(
                         div()
@@ -1741,7 +1723,7 @@ impl WorkspaceView {
                     .gap_4()
                     .flex_shrink_0()
                     .child(div().max_w(px(420.)).truncate().child(tab.status()))
-                    .children(redis_version);
+                    .children(server.clone());
             }
             Some(Tab::Query(query)) => {
                 let tab = query.read(cx);
@@ -1760,9 +1742,8 @@ impl WorkspaceView {
                         )
                         .child(div().truncate().child(tab.mode_status())),
                 );
-                if let Some(db) = &db
-                    && db.environment == Environment::Production
-                    && db.allows(WriteKind::Transactional)
+                if tab.db().environment == Environment::Production
+                    && tab.db().allows(WriteKind::Transactional)
                 {
                     let query = query.clone();
                     left = left.child(
@@ -1794,7 +1775,7 @@ impl WorkspaceView {
                         )
                     })
                     .child(tab.cursor_status(cx))
-                    .children(db.as_ref().map(|db| db.session.server_label().to_string()));
+                    .children(server.clone());
             }
             Some(Tab::Table(table)) => {
                 let tab = table.read(cx);
@@ -1805,7 +1786,7 @@ impl WorkspaceView {
                         .gap_4()
                         .flex_shrink_0()
                         .child(status)
-                        .children(db.as_ref().map(|db| db.session.server_label().to_string()));
+                        .children(server.clone());
                 }
             }
             None => {}
@@ -1868,10 +1849,9 @@ impl WorkspaceView {
                 Tab::File(file) => (AppIcon::Table, file.read(cx).title(), false),
                 Tab::FileQuery(query) => (AppIcon::Code, query.read(cx).title(), false),
             };
-            let tooltip: SharedString = match (tab.db(cx), tab.redis(cx)) {
-                (Some(db), _) => format!("{title} · {}", db.name).into(),
-                (None, Some(redis)) => format!("{title} · {}", redis.name).into(),
-                (None, None) => title.clone(),
+            let tooltip: SharedString = match tab.connection(cx) {
+                Some(connection) => format!("{title} · {}", connection.name).into(),
+                None => title.clone(),
             };
             let tooltip = match tab {
                 Tab::File(file) => file.read(cx).path().display().to_string().into(),
@@ -2146,12 +2126,8 @@ impl Render for WorkspaceView {
             .child(self.render_title_bar(cx))
             // Production is marked by a thin line under the title bar.
             .when(
-                match self.tabs.get(self.active).and_then(|tab| tab.redis(cx)) {
-                    Some(redis) => redis.environment == Environment::Production,
-                    None => self
-                        .active_db(cx)
-                        .is_some_and(|db| db.environment == Environment::Production),
-                },
+                self.active_connection(cx)
+                    .is_some_and(|connection| connection.environment == Environment::Production),
                 |root| root.child(div().h(px(2.)).flex_shrink_0().bg(color(theme::AMBER))),
             )
             .child(

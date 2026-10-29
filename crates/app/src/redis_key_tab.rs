@@ -31,7 +31,7 @@ use crate::assets::AppIcon;
 use crate::chrome;
 use crate::connection::RedisDb;
 use crate::context_menus::item_icon;
-use crate::redis_write::{self, Planned};
+use crate::redis_write::{self, Command};
 use crate::results::{ResultsDelegate, RowMenu};
 use crate::theme::{self, color};
 use crate::ui::{format_bytes, thousands};
@@ -668,7 +668,7 @@ impl KeyTab {
         );
     }
 
-    fn run_planned(&mut self, planned: Vec<Planned>, cx: &mut Context<Self>) {
+    fn run_planned(&mut self, planned: Vec<Command>, cx: &mut Context<Self>) {
         let session = self.db.session.clone();
         let database = self.database;
         self.applying = true;
@@ -689,7 +689,7 @@ impl KeyTab {
                         &this.db,
                         &this.project,
                         database,
-                        &command.line,
+                        &command.planned.line,
                         outcome.clone(),
                         failed,
                         cx,
@@ -697,7 +697,7 @@ impl KeyTab {
                 })
                 .ok();
                 if failed {
-                    failure = Some(format!("{}: {outcome}", command.shown));
+                    failure = Some(format!("{}: {outcome}", command.planned.shown));
                     break;
                 }
                 ran += 1;
@@ -1183,7 +1183,7 @@ fn commands(key: &str, pending: &[Edit]) -> Vec<Vec<String>> {
 
 /// [`commands`] ready to approve; the list item removal is described
 /// rather than shown as its whole script.
-fn plan(key: &str, pending: &[Edit]) -> Vec<Planned> {
+fn plan(key: &str, pending: &[Edit]) -> Vec<Command> {
     let removed: Vec<String> = pending
         .iter()
         .filter_map(|edit| match edit {
@@ -1200,9 +1200,9 @@ fn plan(key: &str, pending: &[Edit]) -> Vec<Planned> {
                     "EVAL: remove items {} from {key} if they are unchanged",
                     removed.join(", ")
                 );
-                Planned::described(args, shown)
+                Command::described(args, shown)
             } else {
-                Planned::new(args)
+                Command::new(args)
             }
         })
         .collect()
@@ -1394,11 +1394,11 @@ mod tests {
         // The review shows what the script does; the audit log gets all of it.
         let planned = plan("q", &pending);
         assert_eq!(
-            planned[0].shown,
+            planned[0].planned.shown,
             "EVAL: remove items 2, 5 from q if they are unchanged"
         );
-        assert!(planned[0].line.starts_with("EVAL \"local k"));
-        assert_eq!(planned[1].shown, "RPUSH q new");
+        assert!(planned[0].planned.line.starts_with("EVAL \"local k"));
+        assert_eq!(planned[1].planned.shown, "RPUSH q new");
         // The removal and the first push ran: only the last push is left.
         assert_eq!(remaining(&pending, 2), [command(&["LPUSH", "q", "first"])]);
         // The removal failed: everything stays.

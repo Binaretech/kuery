@@ -236,7 +236,10 @@ pub fn allow_redis_writes(
     let subject = Subject {
         name: db.name.clone(),
         target: db.target.clone(),
-        scope: Scope::Redis,
+        scope: Scope::NoTransactions {
+            tabs: "The console and key tabs",
+            note: "Redis has no transactions: each command applies as soon as it runs.",
+        },
         allow: Rc::new(move || db.allow_writes()),
     };
     open_allow(subject, window, cx, allowed);
@@ -268,7 +271,12 @@ type OnAllowed = Rc<dyn Fn(&mut Window, &mut App)>;
 /// What a production connection is being allowed to do.
 enum Scope {
     Postgres(WriteKind),
-    Redis,
+    /// Writes on an engine without transactions: `tabs` may change data,
+    /// and `note` says how each change applies.
+    NoTransactions {
+        tabs: &'static str,
+        note: &'static str,
+    },
 }
 
 /// The connection writes are allowed on, and how to allow them.
@@ -343,40 +351,8 @@ impl Render for AllowWrites {
                 )
                 .child(text)
         };
-        let (icon, title, description, confirmed, button) = match subject.scope {
-            Scope::Postgres(WriteKind::Transactional) => (
-                AppIcon::Pencil,
-                "Allow writes on production?",
-                format!(
-                    "Query tabs on {} ({}) will be able to change data.",
-                    subject.name, subject.target
-                ),
-                "Every change is confirmed and stays in a transaction until you commit",
-                "Allow Writes",
-            ),
-            Scope::Postgres(WriteKind::Full) => (
-                AppIcon::FullWrite,
-                "Allow full writes on production?",
-                format!(
-                    "Each script runs against {} and is applied as soon as it finishes. There \
-                     is no Roll Back.",
-                    subject.name
-                ),
-                "Every change is still confirmed before it runs",
-                "Allow Full Writes",
-            ),
-            Scope::Redis => (
-                AppIcon::Pencil,
-                "Allow writes on production?",
-                format!(
-                    "The console and key tabs on {} ({}) will be able to change data. Redis \
-                     has no transactions: each command applies as soon as it runs.",
-                    subject.name, subject.target
-                ),
-                "Every change is confirmed before it runs",
-                "Allow Writes",
-            ),
-        };
+        let (icon, title, description, confirmed, button) =
+            allow_texts(&subject.scope, &subject.name, &subject.target);
         v_flex()
             .gap_4()
             .text_size(px(13.))
@@ -461,6 +437,41 @@ impl Render for AllowWrites {
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
+    }
+}
+
+/// The dialog's icon, title, description, what is still confirmed, and
+/// its button.
+fn allow_texts(
+    scope: &Scope,
+    name: &str,
+    target: &str,
+) -> (AppIcon, &'static str, String, &'static str, &'static str) {
+    match scope {
+        Scope::Postgres(WriteKind::Transactional) => (
+            AppIcon::Pencil,
+            "Allow writes on production?",
+            format!("Query tabs on {name} ({target}) will be able to change data."),
+            "Every change is confirmed and stays in a transaction until you commit",
+            "Allow Writes",
+        ),
+        Scope::Postgres(WriteKind::Full) => (
+            AppIcon::FullWrite,
+            "Allow full writes on production?",
+            format!(
+                "Each script runs against {name} and is applied as soon as it finishes. There \
+                 is no Roll Back."
+            ),
+            "Every change is still confirmed before it runs",
+            "Allow Full Writes",
+        ),
+        Scope::NoTransactions { tabs, note } => (
+            AppIcon::Pencil,
+            "Allow writes on production?",
+            format!("{tabs} on {name} ({target}) will be able to change data. {note}"),
+            "Every change is confirmed before it runs",
+            "Allow Writes",
+        ),
     }
 }
 
@@ -967,6 +978,29 @@ mod tests {
         assert_eq!(
             describe_impact(&kuery_core::sql::POSTGRES, "updat t", &impacts[..1]),
             ["Statement 1: 1,204 rows would change"]
+        );
+    }
+
+    #[test]
+    fn redis_unlock_text_is_unchanged() {
+        let redis = Scope::NoTransactions {
+            tabs: "The console and key tabs",
+            note: "Redis has no transactions: each command applies as soon as it runs.",
+        };
+        let (_, title, description, confirmed, button) = allow_texts(&redis, "prod", "h:6379/0");
+        assert_eq!(title, "Allow writes on production?");
+        assert_eq!(
+            description,
+            "The console and key tabs on prod (h:6379/0) will be able to change data. Redis has \
+             no transactions: each command applies as soon as it runs."
+        );
+        assert_eq!(confirmed, "Every change is confirmed before it runs");
+        assert_eq!(button, "Allow Writes");
+        let (_, _, full, _, _) = allow_texts(&Scope::Postgres(WriteKind::Full), "prod", "h/db");
+        assert_eq!(
+            full,
+            "Each script runs against prod and is applied as soon as it finishes. There is no \
+             Roll Back."
         );
     }
 }

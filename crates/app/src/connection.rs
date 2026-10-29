@@ -97,6 +97,28 @@ impl Environment {
     }
 }
 
+/// The tone of the connection's name in the status bar: amber on
+/// production, so it is never mistaken for another.
+pub fn status_tone(environment: Environment) -> u32 {
+    match environment {
+        Environment::Production => 0xffcf7f,
+        Environment::Development | Environment::Staging => 0xc7c7cc,
+    }
+}
+
+/// What the chrome shows about a tab's connection, whichever its family.
+#[derive(Clone)]
+pub struct ConnMeta {
+    pub name: SharedString,
+    pub environment: Environment,
+    /// `host:port/database`, without credentials.
+    pub target: SharedString,
+    /// `PostgreSQL 16.4`, `Redis 7.4.1`.
+    pub server: SharedString,
+    /// What the driver said the user should know (see `Adapter::notice`).
+    pub notice: Option<SharedString>,
+}
+
 /// How much write mode asks before running a script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -208,6 +230,20 @@ impl Db {
         self.writes_allowed.store(false, Ordering::SeqCst);
         self.full_writes_allowed.store(false, Ordering::SeqCst);
     }
+
+    /// What the status bar, tab tooltips and the production stripe show.
+    pub fn meta(&self) -> ConnMeta {
+        ConnMeta {
+            name: self.name.clone(),
+            environment: self.environment,
+            target: self.target.clone(),
+            server: self.session.server_label().to_string().into(),
+            notice: self
+                .session
+                .notice()
+                .map(|notice| notice.to_string().into()),
+        }
+    }
 }
 
 /// An open Redis connection, shared by the sidebar and the tabs opened from
@@ -255,6 +291,17 @@ impl RedisDb {
 
     pub fn revoke_writes(&self) {
         self.session.revoke_writes();
+    }
+
+    /// What the status bar, tab tooltips and the production stripe show.
+    pub fn meta(&self) -> ConnMeta {
+        ConnMeta {
+            name: self.name.clone(),
+            environment: self.environment,
+            target: self.target.clone(),
+            server: format!("Redis {}", self.session.server().version).into(),
+            notice: None,
+        }
     }
 }
 
@@ -364,6 +411,13 @@ mod tests {
         assert!(!allows(production, true, false, Full));
         assert!(!allows(production, false, true, Full));
         assert!(allows(production, true, true, Full));
+    }
+
+    #[test]
+    fn only_production_names_stand_out_in_the_status_bar() {
+        assert_eq!(status_tone(Environment::Production), 0xffcf7f);
+        assert_eq!(status_tone(Environment::Staging), 0xc7c7cc);
+        assert_eq!(status_tone(Environment::Development), 0xc7c7cc);
     }
 
     #[test]
