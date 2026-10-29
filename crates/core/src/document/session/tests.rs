@@ -13,7 +13,8 @@
 //! `write lost`, the commit does not say whether it applied. Entering a
 //! container runs `enter <name>`. The fake holds documents with keys 1 to
 //! 3: changes to other keys find nothing, and an insert of `{_id: 0}`
-//! inserts nothing.
+//! inserts nothing. A change to key 5 gets no answer, and after an insert
+//! of `{_id: 6}` the commit does not say whether it applied.
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -110,6 +111,8 @@ static FAKE: Language = Language {
     enter: |path| path.first().map(|name| format!("enter {name}")),
     collection_ref: |name| name.to_string(),
     key: |name| name.to_string(),
+    change: |_, change| change.describe(render),
+    check_change: |_| Ok(()),
     key_name: "_id",
     methods: &[],
     operators: &[],
@@ -295,10 +298,10 @@ impl DocumentAdapter for FakeDocs {
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&mut self) -> Result<(), WriteError> {
         self.log.push("commit");
         match std::mem::take(&mut self.lost) {
-            true => Err(CommitError::Unknown(QueryError::Connection(
+            true => Err(WriteError::Unknown(QueryError::Connection(
                 "no answer".into(),
             ))),
             false => Ok(()),
@@ -370,9 +373,20 @@ impl DocumentAdapter for FakeDocs {
         Ok(Count::Exact(42))
     }
 
-    fn apply(&mut self, _: &CollectionRef, change: &DocChange) -> Result<Outcome, QueryError> {
+    fn apply(&mut self, _: &CollectionRef, change: &DocChange) -> Result<Outcome, WriteError> {
         self.log.push(change.describe(render));
         let found = |key| u64::from(FakeDocs::holds(key));
+        match change {
+            DocChange::Update { key, .. } if *key == DocKey(Value::Int32(5)) => {
+                return Err(WriteError::Unknown(QueryError::Connection(
+                    "no answer".into(),
+                )));
+            }
+            DocChange::Insert { document } if document.key() == Some(DocKey(Value::Int32(6))) => {
+                self.lost = true;
+            }
+            _ => {}
+        }
         Ok(match change {
             DocChange::Insert { document } => Outcome {
                 inserted: u64::from(document.key() != Some(DocKey(Value::Int32(0)))),
@@ -531,6 +545,7 @@ fn rejects_writes_on_a_read_only_session_before_the_adapter_sees_them() {
         applied,
         Err(ApplyFailure {
             applied: 0,
+            unknown: 0,
             error: QueryError::WritesDisabled
         })
     );
@@ -1004,6 +1019,45 @@ fn apply_without_transactions_says_what_was_kept() {
 }
 
 #[test]
+fn apply_says_which_changes_may_have_applied_when_no_answer_came() {
+    // Without transactions, the change whose answer never came may have
+    // applied; those before it did.
+    let (session, log) = open(Access::ReadWrite);
+    let failure = block_on(session.apply(orders(), vec![update(1), update(5), update(2)]));
+    assert_eq!(
+        failure,
+        Err(ApplyFailure {
+            applied: 1,
+            unknown: 1,
+            error: QueryError::Connection("no answer".into()),
+        })
+    );
+    assert_eq!(log.take().len(), 2, "it stops at the change");
+    // A refused change is known not to have applied.
+    let failure = block_on(session.apply(orders(), vec![update(9)]));
+    assert_eq!(failure.map_err(|failure| failure.unknown), Err(0));
+
+    // In a transaction, a change without an answer is undone with it…
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let failure = block_on(session.apply(orders(), vec![update(1), update(5)]));
+    assert_eq!(
+        failure.map_err(|failure| (failure.applied, failure.unknown)),
+        Err((0, 0))
+    );
+    assert_eq!(log.take().last().map(String::as_str), Some("abort"));
+    // …but a commit that does not say leaves every change unknown.
+    let failure = block_on(session.apply(orders(), vec![update(1), insert(6)]));
+    assert_eq!(
+        failure,
+        Err(ApplyFailure {
+            applied: 0,
+            unknown: 2,
+            error: QueryError::Connection("no answer".into()),
+        })
+    );
+}
+
+#[test]
 fn a_job_that_panics_ends_the_session_and_says_so() {
     let (session, _) = open(Access::ReadWrite);
     let outcome = run(&session, "write panic", RunMode::Write).end;
@@ -1020,6 +1074,7 @@ fn a_job_that_panics_ends_the_session_and_says_so() {
         applied,
         Err(ApplyFailure {
             applied: 0,
+            unknown: 1,
             error: QueryError::Connection(_)
         })
     ));

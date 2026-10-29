@@ -81,21 +81,22 @@ impl Outcome {
     }
 }
 
-/// Why a transaction did not commit.
+/// Why a write that keeps what it does as soon as it ends (a transaction's
+/// commit, a change applied on its own) did not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommitError {
+pub enum WriteError {
     /// It was not applied: nothing of it was kept.
     Undone(QueryError),
-    /// The engine did not say whether it was applied, as when the commit
-    /// ran out of time or its connection broke.
+    /// The engine did not say whether it was applied, as when it ran out
+    /// of time or its connection broke before the answer came.
     Unknown(QueryError),
 }
 
-impl CommitError {
-    /// The error, whatever the commit left.
+impl WriteError {
+    /// The error, whatever the write left.
     pub fn error(self) -> QueryError {
         match self {
-            CommitError::Undone(error) | CommitError::Unknown(error) => error,
+            WriteError::Undone(error) | WriteError::Unknown(error) => error,
         }
     }
 }
@@ -148,8 +149,8 @@ pub trait DocumentAdapter: Send + 'static {
     }
 
     /// Ends the transaction, applying it; it is gone either way.
-    fn commit(&mut self) -> Result<(), CommitError> {
-        unsupported("transactions").map_err(CommitError::Undone)
+    fn commit(&mut self) -> Result<(), WriteError> {
+        unsupported("transactions").map_err(WriteError::Undone)
     }
 
     fn abort(&mut self) -> Result<(), QueryError> {
@@ -191,12 +192,13 @@ pub trait DocumentAdapter: Send + 'static {
     ) -> Result<Count, QueryError>;
 
     /// Applies one change, only to a document that still holds what the
-    /// change expects; the counts say whether it found one.
+    /// change expects; the counts say whether it found one. A failure says
+    /// whether the change may have been applied all the same.
     fn apply(
         &mut self,
         collection: &CollectionRef,
         change: &DocChange,
-    ) -> Result<Outcome, QueryError>;
+    ) -> Result<Outcome, WriteError>;
 
     /// How many documents a write would touch, without running it and
     /// without changing anything, when the engine can tell; the first of

@@ -26,6 +26,7 @@ mod definition;
 mod diagram_tab;
 mod document_console;
 mod document_detail;
+mod document_edits;
 mod document_grid;
 mod document_write;
 mod drivers;

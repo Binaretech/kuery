@@ -56,9 +56,13 @@ impl DocumentRows {
         self.documents.clear();
     }
 
-    #[cfg(test)]
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// The documents of the rows, in row order.
+    pub fn documents(&self) -> &[Document] {
+        &self.documents
     }
 
     #[cfg(test)]

@@ -46,6 +46,9 @@ pub struct BrowseDelegate {
     loading: bool,
     sort: Option<(String, Direction)>,
     edits: HashMap<(usize, usize), Option<String>>,
+    /// Cells whose field an edit removes from its document: a dimmed dash
+    /// with the edit's mark, not NULL.
+    removed: HashSet<(usize, usize)>,
     deleted: HashSet<usize>,
     on_sort: Option<OnSort>,
     on_menu: Option<OnMenu>,
@@ -89,7 +92,8 @@ impl BrowseDelegate {
             values: (0..self.columns.len())
                 .map(|index| self.shown(row, index).flatten().map(str::to_owned))
                 .collect(),
-            absent: !self.edits.contains_key(&(row, column)) && self.is_absent(row, column),
+            absent: self.removed.contains(&(row, column))
+                || (!self.edits.contains_key(&(row, column)) && self.is_absent(row, column)),
         }
     }
 
@@ -177,12 +181,19 @@ impl BrowseDelegate {
         self.edits.insert((row, column), value);
     }
 
+    /// Marks a field an edit removes from its row's document.
+    pub fn mark_removed(&mut self, row: usize, column: usize) {
+        self.edits.insert((row, column), None);
+        self.removed.insert((row, column));
+    }
+
     pub fn mark_deleted(&mut self, row: usize) {
         self.deleted.insert(row);
     }
 
     pub fn clear_marks(&mut self) {
         self.edits.clear();
+        self.removed.clear();
         self.deleted.clear();
     }
 
@@ -304,6 +315,10 @@ impl TableDelegate for BrowseDelegate {
             Some(Some(text)) => div()
                 .truncate()
                 .child(SharedString::from(text.to_owned()))
+                .into_any_element(),
+            Some(None) if self.removed.contains(&(row_ix, col_ix)) => div()
+                .text_color(color(0xffcf7f))
+                .child("—")
                 .into_any_element(),
             Some(None) if edited.is_none() && self.is_absent(row_ix, col_ix) => div()
                 .text_color(color(theme::TEXT_QUIET))

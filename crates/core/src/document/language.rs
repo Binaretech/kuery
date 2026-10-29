@@ -9,6 +9,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::analysis::StatementKind;
+use crate::document::change::DocChange;
 use crate::document::value::{CollectionRef, Document, FieldPath, Value};
 
 /// How a value prints.
@@ -162,6 +163,16 @@ pub struct Language {
     /// A field's name as a document's key: bare where it reads so, quoted
     /// otherwise (`status`, `"ship.city"`).
     pub key: fn(&str) -> String,
+    /// A document change as the statement that makes it, on one line, as
+    /// the review and the audit log show it: `db.orders.updateOne({_id: 7,
+    /// qty: …}, {$set: …})`. The collection is named alone; the review
+    /// says which container it is in.
+    pub change: fn(&CollectionRef, &DocChange) -> String,
+    /// Why the engine cannot make a document change, if it cannot (an
+    /// update of a field its paths do not reach, such as one named `a.b`).
+    /// The collection tab asks when the change is staged, so Apply never
+    /// stops at it halfway through a batch.
+    pub check_change: fn(&DocChange) -> Result<(), String>,
     /// What the engine calls a document's identity
     /// ([`crate::document::value::Document::key`]), for the review: `_id`.
     pub key_name: &'static str,

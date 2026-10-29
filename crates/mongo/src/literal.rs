@@ -14,7 +14,10 @@
 //! number; Kuery keeps a Double.
 //!
 //! A document whose only fields are those of an Extended JSON wrapper
-//! (`{$oid: "…"}`) always reads as the wrapped type, as in mongosh.
+//! (`{$oid: "…"}`) reads as the wrapped type, as in mongosh, unless a key
+//! writes its `$` as an escape (`{"\u0024oid": "…"}`): that is how a
+//! document that only looks like a wrapper prints, so it reads back as
+//! itself.
 
 use std::ops::Range;
 
@@ -595,6 +598,7 @@ impl<'a> Reader<'a> {
     fn object(&mut self) -> Result<(Value, Range<usize>), ParseError> {
         let open = self.expect('{', "Expected {")?;
         let mut fields: Vec<(String, Value)> = Vec::new();
+        let mut escaped = false;
         while !self.peek_punct('}') {
             let Some(token) = self.peek() else {
                 return Err(error(
@@ -606,6 +610,10 @@ impl<'a> Reader<'a> {
                 Kind::Str(name) | Kind::Ident(name) | Kind::Number(name) => name.clone(),
                 _ => return Err(error(token.span.clone(), "Expected a field name")),
             };
+            // `"\u0024oid"`: a field named `$oid`, not a wrapper's key.
+            if name.starts_with('$') && self.text_at(token.span.clone())[1..].starts_with('\\') {
+                escaped = true;
+            }
             if fields.iter().any(|(seen, _)| *seen == name) {
                 return Err(error(
                     token.span.clone(),
@@ -629,7 +637,7 @@ impl<'a> Reader<'a> {
         let close = self.expect('}', "Expected }")?;
         let span = open.start..close.end;
         let document = Document(fields);
-        if !is_wrapper(&document) {
+        if escaped || !is_wrapper(&document) {
             return Ok((Value::Object(document), span));
         }
         let json = to_ejson(&Value::Object(document), Ejson::Relaxed);
@@ -1087,10 +1095,15 @@ fn write_value(out: &mut String, value: &Value, style: Style, depth: usize) {
             write_list(out, ('[', ']'), items, style, depth);
         }
         Value::Object(document) => {
-            let fields = document
-                .0
-                .iter()
-                .map(|(name, value)| (Some(name.as_str()), value));
+            // Its keys would read as a wrapper's: their `$` is escaped.
+            let lookalike = is_wrapper(document);
+            let fields = document.0.iter().map(|(name, value)| {
+                let key = match lookalike && name.starts_with('$') {
+                    true => format!("\"\\u0024{}", &quote(&name[1..])[1..]),
+                    false => key(name),
+                };
+                (Some(key), value)
+            });
             write_list(out, ('{', '}'), fields, style, depth);
         }
         Value::Ext(ext) => out.push_str(&ext.display),
@@ -1100,7 +1113,7 @@ fn write_value(out: &mut String, value: &Value, style: Style, depth: usize) {
 fn write_list<'v>(
     out: &mut String,
     (open, close): (char, char),
-    items: impl ExactSizeIterator<Item = (Option<&'v str>, &'v Value)>,
+    items: impl ExactSizeIterator<Item = (Option<String>, &'v Value)>,
     style: Style,
     depth: usize,
 ) {
@@ -1119,8 +1132,8 @@ fn write_list<'v>(
         if style == Style::Pretty {
             out.push_str(&"  ".repeat(depth + 1));
         }
-        if let Some(name) = name {
-            out.push_str(&key(name));
+        if let Some(key) = name {
+            out.push_str(&key);
             out.push_str(": ");
         }
         write_value(out, value, style, depth + 1);

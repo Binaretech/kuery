@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::analysis::StatementKind;
-use crate::document::adapter::{CommitError, DocumentAdapter, DocumentSink, Outcome};
+use crate::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
 use crate::document::capabilities::{Capabilities, Preview, Transactions};
 use crate::document::catalog::{CollectionInfo, Container};
 use crate::document::change::{BrowseSpec, Continuation, Count, DocChange, Expected};
@@ -102,11 +102,15 @@ pub struct DocSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyFailure {
     /// Changes kept before the failure: none where the engine has
-    /// transactions, which undo them all, nor when the connection itself
-    /// failed (what it kept then is unknown). A [`QueryError::RowMismatch`]
+    /// transactions, which undo them all. A [`QueryError::RowMismatch`]
     /// says on its own that nothing was applied, so say what this kept
     /// instead of showing that error as it is.
     pub applied: usize,
+    /// Changes after those that may have been applied all the same, since
+    /// the engine's answer never came: the one it stopped at, or every one
+    /// when a transaction's commit did not say (or the session itself
+    /// failed). Applying them again could apply them twice.
+    pub unknown: usize,
     pub error: QueryError,
 }
 
@@ -456,8 +460,9 @@ impl DocumentSession {
 
     /// Applies document changes, each to a document that still holds what
     /// it expects. Where the engine has transactions, all of them or none;
-    /// elsewhere they stop at the first failure, and the failure says how
-    /// many were kept.
+    /// elsewhere they stop at the first failure. The failure says how many
+    /// were kept, and how many more may have been when the engine's answer
+    /// never came.
     pub fn apply(
         &self,
         collection: CollectionRef,
@@ -465,13 +470,19 @@ impl DocumentSession {
     ) -> impl Future<Output = Result<Outcome, ApplyFailure>> + Send + use<> {
         let transactions = self.shared.capabilities.transactions;
         let render = self.shared.language.render;
+        let count = changes.len();
         let applied = self
             .handle
             .call(move |worker| Ok(worker.apply(&collection, &changes, transactions, render)));
         async move {
-            applied
-                .await
-                .unwrap_or_else(|error| Err(ApplyFailure { applied: 0, error }))
+            // The session failed on its way: what it applied is unknown.
+            applied.await.unwrap_or_else(|error| {
+                Err(ApplyFailure {
+                    applied: 0,
+                    unknown: count,
+                    error,
+                })
+            })
         }
     }
 
@@ -668,14 +679,14 @@ impl Worker<dyn DocumentAdapter> {
                 // Cancelled: undone, like any failure.
                 let ended = match self.end_run(outcome) {
                     Ok(summary) => self.adapter.commit().map(|()| summary),
-                    Err(error) => Err(CommitError::Undone(error)),
+                    Err(error) => Err(WriteError::Undone(error)),
                 };
                 ended.map_err(|error| {
                     // Whatever the failure, nothing is left open.
                     let _ = self.adapter.abort();
                     match error {
-                        CommitError::Undone(error) => (error, Left::Undone),
-                        CommitError::Unknown(error) => (error, Left::Unknown),
+                        WriteError::Undone(error) => (error, Left::Undone),
+                        WriteError::Unknown(error) => (error, Left::Unknown),
                     }
                 })
             }
@@ -913,7 +924,11 @@ impl Worker<dyn DocumentAdapter> {
         transactions: Transactions,
         render: fn(&Value, Style) -> String,
     ) -> Result<Outcome, ApplyFailure> {
-        let none_kept = |error| ApplyFailure { applied: 0, error };
+        let none_kept = |error| ApplyFailure {
+            applied: 0,
+            unknown: 0,
+            error,
+        };
         self.writable().map_err(none_kept)?;
         if changes.is_empty() {
             return Ok(Outcome::default());
@@ -932,21 +947,32 @@ impl Worker<dyn DocumentAdapter> {
         for (kept, change) in changes.iter().enumerate() {
             match self.apply_one(collection, change, render) {
                 Ok(outcome) => total.add(outcome),
+                // Undone with the transaction, whatever it did.
                 Err(error) if atomic => {
                     let _ = self.adapter.abort();
-                    return Err(none_kept(error));
+                    return Err(none_kept(error.error()));
                 }
                 Err(error) => {
+                    let unknown = usize::from(matches!(error, WriteError::Unknown(_)));
                     return Err(ApplyFailure {
                         applied: kept,
-                        error,
+                        unknown,
+                        error: error.error(),
                     });
                 }
             }
         }
         if atomic && let Err(error) = self.adapter.commit() {
             let _ = self.adapter.abort();
-            return Err(none_kept(error.error()));
+            let unknown = match error {
+                WriteError::Unknown(_) => changes.len(),
+                WriteError::Undone(_) => 0,
+            };
+            return Err(ApplyFailure {
+                applied: 0,
+                unknown,
+                error: error.error(),
+            });
         }
         Ok(total)
     }
@@ -957,18 +983,18 @@ impl Worker<dyn DocumentAdapter> {
         collection: &CollectionRef,
         change: &DocChange,
         render: fn(&Value, Style) -> String,
-    ) -> Result<Outcome, QueryError> {
+    ) -> Result<Outcome, WriteError> {
         let outcome = self.adapter.apply(collection, change)?;
         let (expected, actual) = match change.expected() {
             Expected::Matched(expected) => (expected, outcome.matched),
             Expected::Inserted(expected) => (expected, outcome.inserted),
         };
         if actual != expected {
-            return Err(QueryError::RowMismatch {
+            return Err(WriteError::Undone(QueryError::RowMismatch {
                 sql: change.describe(render),
                 expected,
                 actual,
-            });
+            }));
         }
         Ok(outcome)
     }
