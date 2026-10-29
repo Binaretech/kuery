@@ -457,6 +457,7 @@ mod tests {
                 password: Some(r"p\ss".into()),
                 tls: Some(tls.into()),
                 tunnel: None,
+                proxy: None,
                 options: Default::default(),
             };
             let target = Target::parse(&crate::conninfo(&options)).unwrap();

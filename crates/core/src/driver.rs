@@ -103,22 +103,26 @@ pub struct OptionField {
     pub placeholder: &'static str,
     /// A line under the field.
     pub help: Option<&'static str>,
+    /// Offered on production connections too. When false the form hides it
+    /// there and the connection does not keep it (allowing invalid
+    /// certificates, say).
+    pub production: bool,
 }
 
 /// How the form asks for an option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionKind {
     Text,
-    /// On or off, stored as `true` or `false`.
+    /// On or off, stored as `true` when on and left out when off.
     Toggle,
-    /// One of these values.
+    /// One of these values, or none for the driver's default.
     Choice(&'static [&'static str]),
     /// A file's path, picked or typed.
     File,
 }
 
 /// Everything the app needs to know about a driver before talking to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DriverInfo {
     /// Stable id, stored in `project.toml`.
     pub id: &'static str,
@@ -141,6 +145,63 @@ pub struct DriverInfo {
     /// stored, so nothing else (a password in a pasted string, say) reaches
     /// the project file.
     pub options: &'static [OptionField],
+    /// Splits a pasted connection string into the form's fields, for
+    /// drivers that have one.
+    pub uri: Option<SplitUri>,
+    /// Where an SSH tunnel leads for these settings, or why they cannot go
+    /// through SSH, asked before `ssh` starts: for a driver whose host field
+    /// takes more than one name and port, or that dials the server through
+    /// a SOCKS proxy. `None` for the others, whose tunnel is a port
+    /// forwarded to the host and port as given.
+    pub ssh_route: Option<RouteSsh>,
+}
+
+/// Says where an SSH tunnel leads (see [`DriverInfo::ssh_route`]).
+pub type RouteSsh = fn(&ConnectOptions) -> Result<SshRoute, String>;
+
+/// Where an SSH tunnel leads (see [`DriverInfo::ssh_route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshRoute {
+    /// A local port forwarded to this host and port, as the SSH host sees
+    /// them.
+    Forward { host: String, port: u16 },
+    /// A SOCKS proxy (`ssh -D`, see [`ConnectOptions::proxy`]) the driver
+    /// dials the server through by its own name: for a driver that can
+    /// check a TLS certificate only against the name it dials.
+    Proxy,
+}
+
+/// Splits a connection string (see [`DriverInfo::uri`]).
+pub type SplitUri = fn(&str) -> Result<ParsedUri, String>;
+
+/// A connection string split into the form's fields.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ParsedUri {
+    /// One host, or members as `a:27017,b:27018`.
+    pub host: String,
+    /// The port of a single host that names one.
+    pub port: Option<u16>,
+    pub database: String,
+    pub user: String,
+    /// Kept only in memory: the form moves it to the keychain.
+    pub password: Option<String>,
+    /// The TLS choice as stored (see [`Tls::stored`]), when the string says.
+    pub tls: Option<String>,
+    /// The driver's options by key (see [`DriverInfo::options`]).
+    pub options: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ParsedUri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedUri")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("tls", &self.tls)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DriverInfo {
@@ -175,6 +236,46 @@ impl DriverInfo {
         }
         Ok(())
     }
+
+    /// Checks a connection's options against [`Self::options`]: keys it
+    /// does not have are refused by name (never with their value, which may
+    /// be a secret), and toggles and choices must hold one of their values.
+    pub fn check_options(&self, options: &BTreeMap<String, String>) -> Result<(), String> {
+        let unknown: Vec<&str> = options
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !self.options.iter().any(|field| field.key == *key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "Kuery does not keep these options: {}",
+                unknown.join(", ")
+            ));
+        }
+        for field in self.options {
+            let Some(value) = options.get(field.key) else {
+                continue;
+            };
+            let allowed: &[&str] = match field.kind {
+                OptionKind::Toggle => &["true", "false"],
+                OptionKind::Choice(choices) => choices,
+                OptionKind::Text | OptionKind::File => continue,
+            };
+            if !allowed.contains(&value.as_str()) {
+                return Err(format!(
+                    "{} is one of {}, not {value}",
+                    field.label,
+                    allowed.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a stored TLS choice (see [`Tls::stored`]) turns TLS on.
+pub fn tls_on(stored: Option<&str>) -> bool {
+    stored.is_some_and(|mode| !mode.is_empty() && mode != "disable")
 }
 
 /// Where and how to reach a database, the same for every driver: each
@@ -195,6 +296,9 @@ pub struct ConnectOptions {
     /// The local port of an SSH tunnel to connect to instead of
     /// `host:port`.
     pub tunnel: Option<u16>,
+    /// The local port of a SOCKS proxy through SSH, to dial `host:port`
+    /// through by name (see [`SshRoute::Proxy`]).
+    pub proxy: Option<u16>,
     /// The driver's other settings by key (see [`DriverInfo::options`]).
     pub options: BTreeMap<String, String>,
 }
@@ -208,6 +312,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("user", &self.user)
             .field("tls", &self.tls)
             .field("tunnel", &self.tunnel)
+            .field("proxy", &self.proxy)
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -226,10 +331,7 @@ impl ConnectOptions {
             },
             port: self.tunnel.unwrap_or(self.port),
             server_name,
-            tls: self
-                .tls
-                .as_deref()
-                .is_some_and(|mode| !mode.is_empty() && mode != "disable"),
+            tls: tls_on(self.tls.as_deref()),
         }
     }
 }
@@ -316,6 +418,8 @@ pub const REDIS: DriverInfo = DriverInfo {
     file: false,
     host_help: None,
     options: &[],
+    uri: None,
+    ssh_route: None,
 };
 
 #[cfg(test)]
@@ -347,6 +451,8 @@ mod tests {
         file: false,
         host_help: None,
         options: &[],
+        uri: None,
+        ssh_route: None,
     };
 
     /// A database file, like SQLite.
@@ -400,6 +506,76 @@ mod tests {
         // A file needs its path, not a host.
         assert!(FILE.validate("", "shop.sqlite", "").is_ok());
         assert!(FILE.validate("", "", "").unwrap_err().contains("file"));
+    }
+
+    #[test]
+    fn keeps_only_the_options_a_driver_has() {
+        const OPTIONS: &[OptionField] = &[
+            OptionField {
+                key: "authSource",
+                label: "Authentication database",
+                kind: OptionKind::Text,
+                placeholder: "admin",
+                help: None,
+                production: true,
+            },
+            OptionField {
+                key: "srv",
+                label: "SRV",
+                kind: OptionKind::Toggle,
+                placeholder: "",
+                help: None,
+                production: true,
+            },
+            OptionField {
+                key: "readPreference",
+                label: "Read preference",
+                kind: OptionKind::Choice(&["primary", "secondary"]),
+                placeholder: "",
+                help: None,
+                production: true,
+            },
+        ];
+        let with = DriverInfo {
+            options: OPTIONS,
+            ..SERVER
+        };
+        let options = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        assert!(with.check_options(&options(&[])).is_ok());
+        assert!(
+            with.check_options(&options(&[
+                ("authSource", "admin"),
+                ("srv", "true"),
+                ("readPreference", "secondary")
+            ]))
+            .is_ok()
+        );
+        // By name only: the value may be a secret.
+        assert_eq!(
+            with.check_options(&options(&[("maxPoolSize", "5"), ("authSource", "admin")]))
+                .unwrap_err(),
+            "Kuery does not keep these options: maxPoolSize"
+        );
+        assert!(
+            with.check_options(&options(&[("srv", "yes")]))
+                .unwrap_err()
+                .contains("SRV is one of true, false")
+        );
+        assert!(
+            with.check_options(&options(&[("readPreference", "nearest")]))
+                .is_err()
+        );
+        // A driver without options keeps none.
+        assert!(
+            SERVER
+                .check_options(&options(&[("authSource", "admin")]))
+                .is_err()
+        );
     }
 
     #[test]

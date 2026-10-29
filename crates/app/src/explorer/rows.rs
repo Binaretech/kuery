@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use gpui_kit::SharedString;
 use kuery_core::catalog::CatalogOverview;
 
+use super::documents::{self, DocumentTrees};
 use super::redis_keys::{self, KeyBrowsers, Keyspace};
 use super::{CatalogState, ConnectionNode, ConnectionState, Group};
 use crate::theme;
@@ -93,6 +94,21 @@ pub(super) enum Row {
         database: i64,
         count: usize,
     },
+    /// A node of a document database: the `item`th child read under
+    /// `path`, its parent.
+    DocumentNode {
+        index: usize,
+        path: Vec<String>,
+        item: usize,
+        depth: usize,
+        expanded: bool,
+    },
+    /// "Load more" under `parent`.
+    DocumentMore {
+        index: usize,
+        parent: Vec<String>,
+        depth: usize,
+    },
 }
 
 /// What the rows need to know about one connection.
@@ -105,6 +121,9 @@ pub(super) enum NodeView<'a> {
         id: &'a str,
         keyspace: &'a Keyspace,
         default_db: i64,
+    },
+    Documents {
+        id: &'a str,
     },
 }
 
@@ -120,11 +139,15 @@ impl<'a> NodeView<'a> {
                 keyspace,
                 default_db: db.session.default_db(),
             },
+            ConnectionState::DocumentReady { .. } => NodeView::Documents { id: &node.spec.id },
         }
     }
 
     fn is_open(&self) -> bool {
-        matches!(self, NodeView::Catalog(_) | NodeView::Redis { .. })
+        matches!(
+            self,
+            NodeView::Catalog(_) | NodeView::Redis { .. } | NodeView::Documents { .. }
+        )
     }
 }
 
@@ -133,6 +156,7 @@ pub(super) struct Tree<'a> {
     /// Keys of expanded nodes, as in [`super::Explorer`].
     pub expanded: &'a HashSet<String>,
     pub redis_keys: &'a KeyBrowsers,
+    pub documents: &'a DocumentTrees,
     /// The filter, trimmed and lowercased; empty for none.
     pub query: &'a str,
 }
@@ -163,6 +187,7 @@ pub(super) fn tree_rows<'a>(
                 keyspace,
                 default_db,
             } => redis_keys::redis_rows(index, id, keyspace, default_db, tree, &mut rows),
+            NodeView::Documents { id } => documents::document_rows(index, id, tree, &mut rows),
             NodeView::Catalog(CatalogState::Loading) => {
                 rows.push(note(1, "Loading catalog…", theme::TEXT_TERTIARY))
             }
@@ -384,9 +409,11 @@ mod tests {
     fn rows(state: &CatalogState, expanded: &[&str], query: &str) -> Vec<Row> {
         let expanded = expanded.iter().map(|key| key.to_string()).collect();
         let redis_keys = HashMap::new();
+        let documents = HashMap::new();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
+            documents: &documents,
             query,
         };
         tree_rows([NodeView::Catalog(state)], &tree)
@@ -541,9 +568,11 @@ mod tests {
     fn a_connection_that_is_not_open_shows_its_state() {
         let expanded: HashSet<String> = ["0", "1", "2", "3"].map(String::from).into();
         let redis_keys = HashMap::new();
+        let documents = HashMap::new();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
+            documents: &documents,
             query: "",
         };
         let (loading, failed) = (
@@ -582,12 +611,60 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_opens_only_open_connections() {
-        let expanded = HashSet::new();
+    fn a_document_connection_lists_what_was_read_under_it() {
+        use kuery_core::document::catalog::{Container, ContainerKind};
+
+        use super::documents::Children;
+
+        let database = Container {
+            name: "shop".into(),
+            kind: ContainerKind::Database,
+            leaf: false,
+            estimated: None,
+            size: Some(1024),
+        };
+        let documents: DocumentTrees = [(
+            ("m".to_string(), Vec::new()),
+            Children::Loaded {
+                items: vec![database],
+                shown: documents::PAGE,
+                counting: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let expanded = ["0".to_string()].into();
         let redis_keys = HashMap::new();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
+            documents: &documents,
+            query: "",
+        };
+        assert_eq!(
+            tree_rows([NodeView::Documents { id: "m" }], &tree),
+            [
+                CONNECTION,
+                Row::DocumentNode {
+                    index: 0,
+                    path: Vec::new(),
+                    item: 0,
+                    depth: 1,
+                    expanded: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_filter_opens_only_open_connections() {
+        let expanded = HashSet::new();
+        let redis_keys = HashMap::new();
+        let documents = HashMap::new();
+        let tree = Tree {
+            expanded: &expanded,
+            redis_keys: &redis_keys,
+            documents: &documents,
             query: "x",
         };
         let failed = CatalogState::Failed("permission denied".into());

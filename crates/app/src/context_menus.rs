@@ -59,8 +59,10 @@ pub struct Cell {
     pub row: usize,
     pub column: usize,
     pub columns: Vec<String>,
-    /// The row's values; `None` is NULL.
+    /// The row's values; `None` is NULL, or an absent field.
     pub values: Vec<Option<String>>,
+    /// The cell is a field the document lacks, not a NULL.
+    pub absent: bool,
 }
 
 impl Cell {
@@ -71,16 +73,26 @@ impl Cell {
     pub fn value(&self) -> Option<&str> {
         self.values.get(self.column).and_then(|v| v.as_deref())
     }
+
+    /// What Copy Value copies: NULL as `NULL`, a field the document lacks
+    /// as nothing.
+    pub fn copied_value(&self) -> String {
+        match self.value() {
+            Some(value) => value.to_string(),
+            None if self.absent => String::new(),
+            None => "NULL".to_string(),
+        }
+    }
 }
 
-/// Copy Value, Copy Row, Copy Row as JSON and Copy Column Name.
-pub fn copy_cell_items(menu: PopupMenu, cell: &Cell) -> PopupMenu {
-    menu.item(copy("Copy Value", cell.value().unwrap_or("NULL").to_string()).icon(IconName::Copy))
+/// Copy Value, Copy Row, Copy Row as JSON and Copy Column Name. `row_json`
+/// replaces the row's text as JSON when the grid knows the row better (a
+/// document's own fields and types).
+pub fn copy_cell_items(menu: PopupMenu, cell: &Cell, row_json: Option<String>) -> PopupMenu {
+    let row_json = row_json.unwrap_or_else(|| row_as_json(&cell.columns, &cell.values));
+    menu.item(copy("Copy Value", cell.copied_value()).icon(IconName::Copy))
         .item(copy("Copy Row", row_as_tsv(&cell.values)))
-        .item(copy(
-            "Copy Row as JSON",
-            row_as_json(&cell.columns, &cell.values),
-        ))
+        .item(copy("Copy Row as JSON", row_json))
         .item(copy("Copy Column Name", cell.column_name().to_string()))
 }
 
@@ -110,6 +122,23 @@ pub fn row_as_json(columns: &[String], values: &[Option<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_null_as_null_and_an_absent_field_as_nothing() {
+        let cell = |values: Vec<Option<String>>, absent| Cell {
+            row: 0,
+            column: 0,
+            columns: vec!["coupon".into()],
+            values,
+            absent,
+        };
+        assert_eq!(
+            cell(vec![Some("SAVE7".into())], false).copied_value(),
+            "SAVE7"
+        );
+        assert_eq!(cell(vec![None], false).copied_value(), "NULL");
+        assert_eq!(cell(vec![None], true).copied_value(), "");
+    }
 
     #[test]
     fn copies_rows_as_tsv_and_json() {

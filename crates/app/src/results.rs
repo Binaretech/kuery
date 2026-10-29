@@ -131,6 +131,7 @@ impl ResultsDelegate {
             values: (0..self.set.columns().len())
                 .map(|index| self.set.cell(row, index).flatten().map(str::to_owned))
                 .collect(),
+            absent: false,
         }
     }
 }
@@ -204,7 +205,7 @@ impl TableDelegate for ResultsDelegate {
             Some(row_menu) => row_menu(menu, row_ix, cx).separator(),
             None => menu,
         };
-        copy_cell_items(menu, &self.cell(row_ix, column))
+        copy_cell_items(menu, &self.cell(row_ix, column), None)
     }
 
     fn render_empty(

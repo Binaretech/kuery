@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use gpui_kit::{Action, actions};
 
 use crate::audit::OpenAuditLog;
+use crate::collection_tab::ReloadCollection;
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
     CancelQuery, CommitTransaction, ExplainAnalyze, ExplainQuery, ExportResults, FormatSql,
@@ -342,6 +343,14 @@ pub const COMMANDS: &[Command] = &[
         action: action!(SaveTableChanges),
         defaults: &["secondary-s"],
         context: Some("TableTab"),
+    },
+    Command {
+        id: "collection.reload",
+        title: "Reload Collection",
+        category: "Collection",
+        action: action!(ReloadCollection),
+        defaults: &["secondary-r"],
+        context: Some("CollectionTab"),
     },
     Command {
         id: "keymap.open",

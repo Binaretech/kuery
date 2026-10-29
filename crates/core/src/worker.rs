@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use futures::channel::oneshot;
@@ -49,6 +49,15 @@ pub(crate) struct State {
     /// A cancel came: some databases let a stopped statement end as if
     /// nothing happened, so the run checks this too.
     pub(crate) cancelled: AtomicBool,
+    /// Held while a run begins, and while a cancel checks which run is on
+    /// and stops it, so the next run cannot begin in between.
+    gate: Mutex<()>,
+}
+
+impl State {
+    fn gate(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The adapter, on the worker's thread. Each contract adds its rules in an
@@ -77,6 +86,7 @@ impl<A: ?Sized> Worker<A> {
 
     /// A job is running, for [`Handle::cancel`].
     pub(crate) fn begin_run(&mut self) {
+        let _gate = self.state.gate();
         self.state.run.fetch_add(1, Ordering::SeqCst);
         self.state.cancelled.store(false, Ordering::SeqCst);
         self.state.running.store(true, Ordering::SeqCst);
@@ -229,25 +239,32 @@ impl<A: ?Sized + Driven> Handle<A> {
     }
 
     /// Stops the running job, if any: now, and again every quarter second
-    /// while it goes on.
+    /// while it goes on. Each try checks the run and stops it behind the
+    /// gate, so one that comes as the run ends never reaches the next.
     pub(crate) fn cancel(&self) {
         let state = self.state.clone();
-        if !state.running.load(Ordering::SeqCst) {
-            return;
-        }
-        state.cancelled.store(true, Ordering::SeqCst);
-        let run = state.run.load(Ordering::SeqCst);
+        let run = {
+            let _gate = state.gate();
+            if !state.running.load(Ordering::SeqCst) {
+                return;
+            }
+            state.cancelled.store(true, Ordering::SeqCst);
+            state.run.load(Ordering::SeqCst)
+        };
         let canceller = self.canceller.clone();
         let _ = std::thread::Builder::new()
             .name("kuery-cancel".into())
             .spawn(move || {
                 for _ in 0..40 {
-                    if !state.running.load(Ordering::SeqCst)
-                        || state.run.load(Ordering::SeqCst) != run
                     {
-                        break;
+                        let _gate = state.gate();
+                        if !state.running.load(Ordering::SeqCst)
+                            || state.run.load(Ordering::SeqCst) != run
+                        {
+                            break;
+                        }
+                        canceller();
                     }
-                    canceller();
                     std::thread::sleep(Duration::from_millis(250));
                 }
             });

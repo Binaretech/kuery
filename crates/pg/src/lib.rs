@@ -144,6 +144,8 @@ pub static DRIVER: SqlDriver = SqlDriver {
         file: false,
         host_help: None,
         options: &[],
+        uri: None,
+        ssh_route: None,
     },
     dialect: &POSTGRES,
     open: |options, access| open(&conninfo(options), access),

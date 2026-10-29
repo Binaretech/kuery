@@ -2,24 +2,27 @@
 //! project's connections. The driver is picked from a searchable list of
 //! every driver Kuery has, grouped by family; the rest of the form follows
 //! the driver's descriptor (see [`kuery_core::driver`]): its default port,
-//! what its database and user fields mean, and how it asks about TLS. The
-//! password goes to the system keychain; the rest to `.kuery/project.toml`.
-//! Any connection can go through an SSH host (see [`crate::tunnel`]).
+//! what its database and user fields mean, how it asks about TLS, and its
+//! other options. Pasting a connection string into the host field, for a
+//! driver that reads one, fills the form instead. The password goes to the
+//! system keychain; the rest to `.kuery/project.toml`. Any connection can go
+//! through an SSH host (see [`crate::tunnel`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::searchable_list::{SearchableGroup, SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{Disableable as _, IndexPath, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, IntoElement,
+    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, div, px,
 };
-use kuery_core::driver::{self, DriverInfo, Family};
+use kuery_core::driver::{self, DriverInfo, Family, OptionField, OptionKind, ParsedUri};
 
 use crate::app;
 use crate::connection::Environment;
@@ -103,6 +106,64 @@ fn driver_groups() -> SearchableVec<SearchableGroup<DriverItem>> {
     )
 }
 
+/// What a pasted connection string puts in the form.
+#[derive(Debug, PartialEq)]
+struct FormValues {
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    /// Typed into the password field, so Save keeps it only in the keychain.
+    password: Option<String>,
+    tls: Option<String>,
+    options: BTreeMap<String, String>,
+}
+
+/// The form's fields for a split connection string: a port it does not name
+/// is the driver's default.
+fn apply_uri(parsed: ParsedUri, default_port: u16) -> FormValues {
+    FormValues {
+        host: parsed.host,
+        port: parsed.port.unwrap_or(default_port).to_string(),
+        database: parsed.database,
+        user: parsed.user,
+        password: parsed.password,
+        tls: parsed.tls,
+        options: parsed.options,
+    }
+}
+
+/// Whether a change to the host field brought more than one character at
+/// once: a paste, not a key typed.
+fn pasted(previous: &str, text: &str) -> bool {
+    text.chars().count() > previous.chars().count() + 1
+}
+
+/// Refuses a host that holds a connection string the driver could not
+/// split, or a user and password: they stay in the field, and must never
+/// reach the project file.
+fn check_host(host: &str) -> Result<(), String> {
+    if host.contains("://") {
+        return Err("The host is a name or an address, not a connection string".into());
+    }
+    if host.contains('@') {
+        return Err(
+            "The host is a name or an address: the user and password have fields of their own"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The control of one of the driver's options.
+enum OptionInput {
+    /// A text, or a file's path.
+    Text(Entity<InputState>),
+    Toggle(bool),
+    /// The driver's default first, then its choices.
+    Choice(Entity<TextSelect>),
+}
+
 enum TestState {
     Idle,
     Testing,
@@ -118,6 +179,9 @@ pub struct ConnectionEditor {
     driver_select: Entity<DriverSelect>,
     name: Entity<InputState>,
     host: Entity<InputState>,
+    /// The host field's text after its last change, to tell a pasted
+    /// connection string from one being typed.
+    host_text: String,
     port: Entity<InputState>,
     database: Entity<InputState>,
     user: Entity<InputState>,
@@ -125,6 +189,8 @@ pub struct ConnectionEditor {
     has_saved_password: bool,
     /// The driver's TLS choices (see [`driver::Tls::options`]).
     tls: Entity<TextSelect>,
+    /// The driver's other options, in its order.
+    options: Vec<(&'static OptionField, OptionInput)>,
     environment: Entity<TextSelect>,
     /// Through an SSH host, and its fields.
     ssh: bool,
@@ -245,6 +311,31 @@ impl ConnectionEditor {
         let environment_index =
             environment_index(spec.as_ref().and_then(|s| s.environment.as_deref()));
         let environment = select(ENVIRONMENTS.to_vec(), environment_index, window, cx);
+        let options = option_inputs(
+            info,
+            &spec.as_ref().map(|s| s.options.clone()).unwrap_or_default(),
+            window,
+            cx,
+        );
+        // A pasted connection string fills the form; the host and the
+        // environment decide which options are offered.
+        cx.subscribe_in(&host, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.host_changed(window, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&ssh_host, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(
+            &environment,
+            |_, _, _: &SelectEvent<SearchableVec<SharedString>>, cx| cx.notify(),
+        )
+        .detach();
 
         let driver_select = cx.new(|cx| {
             let mut state = SelectState::new(driver_groups(), None, window, cx).searchable(true);
@@ -269,6 +360,7 @@ impl ConnectionEditor {
         )
         .detach();
 
+        let host_text = host.read(cx).value().trim().to_string();
         let mut editor = Self {
             model,
             id,
@@ -276,12 +368,14 @@ impl ConnectionEditor {
             driver_select,
             name,
             host,
+            host_text,
             port,
             database,
             user,
             password,
             has_saved_password: false,
             tls,
+            options,
             environment,
             ssh: ssh.is_some(),
             ssh_host,
@@ -369,10 +463,184 @@ impl ConnectionEditor {
                 select.set_selected_index(Some(IndexPath::new(0)), window, cx);
             });
         }
+        self.options = option_inputs(info, &BTreeMap::new(), window, cx);
         self.driver = info;
         self.test = TestState::Idle;
         self.error = None;
         cx.notify();
+    }
+
+    /// A connection string pasted into the host field fills the form, for a
+    /// driver that reads one. The string itself is never kept: its password
+    /// goes to the password field, and so only ever to the keychain. One
+    /// being typed is not split as it grows (`mongodb://k` would already
+    /// fill the host with `k`); Save refuses it whole.
+    fn host_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.host.read(cx).value().trim().to_string();
+        let previous = std::mem::replace(&mut self.host_text, text.clone());
+        if let Some(split) = self.driver.uri
+            && text.contains("://")
+            && pasted(&previous, &text)
+        {
+            match split(&text) {
+                Ok(parsed) => {
+                    let values = apply_uri(parsed, self.driver.default_port);
+                    // Filling the field sends no change of its own.
+                    self.host_text = values.host.clone();
+                    self.fill(values, window, cx);
+                    self.error = None;
+                }
+                Err(error) => self.error = Some(error),
+            }
+            self.test = TestState::Idle;
+        }
+        cx.notify();
+    }
+
+    fn fill(&mut self, values: FormValues, window: &mut Window, cx: &mut Context<Self>) {
+        let inputs = [
+            (&self.host, values.host),
+            (&self.port, values.port),
+            (&self.database, values.database),
+            (&self.user, values.user),
+        ];
+        for (input, value) in inputs {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        if let Some(password) = values.password {
+            self.password
+                .update(cx, |input, cx| input.set_value(password, window, cx));
+        }
+        let tls = self.driver.tls.index(values.tls.as_deref());
+        self.tls.update(cx, |select, cx| {
+            select.set_selected_index(Some(IndexPath::new(tls)), window, cx)
+        });
+        self.options = option_inputs(self.driver, &values.options, window, cx);
+    }
+
+    /// The environment the form's settings give, as it changes: the options
+    /// offered depend on it.
+    fn environment(&self, cx: &App) -> Environment {
+        let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let selected = Self::selected_index(&self.environment, cx);
+        ConnectionSpec {
+            id: String::new(),
+            name: String::new(),
+            driver: self.driver.id.to_string(),
+            host: value(&self.host),
+            port: 0,
+            database: value(&self.database),
+            user: String::new(),
+            sslmode: None,
+            environment: (selected > 0)
+                .then(|| ENVIRONMENTS[selected.min(ENVIRONMENTS.len() - 1)].to_string()),
+            ssh: self.ssh.then(|| SshSpec {
+                host: value(&self.ssh_host),
+                port: None,
+                user: String::new(),
+                identity_file: String::new(),
+            }),
+            options: BTreeMap::new(),
+        }
+        .environment()
+    }
+
+    /// The options as the connection keeps them: empty ones and toggles that
+    /// are off left out, and on production those it may not have.
+    fn option_values(&self, environment: Environment, cx: &App) -> BTreeMap<String, String> {
+        self.options
+            .iter()
+            .filter(|(field, _)| field.production || environment != Environment::Production)
+            .filter_map(|(field, input)| {
+                let value = match (input, field.kind) {
+                    (OptionInput::Text(input), _) => input.read(cx).value().trim().to_string(),
+                    (OptionInput::Toggle(on), _) => match on {
+                        true => "true".to_string(),
+                        false => String::new(),
+                    },
+                    (OptionInput::Choice(select), OptionKind::Choice(choices)) => {
+                        Self::selected_index(select, cx)
+                            .checked_sub(1)
+                            .and_then(|index| choices.get(index))
+                            .map(|choice| choice.to_string())
+                            .unwrap_or_default()
+                    }
+                    (OptionInput::Choice(_), _) => String::new(),
+                };
+                (!value.is_empty()).then(|| (field.key.to_string(), value))
+            })
+            .collect()
+    }
+
+    fn set_toggle(&mut self, position: usize, on: bool, cx: &mut Context<Self>) {
+        if let Some((_, input @ OptionInput::Toggle(_))) = self.options.get_mut(position) {
+            *input = OptionInput::Toggle(on);
+            self.test = TestState::Idle;
+            cx.notify();
+        }
+    }
+
+    /// Asks for a file and puts its path in the option's field.
+    fn choose_file(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((field, OptionInput::Text(input))) = self.options.get(position) else {
+            return;
+        };
+        let input = input.clone();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(field.label.into()),
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                input
+                    .update_in(cx, |input, window, cx| {
+                        input.set_value(path.display().to_string(), window, cx)
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// One option's row, and its help under it.
+    fn option_row(
+        &self,
+        position: usize,
+        option: &'static OptionField,
+        input: &OptionInput,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let control = match input {
+            OptionInput::Text(input) if option.kind == OptionKind::File => h_flex()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(Input::new(input)))
+                .child(
+                    Button::new(("connection-option-file", position))
+                        .label("Choose…")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_file(position, window, cx)
+                        })),
+                )
+                .into_any_element(),
+            OptionInput::Text(input) => Input::new(input).into_any_element(),
+            OptionInput::Toggle(on) => Checkbox::new(("connection-option", position))
+                .checked(*on)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.set_toggle(position, *checked, cx)
+                }))
+                .into_any_element(),
+            OptionInput::Choice(select) => Select::new(select).into_any_element(),
+        };
+        v_flex()
+            .gap_3()
+            .child(field(option.label, control))
+            .children(option.help.map(field_help))
+            .into_any_element()
     }
 
     /// Whether the keychain already has a password, read off the UI thread
@@ -410,6 +678,7 @@ impl ConnectionEditor {
         if name.is_empty() {
             return Err("Give the connection a name".into());
         }
+        check_host(&host)?;
         self.driver.validate(&host, &database, &user)?;
         // A database file has no server: no host, port, user or TLS.
         let file = self.driver.file;
@@ -449,7 +718,7 @@ impl ConnectionEditor {
         } else {
             None
         };
-        Ok(ConnectionSpec {
+        let mut spec = ConnectionSpec {
             id: self.id.clone().unwrap_or_else(new_id),
             name,
             driver: self.driver.id.to_string(),
@@ -463,7 +732,11 @@ impl ConnectionEditor {
             environment: (environment > 0)
                 .then(|| ENVIRONMENTS[environment.min(ENVIRONMENTS.len() - 1)].to_string()),
             ssh,
-        })
+            options: BTreeMap::new(),
+        };
+        spec.options = self.option_values(spec.environment(), cx);
+        self.driver.check_options(&spec.options)?;
+        Ok(spec)
     }
 
     /// The password typed in the form, or the saved one if the field is empty.
@@ -585,6 +858,53 @@ impl ConnectionEditor {
     }
 }
 
+/// A line of help under a field.
+fn field_help(help: &'static str) -> impl IntoElement {
+    field("", muted(help))
+}
+
+/// The controls of a driver's options, holding `values`.
+fn option_inputs(
+    info: &'static DriverInfo,
+    values: &BTreeMap<String, String>,
+    window: &mut Window,
+    cx: &mut Context<ConnectionEditor>,
+) -> Vec<(&'static OptionField, OptionInput)> {
+    info.options
+        .iter()
+        .map(|field| {
+            let value = values.get(field.key).cloned().unwrap_or_default();
+            let input = match field.kind {
+                OptionKind::Text | OptionKind::File => OptionInput::Text(cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder(field.placeholder)
+                        .default_value(value)
+                })),
+                OptionKind::Toggle => OptionInput::Toggle(value == "true"),
+                OptionKind::Choice(choices) => {
+                    let selected = choices
+                        .iter()
+                        .position(|choice| *choice == value)
+                        .map_or(0, |index| index + 1);
+                    let items: Vec<SharedString> = std::iter::once("default")
+                        .chain(choices.iter().copied())
+                        .map(SharedString::from)
+                        .collect();
+                    OptionInput::Choice(cx.new(|cx| {
+                        SelectState::new(
+                            SearchableVec::new(items),
+                            Some(IndexPath::new(selected)),
+                            window,
+                            cx,
+                        )
+                    }))
+                }
+            };
+            (field, input)
+        })
+        .collect()
+}
+
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     h_flex()
         .gap_3()
@@ -621,6 +941,14 @@ impl Render for ConnectionEditor {
             driver::Tls::Modes(_) => "SSL mode",
             driver::Tls::Toggle => "TLS",
         };
+        let production = self.environment(cx) == Environment::Production;
+        let options: Vec<AnyElement> = self
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(_, (field, _))| field.production || !production)
+            .map(|(position, (field, input))| self.option_row(position, field, input, cx))
+            .collect();
 
         v_flex()
             .gap_4()
@@ -638,17 +966,18 @@ impl Render for ConnectionEditor {
                     .child(field("Name", Input::new(&self.name)))
                     .when(!info.file, |form| {
                         form.child(field("Host", Input::new(&self.host)))
-                            .children(info.host_help.map(|help| field("", muted(help))))
+                            .children(info.host_help.map(field_help))
                             .child(field("Port", Input::new(&self.port)))
                     })
                     .child(field(info.database.label, Input::new(&self.database)))
-                    .children(info.database.help.map(|help| field("", muted(help))))
+                    .children(info.database.help.map(field_help))
                     .when(!info.file, |form| {
                         form.child(field(info.user.label, Input::new(&self.user)))
-                            .children(info.user.help.map(|help| field("", muted(help))))
+                            .children(info.user.help.map(field_help))
                             .child(field("Password", Input::new(&self.password).mask_toggle()))
                             .child(field("", muted(password_hint)))
                             .child(field(tls_label, Select::new(&self.tls)))
+                            .children(options)
                     })
                     .when(!info.file, |form| {
                         form.child(field(
@@ -734,6 +1063,74 @@ impl Render for ConnectionEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_string_fills_the_form() {
+        let options: BTreeMap<String, String> = [("authSource", "admin"), ("srv", "true")]
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .into();
+        let parsed = ParsedUri {
+            host: "cluster0.x.mongodb.net".into(),
+            port: None,
+            database: "shop".into(),
+            user: "u".into(),
+            password: Some("p@ss".into()),
+            tls: Some("require".into()),
+            options: options.clone(),
+        };
+        assert_eq!(
+            apply_uri(parsed, 27017),
+            FormValues {
+                host: "cluster0.x.mongodb.net".into(),
+                port: "27017".into(),
+                database: "shop".into(),
+                user: "u".into(),
+                password: Some("p@ss".into()),
+                tls: Some("require".into()),
+                options,
+            }
+        );
+        let one = ParsedUri {
+            host: "localhost".into(),
+            port: Some(27019),
+            database: String::new(),
+            user: String::new(),
+            password: None,
+            tls: None,
+            options: BTreeMap::new(),
+        };
+        let values = apply_uri(one, 27017);
+        assert_eq!((values.port.as_str(), values.password), ("27019", None));
+    }
+
+    #[test]
+    fn only_a_pasted_string_is_split() {
+        assert!(pasted("localhost", "mongodb://kuery:secret@db/shop"));
+        assert!(pasted("", "mongodb://db"));
+        // Typed a key at a time, the string is never split part way.
+        assert!(!pasted("mongodb://", "mongodb://k"));
+        assert!(!pasted(
+            "mongodb://kuery:secret@db/sho",
+            "mongodb://kuery:secret@db/shop"
+        ));
+        assert!(!pasted("mongodb://k", "mongodb://"));
+    }
+
+    #[test]
+    fn a_host_never_keeps_credentials() {
+        assert!(check_host("db.example.com").is_ok());
+        assert!(check_host("a:27017,b:27018").is_ok());
+        assert!(check_host("[::1]").is_ok());
+        // What is left of a typed connection string after its scheme.
+        for refused in [
+            "kuery:secret@db/shop",
+            "mongodb://kuery:secret@db/shop",
+            "user@db",
+        ] {
+            let error = check_host(refused).unwrap_err();
+            assert!(!error.contains("secret"), "{error}");
+        }
+    }
 
     #[test]
     fn saving_keeps_the_environment_the_file_names() {

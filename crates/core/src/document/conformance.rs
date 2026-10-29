@@ -24,6 +24,15 @@ pub struct Fixture {
     pub opener: DocumentOpener,
     /// A collection of at least four documents with an `_id` each.
     pub collection: CollectionRef,
+    /// A collection holding, somewhere in its documents, an Int64 beyond
+    /// 2^53, a decimal and a date.
+    pub types: CollectionRef,
+    /// The same database as a user the server keeps from writing, where
+    /// the engine has users.
+    pub reader: Option<DocumentOpener>,
+    /// A statement that runs for about 20 seconds, for the cancel check the
+    /// console brings.
+    pub slow: String,
 }
 
 /// Runs every check.
@@ -32,6 +41,7 @@ pub fn run(fixture: &Fixture) {
     refuses_writes_twice_when_reading(fixture);
     reads_its_catalog(fixture);
     samples(fixture);
+    keeps_its_types(fixture);
     says_who_keeps_it_read_only(fixture);
 }
 
@@ -171,6 +181,45 @@ pub fn samples(fixture: &Fixture) {
     );
 }
 
+pub fn keeps_its_types(fixture: &Fixture) {
+    let reader = open(fixture, Access::ReadOnly);
+    let (documents, _) = page(&reader, &fixture.types, BrowseSpec::default());
+    let values: Vec<&Value> = documents
+        .iter()
+        .flat_map(|document| document.0.iter().map(|(_, value)| value))
+        .collect();
+    let mut found = Vec::new();
+    for value in values {
+        walk(value, &mut found);
+    }
+    let beyond_doubles =
+        |value: &&Value| matches!(value, Value::Int64(n) if n.unsigned_abs() > 1 << 53);
+    assert!(
+        found.iter().any(beyond_doubles),
+        "no Int64 beyond 2^53 came back as one"
+    );
+    assert!(
+        found.iter().any(|value| matches!(value, Value::Decimal(_))),
+        "no decimal came back as one"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|value| matches!(value, Value::DateTime(_))),
+        "no date came back as one"
+    );
+}
+
+/// Every value in `value`, nested ones too.
+fn walk<'a>(value: &'a Value, found: &mut Vec<&'a Value>) {
+    found.push(value);
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+        Value::Object(document) => document.0.iter().for_each(|(_, value)| walk(value, found)),
+        _ => {}
+    }
+}
+
 pub fn says_who_keeps_it_read_only(fixture: &Fixture) {
     let reader = open(fixture, Access::ReadOnly);
     if let Enforcement::ClientOnly(why) = reader.capabilities().read_only {
@@ -180,4 +229,14 @@ pub fn says_who_keeps_it_read_only(fixture: &Fixture) {
             "only Kuery refuses writes here, and the session must say so"
         );
     }
+    let Some(opener) = &fixture.reader else {
+        return;
+    };
+    let kept = block_on(DocumentSession::open(opener.clone(), Access::ReadOnly))
+        .expect("opens the database as the reading user");
+    assert_eq!(
+        kept.capabilities().read_only,
+        Enforcement::Server,
+        "the server keeps this user from writing, and the session must know"
+    );
 }

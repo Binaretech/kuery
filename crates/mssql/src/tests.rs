@@ -125,6 +125,7 @@ fn reads_targets_from_connection_options() {
         password: Some(String::new()),
         tls: Some("trust server certificate".into()),
         tunnel: None,
+        proxy: None,
         options: Default::default(),
     };
     let target = Target::from(&options);

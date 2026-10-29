@@ -28,6 +28,7 @@ changelog_path = "CHANGELOG.md"
 changelog_include = [
     "kuery-core",
     "kuery-files",
+    "kuery-mongo",
     "kuery-mssql",
     "kuery-mysql",
     "kuery-pg",
@@ -43,6 +44,11 @@ changelog_update = false
 
 [[package]]
 name = "kuery-files"
+version_group = "kuery"
+changelog_update = false
+
+[[package]]
+name = "kuery-mongo"
 version_group = "kuery"
 changelog_update = false
 

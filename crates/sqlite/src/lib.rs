@@ -53,6 +53,8 @@ pub static DRIVER: SqlDriver = SqlDriver {
         file: true,
         host_help: None,
         options: &[],
+        uri: None,
+        ssh_route: None,
     },
     dialect: &SQLITE,
     open: |options, access| open(Path::new(&options.database), access),

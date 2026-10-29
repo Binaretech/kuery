@@ -100,6 +100,7 @@ static FAKE: Language = Language {
     check_filter,
     parse_document: |_| Ok(Document::default()),
     render,
+    field_filter: |_, _| None,
     context: |_, _| CompletionContext::Nothing,
     methods: &[],
     operators: &[],

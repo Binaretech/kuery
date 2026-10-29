@@ -9,7 +9,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::analysis::StatementKind;
-use crate::document::value::{CollectionRef, Document, Value};
+use crate::document::value::{CollectionRef, Document, FieldPath, Value};
 
 /// How a value prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +141,11 @@ pub struct Language {
     /// A value as a typed literal that reads back the same:
     /// `NumberLong("5")`, `ObjectId("…")`.
     pub render: fn(&Value, Style) -> String,
+    /// The filter bar's text that keeps the documents holding `value` at
+    /// `path`, or, for `None`, those that lack the field. A null keeps only
+    /// the documents whose field holds null, not those that lack it.
+    /// `None` when the language cannot say it.
+    pub field_filter: fn(&FieldPath, Option<&Value>) -> Option<String>,
     /// What completion offers at a byte offset of the text.
     pub context: fn(&str, usize) -> CompletionContext,
     pub methods: &'static [&'static str],

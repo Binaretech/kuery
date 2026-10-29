@@ -49,6 +49,7 @@ fn builds_a_quoted_conninfo_with_the_password_in_memory() {
         password: Some(r"p\ss".into()),
         tls: Some("require".into()),
         tunnel: None,
+        proxy: None,
         options: Default::default(),
     };
     assert_eq!(
