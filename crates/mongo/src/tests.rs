@@ -571,16 +571,7 @@ fn a_full_sink_stops_the_read_and_closes_the_cursor() {
         "{}",
         outcome.returned
     );
-    // The cursor closes as the read ends, on the server a moment later.
-    let started = std::time::Instant::now();
-    while !left_behind(&mut mongo).is_empty() {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            left_behind(&mut mongo)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    nothing_left_behind(&mut mongo);
     console(&mut mongo, "db.runCommand({ping: 1})").unwrap();
 }
 
@@ -1249,6 +1240,6 @@ fn cancels_a_sleeping_command_and_keeps_working() {
         started.elapsed()
     );
     canceller.join().unwrap();
-    assert_eq!(left_behind(&mut mongo), Vec::<BsonDocument>::new());
+    nothing_left_behind(&mut mongo);
     console(&mut mongo, "db.runCommand({ping: 1})").unwrap();
 }
