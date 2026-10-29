@@ -14,12 +14,11 @@
 //! runtime there.
 
 use crate::adapter::Canceller;
-use crate::document::capabilities::Capabilities;
+use crate::document::capabilities::{Capabilities, Sampling};
 use crate::document::catalog::{CollectionInfo, Container};
 use crate::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use crate::document::language::Language;
 use crate::document::value::{CollectionRef, Document};
-use crate::plan::Plan;
 use crate::session::{QueryError, RunOptions};
 use crate::worker::Driven;
 
@@ -165,13 +164,14 @@ pub trait DocumentAdapter: Send + 'static {
     fn collection(&mut self, collection: &CollectionRef) -> Result<CollectionInfo, QueryError>;
 
     /// About `n` documents of the collection, picked as
-    /// [`Capabilities::sampling`] says.
+    /// [`Capabilities::sampling`] says where the collection allows it.
+    /// Returns how they were picked: a view, say, may only give its first.
     fn sample(
         &mut self,
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError>;
+    ) -> Result<Sampling, QueryError>;
 
     /// One page of the collection; returns where the next one starts, or
     /// `None` when this was the last.
@@ -213,9 +213,12 @@ pub trait DocumentAdapter: Send + 'static {
         Ok(None)
     }
 
-    /// A statement's plan: estimated, or measured by running it when
-    /// `execute`.
-    fn explain(&mut self, statement: &str, execute: bool) -> Result<Plan, QueryError> {
+    /// A statement's plan, as the engine's own text that
+    /// [`crate::plan::parse`] reads (JSON): what the planner chose, or,
+    /// when `execute`, also measured by running it. The session asks to
+    /// execute only reads; an adapter refuses to execute anything else all
+    /// the same.
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
         let _ = (statement, execute);
         unsupported("plans")
     }

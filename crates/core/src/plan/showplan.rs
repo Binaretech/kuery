@@ -25,6 +25,7 @@ pub fn parse(xml: &str) -> Result<Plan, String> {
         execution_ms: descendant(query_plan, "QueryTimeStats")
             .and_then(|stats| number(stats, "ElapsedTime")),
         analyzed,
+        estimates: true,
         insights: Vec::new(),
     };
     plan.insights = insights(&plan, query_plan);

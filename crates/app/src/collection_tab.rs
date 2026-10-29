@@ -26,6 +26,11 @@
 //! transactions they apply all or nothing; elsewhere Apply stops at the
 //! first failure and keeps the rest staged. Views, and users the server
 //! keeps from writing, offer no edits.
+//!
+//! Besides its documents, the tab shows the schema they hold, sampled on
+//! the connection's catalog session and kept for every tab on the
+//! connection (see [`DocDb::schema`]), beside the one the engine declares.
+//! A new document starts from that schema.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -33,6 +38,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -50,10 +56,11 @@ use gpui_kit::{
 };
 use kuery_core::browse::Direction;
 use kuery_core::document::capabilities::Transactions;
-use kuery_core::document::catalog::ContainerKind;
+use kuery_core::document::catalog::{CollectionInfo, ContainerKind};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use kuery_core::document::export::{DocFormat, DocumentWriter, Ejson, document_ejson};
 use kuery_core::document::language::{Language, ParseError, Style};
+use kuery_core::document::schema::{self, Sampled};
 use kuery_core::document::session::{DocEvent, DocSummary, DocumentSession, Heavy};
 use kuery_core::document::value::{CollectionRef, Document, FieldPath, Value};
 use kuery_core::export::{self, Format};
@@ -66,6 +73,7 @@ use crate::audit;
 #[cfg(test)]
 use crate::audit::AuditRecord;
 use crate::chrome;
+use crate::collection_sections;
 use crate::connection::{DocDb, Environment};
 use crate::context_menus::{Cell, copy, item};
 use crate::document_detail::{DetailEvent, DocumentDetail};
@@ -132,6 +140,23 @@ enum ApplyState {
     Failed(String),
 }
 
+/// What the tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Documents,
+    /// What the documents hold, sampled, beside what the engine declares.
+    Schema,
+    Indexes,
+}
+
+/// Something a section reads, off the UI thread.
+enum Read<T> {
+    Idle,
+    Pending,
+    Ready(T),
+    Failed(String),
+}
+
 enum CountState {
     /// Not asked for: a view, whose count runs its whole pipeline.
     Skipped,
@@ -173,6 +198,15 @@ pub struct CollectionTab {
     status: Status,
     /// A view's pipeline, as the engine's literal.
     pipeline: Option<String>,
+    section: Section,
+    /// The collection's schema, as sampled on the connection.
+    schema: Read<Arc<Sampled>>,
+    /// Its kind, indexes, validator and options, as the engine reports them.
+    info: Read<Rc<CollectionInfo>>,
+    schema_task: Option<Task<()>>,
+    info_task: Option<Task<()>>,
+    /// Insert waits for the schema it starts from.
+    insert_task: Option<Task<()>>,
     /// Find was asked for before the session opened.
     find_on_open: bool,
     export: Option<ExportState>,
@@ -297,24 +331,7 @@ impl CollectionTab {
                 .ok();
         })
         .detach();
-        if kind == ContainerKind::View {
-            let info = db.catalog.collection(collection.clone());
-            let render = db.catalog.language().render;
-            cx.spawn(async move |this, cx| {
-                let pipeline = info.await.ok().and_then(|info| {
-                    let pipeline = info.options.get("pipeline")?;
-                    Some(render(pipeline, Style::Compact))
-                });
-                this.update(cx, |this, cx| {
-                    this.pipeline = pipeline;
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-
-        Self {
+        let mut tab = Self {
             db,
             project,
             session: SessionState::Connecting,
@@ -336,6 +353,12 @@ impl CollectionTab {
             count: CountState::Skipped,
             status: Status::Idle,
             pipeline: None,
+            section: Section::Documents,
+            schema: Read::Idle,
+            info: Read::Idle,
+            schema_task: None,
+            info_task: None,
+            insert_task: None,
             find_on_open: true,
             export: None,
             export_session: None,
@@ -352,7 +375,12 @@ impl CollectionTab {
             focus_handle: cx.focus_handle(),
             #[cfg(test)]
             audited: Vec::new(),
+        };
+        // A view's pipeline shows under the bar.
+        if kind == ContainerKind::View {
+            tab.load_info(cx);
         }
+        tab
     }
 
     /// Whether changes wait to be applied: closing the tab would lose them.
@@ -425,6 +453,66 @@ impl CollectionTab {
 
     fn language(&self) -> &'static Language {
         self.db.catalog.language()
+    }
+
+    /// Shows a section, reading what it needs the first time.
+    fn show_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        if section == Section::Schema && matches!(self.schema, Read::Idle) {
+            self.load_schema(false, cx);
+        }
+        if section != Section::Documents && matches!(self.info, Read::Idle) {
+            self.load_info(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads the collection's schema: the one sampled on the connection,
+    /// or (`again`, or when there is none) a new sample, on the catalog
+    /// session.
+    fn load_schema(&mut self, again: bool, cx: &mut Context<Self>) {
+        let reading = self.db.schema(self.collection.clone(), again);
+        self.schema = Read::Pending;
+        self.schema_task = Some(cx.spawn(async move |this, cx| {
+            let read = reading.await;
+            this.update(cx, |this, cx| {
+                this.schema = match read {
+                    Ok(sampled) => Read::Ready(sampled),
+                    Err(error) => Read::Failed(describe_error(error)),
+                };
+                this.schema_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Reads what the engine reports about the collection, on the catalog
+    /// session: a view's pipeline, the validator, the indexes.
+    fn load_info(&mut self, cx: &mut Context<Self>) {
+        let reading = self.db.catalog.collection(self.collection.clone());
+        let render = self.language().render;
+        self.info = Read::Pending;
+        self.info_task = Some(cx.spawn(async move |this, cx| {
+            let read = reading.await;
+            this.update(cx, |this, cx| {
+                this.info = match read {
+                    Ok(info) => {
+                        this.pipeline = info
+                            .options
+                            .get("pipeline")
+                            .map(|pipeline| render(pipeline, Style::Compact));
+                        Read::Ready(Rc::new(info))
+                    }
+                    Err(error) => Read::Failed(describe_error(error)),
+                };
+                this.info_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Work the language marks heavy runs on development connections only.
@@ -759,6 +847,8 @@ impl CollectionTab {
     /// One that changed since its staged edit was made from it is refused:
     /// the edit would show over what it held before.
     fn edit_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // What was asked last wins over a new document still on its way.
+        self.insert_task = None;
         if self.refuse_edit(cx) {
             return;
         }
@@ -776,23 +866,43 @@ impl CollectionTab {
         self.selected = Some(row);
     }
 
-    /// Opens a new document, from the fields of the documents loaded.
+    /// Opens a new document, from the collection's schema: the one
+    /// sampled on the connection, sampled now if there is none, or, if
+    /// that fails, the documents loaded.
     fn insert_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.applying() || !self.edits_offered() {
+        if self.applying() || !self.edits_offered() || self.insert_task.is_some() {
             return;
         }
-        let template = document_edits::template(self.rows.borrow().documents());
-        self.open_editor(
-            "New Document".into(),
-            &template,
-            Editing::Insert,
-            window,
-            cx,
-        );
+        let key = self.language().key_name;
+        let loaded = schema::infer(self.rows.borrow().documents());
+        let reading = self.db.schema(self.collection.clone(), false);
+        self.insert_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let template = match reading.await {
+                Ok(sampled) => document_edits::template(&sampled.schema, key),
+                Err(_) => document_edits::template(&loaded, key),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.insert_task = None;
+                // Never over an editor opened meanwhile, or while an apply
+                // runs.
+                if this.editing.is_some() || this.applying() {
+                    return;
+                }
+                this.open_editor(
+                    "New Document".into(),
+                    &template,
+                    Editing::Insert,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        }));
     }
 
     /// Opens a copy of a loaded document, without its key, as a new one.
     fn duplicate_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_task = None;
         if self.refuse_edit(cx) {
             return;
         }
@@ -852,6 +962,8 @@ impl CollectionTab {
         cx: &mut Context<Self>,
     ) {
         let text = (self.language().render)(&Value::Object(document.clone()), Style::Pretty);
+        // A new document on its way would open over this one.
+        self.insert_task = None;
         self.editing = Some(editing);
         self.detail
             .update(cx, |detail, cx| detail.edit(title, text, window, cx));
@@ -1720,8 +1832,137 @@ impl Focusable for CollectionTab {
     }
 }
 
+impl CollectionTab {
+    /// The sections, and what the one shown offers.
+    fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = self.section;
+        let note = match (&self.section, &self.schema) {
+            (Section::Schema, Read::Ready(sampled)) => Some(sampled.label()),
+            (Section::Schema, Read::Pending) => Some("Sampling…".into()),
+            _ => None,
+        };
+        let resample = section == Section::Schema && !matches!(self.schema, Read::Pending);
+        let reread = section == Section::Indexes && !matches!(self.info, Read::Pending);
+        h_flex()
+            .h(px(40.))
+            .px_3()
+            .gap_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(color(theme::HAIRLINE))
+            .child(
+                chrome::segmented().children(
+                    [
+                        (
+                            "collection-documents",
+                            AppIcon::Table,
+                            "Documents",
+                            Section::Documents,
+                        ),
+                        (
+                            "collection-schema",
+                            AppIcon::Code,
+                            "Schema",
+                            Section::Schema,
+                        ),
+                        (
+                            "collection-indexes",
+                            AppIcon::Key,
+                            "Indexes",
+                            Section::Indexes,
+                        ),
+                    ]
+                    .map(|(id, icon, label, target)| {
+                        chrome::segment(id, icon, label, section == target).on_click(
+                            cx.listener(move |this, _, _, cx| this.show_section(target, cx)),
+                        )
+                    }),
+                ),
+            )
+            .child(div().flex_1())
+            .children(note.map(|note| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(color(theme::TEXT_TERTIARY))
+                    .child(note)
+            }))
+            .when(section == Section::Schema, |row| {
+                row.child(
+                    chrome::icon_button(
+                        "collection-resample",
+                        AppIcon::Reload,
+                        "Sample Again",
+                        resample,
+                    )
+                    .when(resample, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| {
+                            this.load_schema(true, cx);
+                            this.load_info(cx);
+                        }))
+                    }),
+                )
+            })
+            .when(section == Section::Indexes, |row| {
+                row.child(
+                    chrome::icon_button("collection-reread", AppIcon::Reload, "Reload", reread)
+                        .when(reread, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.load_info(cx)))
+                        }),
+                )
+            })
+    }
+
+    /// The indexes section.
+    fn render_indexes(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        match &self.info {
+            Read::Ready(_) if self.kind == ContainerKind::View => {
+                placeholder("A view has no indexes of its own: it reads through its collection's")
+            }
+            Read::Ready(info) => {
+                collection_sections::index_view(&info.indexes, self.language(), mono)
+            }
+            Read::Failed(error) => placeholder(error.clone()),
+            Read::Idle | Read::Pending => placeholder("Reading the indexes…"),
+        }
+    }
+
+    /// The schema section: what the documents hold, beside what the
+    /// engine declares.
+    fn render_schema(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        match (&self.schema, &self.info) {
+            (Read::Failed(error), _) => placeholder(error.clone()),
+            (Read::Ready(sampled), Read::Ready(info)) => collection_sections::schema_view(
+                sampled,
+                info.validator.as_ref(),
+                self.language(),
+                mono,
+            ),
+            // What the engine declares could not be read: the sample stands.
+            (Read::Ready(sampled), Read::Failed(_)) => {
+                collection_sections::schema_view(sampled, None, self.language(), mono)
+            }
+            _ => placeholder("Sampling the collection…"),
+        }
+    }
+}
+
 impl Render for CollectionTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.section != Section::Documents {
+            let section = match self.section {
+                Section::Schema => self.render_schema(cx),
+                _ => self.render_indexes(cx),
+            };
+            return v_flex()
+                .size_full()
+                .key_context("CollectionTab")
+                .track_focus(&self.focus_handle)
+                .child(self.render_sections(cx))
+                .child(div().flex_1().min_h_0().child(section))
+                .into_any_element();
+        }
         let content: AnyElement = match &self.session {
             SessionState::Connecting => placeholder("Connecting…"),
             SessionState::Failed(error) => placeholder(error.clone()),
@@ -1757,10 +1998,12 @@ impl Render for CollectionTab {
                     this.reload(cx);
                 }
             }))
+            .child(self.render_sections(cx))
             .child(self.render_bar(cx))
             .child(div().flex_1().min_h_0().child(content))
             .children(self.render_changes(cx))
             .child(self.render_footer(cx))
+            .into_any_element()
     }
 }
 
@@ -2465,10 +2708,10 @@ mod tests {
             text.replace(r#""old""#, r#""new""#)
                 .replace(r#"NumberDecimal("9.99")"#, r#"NumberDecimal("10.50")"#)
         });
+        tab.update(cx, |tab, cx| tab.delete_row(2, cx));
+        insert(cx, window, &tab);
         cx.update_window(window, |_, window, cx| {
             tab.update(cx, |tab, cx| {
-                tab.delete_row(2, cx);
-                tab.insert_document(window, cx);
                 tab.stage(r#"{_id: 4, qty: NumberLong(4)}"#, window, cx);
             })
         })
@@ -2549,6 +2792,69 @@ mod tests {
     }
 
     /// The grid's row of the loaded document whose `_id` is `id`.
+    /// Opens a new document, once its template is read.
+    fn insert(
+        cx: &mut gpui::TestAppContext,
+        window: gpui_kit::AnyWindowHandle,
+        tab: &Entity<CollectionTab>,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| tab.insert_document(window, cx))
+        })
+        .unwrap();
+        run_until(cx, tab, |tab| matches!(tab.editing, Some(Editing::Insert)));
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_insert_never_opens_over_another_editor(cx: &mut gpui::TestAppContext) {
+        let (window, tab) = open_collection(cx, &["shop", "products"]);
+        run_until(cx, &tab, settled);
+        let in_window =
+            |cx: &mut gpui::TestAppContext,
+             f: &dyn Fn(&mut CollectionTab, &mut Window, &mut Context<CollectionTab>)| {
+                cx.update_window(window, |_, window, cx| {
+                    tab.update(cx, |tab, cx| f(tab, window, cx))
+                })
+                .unwrap();
+            };
+        // Edit asked for while the new document's schema is read: the
+        // edit stays open.
+        in_window(cx, &|tab, window, cx| {
+            tab.insert_document(window, cx);
+            assert!(tab.insert_task.is_some());
+            tab.edit_row(0, window, cx);
+        });
+        tab.read_with(cx, |tab, _| assert!(tab.insert_task.is_none()));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(300));
+        cx.run_until_parked();
+        tab.read_with(cx, |tab, _| {
+            assert!(matches!(tab.editing, Some(Editing::Edit(_))));
+        });
+        in_window(cx, &|tab, window, cx| tab.cancel_edit(window, cx));
+
+        // The same for a copy.
+        in_window(cx, &|tab, window, cx| {
+            tab.insert_document(window, cx);
+            tab.duplicate_row(0, window, cx);
+            assert!(tab.insert_task.is_none());
+        });
+        in_window(cx, &|tab, window, cx| tab.cancel_edit(window, cx));
+
+        // An apply that started meanwhile keeps the editor closed.
+        in_window(cx, &|tab, window, cx| {
+            tab.insert_document(window, cx);
+            tab.apply = ApplyState::Applying;
+        });
+        run_until(cx, &tab, |tab| tab.insert_task.is_none());
+        tab.read_with(cx, |tab, _| assert!(tab.editing.is_none()));
+        tab.update(cx, |tab, _| tab.apply = ApplyState::Idle);
+
+        // With nothing else open, it opens as before.
+        insert(cx, window, &tab);
+    }
+
     fn row_of(tab: &CollectionTab, id: i32) -> usize {
         tab.rows
             .borrow()
@@ -2656,9 +2962,9 @@ mod tests {
         assert_eq!(kept, Ok(Count::Exact(1)), "their change was undone");
 
         // After an apply whose outcome is unknown, Apply waits for a reload.
+        insert(cx, window, &tab);
         cx.update_window(window, |_, window, cx| {
             tab.update(cx, |tab, cx| {
-                tab.insert_document(window, cx);
                 tab.stage("{n: 4}", window, cx);
                 tab.reload_first = true;
             })
@@ -2688,6 +2994,123 @@ mod tests {
             assert!(!tab.edits_offered());
             assert!(!tab.has_pending());
             assert!(matches!(tab.apply, ApplyState::Failed(_)));
+        });
+    }
+
+    fn schema_read(tab: &CollectionTab) -> bool {
+        !matches!(tab.schema, Read::Idle | Read::Pending)
+            && !matches!(tab.info, Read::Idle | Read::Pending)
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_samples_the_schema_and_inserts_from_it(cx: &mut gpui::TestAppContext) {
+        let (window, tab) = open_collection(cx, &["shop", "products"]);
+        run_until(cx, &tab, settled);
+        tab.update(cx, |tab, cx| tab.show_section(Section::Schema, cx));
+        run_until(cx, &tab, schema_read);
+        tab.read_with(cx, |tab, _| {
+            let Read::Ready(sampled) = &tab.schema else {
+                panic!("not sampled");
+            };
+            // Fewer documents than the sample asks for: all of them.
+            assert_eq!(sampled.label(), "Sampled from 40 documents");
+            let price = sampled
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.path == "price")
+                .unwrap();
+            assert!(price.mixed());
+            assert_eq!(price.label(), "Double 90 %, String 10 %");
+            let Read::Ready(info) = &tab.info else {
+                panic!("no collection info");
+            };
+            assert!(info.validator.is_none());
+            // Kept for every tab on the connection.
+            assert!(tab.db.cached_schema(&tab.collection).is_some());
+        });
+
+        // A new document starts from the schema, without the key.
+        insert(cx, window, &tab);
+        tab.read_with(cx, |tab, cx| {
+            let text = tab.detail.read(cx).text(cx);
+            assert!(text.contains("price: 0"), "{text}");
+            assert!(text.contains("stock: 0"), "{text}");
+            assert!(!text.contains("_id"), "{text}");
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_samples_a_collection_once_and_keeps_no_empty_sample(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_window, tab) = open_collection(cx, &["shop", "products"]);
+        run_until(cx, &tab, settled);
+        let db = tab.read_with(cx, |tab, _| tab.db.clone());
+        let products = CollectionRef::new(&["shop", "products"]);
+        // Asked for twice before the first is done: sampled once.
+        let first = db.schema(products.clone(), true);
+        let second = db.schema(products.clone(), false);
+        let (first, second) = futures::executor::block_on(futures::future::join(first, second));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(db.cached_schema(&products).is_some());
+        // A collection that does not exist yet samples nothing, and that
+        // is not kept for when it does.
+        let missing = CollectionRef::new(&["shop", "kuery_not_there"]);
+        let sampled = futures::executor::block_on(db.schema(missing.clone(), false)).unwrap();
+        assert_eq!(sampled.schema.documents, 0);
+        assert!(db.cached_schema(&missing).is_none());
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_shows_the_declared_schema_beside_the_sample(cx: &mut gpui::TestAppContext) {
+        let (_window, tab) = open_collection(cx, &["shop", "customers"]);
+        run_until(cx, &tab, settled);
+        tab.update(cx, |tab, cx| tab.show_section(Section::Schema, cx));
+        run_until(cx, &tab, schema_read);
+        tab.read_with(cx, |tab, _| {
+            let Read::Ready(sampled) = &tab.schema else {
+                panic!("not sampled");
+            };
+            let tags = sampled
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.path == "tags")
+                .unwrap();
+            assert_eq!(tags.presence(sampled.schema.documents), 0.25);
+            let Read::Ready(info) = &tab.info else {
+                panic!("no collection info");
+            };
+            let declared = info.validator.as_ref().expect("the $jsonSchema validator");
+            assert!(declared.get("required").is_some());
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_lists_indexes_with_their_usage(cx: &mut gpui::TestAppContext) {
+        let (_window, tab) = open_orders(cx);
+        run_until(cx, &tab, settled);
+        tab.update(cx, |tab, cx| tab.show_section(Section::Indexes, cx));
+        run_until(cx, &tab, |tab| {
+            !matches!(tab.info, Read::Idle | Read::Pending)
+        });
+        tab.read_with(cx, |tab, _| {
+            let Read::Ready(info) = &tab.info else {
+                panic!("the indexes were not read");
+            };
+            let names: Vec<&str> = info.indexes.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(names, ["_id_", "status_1_date_-1", "customer_1"]);
+            // As root, $indexStats says how often each is used.
+            assert!(info.indexes.iter().all(|index| index.usage.is_some()));
+            assert!(info.indexes.iter().all(|index| index.size.is_some()));
+            // Indexes need no sample.
+            assert!(matches!(tab.schema, Read::Idle));
         });
     }
 }

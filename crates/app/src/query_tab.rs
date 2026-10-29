@@ -277,6 +277,8 @@ impl QueryTab {
             window,
             |this, _, event: &PlanEvent, window, cx| match event {
                 PlanEvent::Explain { analyze } => this.explain(*analyze, window, cx),
+                // Its plan tab is not made cancellable.
+                PlanEvent::Cancel => {}
             },
         )
         .detach();

@@ -1058,6 +1058,12 @@ impl Explorer {
                 depth,
                 expanded,
             } => self.document_row(*index, path, *item, *depth, *expanded, cx)?,
+            Row::DocumentIndex {
+                index,
+                collection,
+                item,
+                depth,
+            } => self.document_index_row(*index, collection, *item, *depth)?,
             Row::DocumentMore {
                 index,
                 parent,
@@ -1792,16 +1798,29 @@ fn tree_row(
     selected: bool,
 ) -> Stateful<gpui_kit::Div> {
     let chevron = match expanded {
-        Some(true) => Icon::new(IconName::ChevronDown)
-            .size(px(11.))
-            .text_color(color(theme::TEXT_TERTIARY))
-            .into_any_element(),
-        Some(false) => Icon::new(IconName::ChevronRight)
-            .size(px(11.))
-            .text_color(color(theme::TEXT_TERTIARY))
-            .into_any_element(),
+        Some(expanded) => chevron(expanded).into_any_element(),
         None => div().w(px(11.)).into_any_element(),
     };
+    tree_row_with(id, depth, chevron, selected)
+}
+
+/// A row's open or closed chevron.
+fn chevron(expanded: bool) -> Icon {
+    Icon::new(match expanded {
+        true => IconName::ChevronDown,
+        false => IconName::ChevronRight,
+    })
+    .size(px(11.))
+    .text_color(color(theme::TEXT_TERTIARY))
+}
+
+/// A tree row with its own chevron, such as one clicked apart from the row.
+fn tree_row_with(
+    id: SharedString,
+    depth: usize,
+    chevron: AnyElement,
+    selected: bool,
+) -> Stateful<gpui_kit::Div> {
     h_flex()
         .id(id)
         .h(px(ROW_HEIGHT))

@@ -740,6 +740,8 @@ fn reads_indexes_and_the_validator() {
         .expect("the email index");
     assert!(email.unique);
     assert!(email.size.is_some_and(|size| size > 0));
+    // `read` on shop does not let it read $indexStats: usage is unknown.
+    assert!(customers.indexes.iter().all(|index| index.usage.is_none()));
     let validator = customers.validator.expect("the $jsonSchema validator");
     assert_eq!(
         validator.get("bsonType"),
@@ -993,14 +995,32 @@ fn counts_with_a_cap() {
 
 #[test]
 #[ignore = "needs the dev MongoDB"]
+fn reads_index_usage_where_the_user_may() {
+    let mut adapter = open(&target(), Access::ReadOnly).unwrap();
+    let orders = adapter.collection(&shop("orders")).unwrap();
+    let names: Vec<&str> = orders.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["_id_", "status_1_date_-1", "customer_1"]);
+    assert!(
+        orders
+            .indexes
+            .iter()
+            .all(|index| index.usage.is_some_and(|usage| usage.since.is_some())),
+        "{:?}",
+        orders.indexes
+    );
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
 fn samples_at_random_and_views_from_the_start() {
     let mut adapter = open(&reader(), Access::ReadOnly).unwrap();
+    use kuery_core::document::capabilities::Sampling;
     let mut sample = Vec::new();
-    adapter.sample(&shop("orders"), 20, &mut sample).unwrap();
-    assert_eq!(sample.len(), 20);
+    let picked = adapter.sample(&shop("orders"), 20, &mut sample).unwrap();
+    assert_eq!((sample.len(), picked), (20, Sampling::Random));
     let mut view = Vec::new();
-    adapter.sample(&shop("paid_orders"), 5, &mut view).unwrap();
-    assert_eq!(view.len(), 5);
+    let picked = adapter.sample(&shop("paid_orders"), 5, &mut view).unwrap();
+    assert_eq!((view.len(), picked), (5, Sampling::FirstN));
 }
 
 #[test]
@@ -2256,4 +2276,255 @@ db.notes.updateOne({_id: 3}, {$set: {address: null}})"#,
             document.key()
         );
     }
+}
+
+fn explained(
+    session: &DocumentSession,
+    start: &[&str],
+    text: &str,
+    execute: bool,
+    heavy: Heavy,
+) -> Result<kuery_core::plan::Plan, QueryError> {
+    let start: Vec<String> = start.iter().map(|s| s.to_string()).collect();
+    let json = futures::executor::block_on(session.explain_in(
+        &start,
+        text.into(),
+        execute,
+        heavy,
+        RunOptions::default(),
+    ))?;
+    Ok(kuery_core::plan::parse(&json).unwrap_or_else(|error| panic!("{error}: {json}")))
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn explains_reads_planned_and_measured() {
+    use kuery_core::plan::{Category, InsightKind};
+    let reader = futures::executor::block_on(DocumentSession::open(
+        Arc::new(|access| open(&reader(), access)),
+        Access::ReadOnly,
+    ))
+    .unwrap();
+    let planned = explained(
+        &reader,
+        &["shop"],
+        r#"db.orders.find({status: "paid"})"#,
+        false,
+        Heavy::Refuse,
+    )
+    .unwrap();
+    assert!(!planned.analyzed);
+    let scan = planned.root.walk().into_iter().last().unwrap().clone();
+    assert_eq!(scan.title, "Use the index status_1_date_-1");
+
+    // Measured: it runs, and says what each step did. Its own `.explain()`
+    // gives way to the one asked for.
+    let measured = explained(
+        &reader,
+        &["shop"],
+        r#"db.big.find({n: {$lt: 5}}).sort({label: 1}).explain()"#,
+        true,
+        Heavy::Refuse,
+    )
+    .unwrap();
+    assert!(measured.analyzed);
+    assert_eq!(measured.root.actual_rows(), Some(1000.0));
+    let kinds: Vec<InsightKind> = measured.insights.iter().map(|i| i.kind).collect();
+    assert!(kinds.contains(&InsightKind::FullScan), "{kinds:?}");
+    assert!(kinds.contains(&InsightKind::SortInMemory), "{kinds:?}");
+
+    let lookup = explained(
+        &reader,
+        &["shop"],
+        r#"db.orders.aggregate([{$match: {status: "paid"}}, {$lookup: {from: "customers", localField: "customer", foreignField: "_id", as: "buyer"}}, {$group: {_id: "$buyer.country", n: {$sum: 1}}}])"#,
+        true,
+        Heavy::Refuse,
+    )
+    .unwrap();
+    assert!(
+        lookup
+            .root
+            .walk()
+            .iter()
+            .any(|node| node.category == Category::Join
+                && node.title == "Look up matching documents in customers"),
+        "{:?}",
+        lookup
+            .root
+            .walk()
+            .iter()
+            .map(|n| &n.title)
+            .collect::<Vec<_>>()
+    );
+
+    // JavaScript on the server runs only where heavy work may.
+    let heavy = explained(
+        &reader,
+        &["shop"],
+        r#"db.orders.find({$where: "this.number < 3"})"#,
+        true,
+        Heavy::Refuse,
+    );
+    assert!(matches!(heavy, Err(QueryError::Rejected(_))), "{heavy:?}");
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_writes_plan_never_runs_it() {
+    let scratch = Scratch::new(target(), "kuery_explain");
+    let session = scratch.session();
+    write_script(
+        &session,
+        "db.notes.insertMany([{_id: 1, n: 1}, {_id: 2, n: 2}, {_id: 3, n: 3}])",
+    )
+    .unwrap();
+    let plan = explained(
+        &session,
+        &[],
+        "db.notes.deleteMany({n: {$gte: 2}})",
+        false,
+        Heavy::Refuse,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.root.category,
+        kuery_core::plan::Category::Modify,
+        "{:?}",
+        plan.root
+    );
+    assert_eq!(plan.root.title, "Delete documents of notes");
+    // Measuring it would run it: refused, by the session and by the driver.
+    let measured = explained(
+        &session,
+        &[],
+        "db.notes.updateMany({}, {$set: {n: 0}})",
+        true,
+        Heavy::Refuse,
+    );
+    assert!(
+        matches!(measured, Err(QueryError::Explain(_))),
+        "{measured:?}"
+    );
+    let mut mongo = connect(&target(), Access::ReadWrite).unwrap();
+    mongo.database = "kuery_explain".into();
+    let unchecked = DocumentAdapter::explain(&mut mongo, "db.notes.deleteMany({})", true);
+    assert!(
+        matches!(unchecked, Err(QueryError::Explain(_))),
+        "{unchecked:?}"
+    );
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+    let (left, _) = console(&mut mongo, "db.notes.find({n: 0})").unwrap();
+    assert!(left.is_empty(), "nothing was updated: {left:?}");
+
+    // A read-only session does not even plan a write.
+    let reader = futures::executor::block_on(session.reopen(Access::ReadOnly)).unwrap();
+    assert_eq!(
+        explained(
+            &reader,
+            &[],
+            "db.notes.deleteMany({})",
+            false,
+            Heavy::Refuse
+        )
+        .map(|_| ()),
+        Err(QueryError::WritesDisabled)
+    );
+    // And the driver's own guard refuses it if the session did not.
+    let mut guarded = connect(&target(), Access::ReadOnly).unwrap();
+    guarded.database = "kuery_explain".into();
+    assert_eq!(
+        DocumentAdapter::explain(&mut guarded, "db.notes.deleteMany({})", false),
+        Err(QueryError::WritesDisabled)
+    );
+    assert_eq!(notes_held(&session, &scratch), Count::Exact(3));
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_read_that_fails_while_measured_is_an_error_and_explain_true_is_explained_once() {
+    let scratch = Scratch::new(target(), "kuery_explain_failing");
+    let session = scratch.session();
+    write_script(
+        &session,
+        "db.notes.insertMany([{_id: 1, n: 1, s: 'x1'}, {_id: 2, n: 2, s: '2'}])",
+    )
+    .unwrap();
+    let json = |text: &str, execute: bool| {
+        futures::executor::block_on(session.explain_in(
+            &[],
+            text.into(),
+            execute,
+            Heavy::Allow,
+            RunOptions::default(),
+        ))
+        .unwrap()
+    };
+    // The server answers `ok` with the error inside its statistics.
+    let failing = json("db.notes.find({$expr: {$gt: [{$toInt: '$s'}, 1]}})", true);
+    let error = kuery_core::plan::parse(&failing).unwrap_err();
+    assert!(error.contains("Failed to parse number 'x1'"), "{error}");
+    // Out of time, likewise.
+    let slow = futures::executor::block_on(session.explain_in(
+        &[],
+        "db.notes.find({$where: 'sleep(200); return true'})".into(),
+        true,
+        Heavy::Allow,
+        RunOptions {
+            statement_timeout: std::time::Duration::from_millis(100),
+            ..RunOptions::default()
+        },
+    ))
+    .unwrap();
+    let error = kuery_core::plan::parse(&slow).unwrap_err();
+    assert!(error.contains("exceeded time limit"), "{error}");
+
+    // An aggregation's own `{explain: true}` gives way to Kuery's.
+    for execute in [false, true] {
+        let plan = explained(
+            &session,
+            &[],
+            "db.notes.aggregate([{$match: {n: 1}}], {explain: true})",
+            execute,
+            Heavy::Refuse,
+        )
+        .unwrap();
+        assert_eq!(plan.analyzed, execute);
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_schema_sample_of_big_documents_stops_at_its_size() {
+    let scratch = Scratch::new(target(), "kuery_schema_size");
+    let session = scratch.session();
+    // 100 documents of 256 kB each: 25 MB in all.
+    write_script(
+        &session,
+        &format!(
+            "db.chunks.insertMany([{}])",
+            (0..100)
+                .map(|n| format!("{{n: {n}, data: '{}'}}", "x".repeat(1024)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .unwrap();
+    for _ in 0..8 {
+        write_script(
+            &session,
+            "db.chunks.updateMany({}, [{$set: {data: {$concat: ['$data', '$data']}}}])",
+        )
+        .unwrap();
+    }
+    let sampled = futures::executor::block_on(
+        session.schema(CollectionRef::new(&["kuery_schema_size", "chunks"]), 1_000),
+    )
+    .unwrap();
+    assert!(sampled.capped);
+    assert!(
+        (60..100).contains(&sampled.schema.documents),
+        "{}",
+        sampled.schema.documents
+    );
+    assert!(sampled.label().ends_with("as many as fit in 16 MB"));
 }
