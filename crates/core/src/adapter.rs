@@ -27,7 +27,8 @@ use crate::sql::Dialect;
 /// Stops the statement running on a connection, from any thread. Called
 /// again every quarter second until the statement ends, so a cancel that
 /// lands between two steps still stops the next; harmless when nothing
-/// runs.
+/// runs. It returns at once (anything slow goes on another thread): the
+/// next run waits for it to begin.
 pub type Canceller = Arc<dyn Fn() + Send + Sync>;
 
 /// Where a statement's rows go.

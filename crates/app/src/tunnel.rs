@@ -3,7 +3,10 @@
 //!
 //! The tunnel is the system's own `ssh` forwarding a local port, so it
 //! follows `~/.ssh/config` (host aliases, `ProxyJump`, keys), the SSH agent
-//! and `known_hosts`. It never asks anything: authentication is by key or
+//! and `known_hosts`. The port leads to the server, or, for a driver that
+//! must dial the server by its name to check its TLS certificate, is a SOCKS
+//! proxy (`ssh -D`) the driver dials it through (see
+//! [`kuery_core::driver::DriverInfo::ssh_route`]). It never asks anything: authentication is by key or
 //! agent (`BatchMode`), a host seen for the first time is remembered and a
 //! host whose key changed is refused (`StrictHostKeyChecking=accept-new`).
 //! The tunnel lives as long as the connection that opened it.
@@ -14,15 +17,28 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kuery_core::driver::SshRoute;
+
 use crate::project::{ConnectionSpec, SshSpec};
 
 /// How long `ssh` gets to connect, authenticate and start forwarding.
 const START: Duration = Duration::from_secs(20);
 
-/// A running `ssh` that forwards `127.0.0.1:<local_port>` to the server.
+/// What a tunnel's local port leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forward {
+    /// The server, at its host and port as the SSH host sees them.
+    Port { host: String, port: u16 },
+    /// A SOCKS proxy: whatever the driver dials through it, by name, as the
+    /// SSH host resolves it.
+    Socks,
+}
+
+/// A running `ssh` that forwards `127.0.0.1:<local_port>`.
 pub struct Tunnel {
     child: Child,
     local_port: u16,
+    socks: bool,
 }
 
 impl Tunnel {
@@ -30,13 +46,18 @@ impl Tunnel {
         self.local_port
     }
 
+    /// Whether the local port is a SOCKS proxy rather than the server.
+    pub fn is_proxy(&self) -> bool {
+        self.socks
+    }
+
     /// Starts `ssh` and waits until it forwards, or says why it could not.
     /// Blocks: call it off the UI thread (see [`open_for`]).
-    pub fn open(ssh: &SshSpec, host: &str, port: u16) -> Result<Tunnel, String> {
+    pub fn open(ssh: &SshSpec, forward: &Forward) -> Result<Tunnel, String> {
         let local_port = free_port()?;
         let mut command = Command::new("ssh");
         command
-            .args(arguments(ssh, local_port, host, port))
+            .args(arguments(ssh, local_port, forward))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -77,7 +98,12 @@ impl Tunnel {
                 return Err(explain(&said));
             }
             if listening(local_port) {
-                return Ok(Tunnel { child, local_port });
+                let socks = *forward == Forward::Socks;
+                return Ok(Tunnel {
+                    child,
+                    local_port,
+                    socks,
+                });
             }
             if started.elapsed() > START {
                 let _ = child.kill();
@@ -100,20 +126,41 @@ impl Drop for Tunnel {
     }
 }
 
-/// Opens the tunnel a connection asks for, if any, off the calling thread.
+/// Opens the tunnel a connection asks for, if any, off the calling thread:
+/// where the driver says it leads (see [`forward_for`]).
 pub async fn open_for(spec: &ConnectionSpec) -> Result<Option<Arc<Tunnel>>, String> {
     let Some(ssh) = spec.ssh.clone() else {
         return Ok(None);
     };
-    let (host, port) = (spec.host.clone(), spec.port);
+    let forward = forward_for(spec)?;
     let (send, receive) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = send.send(Tunnel::open(&ssh, &host, port));
+        let _ = send.send(Tunnel::open(&ssh, &forward));
     });
     match receive.await {
         Ok(result) => result.map(|tunnel| Some(Arc::new(tunnel))),
         Err(_) => Err("The SSH tunnel stopped before it started".into()),
     }
+}
+
+/// Where a connection's tunnel leads, as its driver says, or why it cannot
+/// go through SSH: a SOCKS proxy for a driver that dials the server by its
+/// name over TLS, else a port forwarded to the server. Without a word from
+/// the driver, the host and port as given.
+fn forward_for(spec: &ConnectionSpec) -> Result<Forward, String> {
+    let route = spec.driver_info().and_then(|info| info.ssh_route);
+    let Some(route) = route else {
+        return Ok(Forward::Port {
+            host: spec.host.clone(),
+            port: spec.port,
+        });
+    };
+    Ok(
+        match route(&crate::drivers::connect_options(spec, None, None))? {
+            SshRoute::Forward { host, port } => Forward::Port { host, port },
+            SshRoute::Proxy => Forward::Socks,
+        },
+    )
 }
 
 /// A local port nobody listens on (the system picks it).
@@ -133,14 +180,8 @@ fn listening(port: u16) -> bool {
     )
 }
 
-/// `ssh`'s arguments: forward the local port to `host:port`, no command, no
-/// questions.
-fn arguments(ssh: &SshSpec, local_port: u16, host: &str, port: u16) -> Vec<String> {
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
+/// `ssh`'s arguments: forward the local port, no command, no questions.
+fn arguments(ssh: &SshSpec, local_port: u16, forward: &Forward) -> Vec<String> {
     let mut arguments: Vec<String> = [
         "-N",
         "-T",
@@ -156,12 +197,21 @@ fn arguments(ssh: &SshSpec, local_port: u16, host: &str, port: u16) -> Vec<Strin
         "ServerAliveInterval=30",
         "-o",
         "ServerAliveCountMax=3",
-        "-L",
     ]
     .into_iter()
     .map(String::from)
     .collect();
-    arguments.push(format!("127.0.0.1:{local_port}:{host}:{port}"));
+    match forward {
+        Forward::Port { host, port } => {
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            arguments.extend(["-L".into(), format!("127.0.0.1:{local_port}:{host}:{port}")]);
+        }
+        Forward::Socks => arguments.extend(["-D".into(), format!("127.0.0.1:{local_port}")]),
+    }
     if let Some(port) = ssh.port {
         arguments.extend(["-p".into(), port.to_string()]);
     }
@@ -231,9 +281,16 @@ mod tests {
         }
     }
 
+    fn to(host: &str, port: u16) -> Forward {
+        Forward::Port {
+            host: host.into(),
+            port,
+        }
+    }
+
     #[test]
     fn forwards_a_local_port_without_asking_anything() {
-        let arguments = arguments(&ssh("bastion"), 40001, "db.internal", 5432);
+        let arguments = arguments(&ssh("bastion"), 40001, &to("db.internal", 5432));
         let line = arguments.join(" ");
         assert!(line.contains("-L 127.0.0.1:40001:db.internal:5432"));
         assert!(line.contains("BatchMode=yes"));
@@ -250,11 +307,65 @@ mod tests {
             identity_file: "/keys/id".into(),
             ..ssh("bastion")
         };
-        let line = arguments(&spec, 40001, "::1", 5432).join(" ");
+        let line = arguments(&spec, 40001, &to("::1", 5432)).join(" ");
         assert!(line.contains("-L 127.0.0.1:40001:[::1]:5432"));
         assert!(line.contains("-p 2222"));
         assert!(line.contains("-l deploy"));
         assert!(line.contains("-i /keys/id -o IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn opens_a_socks_proxy_for_drivers_that_dial_by_name() {
+        let line = arguments(&ssh("bastion"), 40001, &Forward::Socks).join(" ");
+        assert!(line.contains("-D 127.0.0.1:40001"), "{line}");
+        assert!(!line.contains("-L"), "{line}");
+        assert!(line.contains("ExitOnForwardFailure=yes"));
+        assert!(line.ends_with("-- bastion"));
+    }
+
+    #[test]
+    fn forwards_to_the_member_the_driver_names() {
+        let spec = |driver: &str, host: &str, tls: Option<&str>| ConnectionSpec {
+            id: "c".into(),
+            name: "c".into(),
+            driver: driver.into(),
+            host: host.into(),
+            port: 27017,
+            database: String::new(),
+            user: String::new(),
+            sslmode: tls.map(str::to_string),
+            environment: None,
+            ssh: Some(ssh("bastion")),
+            options: Default::default(),
+        };
+        // A member's own port is where the tunnel goes.
+        assert_eq!(
+            forward_for(&spec("mongodb", "db.internal:27018", None)),
+            Ok(to("db.internal", 27018))
+        );
+        let line = arguments(&ssh("bastion"), 40001, &to("db.internal", 27018)).join(" ");
+        assert!(
+            line.contains("-L 127.0.0.1:40001:db.internal:27018"),
+            "{line}"
+        );
+        assert_eq!(
+            forward_for(&spec("mongodb", "mongo-tls", Some("require"))),
+            Ok(Forward::Socks)
+        );
+        // A host list is refused before ssh starts.
+        assert!(
+            forward_for(&spec("mongodb", "a:27017,b:27017", None))
+                .unwrap_err()
+                .starts_with("Through SSH, Kuery reaches a single member")
+        );
+        // Drivers that say nothing get the host and port as given.
+        assert_eq!(
+            forward_for(&ConnectionSpec {
+                port: 5432,
+                ..spec("postgres", "db.internal", None)
+            }),
+            Ok(to("db.internal", 5432))
+        );
     }
 
     #[test]
@@ -288,7 +399,7 @@ mod tests {
             user: "kuery".into(),
             ..ssh("localhost")
         };
-        let tunnel = Tunnel::open(&spec, "postgres", 5432).expect("opens the tunnel");
+        let tunnel = Tunnel::open(&spec, &to("postgres", 5432)).expect("opens the tunnel");
         let port = tunnel.local_port();
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
         drop(tunnel);
@@ -298,7 +409,7 @@ mod tests {
             user: "nobody".into(),
             ..spec
         };
-        let error = Tunnel::open(&wrong, "postgres", 5432).err().unwrap();
+        let error = Tunnel::open(&wrong, &to("postgres", 5432)).err().unwrap();
         assert!(error.contains("Permission denied"), "{error}");
     }
 }

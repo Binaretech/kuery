@@ -21,17 +21,20 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::catalog::{TableInfo, TableRef};
+use kuery_core::document::catalog::ContainerKind;
+use kuery_core::document::value::CollectionRef;
 
 use crate::activity_tab::{ActivityEvent, ActivityTab};
 use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
+use crate::collection_tab::CollectionTab;
 use crate::commands::{
     ClearRecentProjects, CloseTab, FindInSidebar, NewConnection, NewQuery, OpenCommandPalette,
     OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, ShowServerActivity,
     ToggleSidebar,
 };
-use crate::connection::{ConnMeta, Db, Environment, RedisDb, WriteKind, status_tone};
+use crate::connection::{ConnMeta, Db, DocDb, Environment, RedisDb, WriteKind, status_tone};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
@@ -56,6 +59,7 @@ pub(crate) enum Tab {
     Table(Entity<TableTab>),
     RedisKey(Entity<KeyTab>),
     RedisConsole(Entity<ConsoleTab>),
+    Collection(Entity<CollectionTab>),
     Diagram(Entity<DiagramTab>),
     Activity(Entity<ActivityTab>),
     File(Entity<FileTab>),
@@ -69,6 +73,7 @@ impl Tab {
             Tab::Table(table) => table.entity_id(),
             Tab::RedisKey(key) => key.entity_id(),
             Tab::RedisConsole(console) => console.entity_id(),
+            Tab::Collection(collection) => collection.entity_id(),
             Tab::Diagram(diagram) => diagram.entity_id(),
             Tab::Activity(activity) => activity.entity_id(),
             Tab::File(file) => file.entity_id(),
@@ -86,6 +91,7 @@ impl Tab {
             Tab::Activity(activity) => Some(activity.read(cx).db().meta()),
             Tab::RedisKey(key) => Some(key.read(cx).db().meta()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().meta()),
+            Tab::Collection(collection) => Some(collection.read(cx).db().meta()),
             Tab::File(_) | Tab::FileQuery(_) => None,
         }
     }
@@ -98,6 +104,7 @@ impl Tab {
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
             Tab::RedisConsole(_)
+            | Tab::Collection(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
             | Tab::File(_)
@@ -113,6 +120,7 @@ impl Tab {
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
             Tab::RedisConsole(_)
+            | Tab::Collection(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
             | Tab::File(_)
@@ -174,6 +182,18 @@ impl Tab {
             Tab::File(file) => TabState::File {
                 path: file.read(cx).path().to_path_buf(),
             },
+            Tab::Collection(collection) => {
+                let collection = collection.read(cx);
+                let (filter, projection, sort) = collection.bar(cx);
+                TabState::Collection {
+                    connection: collection.db().name.to_string(),
+                    path: collection.collection().path.clone(),
+                    kind: collection.kind().into(),
+                    filter,
+                    projection,
+                    sort,
+                }
+            }
             Tab::FileQuery(_) => return None,
         })
     }
@@ -185,7 +205,11 @@ impl Tab {
             Tab::Table(table) => Some(table.read(cx).db().clone()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
             Tab::Activity(activity) => Some(activity.read(cx).db().clone()),
-            Tab::RedisKey(_) | Tab::RedisConsole(_) | Tab::File(_) | Tab::FileQuery(_) => None,
+            Tab::RedisKey(_)
+            | Tab::RedisConsole(_)
+            | Tab::Collection(_)
+            | Tab::File(_)
+            | Tab::FileQuery(_) => None,
         }
     }
 
@@ -204,6 +228,10 @@ impl Tab {
             }
             Tab::RedisConsole(console) => {
                 console.update(cx, |console, cx| console.focus_editor(window, cx))
+            }
+            Tab::Collection(collection) => {
+                let handle = collection.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
             }
             Tab::Diagram(diagram) => {
                 let handle = diagram.read(cx).focus_handle(cx);
@@ -340,6 +368,15 @@ impl WorkspaceView {
                 ExplorerEvent::OpenRedisConsole { db, database } => {
                     this.open_redis_console(db.clone(), *database, window, cx)
                 }
+                ExplorerEvent::DocumentConnected(db) => {
+                    this.restore_document_tabs(db, window, cx);
+                    cx.notify();
+                }
+                ExplorerEvent::OpenCollection {
+                    db,
+                    collection,
+                    kind,
+                } => this.open_collection(db.clone(), collection.clone(), *kind, window, cx),
             },
         )
         .detach();
@@ -539,6 +576,7 @@ impl WorkspaceView {
                 TabState::Activity { .. } => self.new_activity_tab(db.clone(), window, cx),
                 TabState::RedisKey { .. }
                 | TabState::RedisConsole { .. }
+                | TabState::Collection { .. }
                 | TabState::File { .. } => {
                     continue;
                 }
@@ -563,8 +601,40 @@ impl WorkspaceView {
                 | TabState::Table { .. }
                 | TabState::Diagram { .. }
                 | TabState::Activity { .. }
+                | TabState::Collection { .. }
                 | TabState::File { .. } => continue,
             };
+            self.insert_restored(place, tab, window, cx);
+        }
+    }
+
+    /// Reopens the waiting tabs of a document connection that just opened,
+    /// each with the filter bar it had.
+    fn restore_document_tabs(&mut self, db: &DocDb, window: &mut Window, cx: &mut Context<Self>) {
+        for (place, state) in self.take_restoring(&db.name) {
+            let TabState::Collection {
+                path,
+                kind,
+                filter,
+                projection,
+                sort,
+                ..
+            } = state
+            else {
+                continue;
+            };
+            let tab = self.new_collection_tab(
+                db.clone(),
+                CollectionRef { path },
+                kind.into(),
+                window,
+                cx,
+            );
+            if let Tab::Collection(collection) = &tab {
+                collection.update(cx, |collection, cx| {
+                    collection.set_bar(filter, projection, sort, window, cx)
+                });
+            }
             self.insert_restored(place, tab, window, cx);
         }
     }
@@ -940,6 +1010,45 @@ impl WorkspaceView {
         cx.new(|cx| ConsoleTab::new(db, database, project, window, cx))
     }
 
+    /// Opens a collection in a tab, or shows the tab it is already open in.
+    fn open_collection(
+        &mut self,
+        db: DocDb,
+        collection: CollectionRef,
+        kind: ContainerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (name, shown) = (db.name.clone(), collection.clone());
+        self.focus_or_open(
+            |tab, cx| match tab {
+                Tab::Collection(tab) => {
+                    let tab = tab.read(cx);
+                    tab.db().name == name && *tab.collection() == shown
+                }
+                _ => false,
+            },
+            |this, window, cx| this.new_collection_tab(db, collection, kind, window, cx),
+            window,
+            cx,
+        );
+    }
+
+    fn new_collection_tab(
+        &self,
+        db: DocDb,
+        collection: CollectionRef,
+        kind: ContainerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let project = self.model.read(cx).project.root.clone();
+        let tab = cx.new(|cx| CollectionTab::new(db, collection, kind, project, window, cx));
+        // The status bar shows the page as it loads.
+        cx.observe(&tab, |_, _, cx| cx.notify()).detach();
+        Tab::Collection(tab)
+    }
+
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(index) {
             // A table with unsaved changes is not closed by accident.
@@ -1294,7 +1403,7 @@ impl WorkspaceView {
         self.tabs
             .get(self.active)
             .and_then(|tab| tab.connection(cx))
-            .or_else(|| self.explorer.read(cx).current_db().map(|db| db.meta()))
+            .or_else(|| self.explorer.read(cx).current_meta())
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1633,12 +1742,7 @@ impl WorkspaceView {
                     )
                     .child(div().child(connection.target.clone()));
                 right = right
-                    .children(
-                        connection
-                            .notice
-                            .clone()
-                            .map(|notice| div().text_color(color(theme::AMBER)).child(notice)),
-                    )
+                    .children(notice_item(connection))
                     .child(connection.server.clone());
             }
             None => left = left.child("No open connection"),
@@ -1777,6 +1881,18 @@ impl WorkspaceView {
                     .child(tab.cursor_status(cx))
                     .children(server.clone());
             }
+            Some(Tab::Collection(collection)) => {
+                let tab = collection.read(cx);
+                left = left.child(div().truncate().child(tab.collection().display()));
+                // The connection's notice stays: a document tab is where
+                // its warnings matter.
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .children(connection.as_ref().and_then(notice_item))
+                    .children(tab.page_status())
+                    .children(server.clone());
+            }
             Some(Tab::Table(table)) => {
                 let tab = table.read(cx);
                 let name = &tab.info().table;
@@ -1844,6 +1960,14 @@ impl WorkspaceView {
                     )
                 }
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
+                Tab::Collection(collection) => {
+                    let collection = collection.read(cx);
+                    let icon = match collection.kind() {
+                        ContainerKind::View => AppIcon::Code,
+                        _ => AppIcon::Table,
+                    };
+                    (icon, collection.title(), false)
+                }
                 Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
                 Tab::Activity(activity) => (AppIcon::Activity, activity.read(cx).title(), false),
                 Tab::File(file) => (AppIcon::Table, file.read(cx).title(), false),
@@ -1926,13 +2050,18 @@ impl WorkspaceView {
                             Tab::Table(table) => {
                                 let tab = table.read(cx);
                                 let table = &tab.info().table;
-                                Some(
+                                Some((
+                                    "Copy Table Name",
                                     tab.db()
                                         .session
                                         .dialect()
                                         .quote_qualified(&table.schema, &table.name),
-                                )
+                                ))
                             }
+                            Tab::Collection(collection) => Some((
+                                "Copy Collection Name",
+                                collection.read(cx).collection().display(),
+                            )),
                             _ => None,
                         };
                         move |menu, _, _| {
@@ -1968,10 +2097,8 @@ impl WorkspaceView {
                                     .item(reveal(file.clone()))
                                     .item(copy("Copy Path", file.display().to_string()));
                             }
-                            if let Some(table) = &table {
-                                menu = menu
-                                    .separator()
-                                    .item(copy("Copy Table Name", table.clone()));
+                            if let Some((label, name)) = &table {
+                                menu = menu.separator().item(copy(*label, name.clone()));
                             }
                             menu
                         }
@@ -1998,6 +2125,7 @@ impl WorkspaceView {
             Some(Tab::Table(table)) => table.clone().into_any_element(),
             Some(Tab::RedisKey(key)) => key.clone().into_any_element(),
             Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
+            Some(Tab::Collection(collection)) => collection.clone().into_any_element(),
             Some(Tab::Diagram(diagram)) => diagram.clone().into_any_element(),
             Some(Tab::Activity(activity)) => activity.clone().into_any_element(),
             Some(Tab::File(file)) => file.clone().into_any_element(),
@@ -2079,6 +2207,15 @@ impl DataFileTabs for WorkspaceView {
 }
 
 /// Recent projects other than the one in `root`, newest first.
+/// What the connection's driver said the user should know, in amber, for
+/// the status bar.
+fn notice_item(connection: &ConnMeta) -> Option<gpui_kit::Div> {
+    connection
+        .notice
+        .clone()
+        .map(|notice| div().text_color(color(theme::AMBER)).child(notice))
+}
+
 fn recent_projects_except(root: &std::path::Path) -> Vec<RecentProject> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     recent::available()

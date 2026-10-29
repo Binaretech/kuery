@@ -84,6 +84,7 @@ fn spec() -> ConnectionSpec {
         sslmode: None,
         environment: Some("development".into()),
         ssh: None,
+        options: Default::default(),
     }
 }
 

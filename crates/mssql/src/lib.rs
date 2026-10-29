@@ -150,6 +150,9 @@ pub static DRIVER: SqlDriver = SqlDriver {
         host_help: Some(
             "A named instance is HOST\\INSTANCE; it is found through the SQL Browser service (UDP 1434). Through an SSH tunnel, use the instance's fixed port instead.",
         ),
+        options: &[],
+        uri: None,
+        ssh_route: None,
     },
     dialect: &MSSQL,
     open: |options, access| open(&Target::from(options), access),

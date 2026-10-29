@@ -2,7 +2,8 @@
 //! analysis for write mode, columnar results and their export, the catalog
 //! model, generated SQL for browsing and editing tables, statistics and
 //! totals over results, readable query plans, schema diagrams, Redis command
-//! and key-name helpers, and the drivers' descriptors.
+//! and key-name helpers, the document database contract and its session, and
+//! the drivers' descriptors.
 
 pub mod activity;
 pub mod adapter;
@@ -14,6 +15,7 @@ pub mod completion;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod diagram;
+pub mod document;
 pub mod driver;
 pub mod edit;
 pub mod export;

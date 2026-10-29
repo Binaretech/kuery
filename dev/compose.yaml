@@ -105,3 +105,62 @@ services:
     restart: "no"
     volumes:
       - ./seed-mssql.sql:/seed/seed-mssql.sql:ro
+
+  # MongoDB 8.0 (KUERY_MONGO_IMAGE_TAG picks another tag) as a single-node
+  # replica set (rs0, so it has transactions), with authentication and the
+  # sample shop in `shop`. Users kuery/kuery (root, authSource admin) and
+  # kuery_ro/kuery (read on shop, authSource shop); development only. mongod
+  # listens on 27019 inside too, so the member's name, localhost:27019,
+  # works from the host. The seed starts `shop` over on every start.
+  mongo:
+    image: mongo:${KUERY_MONGO_IMAGE_TAG:-8.0}
+    command:
+      - sh
+      - -c
+      - >-
+        head -c 756 /dev/urandom | base64 | tr -d '\n' > /tmp/kuery.key;
+        chown mongodb:mongodb /tmp/kuery.key; chmod 400 /tmp/kuery.key;
+        gosu mongodb mongod --replSet rs0 --port 27019 --bind_ip_all
+        --keyFile /tmp/kuery.key --setParameter enableTestCommands=1 &
+        until mongosh --port 27019 --quiet --eval 'db.adminCommand({ping: 1})' > /dev/null 2>&1; do sleep 0.5; done;
+        mongosh --port 27019 --quiet --eval '
+        if (!db.hello().setName) rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27019"}]});
+        while (!db.hello().isWritablePrimary) sleep(200);
+        try { db.getSiblingDB("admin").createUser({user: "kuery", pwd: "kuery", roles: ["root"]}) }
+        catch (e) { if (e.codeName !== "Unauthorized") throw e }' > /dev/null;
+        mongosh "mongodb://kuery:kuery@localhost:27019/admin" --quiet --eval '
+        const shop = db.getSiblingDB("shop");
+        if (!shop.getUser("kuery_ro")) shop.createUser({user: "kuery_ro", pwd: "kuery", roles: [{role: "read", db: "shop"}]})' > /dev/null;
+        mongosh "mongodb://kuery:kuery@localhost:27019/shop?authSource=admin" --quiet /seed/seed-mongo.js;
+        wait
+    ports:
+      - "27019:27019"
+    volumes:
+      - ./seed-mongo.js:/seed/seed-mongo.js:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mongosh --port 27019 -u kuery -p kuery --authenticationDatabase admin --quiet --eval 'db.getSiblingDB("shop").orders.countDocuments()'
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  # MongoDB without a replica set and without authentication, for what a
+  # standalone server lacks (transactions, users): docker compose
+  # --profile standalone up -d mongo-standalone. Anyone can write to it.
+  mongo-standalone:
+    image: mongo:${KUERY_MONGO_IMAGE_TAG:-8.0}
+    profiles: ["standalone"]
+    command:
+      - sh
+      - -c
+      - >-
+        gosu mongodb mongod --bind_ip_all &
+        until mongosh --quiet --eval 'db.adminCommand({ping: 1})' > /dev/null 2>&1; do sleep 0.5; done;
+        mongosh mongodb://localhost:27017/shop --quiet /seed/seed-mongo.js;
+        wait
+    ports:
+      - "27029:27017"
+    volumes:
+      - ./seed-mongo.js:/seed/seed-mongo.js:ro

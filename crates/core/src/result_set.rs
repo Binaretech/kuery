@@ -80,6 +80,10 @@ pub enum ColumnKind {
     Date,
     Timestamp,
     Text,
+    /// Nested documents and arrays, as compact literals.
+    Json,
+    /// A document's key (`_id`), shown as a literal.
+    Id,
     /// Not reported by the server: infer it from the values.
     #[default]
     Unknown,
@@ -102,6 +106,8 @@ impl ColumnKind {
             ColumnKind::Date => "date",
             ColumnKind::Timestamp => "timestamp",
             ColumnKind::Text => "text",
+            ColumnKind::Json => "json",
+            ColumnKind::Id => "id",
             ColumnKind::Unknown => "unknown",
         }
     }
@@ -157,14 +163,34 @@ impl ResultSet {
         self.rows
     }
 
+    /// Appends a batch with one array per column: columns that show up
+    /// later come through [`Self::extend_columns`] first.
     pub fn push(&mut self, batch: Batch) {
-        debug_assert_eq!(batch.columns.len(), self.columns.len());
+        assert_eq!(
+            batch.columns.len(),
+            self.columns.len(),
+            "a batch must have the result's columns; extend them first"
+        );
         if batch.rows == 0 {
             return;
         }
         self.batch_starts.push(self.rows);
         self.rows += batch.rows;
         self.batches.push(batch);
+    }
+
+    /// Adds columns that showed up after rows arrived (a field only later
+    /// documents have): the rows already here get NULL in each, and their
+    /// kinds are `Unknown` until set.
+    pub fn extend_columns(&mut self, names: &[String]) {
+        for batch in &mut self.batches {
+            let rows = batch.rows;
+            batch
+                .columns
+                .extend(names.iter().map(|_| Arc::new(StringArray::new_null(rows))));
+        }
+        self.columns.extend(names.iter().cloned());
+        self.kinds.extend(names.iter().map(|_| ColumnKind::Unknown));
     }
 
     /// A cell's value. `None` if the row does not exist, `Some(None)` if it is NULL.
@@ -236,6 +262,34 @@ mod tests {
         assert_eq!(set.cell(2, 0), Some(Some("3")));
         assert_eq!(set.cell(3, 0), None);
         assert_eq!(set.cell(0, 5), None);
+    }
+
+    #[test]
+    fn columns_that_show_up_later_are_null_in_earlier_rows() {
+        let mut set = ResultSet::new(vec!["id".into(), "name".into()]);
+        set.push(batch(&[[Some("1"), Some("a")]]));
+        set.push(batch(&[[Some("2"), Some("b")]]));
+        set.extend_columns(&["note".into()]);
+        assert_eq!(set.columns(), ["id", "name", "note"]);
+        assert_eq!(set.kinds()[2], ColumnKind::Unknown);
+        assert_eq!(set.cell(0, 2), Some(None));
+        assert_eq!(set.cell(1, 2), Some(None));
+
+        let mut builder = BatchBuilder::new(3, 1);
+        builder.push_row(|i| [Some("3"), Some("c"), Some("late")][i]);
+        set.push(builder.finish());
+        assert_eq!(set.cell(2, 2), Some(Some("late")));
+        assert_eq!(
+            set.column_values(2).collect::<Vec<_>>(),
+            [None, None, Some("late")]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "extend them first")]
+    fn a_batch_with_other_columns_is_refused() {
+        let mut set = ResultSet::new(vec!["id".into()]);
+        set.push(batch(&[[Some("1"), Some("a")]]));
     }
 
     #[test]

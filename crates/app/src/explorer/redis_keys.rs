@@ -597,9 +597,11 @@ mod tests {
             .into_iter()
             .map(|b| (("cache".to_string(), 1), b))
             .collect();
+        let documents = HashMap::new();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
+            documents: &documents,
             query: "",
         };
         let mut rows = Vec::new();
@@ -651,9 +653,11 @@ mod tests {
         );
         let failed = Keyspace::Failed("NOAUTH".into());
         let (expanded, redis_keys) = (HashSet::new(), HashMap::new());
+        let documents = HashMap::new();
         let tree = Tree {
             expanded: &expanded,
             redis_keys: &redis_keys,
+            documents: &documents,
             query: "",
         };
         let mut rows = Vec::new();

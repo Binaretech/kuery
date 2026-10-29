@@ -46,10 +46,23 @@ impl Format {
 /// Writes every row of `set` to `out` in `format`. Buffer `out`: rows are
 /// written field by field.
 pub fn write(set: &ResultSet, format: Format, out: &mut impl Write) -> io::Result<()> {
+    write_lacking(set, format, &|_, _| false, out)
+}
+
+/// [`write`] for a grid of documents, whose empty cells are either a null or
+/// a field the document lacks: `absent(row, column)` says which, and JSON
+/// leaves those fields out of the row's object. CSV and TSV have nothing to
+/// tell them apart with, and write both empty.
+pub fn write_lacking(
+    set: &ResultSet,
+    format: Format,
+    absent: &dyn Fn(usize, usize) -> bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
     match format {
         Format::Csv => write_separated(set, out, ',', csv_field),
         Format::Tsv => write_separated(set, out, '\t', tsv_field),
-        Format::Json => write_json(set, out),
+        Format::Json => write_json(set, absent, out),
     }
 }
 
@@ -106,19 +119,29 @@ fn tsv_field(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn write_json(set: &ResultSet, out: &mut impl Write) -> io::Result<()> {
+fn write_json(
+    set: &ResultSet,
+    absent: &dyn Fn(usize, usize) -> bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let keys: Vec<String> = set.columns().iter().map(|c| json_string(c)).collect();
     let mut first = true;
     let mut line = String::new();
+    let mut row_index = 0;
     out.write_all(b"[")?;
     set.try_for_each_row(|row| {
         line.clear();
         line.push_str(if first { "\n  {" } else { ",\n  {" });
         first = false;
+        let mut written = 0;
         for (index, (key, value)) in keys.iter().zip(row).enumerate() {
-            if index > 0 {
+            if value.is_none() && absent(row_index, index) {
+                continue;
+            }
+            if written > 0 {
                 line.push_str(", ");
             }
+            written += 1;
             line.push_str(key);
             line.push_str(": ");
             match value {
@@ -127,6 +150,7 @@ fn write_json(set: &ResultSet, out: &mut impl Write) -> io::Result<()> {
             }
         }
         line.push('}');
+        row_index += 1;
         out.write_all(line.as_bytes())
     })?;
     out.write_all(if first { b"]\n" } else { b"\n]\n" })
@@ -223,6 +247,23 @@ mod tests {
         let mut out = Vec::new();
         write(&ResultSet::new(vec!["x".into()]), Format::Json, &mut out).unwrap();
         assert_eq!(out, b"[]\n");
+    }
+
+    #[test]
+    fn leaves_out_the_fields_a_document_lacks() {
+        // Row 3's note is absent, not null; row 1's id is never empty.
+        let absent = |row: usize, column: usize| (row, column) == (2, 1) || row == 0;
+        let mut out = Vec::new();
+        write_lacking(&sample(), Format::Json, &absent, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "[\n  {\"id\": \"1\", \"note\": \"plain\"},\n  \
+             {\"id\": \"2\", \"note\": \"a, \\\"quoted\\\"\\nline\\twith tab\"},\n  \
+             {\"id\": \"3\"}\n]\n"
+        );
+        let mut out = Vec::new();
+        write_lacking(&sample(), Format::Csv, &absent, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), render(Format::Csv));
     }
 
     #[test]

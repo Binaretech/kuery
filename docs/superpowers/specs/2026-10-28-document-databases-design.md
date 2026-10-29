@@ -475,3 +475,71 @@ Cada fase es un PR, y el título de cada commit es la línea del changelog.
 7. En producción, cuando el usuario de Mongo puede escribir y hay autenticación, ¿basta con el aviso, se exige un reconocimiento explícito o se rechaza la conexión?
 8. ¿Debe Redis pasar algún día a las capas compartidas (pestañas, árbol), o se queda como está salvo la revisión de escrituras ya extraída?
 9. SQL sobre documentos: ¿se queda en solo lectura, o se planifica más adelante `UPDATE`/`DELETE` en SQL por la revisión de escrituras normal?
+
+## Resultados de los spikes
+
+Hechos el 2026-10-28 contra los servicios de desarrollo (`mongo`: `mongo:8.0`, replica set `rs0` con autenticación en el puerto 27019; `mongo-standalone`: sin replica set ni autenticación en el 27029) con `mongodb` 3.9.1 (`compat-3-3-0`, `bson-3`, `rustls-tls`, `dns-resolver`). El código del spike era desechable y no se conserva.
+
+### Dependencias: solo ring
+
+- `cargo tree -p kuery-mongo -e normal -i aws-lc-rs` no encuentra el paquete, y `cargo tree -i openssl-sys` tampoco en todo el workspace: `mongodb` con `rustls-tls` solo trae `ring` y `webpki-roots`.
+- En el árbol del workspace, `cargo tree -i aws-lc-rs -e normal` sí lista `mongodb`, pero solo porque comparte el crate `rustls`, al que la ruta existente de tiberius (`tokio-rustls` con sus features por defecto) le activa `aws_lc_rs` por unificación de features. `mongodb` no activa ninguna feature de aws-lc. La comprobación de CI tiene que mirar quién activa la feature (`cargo tree -e features -i rustls`) o el árbol de `kuery-mongo` solo, no buscar `mongodb` en el árbol inverso.
+
+### Cancelar por etiqueta de comentario
+
+Cada operación se lanzó con `runtime().spawn` y se esperó su `JoinHandle` (con un `timeout` sobre `&mut handle`, que no suelta la tarea). A los 300 ms, `$currentOp` filtrado por `command.comment` encontró la operación y `killOp` la paró:
+
+| Operación | Encontrada como | Termina tras `killOp` | Error |
+| --- | --- | --- | --- |
+| `find` en `big` con `$where: "sleep(5) \|\| true"`, matada desde otro `Client` | `op: query`, `find` | 71 ms | 11601 `Interrupted` |
+| El mismo `find` con `sleep(100)`, matado desde el mismo `Client` | `op: query`, `find` | 19 ms | 11601 `Interrupted` |
+| `find` con `batchSize: 10`, matado durante un `getMore` | `op: getmore`, con `cursorId` | inmediato | 11601 `Interrupted` |
+| `{sleep: 1, secs: 20, lock: "none", comment}` | `op: command`, `sleep` | inmediato | 11601 `Interrupted` |
+| `aggregate` con `$function` que duerme | `op: command`, `aggregate` | 3 ms | 11601 `Interrupted` ("JavaScript execution interrupted") |
+| `find` dentro de una transacción | `op: query`, `find` | 10 ms | 11601; después `abortTransaction` funciona |
+
+- En todos los casos, un `$currentOp` posterior con `idleCursors: true` no encuentra nada con la etiqueta: ni la operación ni el cursor quedan vivos, también cuando se mata un `getMore`.
+- El driver envía el `comment` también en cada `getMore` (servidor 4.4 o posterior), así que la etiqueta sirve durante toda la vida del cursor, no solo en el primer lote.
+- Matar desde el mismo `Client` funciona: el pool da otra conexión para `$currentOp` y `killOp`. No hace falta un segundo cliente.
+- Ambos clientes siguen respondiendo a `ping` después de cada cancelación.
+- **Se puede parar una operación sin soltar su futuro**: el diseño de "spawn, `killOp` por etiqueta y seguir esperando" se mantiene. El margen de 5 s del plan es holgado; lo observado está por debajo de 100 ms.
+- **Corrección al plan**: `$currentOp { ownOps: true }` no existe como etapa de agregación (error 40415, "unknown field"). Las operaciones propias se piden con `$ownOps` en el comando antiguo `currentOp`. En la etapa, las operaciones propias son el valor por defecto (`allUsers: false`). La prueba de `activity`/`kill` de la Tarea 10 debe ser `$currentOp: {}`.
+- Un usuario con solo el rol `read` puede ejecutar `$currentOp` sobre sus propias operaciones y matarlas con `killOp` sin el privilegio `killop` (probado con `kuery_ro`: 11601 en 6 ms). Con `allUsers: true` recibe 13 `Unauthorized`. La cancelación de Kuery funciona, por tanto, con usuarios de solo lectura; la vista de actividad de todos los usuarios necesita `inprog`.
+
+### Explain de escrituras
+
+Con el comando `explain` sobre `update` y `delete` (mongosh no ofrece `explain().updateMany`; el comando es lo que Kuery enviará):
+
+- `queryPlanner` devuelve el plan (`UPDATE`/`FETCH`, `BATCHED_DELETE`/`COLLSCAN`) sin ningún recuento.
+- `executionStats` devuelve en `executionStages` `nMatched`, `nWouldModify` y `nWouldUpsert` para `update` (también con `multi: false`, con pipeline de actualización y con `upsert: true`: `nWouldUpsert: 1`), `nWouldDelete` para `delete`, y lo mismo para `findAndModify`. Además da `totalDocsExamined` y `totalKeysExamined`.
+- No escribe nada: los recuentos antes y después son iguales (`flag: true` sigue en 0 y `big` en 20 000). El explain de un `aggregate` con `$out` tampoco crea la colección.
+- `nWouldModify` no detecta las actualizaciones que no cambian nada: `$set: {status: "paid"}` sobre los 125 pedidos pagados da `nWouldModify: 125`, mientras que la escritura real daría `modifiedCount: 0`.
+- Con `maxTimeMS` el explain no falla: devuelve `ok: 1` con `executionSuccess: false`, `errorCode: 50` y recuentos parciales (`nWouldDelete: 7` de 2 000). Hay que leer `executionSuccess`; los recuentos parciales son un mínimo.
+- Un usuario sin privilegio de escritura recibe 13 `Unauthorized` al pedir el explain de una escritura, incluso en `queryPlanner`.
+- **Decisión**: donde no hay transacciones, `Preview::Estimated` usa `explain` con `executionStats` y `maxTimeMS`: `nMatched`/`nWouldModify`/`nWouldUpsert`/`nWouldDelete` son exactos para el filtro en ese instante, `executionSuccess: false` da `Count::AtLeast`, y cubre upserts, pipelines y `findAndModify`, que un `countDocuments` no distingue. Si el explain se rechaza (sin privilegio, o en motores compatibles que no lo implementan para escrituras), se usa `countDocuments(filter, {limit: 10001, maxTimeMS})`. Los primeros 20 documentos siguen saliendo de un `find` con el mismo filtro. La revisión dice "Estimada" en ambos casos, porque los datos pueden cambiar antes de escribir y porque `nWouldModify` cuenta también lo que no cambiaría.
+
+### TLS a través del túnel
+
+Montaje: un `mongod` con `--tlsMode requireTLS` y un certificado firmado por una CA propia para el nombre `mongo-tls`, en la red de `bastion`, alcanzado con el `ssh` del sistema como hace `app/src/tunnel.rs`.
+
+- Por el extremo local de `ssh -L` (`127.0.0.1:<puerto>`) con `tls=true` y la CA: falla la selección de servidor con `invalid peer certificate: certificate not valid for name "127.0.0.1"; certificate is only valid for DnsName("mongo-tls")`.
+- `mongodb` 3.9 con `rustls-tls` no ofrece forma de verificar contra otro nombre: `TlsOptions` solo tiene `allow_invalid_certificates`, `ca_file_path` y `cert_key_file_path`, `allow_invalid_hostnames` existe solo con `openssl-tls`, y no se puede pasar un `ClientConfig` ni un resolvedor propio para hosts que no son SRV. Con `allow_invalid_certificates` conecta, pero sin comprobar ni el nombre ni la cadena.
+- **Lo que sí funciona**: la feature `socks5-proxy` de `mongodb` (solo añade `fast-socks5`, sin aws-lc ni openssl) con `ssh -D` (reenvío dinámico, que es un proxy SOCKS5). El cliente se conecta a `mongo-tls:27017`, el nombre tal cual, a través del proxy; el nombre se resuelve en el bastión y rustls verifica el certificado contra `mongo-tls` con la CA. `ping` respondió bien.
+- **Decisión para la Tarea 12**: con TLS activo y túnel SSH, Kuery abre el túnel como reenvío dinámico (`ssh -D` en un puerto local, con las mismas opciones de `tunnel.rs`) y conecta con `socks5_proxy` al servidor tal como se llama, verificando su certificado. Hay que añadir `socks5-proxy` a las features de `mongodb`. Sin TLS se mantiene `ssh -L`. Nunca se activa `tlsAllowInvalidCertificates` por estar en un túnel; esa opción sigue siendo una elección explícita del usuario fuera de producción. Si la Tarea 12 no pudiera llevar el reenvío dinámico, la alternativa es rechazar TLS por túnel con el mensaje "Through SSH with TLS, Kuery cannot check the server's certificate", nunca conectar sin verificar.
+- Por SOCKS, el descubrimiento de miembros y SRV pasarían también por el túnel, porque el driver se conecta a cada miembro por su nombre a través del proxy. La regla de un solo miembro por SSH se mantiene por ahora, porque es decisión del dueño, pero esta vía permitiría relajarla.
+
+### Privilegios
+
+`connectionStatus { showPrivileges: true }` en `admin`:
+
+| Conexión | `authenticatedUsers` | Privilegios | Acciones | `insertOne` |
+| --- | --- | --- | --- | --- |
+| `kuery` (`root`) | `kuery@admin` | 26 | 137, entre ellas `insert`, `update`, `remove`, `dropDatabase`, `createUser`, `killop`, `inprog` | escribe |
+| `kuery_ro` (`read` en `shop`) | `kuery_ro@shop` | 2 | `changeStream collStats dbHash dbStats find killCursors listCollections listIndexes listSearchIndexes planCacheRead` | 13 `Unauthorized` |
+| `mongo-standalone` sin autenticación | vacío | 0 | ninguna | escribe |
+| replica set con autenticación, sin usuario | vacío | 0 | ninguna | 13 `Unauthorized` ("requires authentication"), igual que `listDatabases` |
+
+- Confirmado el riesgo de la "Revisión 2": sin autenticación, las listas vienen vacías aunque cualquiera puede escribir. Vacío nunca significa "solo lectura".
+- Una conexión sin usuario a un servidor con autenticación devuelve exactamente lo mismo en `connectionStatus`. Para no decir "este servidor no tiene autenticación" cuando sí la tiene, la Tarea 10 distingue los dos casos con `listDatabases { nameOnly: true }`: si responde, no hay autenticación; si falla con 13, la conexión simplemente no tiene usuario. En ambos casos es `ClientOnly`.
+- Acciones de los roles integrados de lectura, tomadas del servidor con usuarios temporales: `readAnyDatabase` añade `listDatabases` a las de `read`; `clusterMonitor` da 38. `readWrite` añade, entre otras, `insert`, `update`, `remove`, `createCollection`, `createIndex`, `dropCollection`, `dropIndex`, `renameCollectionSameDB`, `convertToCapped` y las de índices de búsqueda.
+- **Lista de acciones de lectura** que exige `Enforcement::Server` (la unión de `read`, `readAnyDatabase` y `clusterMonitor`): `allCollectionStats`, `changeStream`, `collStats`, `connPoolStats`, `dbHash`, `dbStats`, `find`, `getCmdLineOpts`, `getDatabaseVersion`, `getDefaultRWConcern`, `getLog`, `getParameter`, `getShardMap`, `getShardVersion`, `hostInfo`, `indexStats`, `inprog`, `killCursors`, `listClusterCatalog`, `listCollections`, `listDatabases`, `listIndexes`, `listSampledQueries`, `listSearchIndexes`, `listSessions`, `listShards`, `netstat`, `operationMetrics`, `planCacheRead`, `queryStatsRead`, `queryStatsReadTransformed`, `replSetGetConfig`, `replSetGetStatus`, `serverStatus`, `shardedDataDistribution`, `shardingState`, `top` y `useUUID` (este último, de `clusterMonitor`, no permite escribir sin `applyOps`). Cualquier acción fuera de la lista, incluidas las que traigan versiones futuras, cuenta como escritura y da `ClientOnly`: en la duda se avisa.

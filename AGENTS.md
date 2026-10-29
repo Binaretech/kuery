@@ -35,9 +35,9 @@ version.
 
 ### Scope: where it changed
 
-The crate's directory name: `app`, `core`, `files`, `mssql`, `mysql`, `pg`,
-`redis`, `sqlite` or `update`. Leave the scope out when a change spans several
-crates.
+The crate's directory name: `app`, `core`, `files`, `mongo`, `mssql`, `mysql`,
+`pg`, `redis`, `sqlite` or `update`. Leave the scope out when a change spans
+several crates.
 
 Only commits that touch a crate (`crates/…`, including its `Cargo.toml`)
 count toward a release and appear in the changelog. Changes to the website
