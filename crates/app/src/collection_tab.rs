@@ -1205,18 +1205,18 @@ pub fn export_format(path: &Path) -> DocFormat {
 }
 
 /// An export being written, and how many documents went in so far.
-struct ExportWriter {
+pub(crate) struct ExportWriter {
     writer: DocumentWriter<BufWriter<File>>,
-    written: usize,
+    pub(crate) written: usize,
 }
 
 impl ExportWriter {
-    fn finish(self) -> io::Result<()> {
+    pub(crate) fn finish(self) -> io::Result<()> {
         self.writer.finish()?.flush()
     }
 }
 
-fn open_export(path: &Path) -> io::Result<ExportWriter> {
+pub(crate) fn open_export(path: &Path) -> io::Result<ExportWriter> {
     let out = BufWriter::new(File::create(path)?);
     Ok(ExportWriter {
         writer: DocumentWriter::new(out, export_format(path), Ejson::Relaxed),
@@ -1224,7 +1224,7 @@ fn open_export(path: &Path) -> io::Result<ExportWriter> {
     })
 }
 
-fn write_batch(export: &mut ExportWriter, batch: &[Document]) -> io::Result<()> {
+pub(crate) fn write_batch(export: &mut ExportWriter, batch: &[Document]) -> io::Result<()> {
     for document in batch {
         export.writer.write(document)?;
         export.written += 1;
@@ -1342,7 +1342,7 @@ fn describe_count(count: Count) -> String {
     }
 }
 
-fn plural_documents(n: u64) -> String {
+pub(crate) fn plural_documents(n: u64) -> String {
     match n {
         1 => "1 document".to_string(),
         n => format!("{} documents", thousands(n)),
@@ -1521,6 +1521,7 @@ mod tests {
             Environment::Development,
             catalog,
             "127.0.0.1:27019/".into(),
+            Vec::new(),
             None,
         );
         cx.update(|cx| {

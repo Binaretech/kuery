@@ -66,14 +66,28 @@ const JAVASCRIPT: &[&str] = &["$where", "$function", "$accumulator"];
 /// Whether a filter, a projection or a pipeline makes the server run
 /// JavaScript, at any depth.
 pub(crate) fn runs_javascript(value: &Value) -> bool {
-    match value {
-        Value::Object(document) => document
-            .0
-            .iter()
-            .any(|(name, value)| JAVASCRIPT.contains(&name.as_str()) || runs_javascript(value)),
-        Value::Array(items) => items.iter().any(runs_javascript),
-        _ => false,
+    any_key(value, |name| JAVASCRIPT.contains(&name))
+}
+
+/// Whether a key of a document anywhere in `value` is one `found` looks
+/// for. Walked without recursion, so no nesting overflows the stack.
+pub(crate) fn any_key(value: &Value, found: impl Fn(&str) -> bool) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(document) => {
+                for (name, value) in &document.0 {
+                    if found(name) {
+                        return true;
+                    }
+                    pending.push(value);
+                }
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
     }
+    false
 }
 
 /// A value as a literal that reads back the same.
@@ -390,7 +404,7 @@ impl Lexer<'_> {
     }
 }
 
-fn error(span: Range<usize>, message: impl Into<String>) -> ParseError {
+pub(crate) fn error(span: Range<usize>, message: impl Into<String>) -> ParseError {
     ParseError {
         span,
         message: message.into(),
@@ -405,7 +419,14 @@ pub(crate) struct Reader<'a> {
     text: &'a str,
     tokens: &'a [Token],
     pub(crate) at: usize,
+    /// Values open around the one read now, up to [`MAX_DEPTH`].
+    depth: usize,
 }
+
+/// How deep values may nest: far deeper than any query, and shallow
+/// enough that reading them (on the UI thread too) never runs out of
+/// stack.
+pub(crate) const MAX_DEPTH: usize = 200;
 
 /// The Extended JSON wrappers: a document with exactly these fields is the
 /// type they wrap.
@@ -436,14 +457,27 @@ impl<'a> Reader<'a> {
             text,
             tokens,
             at: 0,
+            depth: 0,
         }
+    }
+
+    /// The text under a span of the reader's tokens.
+    pub(crate) fn text_at(&self, span: Range<usize>) -> &'a str {
+        &self.text[span]
+    }
+
+    /// Where the last token read ends.
+    pub(crate) fn last_end(&self) -> usize {
+        self.at
+            .checked_sub(1)
+            .map_or(0, |last| self.tokens[last].span.end)
     }
 
     pub(crate) fn peek(&self) -> Option<&'a Token> {
         self.tokens.get(self.at)
     }
 
-    fn peek_punct(&self, c: char) -> bool {
+    pub(crate) fn peek_punct(&self, c: char) -> bool {
         self.peek()
             .is_some_and(|token| token.kind == Kind::Punct(c))
     }
@@ -454,12 +488,12 @@ impl<'a> Reader<'a> {
     }
 
     /// The next token's span, or the end.
-    fn here(&self) -> Range<usize> {
+    pub(crate) fn here(&self) -> Range<usize> {
         self.peek()
             .map_or_else(|| self.eof(), |token| token.span.clone())
     }
 
-    fn expect(&mut self, c: char, message: &str) -> Result<Range<usize>, ParseError> {
+    pub(crate) fn expect(&mut self, c: char, message: &str) -> Result<Range<usize>, ParseError> {
         if self.peek_punct(c) {
             self.at += 1;
             return Ok(self.tokens[self.at - 1].span.clone());
@@ -487,8 +521,22 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// One value, and where it was.
+    /// One value, and where it was. Every nested value is read through
+    /// here, which keeps their depth to [`MAX_DEPTH`].
     pub(crate) fn value(&mut self) -> Result<(Value, Range<usize>), ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(error(
+                self.here(),
+                format!("Values nest deeper than {MAX_DEPTH} levels here"),
+            ));
+        }
+        self.depth += 1;
+        let read = self.nested();
+        self.depth -= 1;
+        read
+    }
+
+    fn nested(&mut self) -> Result<(Value, Range<usize>), ParseError> {
         let Some(token) = self.peek() else {
             return Err(error(self.eof(), "Expected a value"));
         };
@@ -1084,8 +1132,8 @@ fn write_list<'v>(
     out.push(close);
 }
 
-/// A field name, bare when it can be.
-fn key(name: &str) -> String {
+/// A field name as a key, bare when it can be: `status`, `"ship.city"`.
+pub fn key(name: &str) -> String {
     let mut chars = name.chars();
     let bare = chars
         .next()

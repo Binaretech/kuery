@@ -39,6 +39,7 @@ use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
+use crate::document_console::DocumentConsole;
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::file_query_tab::FileQueryTab;
 use crate::file_tab::FileTab;
@@ -60,6 +61,7 @@ pub(crate) enum Tab {
     RedisKey(Entity<KeyTab>),
     RedisConsole(Entity<ConsoleTab>),
     Collection(Entity<CollectionTab>),
+    DocumentConsole(Entity<DocumentConsole>),
     Diagram(Entity<DiagramTab>),
     Activity(Entity<ActivityTab>),
     File(Entity<FileTab>),
@@ -74,6 +76,7 @@ impl Tab {
             Tab::RedisKey(key) => key.entity_id(),
             Tab::RedisConsole(console) => console.entity_id(),
             Tab::Collection(collection) => collection.entity_id(),
+            Tab::DocumentConsole(console) => console.entity_id(),
             Tab::Diagram(diagram) => diagram.entity_id(),
             Tab::Activity(activity) => activity.entity_id(),
             Tab::File(file) => file.entity_id(),
@@ -92,6 +95,7 @@ impl Tab {
             Tab::RedisKey(key) => Some(key.read(cx).db().meta()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().meta()),
             Tab::Collection(collection) => Some(collection.read(cx).db().meta()),
+            Tab::DocumentConsole(console) => Some(console.read(cx).db().meta()),
             Tab::File(_) | Tab::FileQuery(_) => None,
         }
     }
@@ -105,6 +109,7 @@ impl Tab {
             Tab::RedisKey(key) => key.read(cx).has_pending(),
             Tab::RedisConsole(_)
             | Tab::Collection(_)
+            | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
             | Tab::File(_)
@@ -121,6 +126,7 @@ impl Tab {
             Tab::RedisKey(key) => key.read(cx).has_pending(),
             Tab::RedisConsole(_)
             | Tab::Collection(_)
+            | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
             | Tab::File(_)
@@ -194,6 +200,14 @@ impl Tab {
                     sort,
                 }
             }
+            Tab::DocumentConsole(console) => {
+                let console = console.read(cx);
+                TabState::DocumentConsole {
+                    connection: console.db().name.to_string(),
+                    path: console.path().to_vec(),
+                    text: console.text(cx),
+                }
+            }
             Tab::FileQuery(_) => return None,
         })
     }
@@ -208,6 +222,7 @@ impl Tab {
             Tab::RedisKey(_)
             | Tab::RedisConsole(_)
             | Tab::Collection(_)
+            | Tab::DocumentConsole(_)
             | Tab::File(_)
             | Tab::FileQuery(_) => None,
         }
@@ -232,6 +247,9 @@ impl Tab {
             Tab::Collection(collection) => {
                 let handle = collection.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
+            }
+            Tab::DocumentConsole(console) => {
+                console.update(cx, |console, cx| console.focus_editor(window, cx))
             }
             Tab::Diagram(diagram) => {
                 let handle = diagram.read(cx).focus_handle(cx);
@@ -370,7 +388,14 @@ impl WorkspaceView {
                 }
                 ExplorerEvent::DocumentConnected(db) => {
                     this.restore_document_tabs(db, window, cx);
+                    // The first connection to open gets a console to start with.
+                    if this.tabs.is_empty() && !this.restored_session {
+                        this.open_document_console(db.clone(), db.home.clone(), window, cx);
+                    }
                     cx.notify();
+                }
+                ExplorerEvent::OpenDocumentConsole { db, path } => {
+                    this.open_document_console(db.clone(), path.clone(), window, cx)
                 }
                 ExplorerEvent::OpenCollection {
                     db,
@@ -577,6 +602,7 @@ impl WorkspaceView {
                 TabState::RedisKey { .. }
                 | TabState::RedisConsole { .. }
                 | TabState::Collection { .. }
+                | TabState::DocumentConsole { .. }
                 | TabState::File { .. } => {
                     continue;
                 }
@@ -602,6 +628,7 @@ impl WorkspaceView {
                 | TabState::Diagram { .. }
                 | TabState::Activity { .. }
                 | TabState::Collection { .. }
+                | TabState::DocumentConsole { .. }
                 | TabState::File { .. } => continue,
             };
             self.insert_restored(place, tab, window, cx);
@@ -612,29 +639,42 @@ impl WorkspaceView {
     /// each with the filter bar it had.
     fn restore_document_tabs(&mut self, db: &DocDb, window: &mut Window, cx: &mut Context<Self>) {
         for (place, state) in self.take_restoring(&db.name) {
-            let TabState::Collection {
-                path,
-                kind,
-                filter,
-                projection,
-                sort,
-                ..
-            } = state
-            else {
-                continue;
+            let tab = match state {
+                TabState::Collection {
+                    path,
+                    kind,
+                    filter,
+                    projection,
+                    sort,
+                    ..
+                } => {
+                    let tab = self.new_collection_tab(
+                        db.clone(),
+                        CollectionRef { path },
+                        kind.into(),
+                        window,
+                        cx,
+                    );
+                    if let Tab::Collection(collection) = &tab {
+                        collection.update(cx, |collection, cx| {
+                            collection.set_bar(filter, projection, sort, window, cx)
+                        });
+                    }
+                    tab
+                }
+                TabState::DocumentConsole { path, text, .. } => {
+                    let console = self.new_document_console_tab(db.clone(), path, window, cx);
+                    console.update(cx, |console, cx| console.set_text(text, window, cx));
+                    Tab::DocumentConsole(console)
+                }
+                TabState::Query { .. }
+                | TabState::Table { .. }
+                | TabState::Diagram { .. }
+                | TabState::Activity { .. }
+                | TabState::RedisKey { .. }
+                | TabState::RedisConsole { .. }
+                | TabState::File { .. } => continue,
             };
-            let tab = self.new_collection_tab(
-                db.clone(),
-                CollectionRef { path },
-                kind.into(),
-                window,
-                cx,
-            );
-            if let Tab::Collection(collection) = &tab {
-                collection.update(cx, |collection, cx| {
-                    collection.set_bar(filter, projection, sort, window, cx)
-                });
-            }
             self.insert_restored(place, tab, window, cx);
         }
     }
@@ -1008,6 +1048,33 @@ impl WorkspaceView {
     ) -> Entity<ConsoleTab> {
         let project = self.model.read(cx).project.root.clone();
         cx.new(|cx| ConsoleTab::new(db, database, project, window, cx))
+    }
+
+    fn open_document_console(
+        &mut self,
+        db: DocDb,
+        path: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let console = self.new_document_console_tab(db, path, window, cx);
+        self.tabs.push(Tab::DocumentConsole(console));
+        let index = self.tabs.len() - 1;
+        self.activate(index, window, cx);
+    }
+
+    fn new_document_console_tab(
+        &self,
+        db: DocDb,
+        path: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DocumentConsole> {
+        let project = self.model.read(cx).project.root.clone();
+        let console = cx.new(|cx| DocumentConsole::new(db, path, project, window, cx));
+        // The status bar shows what runs.
+        cx.observe(&console, |_, _, cx| cx.notify()).detach();
+        console
     }
 
     /// Opens a collection in a tab, or shows the tab it is already open in.
@@ -1881,6 +1948,21 @@ impl WorkspaceView {
                     .child(tab.cursor_status(cx))
                     .children(server.clone());
             }
+            Some(Tab::DocumentConsole(console)) => {
+                let tab = console.read(cx);
+                left = left.child(
+                    h_flex()
+                        .gap(px(5.))
+                        .child(Icon::new(AppIcon::Lock).size(px(11.)))
+                        .child("Read-only"),
+                );
+                right = h_flex()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .children(connection.as_ref().and_then(notice_item))
+                    .child(div().max_w(px(420.)).truncate().child(tab.status()))
+                    .children(server.clone());
+            }
             Some(Tab::Collection(collection)) => {
                 let tab = collection.read(cx);
                 left = left.child(div().truncate().child(tab.collection().display()));
@@ -1960,6 +2042,7 @@ impl WorkspaceView {
                     )
                 }
                 Tab::RedisConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
+                Tab::DocumentConsole(console) => (AppIcon::Code, console.read(cx).title(), false),
                 Tab::Collection(collection) => {
                     let collection = collection.read(cx);
                     let icon = match collection.kind() {
@@ -2126,6 +2209,7 @@ impl WorkspaceView {
             Some(Tab::RedisKey(key)) => key.clone().into_any_element(),
             Some(Tab::RedisConsole(console)) => console.clone().into_any_element(),
             Some(Tab::Collection(collection)) => collection.clone().into_any_element(),
+            Some(Tab::DocumentConsole(console)) => console.clone().into_any_element(),
             Some(Tab::Diagram(diagram)) => diagram.clone().into_any_element(),
             Some(Tab::Activity(activity)) => activity.clone().into_any_element(),
             Some(Tab::File(file)) => file.clone().into_any_element(),

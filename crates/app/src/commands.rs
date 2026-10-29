@@ -198,7 +198,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(RunQuery),
         defaults: &["secondary-enter"],
-        context: Some("QueryTab || FileQueryTab"),
+        context: Some("QueryTab || FileQueryTab || DocumentConsole"),
     },
     Command {
         id: "query.run_all",
@@ -206,7 +206,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(RunAll),
         defaults: &["secondary-alt-enter"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || DocumentConsole"),
     },
     Command {
         id: "query.format",
@@ -238,7 +238,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(CancelQuery),
         defaults: &["secondary-."],
-        context: Some("QueryTab || FileQueryTab"),
+        context: Some("QueryTab || FileQueryTab || DocumentConsole"),
     },
     Command {
         id: "query.toggle_results",

@@ -9,6 +9,8 @@
 //!
 //! [`DocumentAdapter`]: crate::document::adapter::DocumentAdapter
 
+use std::time::{Duration, Instant};
+
 use futures::executor::block_on;
 
 use crate::document::capabilities::Enforcement;
@@ -30,8 +32,8 @@ pub struct Fixture {
     /// The same database as a user the server keeps from writing, where
     /// the engine has users.
     pub reader: Option<DocumentOpener>,
-    /// A statement that runs for about 20 seconds, for the cancel check the
-    /// console brings.
+    /// A read of the engine's language that runs for 20 seconds or more,
+    /// for the cancel check. It may be heavy.
     pub slow: String,
 }
 
@@ -43,6 +45,7 @@ pub fn run(fixture: &Fixture) {
     samples(fixture);
     keeps_its_types(fixture);
     says_who_keeps_it_read_only(fixture);
+    cancels_the_slow_statement(fixture);
 }
 
 fn open(fixture: &Fixture, access: Access) -> DocumentSession {
@@ -238,5 +241,47 @@ pub fn says_who_keeps_it_read_only(fixture: &Fixture) {
         kept.capabilities().read_only,
         Enforcement::Server,
         "the server keeps this user from writing, and the session must know"
+    );
+}
+
+pub fn cancels_the_slow_statement(fixture: &Fixture) {
+    let reader = open(fixture, Access::ReadOnly);
+    let started = Instant::now();
+    let rx = reader.run(
+        fixture.slow.clone(),
+        RunMode::Read,
+        Heavy::Allow,
+        RunOptions::default(),
+    );
+    let canceller = reader.clone();
+    let cancelling = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        canceller.cancel();
+    });
+    let (_, ended) = drain(rx);
+    cancelling.join().expect("cancels");
+    assert_eq!(
+        ended.err(),
+        Some(QueryError::Cancelled),
+        "the slow statement ran to the end"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancelling took {:?}",
+        started.elapsed()
+    );
+    // The session goes on working, and the cancel reached nothing after it.
+    let (documents, _) = page(
+        &reader,
+        &fixture.collection,
+        BrowseSpec {
+            limit: 1,
+            ..BrowseSpec::default()
+        },
+    );
+    assert_eq!(
+        documents.len(),
+        1,
+        "the session stopped working after a cancel"
     );
 }

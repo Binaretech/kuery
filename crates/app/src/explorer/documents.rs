@@ -207,6 +207,21 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Opens a console on the connection, its runs starting in `path`, or
+    /// in the connection's own database for `None`.
+    pub(super) fn open_document_console(
+        &mut self,
+        index: usize,
+        path: Option<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.doc_db(index) else {
+            return;
+        };
+        let path = path.unwrap_or_else(|| db.home.clone());
+        cx.emit(ExplorerEvent::OpenDocumentConsole { db, path });
+    }
+
     fn show_more(&mut self, index: usize, parent: Vec<String>, cx: &mut Context<Self>) {
         let place = (self.connections[index].spec.id.clone(), parent);
         if let Some(Children::Loaded { shown, .. }) = self.documents.get_mut(&place) {
@@ -295,7 +310,14 @@ impl Explorer {
             }))
             .context_menu(move |menu, _, _| {
                 let refresh = path.clone();
+                let console = path.clone();
                 menu.item(item_icon(
+                    "Open Console",
+                    AppIcon::Code,
+                    &this,
+                    move |this, _, cx| this.open_document_console(index, Some(console.clone()), cx),
+                ))
+                .item(item_icon(
                     "Refresh",
                     AppIcon::Reload,
                     &this,

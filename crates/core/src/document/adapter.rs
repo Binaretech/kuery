@@ -28,6 +28,13 @@ pub trait DocumentSink {
     /// Some documents, in the order the engine returned them. An error (the
     /// reader went away, say) means stop.
     fn documents(&mut self, batch: Vec<Document>) -> Result<(), QueryError>;
+
+    /// Whether it holds all it takes of the statement that runs: the
+    /// adapter stops reading and closes the cursor, and the statement ends
+    /// well. Documents given after that are dropped.
+    fn full(&self) -> bool {
+        false
+    }
 }
 
 /// Collects documents, for an adapter's own reads and for samples.
@@ -81,6 +88,14 @@ pub trait DocumentAdapter: Send + 'static {
     /// protection it cannot give; asked once, at open.
     fn notice(&self) -> Option<String> {
         None
+    }
+
+    /// The container statements work in when the connection opens, such as
+    /// `["test"]` for MongoDB without a database; empty when statements
+    /// work in none. A console enters it again before each run that has no
+    /// other container to start in.
+    fn home(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// How long what runs next may take, and how big its batches are.

@@ -68,6 +68,7 @@ fn analyze(text: &str) -> Result<Vec<Statement>, ParseError> {
                 dangers: Vec::new(),
                 heavy: trimmed == "heavy",
                 explainable: false,
+                enters: None,
             },
         });
     }
@@ -102,6 +103,9 @@ static FAKE: Language = Language {
     render,
     field_filter: |_, _| None,
     context: |_, _| CompletionContext::Nothing,
+    enter: |_| None,
+    collection_ref: |name| name.to_string(),
+    key: |name| name.to_string(),
     methods: &[],
     operators: &[],
     stages: &[],
@@ -166,6 +170,10 @@ impl DocumentAdapter for FakeDocs {
         Some("Kuery refuses writes by itself".into())
     }
 
+    fn home(&self) -> Vec<String> {
+        vec!["shop".into()]
+    }
+
     fn limit(&mut self, _: &RunOptions) -> Result<(), QueryError> {
         Ok(())
     }
@@ -208,12 +216,19 @@ impl DocumentAdapter for FakeDocs {
             },
             ["read", n] => {
                 let count: usize = n.parse().unwrap_or(1);
-                // In small chunks, as a driver's cursor gives them.
+                // In small chunks, as a driver's cursor gives them, until
+                // the sink holds all it takes.
+                let mut read = 0;
                 for start in (0..count).step_by(50) {
-                    sink.documents(numbered(start..(start + 50).min(count)))?;
+                    if sink.full() {
+                        break;
+                    }
+                    let end = (start + 50).min(count);
+                    sink.documents(numbered(start..end))?;
+                    read = end;
                 }
                 Ok(Outcome {
-                    returned: count as u64,
+                    returned: read as u64,
                     ..Outcome::default()
                 })
             }
@@ -411,6 +426,7 @@ fn rejects_writes_on_a_read_only_session_before_the_adapter_sees_them() {
     let (session, log) = open(Access::ReadOnly);
     assert_eq!(session.server_label(), "Fake Docs 1.0");
     assert_eq!(session.notice(), Some("Kuery refuses writes by itself"));
+    assert_eq!(session.home(), ["shop"]);
     let refused = run(&session, "read 1; write 1", RunMode::Read).end;
     assert!(
         matches!(&refused, Err(QueryError::Rejected(Rejection::Statement(s))) if s == "write 1"),
@@ -563,6 +579,33 @@ fn streams_documents_in_growing_batches() {
     let two = run(&session, "read 2; read 3", RunMode::Read);
     assert_eq!(two.batches, [2, 3]);
     assert_eq!(two.end.unwrap().outcome.returned, 5);
+}
+
+#[test]
+fn stops_reading_each_statement_at_the_document_cap() {
+    let (session, _) = open(Access::ReadOnly);
+    let capped = drain(session.run(
+        "read 2600; read 30; read 200".into(),
+        RunMode::Read,
+        Heavy::Refuse,
+        RunOptions {
+            first_batch_rows: 100,
+            max_documents: Some(120),
+            ..RunOptions::default()
+        },
+    ));
+    // 120 of each statement, no more: the third starts its own count.
+    assert_eq!(capped.batches, [100, 20, 30, 120]);
+    // The adapter stopped reading once the sink was full, and the
+    // statements ended well.
+    let read: Vec<u64> = capped
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.returned)
+        .collect();
+    assert_eq!(read, [150, 30, 150]);
+    let summary = capped.end.unwrap();
+    assert_eq!((summary.documents, summary.statements), (270, 3));
 }
 
 #[test]

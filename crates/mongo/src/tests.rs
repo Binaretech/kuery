@@ -529,6 +529,52 @@ fn a_reader_that_goes_away_closes_the_cursor() {
     nothing_left_behind(&mut mongo);
 }
 
+/// Takes documents up to `cap`, as the session's stream does with
+/// `RunOptions::max_documents`.
+struct Capped {
+    documents: Vec<Document>,
+    cap: usize,
+}
+
+impl DocumentSink for Capped {
+    fn documents(&mut self, batch: Vec<Document>) -> Result<(), QueryError> {
+        let room = self.cap.saturating_sub(self.documents.len());
+        self.documents.extend(batch.into_iter().take(room));
+        Ok(())
+    }
+
+    fn full(&self) -> bool {
+        self.documents.len() >= self.cap
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_full_sink_stops_the_read_and_closes_the_cursor() {
+    let mut mongo = connect(&target(), Access::ReadOnly).unwrap();
+    mongo
+        .limit(&RunOptions {
+            first_batch_rows: 100,
+            max_batch_rows: 100,
+            ..RunOptions::default()
+        })
+        .unwrap();
+    let mut capped = Capped {
+        documents: Vec::new(),
+        cap: 250,
+    };
+    let outcome = mongo.execute("db.big.find()", &mut capped).unwrap();
+    assert_eq!(capped.documents.len(), 250);
+    // Read in groups of 100 until the sink was full, of `big`'s 20 000.
+    assert!(
+        (250..1_000).contains(&outcome.returned),
+        "{}",
+        outcome.returned
+    );
+    nothing_left_behind(&mut mongo);
+    console(&mut mongo, "db.runCommand({ping: 1})").unwrap();
+}
+
 #[test]
 #[ignore = "needs the dev MongoDB"]
 fn times_out_with_max_time_ms() {
@@ -1004,4 +1050,196 @@ fn works_like_any_document_database() {
         reader: Some(Arc::new(|access| open(&reader(), access))),
         slow: r#"db.big.find({$where: "sleep(100) || true"})"#.into(),
     });
+}
+
+/// Runs one console statement, as the session would hand it over.
+fn console(mongo: &mut Mongo, statement: &str) -> Result<(Vec<Document>, Outcome), QueryError> {
+    let mut documents = Vec::new();
+    let outcome = mongo.execute(statement, &mut documents)?;
+    Ok((documents, outcome))
+}
+
+fn count_of(documents: &[Document]) -> u64 {
+    match documents {
+        [document] => match document.get("count") {
+            Some(Value::Int32(n)) => *n as u64,
+            Some(Value::Int64(n)) => *n as u64,
+            other => panic!("not a count: {other:?}"),
+        },
+        _ => panic!("not one document: {documents:?}"),
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn runs_each_read_of_the_console() {
+    let mut mongo = connect(&target(), Access::ReadOnly).unwrap();
+    let mut read = |statement: &str| {
+        console(&mut mongo, statement).unwrap_or_else(|error| panic!("{statement}: {error}"))
+    };
+    let (paid, outcome) =
+        read(r#"db.orders.find({status: "paid"}, {number: 1}).sort({number: 1}).limit(3)"#);
+    let numbers: Vec<_> = paid
+        .iter()
+        .map(|order| order.get("number").cloned())
+        .collect();
+    assert_eq!(
+        numbers,
+        [1, 5, 9].map(|n| Some(Value::Int32(n))),
+        "{paid:?}"
+    );
+    assert_eq!(outcome.returned, 3);
+    assert_eq!(read("db.orders.findOne({number: 7})").0.len(), 1);
+    let (groups, _) = read(
+        r#"db.orders.aggregate([{$group: {_id: "$status", n: {$sum: 1}}}, {$sort: {_id: 1}}])"#,
+    );
+    assert_eq!(groups.len(), 4);
+    assert_eq!(
+        count_of(&read(r#"db.orders.countDocuments({status: "paid"})"#).0),
+        125
+    );
+    assert_eq!(
+        count_of(&read("db.orders.countDocuments({}, {limit: 10})").0),
+        10
+    );
+    assert_eq!(count_of(&read("db.orders.estimatedDocumentCount()").0), 500);
+    assert_eq!(
+        count_of(&read("db.orders.countDocuments({number: {$gt: 1000}})").0),
+        0
+    );
+    assert_eq!(read("db.orders.distinct('status')").0.len(), 4);
+    assert_eq!(read("db.orders.getIndexes()").0.len(), 3);
+    let (stats, _) = read("db.orders.stats()");
+    assert_eq!(
+        stats[0].get("ns"),
+        Some(&Value::String("shop.orders".into()))
+    );
+    let (stats, _) = read("db.stats()");
+    assert_eq!(stats[0].get("db"), Some(&Value::String("shop".into())));
+    assert_eq!(read("db.runCommand({ping: 1})").0.len(), 1);
+    let (plan, _) = read(r#"db.orders.find({status: "paid"}).explain()"#);
+    assert!(plan[0].get("queryPlanner").is_some(), "{plan:?}");
+    let (databases, _) = read("show dbs");
+    assert!(
+        databases
+            .iter()
+            .any(|database| database.get("name") == Some(&Value::String("shop".into())))
+    );
+    let (names, _) = read("db.getCollectionNames()");
+    assert!(names.len() >= 6, "{names:?}");
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn use_changes_the_database_of_what_follows() {
+    let nowhere = Target {
+        database: String::new(),
+        ..target()
+    };
+    let mut mongo = connect(&nowhere, Access::ReadOnly).unwrap();
+    // mongosh's own, without a database.
+    assert_eq!(DocumentAdapter::home(&mongo), ["test"]);
+    let (collections, _) = console(&mut mongo, "show collections").unwrap();
+    assert!(
+        collections.is_empty(),
+        "test holds nothing: {collections:?}"
+    );
+    console(&mut mongo, "use shop").unwrap();
+    let (collections, _) = console(&mut mongo, "show collections").unwrap();
+    assert!(
+        collections
+            .iter()
+            .any(|collection| collection.get("name") == Some(&Value::String("orders".into()))),
+        "{collections:?}"
+    );
+    let (count, _) = console(&mut mongo, "db.orders.estimatedDocumentCount()").unwrap();
+    assert_eq!(count_of(&count), 500);
+    // Where it opened stays the same.
+    assert_eq!(DocumentAdapter::home(&mongo), ["test"]);
+    let opened_in_shop = connect(&target(), Access::ReadOnly).unwrap();
+    assert_eq!(DocumentAdapter::home(&opened_in_shop), ["shop"]);
+    // Another database, named for one statement only.
+    let (count, _) = console(
+        &mut mongo,
+        r#"db.getSiblingDB("admin").getCollection("system.version").countDocuments({})"#,
+    )
+    .unwrap();
+    assert!(count_of(&count) >= 1);
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_read_only_console_cannot_write_even_unchecked() {
+    let mut mongo = connect(&target(), Access::ReadOnly).unwrap();
+    for statement in [
+        r#"db.orders.insertOne({kuery: "must never be written"})"#,
+        r#"db.orders.aggregate([{$facet: {a: [{$out: "copy"}]}}])"#,
+        r#"db.orders.explain().deleteMany({})"#,
+        r#"db.runCommand({insert: "orders", documents: [{}]})"#,
+        r#"db.orders.renameCollection("copy")"#,
+    ] {
+        assert_eq!(
+            console(&mut mongo, statement).map(|_| ()),
+            Err(QueryError::WritesDisabled),
+            "{statement}"
+        );
+    }
+    let (count, _) = console(&mut mongo, "db.orders.estimatedDocumentCount()").unwrap();
+    assert_eq!(count_of(&count), 500);
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn writes_from_the_console_report_what_they_did() {
+    let mut mongo = connect(&target(), Access::ReadWrite).unwrap();
+    let mut run = |statement: &str| console(&mut mongo, statement);
+    run("use kuery_console").unwrap();
+    run("db.dropDatabase()").unwrap();
+    let (_, inserted) =
+        run("db.notes.insertMany([{_id: 1, a: 1}, {_id: 2, a: 2}, {_id: 3, a: 3}])").unwrap();
+    assert_eq!(inserted.inserted, 3);
+    let (_, updated) =
+        run("db.notes.updateMany({a: {$gte: 2}}, {$set: {b: NumberLong(1)}})").unwrap();
+    assert_eq!((updated.matched, updated.modified), (2, 2));
+    let (_, upserted) =
+        run("db.notes.updateOne({_id: 9}, {$set: {a: 9}}, {upsert: true})").unwrap();
+    assert_eq!((upserted.matched, upserted.upserted), (0, 1));
+    let (found, deleted) = run("db.notes.findOneAndDelete({a: 1})").unwrap();
+    assert_eq!((found.len(), deleted.deleted), (1, 1));
+    let duplicate = run("db.notes.insertOne({_id: 2})").map(|_| ());
+    assert!(
+        matches!(&duplicate, Err(QueryError::Database { code, .. }) if code == "11000"),
+        "{duplicate:?}"
+    );
+    let (kept, _) = run("db.notes.find({b: NumberLong(1)}).sort({_id: 1})").unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].get("b"), Some(&Value::Int64(1)));
+    let (_, removed) = run("db.notes.deleteMany({})").unwrap();
+    assert_eq!(removed.deleted, 3);
+    run("db.dropDatabase()").unwrap();
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn cancels_a_sleeping_command_and_keeps_working() {
+    let mut mongo = connect(&target(), Access::ReadWrite).unwrap();
+    let cancel = DocumentAdapter::canceller(&mongo);
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        cancel();
+    });
+    let started = std::time::Instant::now();
+    let slept = console(
+        &mut mongo,
+        r#"db.adminCommand({sleep: 1, secs: 20, lock: "none"})"#,
+    );
+    assert_eq!(slept.map(|_| ()), Err(QueryError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    canceller.join().unwrap();
+    nothing_left_behind(&mut mongo);
+    console(&mut mongo, "db.runCommand({ping: 1})").unwrap();
 }

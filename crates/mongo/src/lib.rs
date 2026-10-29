@@ -16,10 +16,14 @@
 
 mod browse;
 mod catalog;
+pub mod classify;
+mod command;
 pub mod convert;
 mod detect;
+mod execute;
 pub mod literal;
 mod run;
+pub mod shell;
 mod uri;
 mod wire;
 
@@ -38,11 +42,12 @@ use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome};
 use kuery_core::document::capabilities::Capabilities;
 use kuery_core::document::catalog::{CollectionInfo, Container};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
-use kuery_core::document::language::{CompletionContext, Language, ParseError};
+use kuery_core::document::language::Language;
 use kuery_core::document::value::{CollectionRef, Document};
 use kuery_core::driver::{
     ConnectOptions, DocumentDriver, DriverInfo, Family, Field, SshRoute, Tls,
 };
+use kuery_core::read_only::Rejection;
 use kuery_core::session::{Access, QueryError, RunOptions};
 use mongodb::Client;
 use mongodb::error::{ErrorKind, WriteFailure};
@@ -50,7 +55,8 @@ use mongodb::options::{AuthMechanism, ClientOptions, Credential, Socks5Proxy};
 use tokio::runtime::Runtime;
 
 use crate::detect::{Detected, Facts};
-use crate::run::{Stop, Tag};
+use crate::run::{Stop, Tag, Wants};
+use crate::shell::Op;
 
 pub use uri::{OPTIONS, parse as parse_uri};
 
@@ -455,28 +461,28 @@ fn uses_tls(options: &ConnectOptions) -> bool {
     }
 }
 
-/// mongosh's commands, read and never evaluated. The filter bar and the
-/// document editor read its literals already; the console comes later.
+/// mongosh's commands, read and never evaluated: the console's statements
+/// (see [`shell`]), and the literals of the filter bar and the document
+/// editor.
 pub static LANGUAGE: Language = Language {
     name: "mongosh",
     editor: "javascript",
-    analyze: |text| {
-        Err(ParseError {
-            span: 0..text.len(),
-            message: LATER.into(),
-        })
-    },
+    analyze: classify::analyze,
     check_filter: literal::check_filter,
     parse_document: literal::parse_document,
     render: literal::render,
     field_filter: literal::field_filter,
-    context: |_, _| CompletionContext::Nothing,
+    context: shell::context,
+    enter: |path| match path {
+        [database] => Some(shell::print(&Op::Use(database.clone()))),
+        _ => None,
+    },
+    collection_ref: shell::collection_ref,
+    key: literal::key,
     methods: METHODS,
     operators: OPERATORS,
     stages: STAGES,
 };
-
-const LATER: &str = "The MongoDB console comes in a later version of Kuery";
 
 /// A collection's methods, for completion after `db.orders.`.
 const METHODS: &[&str] = &[
@@ -639,6 +645,10 @@ struct Mongo {
     commands: u64,
     stop: Arc<Stop>,
     limits: Limits,
+    /// The database the console's statements work in, as `use` left it.
+    database: String,
+    /// The one it opened in: the connection's own, or mongosh's `test`.
+    home: String,
 }
 
 /// What [`DocumentAdapter::limit`] set for what runs next.
@@ -650,11 +660,15 @@ struct Limits {
 }
 
 impl From<&RunOptions> for Limits {
+    /// A run that takes at most so many documents of a statement asks the
+    /// server for no bigger batches, so the server stops reading near
+    /// there too.
     fn from(options: &RunOptions) -> Self {
+        let most = options.max_documents.unwrap_or(usize::MAX);
         Limits {
             max_time: options.statement_timeout,
-            first_batch: options.first_batch_rows.max(1),
-            max_batch: options.max_batch_rows.max(1),
+            first_batch: options.first_batch_rows.min(most).max(1),
+            max_batch: options.max_batch_rows.min(most).max(1),
         }
     }
 }
@@ -697,6 +711,11 @@ fn connect(target: &Target, access: Access) -> Result<Mongo, String> {
         None => pool.facts.get().expect("known"),
     };
     let detected = detect::detect(facts, access, &target.hosts);
+    let home: String = match target.database.as_str() {
+        // Where mongosh starts without one.
+        "" => "test".into(),
+        database => database.into(),
+    };
     Ok(Mongo {
         pool: OnRuntime::new(pool),
         access,
@@ -705,6 +724,8 @@ fn connect(target: &Target, access: Access) -> Result<Mongo, String> {
         commands: 0,
         stop: Arc::default(),
         limits: Limits::from(&RunOptions::default()),
+        database: home.clone(),
+        home,
     })
 }
 
@@ -773,6 +794,34 @@ impl Mongo {
         command: BsonDocument,
         sink: &mut dyn FnMut(Vec<BsonDocument>) -> Result<(), QueryError>,
     ) -> Result<u64, QueryError> {
+        self.cursor_until(database, command, &mut |batch| {
+            sink(batch).map(|()| Wants::More)
+        })
+    }
+
+    /// Runs a command that answers with a cursor into a document sink,
+    /// closing the cursor once the sink is full. Returns how many documents
+    /// the sink was given.
+    fn cursor_into(
+        &mut self,
+        database: &str,
+        command: BsonDocument,
+        sink: &mut dyn DocumentSink,
+    ) -> Result<u64, QueryError> {
+        self.cursor_until(database, command, &mut |batch| {
+            sink.documents(batch.iter().map(convert::document).collect())?;
+            Ok(wants(sink))
+        })
+    }
+
+    /// Runs a command that answers with a cursor, until `sink` has had
+    /// enough or the cursor ends.
+    fn cursor_until(
+        &mut self,
+        database: &str,
+        command: BsonDocument,
+        sink: &mut dyn FnMut(Vec<BsonDocument>) -> Result<Wants, QueryError>,
+    ) -> Result<u64, QueryError> {
         let (command, tag) = self.prepare(command)?;
         let db = self.pool.client.database(database);
         let comment = Bson::String(tag.as_str().into());
@@ -802,6 +851,14 @@ impl Mongo {
     }
 }
 
+/// Whether a document sink takes more.
+fn wants(sink: &dyn DocumentSink) -> Wants {
+    match sink.full() {
+        true => Wants::Enough,
+        false => Wants::More,
+    }
+}
+
 impl DocumentAdapter for Mongo {
     fn language(&self) -> &'static Language {
         &LANGUAGE
@@ -819,6 +876,10 @@ impl DocumentAdapter for Mongo {
         self.detected.notice.clone()
     }
 
+    fn home(&self) -> Vec<String> {
+        vec![self.home.clone()]
+    }
+
     fn limit(&mut self, options: &RunOptions) -> Result<(), QueryError> {
         self.limits = Limits::from(options);
         Ok(())
@@ -829,12 +890,28 @@ impl DocumentAdapter for Mongo {
         Arc::new(move || stop.request())
     }
 
+    /// Reads the statement again and runs it as one command; `use` only
+    /// changes the database the next ones work in.
     fn execute(
         &mut self,
-        _statement: &str,
-        _sink: &mut dyn DocumentSink,
+        statement: &str,
+        sink: &mut dyn DocumentSink,
     ) -> Result<Outcome, QueryError> {
-        Err(QueryError::Unsupported(LATER.into()))
+        let mut statements = shell::statements(statement)
+            .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(statement))))?;
+        let op = match statements.len() {
+            0 => return Err(QueryError::Rejected(Rejection::Empty)),
+            1 => statements.remove(0).1,
+            n => return Err(QueryError::Rejected(Rejection::MultipleStatements(n))),
+        };
+        if let Op::Use(database) = op {
+            self.database = database;
+            return Ok(Outcome::default());
+        }
+        match command::build(&op, &self.database)? {
+            Some(built) => self.run_built(built, sink),
+            None => Ok(Outcome::default()),
+        }
     }
 
     /// Refused on a read-only connection whatever the session checked.
@@ -870,9 +947,7 @@ impl DocumentAdapter for Mongo {
             false => doc! { "$sample": { "size": size } },
         };
         let command = doc! { "aggregate": name, "pipeline": [stage], "cursor": {} };
-        self.cursor(database, command, &mut |batch| {
-            sink.documents(batch.iter().map(convert::document).collect())
-        })?;
+        self.cursor_into(database, command, sink)?;
         Ok(())
     }
 
@@ -885,13 +960,14 @@ impl DocumentAdapter for Mongo {
         let (database, name) = catalog::split(collection)?;
         let command = browse::find(name, spec, self.limits.first_batch)?;
         let (mut returned, mut last) = (0, None);
-        self.cursor(database, command, &mut |batch| {
+        self.cursor_until(database, command, &mut |batch| {
             let documents: Vec<Document> = batch.iter().map(convert::document).collect();
             returned += documents.len();
             if let Some(document) = documents.last() {
                 last = document.get("_id").cloned();
             }
-            sink.documents(documents)
+            sink.documents(documents)?;
+            Ok(wants(sink))
         })?;
         Ok(browse::next(spec, returned, last))
     }
@@ -962,6 +1038,22 @@ mod unit {
             options.options.insert(key.to_string(), value.to_string());
         }
         options
+    }
+
+    #[test]
+    fn completes_every_method_the_console_runs() {
+        for method in shell::Method::ALL {
+            assert!(METHODS.contains(&method.name()), "{}", method.name());
+        }
+        assert_eq!(
+            (LANGUAGE.enter)(&["shop".into()]).as_deref(),
+            Some("use shop")
+        );
+        assert_eq!(
+            (LANGUAGE.enter)(&["my db".into()]).as_deref(),
+            Some("use \"my db\"")
+        );
+        assert_eq!((LANGUAGE.enter)(&[]), None);
     }
 
     #[test]
