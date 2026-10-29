@@ -1248,7 +1248,9 @@ fn kind_icon(kind: ColumnKind) -> (AppIcon, u32) {
         ColumnKind::Integer | ColumnKind::Number => (AppIcon::Hash, 0x4da3ff),
         ColumnKind::Date | ColumnKind::Timestamp => (AppIcon::History, 0xb9a3e6),
         ColumnKind::Boolean => (AppIcon::Toggle, theme::GREEN),
-        ColumnKind::Text | ColumnKind::Unknown => (AppIcon::TextType, 0xc7c7cc),
+        ColumnKind::Text | ColumnKind::Json | ColumnKind::Id | ColumnKind::Unknown => {
+            (AppIcon::TextType, 0xc7c7cc)
+        }
     }
 }
 

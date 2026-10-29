@@ -10,6 +10,7 @@
 //! Passwords go to the OS keychain under each connection's `id` (see
 //! [`crate::secrets`]), so the folder can be committed to Git.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kuery_core::driver::{ConnectOptions, DriverInfo, Family};
@@ -69,6 +70,11 @@ pub struct ConnectionSpec {
     /// the server's as the SSH host sees them (see [`crate::tunnel`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshSpec>,
+    /// The driver's other settings by key (MongoDB's `authSource`, say),
+    /// only those its descriptor lists (see
+    /// [`kuery_core::driver::DriverInfo::options`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
 }
 
 /// An SSH host to tunnel through: a host name or a `~/.ssh/config` alias.
@@ -108,13 +114,23 @@ fn is_default_driver(id: &str) -> bool {
 impl ConnectionSpec {
     /// Through SSH the SSH host decides: the server's `localhost` is the
     /// SSH host's, not this machine's. A database file is on this machine.
+    /// Of several hosts (`a:27017,b:27017`), each must be local for the
+    /// connection to be.
     pub fn environment(&self) -> Environment {
         let host = match &self.ssh {
             _ if self.is_file() => "localhost",
             Some(ssh) => &ssh.host,
             None => &self.host,
         };
-        Environment::detect(&format!("postgres://{host}/"), self.environment.as_deref())
+        let local = |host: &str| {
+            Environment::detect(&format!("postgres://{}/", host.trim()), None)
+                == Environment::Development
+        };
+        match self.environment.as_deref() {
+            Some(name) => Environment::parse(name),
+            None if host.split(',').all(local) => Environment::Development,
+            None => Environment::Production,
+        }
     }
 
     /// The driver's descriptor; `None` for an id this version does not know.
@@ -130,7 +146,7 @@ impl ConnectionSpec {
     pub fn dialect(&self) -> Option<&'static kuery_core::sql::Dialect> {
         match drivers::find(&self.driver)? {
             Driver::Sql(sql) => Some(sql.dialect),
-            Driver::Redis => None,
+            Driver::Redis | Driver::Document(_) => None,
         }
     }
 
@@ -172,6 +188,11 @@ impl ConnectionSpec {
         }
         let target = match self.family() {
             Some(Family::KeyValue) => format!("{}:{}/{}", self.host, self.port, self.redis_db()),
+            _ if self.options.get("srv").is_some_and(|srv| srv == "true") => {
+                format!("srv:{}/{}", self.host, self.database)
+            }
+            // Members name their own ports.
+            _ if self.host.contains(',') => format!("{}/{}", self.host, self.database),
             _ => format!("{}:{}/{}", self.host, self.port, self.database),
         };
         match &self.ssh {
@@ -490,6 +511,7 @@ mod tests {
             sslmode: None,
             environment: None,
             ssh: None,
+            options: BTreeMap::new(),
         }
     }
 
@@ -497,6 +519,7 @@ mod tests {
     fn keeps_postgres_files_as_they_were_and_reads_redis_ones() {
         let postgres = toml::to_string(&spec("local-dev")).unwrap();
         assert!(!postgres.contains("driver"));
+        assert!(!postgres.contains("options"), "{postgres}");
         let redis: ConnectionSpec = toml::from_str(
             "id = \"r\"\nname = \"cache\"\ndriver = \"redis\"\nhost = \"localhost\"\nport = 63799\n",
         )
@@ -569,6 +592,44 @@ mod tests {
         assert_eq!(project.connection(&first.id).unwrap().name, "b");
         project.remove_connection(&first.id);
         assert!(project.connections.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_mongodb_connection_with_its_options() {
+        let options = [("authSource", "admin"), ("srv", "true")]
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .into();
+        let atlas = ConnectionSpec {
+            driver: "mongodb".into(),
+            host: "cluster0.x.mongodb.net".into(),
+            port: 27017,
+            database: "shop".into(),
+            options,
+            ..spec("atlas")
+        };
+        let text = toml::to_string(&atlas).unwrap();
+        assert!(
+            text.contains("[options]\nauthSource = \"admin\"\nsrv = \"true\""),
+            "{text}"
+        );
+        assert!(!text.contains("password"), "{text}");
+        let read: ConnectionSpec = toml::from_str(&text).unwrap();
+        assert_eq!(read, atlas);
+        assert_eq!(atlas.target(), "srv:cluster0.x.mongodb.net/shop");
+        assert_eq!(atlas.environment(), Environment::Production);
+        let members = ConnectionSpec {
+            host: "localhost:27017,localhost:27018".into(),
+            options: BTreeMap::new(),
+            ..atlas
+        };
+        assert_eq!(members.target(), "localhost:27017,localhost:27018/shop");
+        assert_eq!(members.environment(), Environment::Development);
+        // One member elsewhere makes the whole connection production.
+        let mixed = ConnectionSpec {
+            host: "localhost:27017,db.example.com:27017".into(),
+            ..members
+        };
+        assert_eq!(mixed.environment(), Environment::Production);
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub fn approve(
                 .collect(),
         ),
         preview: Rc::new(move |_| preview(&db, database, commands.clone())),
+        stopped: Rc::new(|| false),
     };
     write_review::approve(request, window, cx, approved);
 }

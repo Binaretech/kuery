@@ -123,6 +123,9 @@ pub enum Rejection {
     SelectInto,
     /// A call to a function with side effects.
     Function(String),
+    /// Work that weighs on the server (JavaScript it runs, an index build),
+    /// refused outside development.
+    Heavy(String),
 }
 
 impl fmt::Display for Rejection {
@@ -147,6 +150,10 @@ impl fmt::Display for Rejection {
                     "The function {name}() has side effects and is not allowed"
                 )
             }
+            Rejection::Heavy(summary) => write!(
+                f,
+                "{summary} runs heavy work on the server (JavaScript, index builds) and only runs on development connections"
+            ),
         }
     }
 }

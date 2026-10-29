@@ -11,6 +11,7 @@ kuery-redis.workspace = true
 kuery-sqlite.workspace = true
 kuery-mysql.workspace = true
 kuery-mssql.workspace = true
+kuery-mongo.workspace = true
 kuery-files.workspace = true
 kuery-update.workspace = true
 anyhow.workspace = true

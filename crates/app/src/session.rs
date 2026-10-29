@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{App, Bounds, DisplayId, Window, WindowBounds, point, px, size};
 use kuery_core::catalog::TableKind;
+use kuery_core::document::catalog::ContainerKind;
 use serde::{Deserialize, Serialize};
 
 use crate::explorer::Mode;
@@ -190,6 +191,25 @@ pub enum TabState {
         database: i64,
         text: String,
     },
+    /// A document collection, with its filter bar as typed.
+    Collection {
+        connection: String,
+        /// `[database, collection]`.
+        path: Vec<String>,
+        #[serde(rename = "collection_kind")]
+        kind: ContainerKindState,
+        filter: String,
+        projection: String,
+        sort: String,
+    },
+    /// A document database's console, with its statements.
+    DocumentConsole {
+        connection: String,
+        /// The container its runs start in (`["shop"]`); empty for the
+        /// connection's own.
+        path: Vec<String>,
+        text: String,
+    },
     File {
         path: PathBuf,
     },
@@ -204,7 +224,9 @@ impl TabState {
             | TabState::Diagram { connection, .. }
             | TabState::Activity { connection }
             | TabState::RedisKey { connection, .. }
-            | TabState::RedisConsole { connection, .. } => Some(connection),
+            | TabState::RedisConsole { connection, .. }
+            | TabState::Collection { connection, .. }
+            | TabState::DocumentConsole { connection, .. } => Some(connection),
             TabState::File { .. } => None,
         }
     }
@@ -240,6 +262,43 @@ impl From<TableKindState> for TableKind {
             TableKindState::View => Self::View,
             TableKindState::MaterializedView => Self::MaterializedView,
             TableKindState::ForeignTable => Self::ForeignTable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKindState {
+    Database,
+    Scope,
+    Collection,
+    View,
+    TimeSeries,
+    Capped,
+}
+
+impl From<ContainerKind> for ContainerKindState {
+    fn from(kind: ContainerKind) -> Self {
+        match kind {
+            ContainerKind::Database => Self::Database,
+            ContainerKind::Scope => Self::Scope,
+            ContainerKind::Collection => Self::Collection,
+            ContainerKind::View => Self::View,
+            ContainerKind::TimeSeries => Self::TimeSeries,
+            ContainerKind::Capped => Self::Capped,
+        }
+    }
+}
+
+impl From<ContainerKindState> for ContainerKind {
+    fn from(kind: ContainerKindState) -> Self {
+        match kind {
+            ContainerKindState::Database => Self::Database,
+            ContainerKindState::Scope => Self::Scope,
+            ContainerKindState::Collection => Self::Collection,
+            ContainerKindState::View => Self::View,
+            ContainerKindState::TimeSeries => Self::TimeSeries,
+            ContainerKindState::Capped => Self::Capped,
         }
     }
 }
@@ -396,6 +455,14 @@ mod tests {
                                     database: 2,
                                     text: "GET a\n".into(),
                                 },
+                                TabState::Collection {
+                                    connection: "docs".into(),
+                                    path: vec!["shop".into(), "orders".into()],
+                                    kind: ContainerKindState::TimeSeries,
+                                    filter: "{status: \"paid\"}".into(),
+                                    projection: String::new(),
+                                    sort: "{total: -1}".into(),
+                                },
                                 TabState::File {
                                     path: "/data/orders.csv".into(),
                                 },
@@ -444,8 +511,53 @@ mod tests {
         let connections: Vec<_> = workspace.tabs.iter().map(TabState::connection).collect();
         assert_eq!(
             connections,
-            [Some("local"), Some("local"), Some("cache"), None]
+            [
+                Some("local"),
+                Some("local"),
+                Some("cache"),
+                Some("docs"),
+                None
+            ]
         );
+    }
+
+    #[test]
+    fn a_collection_tab_keeps_its_place_and_bar() {
+        let tab = TabState::Collection {
+            connection: "docs".into(),
+            path: vec!["shop".into(), "orders".into()],
+            kind: ContainerKindState::View,
+            filter: "{status: \"paid\"}".into(),
+            projection: "{total: 1}".into(),
+            sort: String::new(),
+        };
+        let text = serde_json::to_string(&tab).unwrap();
+        assert!(
+            text.starts_with(r#"{"kind":"collection","connection":"docs","path":["shop","orders"],"collection_kind":"view""#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<TabState>(&text).unwrap(), tab);
+        assert_eq!(tab.connection(), Some("docs"));
+        assert_eq!(
+            ContainerKind::from(ContainerKindState::from(ContainerKind::Capped)),
+            ContainerKind::Capped
+        );
+    }
+
+    #[test]
+    fn a_document_console_keeps_its_database_and_statements() {
+        let tab = TabState::DocumentConsole {
+            connection: "docs".into(),
+            path: vec!["shop".into()],
+            text: "db.orders.find()\n".into(),
+        };
+        let text = serde_json::to_string(&tab).unwrap();
+        assert_eq!(
+            text,
+            r#"{"kind":"document_console","connection":"docs","path":["shop"],"text":"db.orders.find()\n"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabState>(&text).unwrap(), tab);
+        assert_eq!(tab.connection(), Some("docs"));
     }
 
     #[test]

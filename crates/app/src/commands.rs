@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use gpui_kit::{Action, actions};
 
 use crate::audit::OpenAuditLog;
+use crate::collection_tab::ReloadCollection;
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
     CancelQuery, CommitTransaction, ExplainAnalyze, ExplainQuery, ExportResults, FormatSql,
@@ -197,7 +198,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(RunQuery),
         defaults: &["secondary-enter"],
-        context: Some("QueryTab || FileQueryTab"),
+        context: Some("QueryTab || FileQueryTab || DocumentConsole"),
     },
     Command {
         id: "query.run_all",
@@ -205,7 +206,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(RunAll),
         defaults: &["secondary-alt-enter"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || DocumentConsole"),
     },
     Command {
         id: "query.format",
@@ -237,7 +238,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(CancelQuery),
         defaults: &["secondary-."],
-        context: Some("QueryTab || FileQueryTab"),
+        context: Some("QueryTab || FileQueryTab || DocumentConsole"),
     },
     Command {
         id: "query.toggle_results",
@@ -342,6 +343,14 @@ pub const COMMANDS: &[Command] = &[
         action: action!(SaveTableChanges),
         defaults: &["secondary-s"],
         context: Some("TableTab"),
+    },
+    Command {
+        id: "collection.reload",
+        title: "Reload Collection",
+        category: "Collection",
+        action: action!(ReloadCollection),
+        defaults: &["secondary-r"],
+        context: Some("CollectionTab"),
     },
     Command {
         id: "keymap.open",

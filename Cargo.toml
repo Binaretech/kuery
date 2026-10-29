@@ -14,6 +14,7 @@ kuery-redis = { path = "crates/redis" }
 kuery-sqlite = { path = "crates/sqlite" }
 kuery-mysql = { path = "crates/mysql" }
 kuery-mssql = { path = "crates/mssql" }
+kuery-mongo = { path = "crates/mongo" }
 kuery-files = { path = "crates/files" }
 kuery-update = { path = "crates/update" }
 
@@ -23,7 +24,11 @@ polars = { version = "=0.55.2", default-features = false, features = ["lazy", "c
 anyhow = "1"
 arrow-array = "60"
 async-channel = "2"
+# Binary values in exported documents (Extended JSON).
+base64 = "0.22"
 futures = "0.3"
+# Property tests of the document literal grammar.
+proptest = "1"
 keyring = "4"
 # SQL Server's showplan XML, read into plans.
 roxmltree = "0.21"
@@ -44,6 +49,11 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled", 
 # native-tls hangs in the handshake on macOS.
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "sql-browser-tokio"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+# MongoDB over rustls with `ring`; roots from webpki-roots, private CAs from a `tlsCAFile` option.
+# Through SSH with TLS it dials the server by name over a SOCKS proxy (`ssh -D`), so the certificate is checked.
+mongodb = { version = "3.9", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver", "socks5-proxy"] }
+# The BSON `mongodb` uses, with its Extended JSON, which keeps MongoDB's own types lossless.
+bson = { version = "3.1", features = ["serde_json-1"] }
 # TLS with rustls and the `ring` provider, the one every connection uses.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
@@ -64,8 +74,9 @@ sentry = { version = "0.49.5", default-features = false, features = ["backtrace"
 
 # gpui-kit pins its own gpui version; upgrade it on purpose, never by accident.
 # SQL for query tabs; Bash for the Redis console, whose lines are shell-like
-# (words, quoted strings, `#` comments).
-gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql", "tree-sitter-bash"] }
+# (words, quoted strings, `#` comments); JavaScript for the MongoDB console
+# and its documents, whose commands and literals are mongosh's.
+gpui-kit = { version = "=0.7.3", features = ["tree-sitter-sql", "tree-sitter-bash", "tree-sitter-javascript"] }
 # The editor's completion types; must be the version gpui-kit uses.
 lsp-types = "0.97"
 

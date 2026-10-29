@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::SharedString;
+use kuery_core::document::session::DocumentSession;
 use kuery_core::session::{Access, Session};
 
 use crate::theme;
@@ -305,6 +306,76 @@ impl RedisDb {
     }
 }
 
+/// An open document connection. The sidebar uses `catalog`; each tab
+/// opened on it opens a session of its own from it
+/// ([`DocumentSession::reopen`]), sharing the driver's client, so the
+/// sidebar never waits behind a long query.
+#[derive(Clone)]
+pub struct DocDb {
+    pub name: SharedString,
+    pub environment: Environment,
+    pub catalog: DocumentSession,
+    /// `host:port/database`, without credentials.
+    pub target: SharedString,
+    /// The container the form names (`["shop"]`), where a console starts;
+    /// empty for the driver's own default.
+    pub home: Vec<String>,
+    /// Production only: whether writes were allowed for this connection
+    /// session. Shared by every tab on it, gone when it disconnects.
+    writes_allowed: Arc<AtomicBool>,
+    /// The SSH tunnel the connection goes through, open while any clone is.
+    _tunnel: Option<Arc<Tunnel>>,
+}
+
+impl DocDb {
+    pub fn new(
+        name: SharedString,
+        environment: Environment,
+        catalog: DocumentSession,
+        target: SharedString,
+        home: Vec<String>,
+        tunnel: Option<Arc<Tunnel>>,
+    ) -> Self {
+        Self {
+            name,
+            environment,
+            catalog,
+            target,
+            home,
+            writes_allowed: Arc::new(AtomicBool::new(false)),
+            _tunnel: tunnel,
+        }
+    }
+
+    /// Whether writes can run without allowing them first.
+    pub fn allows_writes(&self) -> bool {
+        self.environment.write_policy() != WritePolicy::SessionUnlock
+            || self.writes_allowed.load(Ordering::SeqCst)
+    }
+
+    pub fn allow_writes(&self) {
+        self.writes_allowed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn revoke_writes(&self) {
+        self.writes_allowed.store(false, Ordering::SeqCst);
+    }
+
+    /// What the status bar, tab tooltips and the production stripe show.
+    pub fn meta(&self) -> ConnMeta {
+        ConnMeta {
+            name: self.name.clone(),
+            environment: self.environment,
+            target: self.target.clone(),
+            server: self.catalog.server_label().to_string().into(),
+            notice: self
+                .catalog
+                .notice()
+                .map(|notice| notice.to_string().into()),
+        }
+    }
+}
+
 /// Whether `kind` may run, given what the connection session allows.
 fn allows(policy: WritePolicy, writes: bool, full_writes: bool, kind: WriteKind) -> bool {
     if policy != WritePolicy::SessionUnlock {
@@ -378,6 +449,10 @@ mod tests {
         );
         assert_eq!(
             detect("postgres://u:p@localhost.example.com/db"),
+            Environment::Production
+        );
+        assert_eq!(
+            detect("postgres://cluster0.x.mongodb.net/"),
             Environment::Production
         );
     }

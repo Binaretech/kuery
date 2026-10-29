@@ -144,3 +144,63 @@ fn a_cancel_stops_the_running_job_and_never_the_next() {
     let event = block_on(next.recv());
     assert!(matches!(event, Ok(Tick::Finished(false))), "{event:?}");
 }
+
+/// A ticker whose canceller takes its time between deciding to stop the
+/// run and stopping it, as a thread the system paused there would.
+struct Late {
+    stop: Arc<AtomicBool>,
+}
+
+impl Driven for Late {
+    fn canceller(&self) -> Canceller {
+        let stop = self.stop.clone();
+        Arc::new(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stop.store(true, Ordering::SeqCst);
+        })
+    }
+}
+
+#[test]
+fn a_cancel_on_its_way_as_the_run_ends_never_reaches_the_next() {
+    let opened = Handle::open(
+        Access::ReadOnly,
+        || {
+            Ok(Box::new(Late {
+                stop: Arc::new(AtomicBool::new(false)),
+            }))
+        },
+        |_| (),
+    );
+    let handle = block_on(opened).unwrap().0;
+    // Ends by itself while the canceller is still on its way.
+    let first = handle.stream(|worker: &mut Worker<Late>, tx| {
+        worker.begin_run();
+        let _ = tx.send_blocking(Tick::Started);
+        std::thread::sleep(Duration::from_millis(100));
+        worker.end_run(Ok(false))
+    });
+    assert!(matches!(block_on(first.recv()), Ok(Tick::Started)));
+    handle.cancel();
+    let next = handle.stream(|worker: &mut Worker<Late>, tx| {
+        worker.begin_run();
+        // What an adapter does as it starts a statement: a stop from
+        // before is forgotten.
+        let stop = worker.adapter.stop.clone();
+        stop.store(false, Ordering::SeqCst);
+        let _ = tx.send_blocking(Tick::Started);
+        let started = Instant::now();
+        while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_millis(600) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.end_run(Ok(stop.load(Ordering::SeqCst)))
+    });
+    let event = block_on(first.recv());
+    assert!(
+        matches!(event, Ok(Tick::Failed(QueryError::Cancelled))),
+        "{event:?}"
+    );
+    assert!(matches!(block_on(next.recv()), Ok(Tick::Started)));
+    let event = block_on(next.recv());
+    assert!(matches!(event, Ok(Tick::Finished(false))), "{event:?}");
+}

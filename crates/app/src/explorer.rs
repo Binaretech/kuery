@@ -1,7 +1,8 @@
 //! Sidebar: the project's connections as a tree (connection → schema →
 //! tables, views, functions, triggers and enums for Postgres; connection →
-//! database → keys for Redis, see [`redis_keys`]), its saved queries, and the
-//! query history.
+//! database → keys for Redis, see [`redis_keys`]; connection → database →
+//! collections for document databases, see [`documents`]), its saved
+//! queries, and the query history.
 //!
 //! The sidebar owns the open connections: it opens each one when it is first
 //! expanded (the first one opens on start), reading its password from the
@@ -10,6 +11,7 @@
 
 #[cfg(test)]
 mod bench;
+mod documents;
 mod redis_keys;
 mod rows;
 
@@ -31,12 +33,14 @@ use gpui_kit::{
 use kuery_core::catalog::{
     CatalogOverview, EnumInfo, FunctionInfo, TableInfo, TableRef, TriggerRef,
 };
+use kuery_core::document::catalog::ContainerKind;
+use kuery_core::document::value::CollectionRef;
 use kuery_core::driver::Family;
 use kuery_core::sql::{Dialect, POSTGRES};
 
 use crate::app;
 use crate::assets::AppIcon;
-use crate::connection::{Db, RedisDb};
+use crate::connection::{ConnMeta, Db, DocDb, RedisDb};
 use crate::context_menus::{copy, item, item_icon, reveal};
 use crate::drivers::{self, Connection};
 use crate::history::{self, HistoryEntry};
@@ -82,6 +86,20 @@ pub enum ExplorerEvent {
         db: RedisDb,
         database: i64,
     },
+    /// A document connection finished opening.
+    DocumentConnected(DocDb),
+    /// A collection (or a view) of a document database.
+    OpenCollection {
+        db: DocDb,
+        collection: CollectionRef,
+        kind: ContainerKind,
+    },
+    /// A console on a document database, its runs starting in `path`
+    /// (empty for the connection's own container).
+    OpenDocumentConsole {
+        db: DocDb,
+        path: Vec<String>,
+    },
 }
 
 enum ConnectionState {
@@ -94,6 +112,9 @@ enum ConnectionState {
     RedisReady {
         db: RedisDb,
         keyspace: redis_keys::Keyspace,
+    },
+    DocumentReady {
+        db: DocDb,
     },
     Failed(String),
 }
@@ -175,6 +196,8 @@ pub struct Explorer {
     history_saves: u64,
     /// Keys read so far per (connection id, Redis database).
     redis_keys: redis_keys::KeyBrowsers,
+    /// Document databases' nodes read so far, per connection id.
+    documents: documents::DocumentTrees,
     /// Bumped on every edit of the filter, so only the last one rescans.
     filter_edits: u64,
     /// The tree's rows, built again when the explorer changes or the filter
@@ -247,6 +270,7 @@ impl Explorer {
             history_saved: Arc::new(Mutex::new(0)),
             history_saves: 0,
             redis_keys: HashMap::new(),
+            documents: HashMap::new(),
             filter_edits: 0,
             rows: Vec::new(),
             rows_query: String::new(),
@@ -308,15 +332,18 @@ impl Explorer {
             match self.connections[index].state {
                 ConnectionState::Ready { .. } => self.load_catalog(index, cx),
                 ConnectionState::RedisReady { .. } => self.load_keyspace(index, cx),
+                ConnectionState::DocumentReady { .. } => self.refresh_documents(index, cx),
                 _ => {}
             }
         }
     }
 
-    /// Reloads one connection's catalog, or its databases for Redis.
+    /// Reloads one connection's catalog, its databases for Redis, or the
+    /// nodes read so far for a document database.
     fn refresh(&mut self, index: usize, cx: &mut Context<Self>) {
         match self.connections.get(index).map(|node| &node.state) {
             Some(ConnectionState::RedisReady { .. }) => self.load_keyspace(index, cx),
+            Some(ConnectionState::DocumentReady { .. }) => self.refresh_documents(index, cx),
             _ => self.load_catalog(index, cx),
         }
     }
@@ -350,6 +377,25 @@ impl Explorer {
             .and_then(|key| key.split('/').next()?.parse::<usize>().ok())
             .and_then(|index| self.db(index));
         selected.or_else(|| (0..self.connections.len()).find_map(|index| self.db(index)))
+    }
+
+    /// What the status bar shows with no tab open: the selected connection,
+    /// SQL or documents, else the first one open.
+    pub fn current_meta(&self) -> Option<ConnMeta> {
+        let selected = self
+            .selected
+            .as_ref()
+            .and_then(|key| key.split('/').next()?.parse::<usize>().ok())
+            .and_then(|index| self.meta(index));
+        selected.or_else(|| (0..self.connections.len()).find_map(|index| self.meta(index)))
+    }
+
+    fn meta(&self, index: usize) -> Option<ConnMeta> {
+        match &self.connections.get(index)?.state {
+            ConnectionState::Ready { db, .. } => Some(db.meta()),
+            ConnectionState::DocumentReady { db } => Some(db.meta()),
+            _ => None,
+        }
     }
 
     /// Tables and views of every connection whose catalog is loaded, for the
@@ -446,6 +492,7 @@ impl Explorer {
             ConnectionState::Connecting
                 | ConnectionState::Ready { .. }
                 | ConnectionState::RedisReady { .. }
+                | ConnectionState::DocumentReady { .. }
         ) {
             return;
         }
@@ -495,6 +542,11 @@ impl Explorer {
                         };
                         this.load_keyspace(index, cx);
                         cx.emit(ExplorerEvent::RedisConnected(db));
+                    }
+                    Ok(Connection::Document(db)) => {
+                        node.state = ConnectionState::DocumentReady { db: db.clone() };
+                        this.load_children(index, Vec::new(), cx);
+                        cx.emit(ExplorerEvent::DocumentConnected(db));
                     }
                     Err(error) => node.state = ConnectionState::Failed(error),
                 }
@@ -548,6 +600,11 @@ impl Explorer {
                 node.spec.id == *id && matches!(node.state, ConnectionState::RedisReady { .. })
             })
         });
+        self.documents.retain(|(id, _), _| {
+            connections.iter().any(|node| {
+                node.spec.id == *id && matches!(node.state, ConnectionState::DocumentReady { .. })
+            })
+        });
         cx.notify();
     }
 
@@ -577,6 +634,7 @@ impl Explorer {
                     ConnectionState::Connecting
                         | ConnectionState::Ready { .. }
                         | ConnectionState::RedisReady { .. }
+                        | ConnectionState::DocumentReady { .. }
                 )
             })
             .map(|node| node.spec.name.clone())
@@ -744,6 +802,7 @@ impl Explorer {
             self.expanded.remove(&index.to_string());
             let id = node.spec.id.clone();
             self.redis_keys.retain(|(other, _), _| *other != id);
+            self.documents.retain(|(other, _), _| *other != id);
             cx.notify();
         }
     }
@@ -851,6 +910,7 @@ impl Explorer {
         let tree = rows::Tree {
             expanded: &self.expanded,
             redis_keys: &self.redis_keys,
+            documents: &self.documents,
             query: &query,
         };
         self.rows = rows::tree_rows(self.connections.iter().map(rows::NodeView::of), &tree);
@@ -991,6 +1051,18 @@ impl Explorer {
                 database,
                 count,
             } => self.more_row(*index, *database, *count, cx),
+            Row::DocumentNode {
+                index,
+                path,
+                item,
+                depth,
+                expanded,
+            } => self.document_row(*index, path, *item, *depth, *expanded, cx)?,
+            Row::DocumentMore {
+                index,
+                parent,
+                depth,
+            } => self.document_more_row(*index, parent, *depth, cx),
         };
         Some(element)
     }
@@ -1003,10 +1075,12 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let environment = node.spec.environment();
-        let redis = node.spec.family() == Some(Family::KeyValue);
+        let family = node.spec.family();
         let ready = matches!(
             node.state,
-            ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. }
+            ConnectionState::Ready { .. }
+                | ConnectionState::RedisReady { .. }
+                | ConnectionState::DocumentReady { .. }
         );
         let activity = matches!(
             &node.state,
@@ -1015,7 +1089,9 @@ impl Explorer {
         // The environment's color: filled once connected, an outline before;
         // amber while connecting, red when it failed.
         let dot = match &node.state {
-            ConnectionState::Ready { .. } | ConnectionState::RedisReady { .. } => div()
+            ConnectionState::Ready { .. }
+            | ConnectionState::RedisReady { .. }
+            | ConnectionState::DocumentReady { .. } => div()
                 .size(px(6.))
                 .rounded_full()
                 .bg(color(environment.color())),
@@ -1115,7 +1191,7 @@ impl Explorer {
             let id = node.spec.id.clone();
             let target = node.spec.target();
             move |menu, _, _| {
-                let menu = if ready && redis {
+                let menu = if ready && family == Some(Family::KeyValue) {
                     menu.item(item_icon(
                         "Open Console",
                         AppIcon::Code,
@@ -1127,6 +1203,22 @@ impl Explorer {
                         AppIcon::Reload,
                         &this,
                         move |this, _, cx| this.load_keyspace(index, cx),
+                    ))
+                    .item(item("Disconnect", &this, move |this, _, cx| {
+                        this.disconnect(index, cx)
+                    }))
+                } else if ready && family == Some(Family::Document) {
+                    menu.item(item_icon(
+                        "Open Console",
+                        AppIcon::Code,
+                        &this,
+                        move |this, _, cx| this.open_document_console(index, None, cx),
+                    ))
+                    .item(item_icon(
+                        "Refresh",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.refresh_documents(index, cx),
                     ))
                     .item(item("Disconnect", &this, move |this, _, cx| {
                         this.disconnect(index, cx)
@@ -1955,6 +2047,7 @@ mod tests {
             sslmode: None,
             environment: Some("development".into()),
             ssh: None,
+            options: Default::default(),
         }
     }
 
@@ -2149,6 +2242,117 @@ mod tests {
             assert!(!loaded(1), "A got C's databases");
             assert!(explorer.key_browser(0, 0).is_none(), "C got A's keys");
             assert!(explorer.key_browser(1, 0).is_some(), "A lost its keys");
+        });
+        let root = model.read_with(cx, |model, _| model.project.root.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A document connection to the dev MongoDB, as `root`.
+    fn mongo_db(name: &str) -> DocDb {
+        use kuery_core::document::session::{DocumentOpener, DocumentSession};
+        let options = kuery_core::driver::ConnectOptions {
+            host: "127.0.0.1".into(),
+            port: 27019,
+            user: "kuery".into(),
+            password: Some("kuery".into()),
+            options: [("authSource".to_string(), "admin".to_string())].into(),
+            ..Default::default()
+        };
+        let opener: DocumentOpener =
+            Arc::new(move |access| (kuery_mongo::DRIVER.open)(&options, access));
+        let catalog = block_on(DocumentSession::open(opener, Access::ReadWrite)).unwrap();
+        DocDb::new(
+            name.into(),
+            Environment::Development,
+            catalog,
+            "127.0.0.1:27019/".into(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn the_status_bar_names_a_selected_document_connection(cx: &mut TestAppContext) {
+        let (model, explorer) = open(
+            cx,
+            vec![
+                spec("a", "sqlite", 0),
+                spec("b", "mongodb", 27019),
+                spec("c", "mongodb", 27019),
+            ],
+        );
+        explorer.update(cx, |explorer, _| {
+            assert!(explorer.current_meta().is_none(), "nothing is open yet");
+            for (index, name) in [(1, "b"), (2, "c")] {
+                explorer.connections[index].state =
+                    ConnectionState::DocumentReady { db: mongo_db(name) };
+            }
+            // No SQL connection is open, and none selected: the first open.
+            assert_eq!(explorer.current_meta().unwrap().name.as_ref(), "b");
+            explorer.selected = Some("2/shop".into());
+            assert_eq!(explorer.current_meta().unwrap().name.as_ref(), "c");
+            assert!(explorer.current_db().is_none());
+        });
+        let root = model.read_with(cx, |model, _| model.project.root.clone());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn document_nodes_stay_with_their_connection_after_a_reorder(cx: &mut TestAppContext) {
+        let (model, explorer) = open(
+            cx,
+            vec![spec("a", "mongodb", 27019), spec("c", "mongodb", 27019)],
+        );
+        explorer.update(cx, |explorer, cx| {
+            for (index, name) in ["a", "c"].into_iter().enumerate() {
+                explorer.connections[index].state =
+                    ConnectionState::DocumentReady { db: mongo_db(name) };
+            }
+            explorer.load_children(0, Vec::new(), cx);
+        });
+        let read = |explorer: &Explorer, id: &str, path: &[&str]| {
+            let path = path.iter().map(|s| s.to_string()).collect();
+            match explorer.documents.get(&(id.to_string(), path)) {
+                Some(documents::Children::Loaded { items, .. }) => Some(
+                    items
+                        .iter()
+                        .map(|item| item.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            }
+        };
+        run_until(cx, &explorer, |explorer| read(explorer, "a", &[]).is_some());
+
+        // C's collections are being read when the two swap places.
+        explorer.update(cx, |explorer, cx| {
+            explorer.load_children(1, vec!["shop".into()], cx)
+        });
+        move_connections(cx, &model, |connections| connections.reverse());
+        run_until(cx, &explorer, |explorer| {
+            read(explorer, "c", &["shop"]).is_some()
+        });
+        explorer.read_with(cx, |explorer, _| {
+            let ids: Vec<&str> = explorer
+                .connections
+                .iter()
+                .map(|node| node.spec.id.as_str())
+                .collect();
+            assert_eq!(ids, ["c", "a"]);
+            let databases = read(explorer, "a", &[]).expect("A kept its databases");
+            assert!(databases.contains(&"shop".to_string()), "{databases:?}");
+            let collections = read(explorer, "c", &["shop"]).expect("C got its collections");
+            assert!(
+                collections.contains(&"orders".to_string()),
+                "{collections:?}"
+            );
+            assert!(
+                read(explorer, "a", &["shop"]).is_none(),
+                "A got C's collections"
+            );
+            assert!(read(explorer, "c", &[]).is_none(), "C got A's databases");
         });
         let root = model.read_with(cx, |model, _| model.project.root.clone());
         let _ = std::fs::remove_dir_all(root);

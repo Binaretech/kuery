@@ -41,6 +41,10 @@ pub struct RunOptions {
     /// How long a write waits for a lock before giving up (`lock_timeout`),
     /// so a busy table does not leave the script hanging.
     pub lock_timeout: Duration,
+    /// Documents a document database's statement returns before its
+    /// reading stops and its cursor closes; `None` reads them all. SQL
+    /// runs have no use for it.
+    pub max_documents: Option<usize>,
 }
 
 impl Default for RunOptions {
@@ -50,6 +54,7 @@ impl Default for RunOptions {
             first_batch_rows: 500,
             max_batch_rows: 50_000,
             lock_timeout: Duration::from_secs(5),
+            max_documents: None,
         }
     }
 }

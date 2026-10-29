@@ -455,7 +455,13 @@ where
 {
     let distinct = counted.counts.len();
     match counted.kind {
-        ColumnKind::Integer | ColumnKind::Text | ColumnKind::Unknown if counted.unique() => {
+        ColumnKind::Integer
+        | ColumnKind::Text
+        | ColumnKind::Json
+        | ColumnKind::Id
+        | ColumnKind::Unknown
+            if counted.unique() =>
+        {
             key(counted)
         }
         ColumnKind::Boolean => boolean(counted),
@@ -464,10 +470,14 @@ where
         ColumnKind::Date | ColumnKind::Timestamp => {
             temporal(values, counted.kind, options.granularity)
         }
-        ColumnKind::Text | ColumnKind::Unknown if distinct <= TEXT_CATEGORIES => {
+        ColumnKind::Text | ColumnKind::Json | ColumnKind::Id | ColumnKind::Unknown
+            if distinct <= TEXT_CATEGORIES =>
+        {
             categorical(counted, options)
         }
-        ColumnKind::Text | ColumnKind::Unknown => text(counted, options),
+        ColumnKind::Text | ColumnKind::Json | ColumnKind::Id | ColumnKind::Unknown => {
+            text(counted, options)
+        }
     }
 }
 
