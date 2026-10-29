@@ -7,11 +7,12 @@
 
 use kuery_core::browse::Direction;
 use kuery_core::document::capabilities::{Enforcement, Preview, Transactions};
+use kuery_core::document::diff::diff;
 use kuery_core::document::language::Style;
 use kuery_core::document::session::{
-    DocEvent, DocSummary, DocumentSession, Estimate, Heavy, Impact, Left, RunMode,
+    ApplyFailure, DocEvent, DocSummary, DocumentSession, Estimate, Heavy, Impact, Left, RunMode,
 };
-use kuery_core::document::value::{FieldPath, Value};
+use kuery_core::document::value::{DocKey, FieldPath, Value};
 use kuery_core::driver::ConnectOptions;
 
 use super::*;
@@ -1765,4 +1766,494 @@ fn a_failed_write_says_what_it_changed_before_it_failed() {
         matches!(changed, Ok(Count::Exact(n)) if n > 0),
         "{changed:?}"
     );
+}
+
+/// The scratch collection's documents, in `_id` order.
+fn notes_in(session: &DocumentSession, scratch: &Scratch) -> Vec<Document> {
+    let events = session.browse(
+        scratch.notes(),
+        BrowseSpec::default(),
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    futures::executor::block_on(async {
+        let mut found = Vec::new();
+        while let Ok(event) = events.recv().await {
+            match event {
+                DocEvent::Documents(batch) => found.extend(batch),
+                DocEvent::Finished(_) => break,
+                DocEvent::Failed(error) => panic!("{error}"),
+                DocEvent::Outcome(_) | DocEvent::Left(_) => {}
+            }
+        }
+        found
+    })
+}
+
+/// The document edited in its literal, as the collection tab stages it.
+fn edited(document: &Document, edit: impl Fn(&str) -> String) -> Document {
+    let text = literal::render(&Value::Object(document.clone()), Style::Pretty);
+    literal::parse_document(&edit(&text)).unwrap()
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn an_edit_keeps_the_types_of_what_it_did_not_touch() {
+    let scratch = Scratch::new(target(), "kuery_edits");
+    let session = scratch.session();
+    write_script(
+        &session,
+        r#"db.notes.insertOne({_id: 1, qty: NumberLong("9007199254740993"), price: NumberDecimal("9.99"), ratio: 42.0, when: ISODate("2026-10-29T10:00:00Z"), note: "old", gone: null})"#,
+    )
+    .unwrap();
+    let loaded = notes_in(&session, &scratch).remove(0);
+    let after = edited(&loaded, |text| {
+        text.replace(r#""old""#, r#""new""#)
+            .replace("gone: null,\n", "")
+            .replace("gone: null\n", "")
+            .replace(r#"NumberDecimal("9.99")"#, r#"NumberDecimal("10.50")"#)
+    });
+    assert_eq!(after.get("gone"), None, "{after:?}");
+    let change = diff(&loaded, &after).unwrap().unwrap();
+    let DocChange::Update { set, unset, .. } = &change else {
+        panic!("{change:?}");
+    };
+    let set: Vec<String> = set.iter().map(|(path, _)| path.dotted()).collect();
+    assert_eq!(set, ["price", "note"]);
+    assert_eq!(unset, &[FieldPath::field("gone")]);
+    let applied = futures::executor::block_on(session.apply(scratch.notes(), vec![change]));
+    assert_eq!(applied.map(|outcome| outcome.modified), Ok(1));
+    let stored = notes_in(&session, &scratch).remove(0);
+    assert_eq!(stored, after);
+    assert_eq!(
+        stored.get("qty"),
+        Some(&Value::Int64(9_007_199_254_740_993))
+    );
+    assert_eq!(stored.get("price"), Some(&Value::Decimal("10.50".into())));
+    assert_eq!(stored.get("ratio"), Some(&Value::Double(42.0)));
+    // Removed, not set to null.
+    assert_eq!(stored.get("gone"), None);
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_concurrent_change_is_detected_and_left_alone() {
+    let scratch = Scratch::new(target(), "kuery_concurrent");
+    let session = scratch.session();
+    write_script(
+        &session,
+        r#"db.notes.insertMany([{_id: 1, n: NumberLong(1)}, {_id: 2, n: 1}])"#,
+    )
+    .unwrap();
+    let loaded = notes_in(&session, &scratch);
+    let set_n = |document: &Document, value: Value| {
+        let mut after = document.clone();
+        after.0[1].1 = value;
+        diff(document, &after).unwrap().unwrap()
+    };
+    // Someone else changes the first one, and the type of the second.
+    write_script(
+        &session,
+        "db.notes.updateOne({_id: 1}, {$set: {n: NumberLong(5)}})\ndb.notes.updateOne({_id: 2}, {$set: {n: NumberLong(1)}})",
+    )
+    .unwrap();
+    for (document, expected) in loaded.iter().zip([Value::Int64(5), Value::Int64(1)]) {
+        let applied = futures::executor::block_on(
+            session.apply(scratch.notes(), vec![set_n(document, Value::Int32(9))]),
+        );
+        assert!(
+            matches!(
+                &applied,
+                Err(ApplyFailure {
+                    applied: 0,
+                    unknown: 0,
+                    error: QueryError::RowMismatch { .. }
+                })
+            ),
+            "{applied:?}"
+        );
+        let stored = notes_in(&session, &scratch);
+        let now = stored.iter().find(|d| d.key() == document.key()).unwrap();
+        assert_eq!(now.get("n"), Some(&expected), "the stale edit changed it");
+    }
+    // Deleting a field that someone else added meanwhile is refused too.
+    let added = Document(vec![("_id".into(), Value::Int32(3))]);
+    write_script(&session, "db.notes.insertOne({_id: 3})").unwrap();
+    let mut with = added.clone();
+    with.0.push(("tag".into(), Value::String("mine".into())));
+    let change = diff(&added, &with).unwrap().unwrap();
+    write_script(
+        &session,
+        r#"db.notes.updateOne({_id: 3}, {$set: {tag: "theirs"}})"#,
+    )
+    .unwrap();
+    let applied = futures::executor::block_on(session.apply(scratch.notes(), vec![change]));
+    assert!(
+        matches!(
+            &applied,
+            Err(ApplyFailure {
+                error: QueryError::RowMismatch { .. },
+                ..
+            })
+        ),
+        "{applied:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn changes_without_transactions_stop_at_the_first_failure() {
+    let Some(standalone) = standalone() else {
+        return;
+    };
+    let scratch = Scratch::new(standalone, "kuery_edits_standalone");
+    let session = scratch.session();
+    write_script(&session, "db.notes.insertOne({_id: 1, n: 1})").unwrap();
+    let loaded = notes_in(&session, &scratch).remove(0);
+    let mut after = loaded.clone();
+    after.0[1].1 = Value::Int32(2);
+    let edit = diff(&loaded, &after).unwrap().unwrap();
+    let insert = |id: i32| DocChange::Insert {
+        document: Document(vec![("_id".into(), Value::Int32(id))]),
+    };
+    let applied = futures::executor::block_on(session.apply(
+        scratch.notes(),
+        vec![insert(2), edit.clone(), edit, insert(3)],
+    ));
+    assert!(
+        matches!(
+            &applied,
+            Err(ApplyFailure {
+                applied: 2,
+                unknown: 0,
+                error: QueryError::RowMismatch { .. }
+            })
+        ),
+        "{applied:?}"
+    );
+    let ids: Vec<Option<DocKey>> = notes_in(&session, &scratch)
+        .iter()
+        .map(Document::key)
+        .collect();
+    assert_eq!(
+        ids,
+        [Some(DocKey(Value::Int32(1))), Some(DocKey(Value::Int32(2)))]
+    );
+}
+
+/// A value of every BSON type, as a field's name and value, with what
+/// someone else could change it to that equality alone does not tell
+/// apart from it: the same number of another type, an array that holds it,
+/// the same text as a symbol…
+fn every_type() -> Vec<(&'static str, Bson, Vec<Bson>)> {
+    use bson::spec::BinarySubtype;
+    use bson::{Binary, DateTime, JavaScriptCodeWithScope, Regex, Timestamp, oid::ObjectId};
+
+    let decimal = |text: &str| Bson::Decimal128(text.parse().unwrap());
+    let binary = |subtype, bytes: Vec<u8>| Bson::Binary(Binary { subtype, bytes });
+    let regex = |pattern: &str, options: &str| {
+        Bson::RegularExpression(Regex {
+            pattern: pattern.to_string().try_into().unwrap(),
+            options: options.to_string().try_into().unwrap(),
+        })
+    };
+    let oid = ObjectId::parse_str("65f0c0ffee0000000000beef").unwrap();
+    let pointer = Bson::try_from(serde_json::json!({
+        "$dbPointer": {"$ref": "c", "$id": {"$oid": "65f0c0ffee0000000000beef"}}
+    }))
+    .unwrap();
+    let nested = Bson::Document(doc! { "b": 1, "a": [1, { "c": 3_i64 }] });
+    let one = |value: Bson| Bson::Array(vec![value]);
+    let types = vec![
+        (
+            "int",
+            Bson::Int32(42),
+            vec![Bson::Int64(42), Bson::Double(42.0)],
+        ),
+        (
+            "long",
+            Bson::Int64(42),
+            vec![Bson::Int32(42), decimal("42")],
+        ),
+        ("double", Bson::Double(42.0), vec![Bson::Int32(42)]),
+        ("negative_zero", Bson::Double(-0.0), vec![Bson::Int32(0)]),
+        ("nan", Bson::Double(f64::NAN), vec![decimal("NaN")]),
+        (
+            "infinity",
+            Bson::Double(f64::INFINITY),
+            vec![decimal("Infinity")],
+        ),
+        (
+            "minus_infinity",
+            Bson::Double(f64::NEG_INFINITY),
+            vec![decimal("-Infinity")],
+        ),
+        ("decimal", decimal("1.50"), vec![Bson::Double(1.5)]),
+        ("decimal_nan", decimal("NaN"), vec![Bson::Double(f64::NAN)]),
+        (
+            "decimal_negative_zero",
+            decimal("-0.00"),
+            vec![Bson::Int32(0)],
+        ),
+        (
+            "date",
+            Bson::DateTime(DateTime::from_millis(1_700_000_000_123)),
+            vec![Bson::Int64(1_700_000_000_123)],
+        ),
+        (
+            "far_date",
+            Bson::DateTime(DateTime::from_millis(i64::MAX)),
+            vec![Bson::Int64(i64::MAX)],
+        ),
+        (
+            "object_id",
+            Bson::ObjectId(oid),
+            vec![Bson::String(oid.to_hex())],
+        ),
+        (
+            "uuid",
+            binary(BinarySubtype::Uuid, vec![1; 16]),
+            vec![binary(BinarySubtype::UuidOld, vec![1; 16])],
+        ),
+        (
+            "old_uuid",
+            binary(BinarySubtype::UuidOld, vec![1; 16]),
+            vec![binary(BinarySubtype::Uuid, vec![1; 16])],
+        ),
+        (
+            "empty_binary",
+            binary(BinarySubtype::Generic, Vec::new()),
+            vec![],
+        ),
+        (
+            "user_binary",
+            binary(BinarySubtype::UserDefined(0x80), vec![9; 4]),
+            vec![binary(BinarySubtype::Generic, vec![9; 4])],
+        ),
+        (
+            "timestamp",
+            Bson::Timestamp(Timestamp {
+                time: 4_000_000_000,
+                increment: 7,
+            }),
+            vec![],
+        ),
+        ("regex", regex("^a.b", "i"), vec![regex("^a.b", "")]),
+        ("min_key", Bson::MinKey, vec![]),
+        ("max_key", Bson::MaxKey, vec![]),
+        (
+            "symbol",
+            Bson::Symbol("s".into()),
+            vec![Bson::String("s".into())],
+        ),
+        (
+            "string",
+            Bson::String("ñ😀".into()),
+            vec![Bson::Symbol("ñ😀".into())],
+        ),
+        ("dollar_string", Bson::String("$string".into()), vec![]),
+        (
+            "code",
+            Bson::JavaScriptCode("x + 1".into()),
+            vec![Bson::String("x + 1".into())],
+        ),
+        (
+            "code_with_scope",
+            Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                code: "x".into(),
+                scope: doc! { "x": 1_i64 },
+            }),
+            vec![Bson::JavaScriptCode("x".into())],
+        ),
+        ("undefined", Bson::Undefined, vec![Bson::Null]),
+        ("null", Bson::Null, vec![]),
+        ("bool", Bson::Boolean(false), vec![Bson::Int32(0)]),
+        (
+            "array",
+            Bson::Array(vec![Bson::Int64(1), Bson::Double(1.0), Bson::Null]),
+            vec![
+                Bson::Array(vec![Bson::Int32(1), Bson::Double(1.0), Bson::Null]),
+                Bson::Array(vec![Bson::Int64(1), Bson::Int64(1), Bson::Null]),
+            ],
+        ),
+        ("empty_array", Bson::Array(Vec::new()), vec![]),
+        (
+            "document",
+            nested.clone(),
+            vec![
+                Bson::Document(doc! { "b": 1, "a": [1, { "c": 3 }] }),
+                Bson::Document(doc! { "a": [1, { "c": 3_i64 }], "b": 1 }),
+            ],
+        ),
+        ("empty_document", Bson::Document(doc! {}), vec![]),
+        (
+            "wrapper_lookalike",
+            Bson::Document(doc! { "$numberLong": "5" }),
+            vec![Bson::Int64(5)],
+        ),
+        ("db_pointer", pointer, vec![]),
+    ];
+    // Each also changed to an array that holds it, which `{f: v}` finds.
+    types
+        .into_iter()
+        .map(|(name, value, mut twins)| {
+            twins.push(one(value.clone()));
+            (name, value, twins)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn edits_check_every_type_exactly() {
+    use futures::executor::block_on;
+
+    let scratch = Scratch::new(target(), "kuery_edit_types");
+    let session = scratch.session();
+    let apply = |changes: Vec<DocChange>| block_on(session.apply(scratch.notes(), changes));
+    let types = every_type();
+    let id = |n: i32| Bson::Document(doc! { "k": n, "j": 2_i64 });
+    let stored = |n: i32| {
+        let key = DocKey(convert::value(&id(n)));
+        notes_in(&session, &scratch)
+            .into_iter()
+            .find(|document| document.key().as_ref() == Some(&key))
+    };
+
+    // Unchanged, every value still matches what was loaded: removing each
+    // field in turn applies, and so does deleting the whole document.
+    let mut all = doc! { "_id": id(0) };
+    for (name, value, _) in &types {
+        all.insert(*name, value.clone());
+    }
+    let inserted = DocChange::Insert {
+        document: convert::document(&all),
+    };
+    apply(vec![inserted.clone()]).expect("inserts every type");
+    for (name, _, _) in &types {
+        let loaded = stored(0).unwrap();
+        let mut after = loaded.clone();
+        after.0.retain(|(field, _)| field != name);
+        let change = diff(&loaded, &after).unwrap().unwrap();
+        let applied = apply(vec![change]);
+        assert_eq!(
+            applied.map(|outcome| outcome.modified),
+            Ok(1),
+            "{name} no longer matched itself"
+        );
+    }
+    apply(vec![DocChange::Delete {
+        key: DocKey(convert::value(&id(0))),
+        version: None,
+        expect: Vec::new(),
+    }])
+    .unwrap();
+    apply(vec![inserted]).unwrap();
+    let loaded = stored(0).unwrap();
+    let whole = |loaded: &Document| DocChange::Delete {
+        key: loaded.key().unwrap(),
+        version: None,
+        expect: vec![(FieldPath(Vec::new()), Some(Value::Object(loaded.clone())))],
+    };
+    assert_eq!(
+        apply(vec![whole(&loaded)]).map(|outcome| outcome.deleted),
+        Ok(1),
+        "the whole document no longer matched itself"
+    );
+
+    // Changed by someone else, each value is told apart from what was
+    // loaded: neither an edit nor a delete applies, and their change stays.
+    let mut n = 0;
+    for (name, value, twins) in &types {
+        let twins = twins.iter().map(Some).chain([None]);
+        for twin in twins {
+            n += 1;
+            let document = doc! { "_id": id(n), *name: value.clone(), "other": 1 };
+            apply(vec![DocChange::Insert {
+                document: convert::document(&document),
+            }])
+            .unwrap();
+            let loaded = stored(n).unwrap();
+            let key = loaded.key().unwrap();
+            let theirs = match twin {
+                Some(twin) => DocChange::Update {
+                    key: key.clone(),
+                    version: None,
+                    set: vec![(FieldPath::field(name), convert::value(twin))],
+                    unset: Vec::new(),
+                    expect: Vec::new(),
+                },
+                None => DocChange::Update {
+                    key: key.clone(),
+                    version: None,
+                    set: Vec::new(),
+                    unset: vec![FieldPath::field(name)],
+                    expect: Vec::new(),
+                },
+            };
+            apply(vec![theirs]).unwrap();
+            let now = stored(n).unwrap();
+            let mut mine = loaded.clone();
+            mine.0[1].1 = Value::String("mine".into());
+            for stale in [diff(&loaded, &mine).unwrap().unwrap(), whole(&loaded)] {
+                let applied = apply(vec![stale]);
+                assert!(
+                    matches!(
+                        &applied,
+                        Err(ApplyFailure {
+                            error: QueryError::RowMismatch { .. },
+                            unknown: 0,
+                            ..
+                        })
+                    ),
+                    "{name} changed to {twin:?}, and a stale change said {applied:?}"
+                );
+                // NaN is not equal to itself, but the same as itself.
+                let kept = stored(n).map(|stored| diff(&now, &stored));
+                assert_eq!(kept, Some(Ok(None)), "{name}: theirs was lost");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn an_edit_of_a_nested_field_checks_what_it_goes_through() {
+    let scratch = Scratch::new(target(), "kuery_edit_nested");
+    let session = scratch.session();
+    write_script(
+        &session,
+        r#"db.notes.insertMany([{_id: 1, address: {city: "Lima"}}, {_id: 2, address: {city: "Lima"}}, {_id: 3, address: {}}])"#,
+    )
+    .unwrap();
+    let loaded = notes_in(&session, &scratch);
+    // Someone else makes each address something that is not a document,
+    // yet holds the same city, or none.
+    write_script(
+        &session,
+        r#"db.notes.updateOne({_id: 1}, {$set: {address: [{city: "Lima"}]}})
+db.notes.updateOne({_id: 2}, {$set: {address: [{city: "Lima"}, {city: "Cusco"}]}})
+db.notes.updateOne({_id: 3}, {$set: {address: null}})"#,
+    )
+    .unwrap();
+    for document in &loaded {
+        let mut after = document.clone();
+        after.0[1].1 = Value::Object(Document(vec![(
+            "city".into(),
+            Value::String("Cusco".into()),
+        )]));
+        let change = diff(document, &after).unwrap().unwrap();
+        let applied = futures::executor::block_on(session.apply(scratch.notes(), vec![change]));
+        assert!(
+            matches!(
+                &applied,
+                Err(ApplyFailure {
+                    error: QueryError::RowMismatch { .. },
+                    ..
+                })
+            ),
+            "{:?}: {applied:?}",
+            document.key()
+        );
+    }
 }

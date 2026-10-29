@@ -178,11 +178,16 @@ impl Reading {
         }
     }
 
+    /// The document the cursor is at, read element by element: going
+    /// through serde would read one shaped like Extended JSON
+    /// (`{$numberLong: "5"}`, which MongoDB stores as a document) as the
+    /// type it wraps.
     fn current(&self) -> mongodb::error::Result<Document> {
-        match self {
-            Reading::Alone(cursor) => cursor.deserialize_current(),
-            Reading::InSession(cursor, _) => cursor.deserialize_current(),
-        }
+        let raw = match self {
+            Reading::Alone(cursor) => cursor.current(),
+            Reading::InSession(cursor, _) => cursor.current(),
+        };
+        Ok(Document::try_from(raw)?)
     }
 }
 

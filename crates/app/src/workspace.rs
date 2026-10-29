@@ -107,8 +107,8 @@ impl Tab {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::Collection(collection) => collection.read(cx).has_pending(),
             Tab::RedisConsole(_)
-            | Tab::Collection(_)
             | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
@@ -124,8 +124,8 @@ impl Tab {
             Tab::Query(query) => query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::Collection(collection) => collection.read(cx).has_pending(),
             Tab::RedisConsole(_)
-            | Tab::Collection(_)
             | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
@@ -452,7 +452,8 @@ impl WorkspaceView {
     }
 
     /// Whether closing the window now would lose work: a query with unsaved
-    /// edits or an open transaction, or a table with pending row changes.
+    /// edits or an open transaction, or a table or collection with staged
+    /// changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         self.tabs.iter().any(|tab| tab.needs_attention(cx))
     }
@@ -1125,6 +1126,9 @@ impl WorkspaceView {
             Some(Tab::RedisKey(key)) if key.read(cx).has_pending() => {
                 self.activate(index, window, cx);
             }
+            Some(Tab::Collection(collection)) if collection.read(cx).has_pending() => {
+                self.activate(index, window, cx);
+            }
             Some(Tab::Query(query)) if query.read(cx).in_transaction() => {
                 let query = query.clone();
                 self.activate(index, window, cx);
@@ -1223,7 +1227,7 @@ impl WorkspaceView {
             (
                 "Close the window without saving?",
                 format!(
-                    "{tabs} unsaved SQL, staged row changes or an open transaction. \
+                    "{tabs} unsaved SQL, staged changes or an open transaction. \
                      They will be lost, and open transactions rolled back."
                 ),
                 "Close Without Saving",
@@ -2044,7 +2048,7 @@ impl WorkspaceView {
                         ContainerKind::View => AppIcon::Code,
                         _ => AppIcon::Table,
                     };
-                    (icon, collection.title(), false)
+                    (icon, collection.title(), collection.has_pending())
                 }
                 Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
                 Tab::Activity(activity) => (AppIcon::Activity, activity.read(cx).title(), false),

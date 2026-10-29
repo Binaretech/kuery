@@ -20,6 +20,7 @@ pub mod classify;
 mod command;
 pub mod convert;
 mod detect;
+mod edit;
 mod estimate;
 mod execute;
 pub mod literal;
@@ -39,7 +40,7 @@ use std::time::Duration;
 use bson::{Bson, Document as BsonDocument, doc};
 
 use kuery_core::adapter::Canceller;
-use kuery_core::document::adapter::{CommitError, DocumentAdapter, DocumentSink, Outcome};
+use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
 use kuery_core::document::capabilities::Capabilities;
 use kuery_core::document::catalog::{CollectionInfo, Container};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
@@ -480,6 +481,8 @@ pub static LANGUAGE: Language = Language {
     },
     collection_ref: shell::collection_ref,
     key: literal::key,
+    change: edit::statement,
+    check_change: edit::check,
     key_name: "_id",
     methods: METHODS,
     operators: OPERATORS,
@@ -986,9 +989,9 @@ impl DocumentAdapter for Mongo {
     /// Ends the transaction, which is gone whether or not it commits. A
     /// commit out of time, or one the server or the driver marks
     /// `UnknownTransactionCommitResult`, may have applied.
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&mut self) -> Result<(), WriteError> {
         let session = self.transaction.take().ok_or_else(|| {
-            CommitError::Undone(QueryError::Unsupported("No transaction is open".into()))
+            WriteError::Undone(QueryError::Unsupported("No transaction is open".into()))
         })?;
         let committed = self.settle(async move {
             let committed = session.lock_owned().await.commit_transaction().await;
@@ -1000,11 +1003,11 @@ impl DocumentAdapter for Mongo {
         match committed {
             Ok(Ok(())) => Ok(()),
             Ok(Err((unknown, error))) if unknown || run::out_of_time(&error) => {
-                Err(CommitError::Unknown(error))
+                Err(WriteError::Unknown(error))
             }
-            Ok(Err((_, error))) => Err(CommitError::Undone(error)),
+            Ok(Err((_, error))) => Err(WriteError::Undone(error)),
             // Waiting for the answer stopped: it may still apply.
-            Err(error) => Err(CommitError::Unknown(error)),
+            Err(error) => Err(WriteError::Unknown(error)),
         }
     }
 
@@ -1106,14 +1109,42 @@ impl DocumentAdapter for Mongo {
         }
     }
 
-    /// Refused on a read-only connection whatever the session checked.
+    /// One `update`, `insert` or `delete` command, in the open transaction
+    /// if there is one. A delete counts what it found as matched, as every
+    /// other change does. Refused on a read-only connection whatever the
+    /// session checked. Whether a change that failed was applied is unknown
+    /// when the answer never came (a lost connection, a wait that ran out,
+    /// a cancel), and when the server applied it but could not confirm it
+    /// was kept (a write concern error).
     fn apply(
         &mut self,
-        _collection: &CollectionRef,
-        _change: &DocChange,
-    ) -> Result<Outcome, QueryError> {
-        self.writable()?;
-        later()
+        collection: &CollectionRef,
+        change: &DocChange,
+    ) -> Result<Outcome, WriteError> {
+        self.writable().map_err(WriteError::Undone)?;
+        let (database, name) = catalog::split(collection).map_err(WriteError::Undone)?;
+        let database = database.to_string();
+        let (command, write) = edit::command(name, change).map_err(WriteError::Undone)?;
+        let answer = self
+            .command(&database, command)
+            .map_err(|error| match error {
+                QueryError::Connection(_) | QueryError::Cancelled => WriteError::Unknown(error),
+                // The server's own time limit, or the wait for its answer.
+                QueryError::Database { ref code, .. } if code == "50" => WriteError::Unknown(error),
+                error => WriteError::Undone(error),
+            })?;
+        execute::failed(&answer).map_err(|error| match answer.contains_key("writeErrors") {
+            true => WriteError::Undone(error),
+            false => WriteError::Unknown(error),
+        })?;
+        let outcome = execute::written(write, &answer);
+        Ok(match write {
+            command::Write::Delete => Outcome {
+                matched: outcome.deleted,
+                ..outcome
+            },
+            _ => outcome,
+        })
     }
 }
 
@@ -1126,12 +1157,6 @@ fn one(statement: &str) -> Result<Op, QueryError> {
         1 => Ok(statements.remove(0).1),
         n => Err(QueryError::Rejected(Rejection::MultipleStatements(n))),
     }
-}
-
-fn later<T>() -> Result<T, QueryError> {
-    Err(QueryError::Unsupported(
-        "Kuery does not change MongoDB documents yet".into(),
-    ))
 }
 
 #[cfg(test)]

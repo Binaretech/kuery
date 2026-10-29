@@ -16,6 +16,16 @@
 //! copies it as the engine's literal or as Extended JSON, from the document
 //! itself. Export Documents writes every document the bar matches, read
 //! through the cursor as it streams, not just the loaded page.
+//!
+//! Documents are edited in stages, as rows of a table are: Edit opens the
+//! document's typed literal beside the grid, Insert a template of the
+//! fields loaded, Duplicate a copy without its key, and Delete marks the
+//! row; each is staged (see [`crate::document_edits`]) and marked on the
+//! grid until Apply sends them through the write review, on a session of
+//! their own that may write, and audits them. Where the engine has
+//! transactions they apply all or nothing; elsewhere Apply stops at the
+//! first failure and keeps the rest staged. Views, and users the server
+//! keeps from writing, offer no edits.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -39,8 +49,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, actions, div, px,
 };
 use kuery_core::browse::Direction;
+use kuery_core::document::capabilities::Transactions;
 use kuery_core::document::catalog::ContainerKind;
-use kuery_core::document::change::{BrowseSpec, Continuation, Count};
+use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use kuery_core::document::export::{DocFormat, DocumentWriter, Ejson, document_ejson};
 use kuery_core::document::language::{Language, ParseError, Style};
 use kuery_core::document::session::{DocEvent, DocSummary, DocumentSession, Heavy};
@@ -48,14 +59,19 @@ use kuery_core::document::value::{CollectionRef, Document, FieldPath, Value};
 use kuery_core::export::{self, Format};
 use kuery_core::read_only::Rejection;
 use kuery_core::result_set::ResultSet;
-use kuery_core::session::RunOptions;
+use kuery_core::session::{Access, RunOptions};
 
 use crate::assets::AppIcon;
+use crate::audit;
+#[cfg(test)]
+use crate::audit::AuditRecord;
 use crate::chrome;
 use crate::connection::{DocDb, Environment};
 use crate::context_menus::{Cell, copy, item};
 use crate::document_detail::{DetailEvent, DocumentDetail};
+use crate::document_edits::{self, Mark, Staging};
 use crate::document_grid::{DocumentRows, Flattened};
+use crate::document_write;
 use crate::grid::BrowseDelegate;
 use crate::query_tab::describe_error;
 use crate::theme::{self, color};
@@ -97,6 +113,22 @@ enum Status {
 enum ExportState {
     Running { documents: usize },
     Done(String),
+    Failed(String),
+}
+
+/// What the detail's literal becomes when it is staged.
+enum Editing {
+    /// An edit of this document, as it was loaded.
+    Edit(Document),
+    /// A new document.
+    Insert,
+}
+
+/// Where the staged changes stand.
+enum ApplyState {
+    Idle,
+    Applying,
+    Applied(String),
     Failed(String),
 }
 
@@ -150,7 +182,24 @@ pub struct CollectionTab {
     page_task: Option<Task<()>>,
     count_task: Option<Task<()>>,
     export_task: Option<Task<()>>,
+    /// Document changes waiting for Apply.
+    staging: Staging,
+    /// What the detail's literal is open for, if it is.
+    editing: Option<Editing>,
+    /// A session of its own that may write, opened on the first Apply; the
+    /// tab's own only reads.
+    writer: Option<DocumentSession>,
+    apply: ApplyState,
+    apply_task: Option<Task<()>>,
+    /// The last apply did not say whether some changes applied: Apply
+    /// waits for a page to be read again, so they are not applied twice.
+    reload_first: bool,
+    /// The staged changes are listed as the statements they become.
+    show_changes: bool,
     focus_handle: FocusHandle,
+    /// What the audit log was given, for the tests.
+    #[cfg(test)]
+    audited: Vec<AuditRecord>,
 }
 
 impl CollectionTab {
@@ -211,6 +260,13 @@ impl CollectionTab {
                     this.selected = None;
                     cx.notify();
                 }
+                DetailEvent::Edit => {
+                    if let Some(row) = this.selected {
+                        this.edit_row(row, window, cx);
+                    }
+                }
+                DetailEvent::Stage(text) => this.stage(text, window, cx),
+                DetailEvent::CancelEdit => this.cancel_edit(window, cx),
             },
         )
         .detach();
@@ -286,8 +342,22 @@ impl CollectionTab {
             page_task: None,
             count_task: None,
             export_task: None,
+            staging: Staging::default(),
+            editing: None,
+            writer: None,
+            apply: ApplyState::Idle,
+            reload_first: false,
+            apply_task: None,
+            show_changes: false,
             focus_handle: cx.focus_handle(),
+            #[cfg(test)]
+            audited: Vec::new(),
         }
+    }
+
+    /// Whether changes wait to be applied: closing the tab would lose them.
+    pub fn has_pending(&self) -> bool {
+        !self.staging.is_empty()
     }
 
     pub fn db(&self) -> &DocDb {
@@ -492,6 +562,8 @@ impl CollectionTab {
         mut spec: BrowseSpec,
         cx: &mut Context<Self>,
     ) {
+        // What the last apply left is on its way to the grid.
+        self.reload_first = false;
         spec.after = self.pages.last().cloned().flatten();
         self.shown = Some(spec.clone());
         self.next = None;
@@ -503,10 +575,14 @@ impl CollectionTab {
             let delegate = grid.delegate_mut();
             delegate.set_columns(Vec::new(), sort);
             delegate.set_page(ResultSet::default());
+            delegate.clear_marks();
             delegate.set_loading(true);
             grid.clear_selection(cx);
             grid.refresh(cx);
         });
+        let editable = self.edits_refused().is_none();
+        self.detail
+            .update(cx, |detail, cx| detail.set_editable(editable, cx));
 
         let render = self.language().render;
         let events = session.browse(
@@ -567,6 +643,9 @@ impl CollectionTab {
                 cx.notify();
             }
         });
+        if !self.staging.is_empty() {
+            self.mark(cx);
+        }
     }
 
     fn page_loaded(&mut self, summary: DocSummary, cx: &mut Context<Self>) {
@@ -630,7 +709,9 @@ impl CollectionTab {
     /// Shows a row's document beside the grid.
     fn select_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
         let document = self.rows.borrow().document(row).cloned();
-        if document.is_none() {
+        // An edit under way keeps the detail until it is staged or
+        // cancelled.
+        if document.is_none() || self.editing.is_some() {
             return;
         }
         self.selected = Some(row);
@@ -645,6 +726,378 @@ impl CollectionTab {
         self.filter
             .update(cx, |input, cx| input.set_value(filter, window, cx));
         self.find(cx);
+    }
+
+    // Edits ----------------------------------------------------------------
+
+    /// Why documents cannot be edited here, if they cannot: a view, a user
+    /// the server keeps from writing, or a projection, whose documents are
+    /// not whole.
+    fn edits_refused(&self) -> Option<&'static str> {
+        let refused = document_edits::read_only_reason(self.kind, self.db.catalog.capabilities());
+        if refused.is_some() {
+            return refused;
+        }
+        let projected = self
+            .shown
+            .as_ref()
+            .is_some_and(|spec| spec.projection.is_some());
+        projected.then_some("Clear the projection to edit: the documents shown are not whole")
+    }
+
+    /// Whether the tab offers edits at all: a projection only keeps them
+    /// until it is cleared.
+    fn edits_offered(&self) -> bool {
+        document_edits::read_only_reason(self.kind, self.db.catalog.capabilities()).is_none()
+    }
+
+    fn applying(&self) -> bool {
+        matches!(self.apply, ApplyState::Applying)
+    }
+
+    /// Opens a loaded document for editing, as already edited if it was.
+    /// One that changed since its staged edit was made from it is refused:
+    /// the edit would show over what it held before.
+    fn edit_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_edit(cx) {
+            return;
+        }
+        let Some(loaded) = self.rows.borrow().document(row).cloned() else {
+            return;
+        };
+        if self.staging.stale(&loaded) {
+            self.apply = ApplyState::Failed(document_edits::STALE.into());
+            cx.notify();
+            return;
+        }
+        let current = self.staging.current(&loaded);
+        let title = format!("Edit {}", self.document_name(&loaded));
+        self.open_editor(title, &current, Editing::Edit(loaded), window, cx);
+        self.selected = Some(row);
+    }
+
+    /// Opens a new document, from the fields of the documents loaded.
+    fn insert_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.applying() || !self.edits_offered() {
+            return;
+        }
+        let template = document_edits::template(self.rows.borrow().documents());
+        self.open_editor(
+            "New Document".into(),
+            &template,
+            Editing::Insert,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens a copy of a loaded document, without its key, as a new one.
+    fn duplicate_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_edit(cx) {
+            return;
+        }
+        let Some(loaded) = self.rows.borrow().document(row).cloned() else {
+            return;
+        };
+        let copy = document_edits::duplicate(&self.staging.current(&loaded));
+        let title = format!("Copy of {}", self.document_name(&loaded));
+        self.open_editor(title, &copy, Editing::Insert, window, cx);
+    }
+
+    /// Stages the delete of a loaded document.
+    fn delete_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        if self.refuse_edit(cx) {
+            return;
+        }
+        let Some(loaded) = self.rows.borrow().document(row).cloned() else {
+            return;
+        };
+        self.staging.delete(&loaded);
+        self.staged(cx);
+    }
+
+    /// Says why the loaded documents cannot be edited, if they cannot;
+    /// nothing is staged while an apply runs.
+    fn refuse_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.applying() {
+            return true;
+        }
+        match self.edits_refused() {
+            Some(reason) => {
+                self.apply = ApplyState::Failed(reason.into());
+                cx.notify();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `Document 7`, after its key.
+    fn document_name(&self, document: &Document) -> String {
+        match document.key() {
+            Some(key) => format!(
+                "Document {}",
+                (self.language().render)(&key.0, Style::Compact)
+            ),
+            None => "Document".into(),
+        }
+    }
+
+    fn open_editor(
+        &mut self,
+        title: String,
+        document: &Document,
+        editing: Editing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = (self.language().render)(&Value::Object(document.clone()), Style::Pretty);
+        self.editing = Some(editing);
+        self.detail
+            .update(cx, |detail, cx| detail.edit(title, text, window, cx));
+        cx.notify();
+    }
+
+    /// Stages the edited literal: read and diffed against the document as
+    /// it was loaded, or read as a new document. What cannot be staged
+    /// stays open, saying why.
+    fn stage(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.applying() {
+            return;
+        }
+        let language = self.language();
+        let staged = match &self.editing {
+            Some(Editing::Edit(loaded)) => self.staging.edit(loaded, text, language),
+            Some(Editing::Insert) => self.staging.insert(text, language),
+            None => return,
+        };
+        match staged {
+            Ok(()) => {
+                self.close_editor(window, cx);
+                self.staged(cx);
+            }
+            Err(error) => self
+                .detail
+                .update(cx, |detail, cx| detail.refuse(error, cx)),
+        }
+    }
+
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Back to the selected document, if any.
+    fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing = None;
+        let document = self
+            .selected
+            .and_then(|row| self.rows.borrow().document(row).cloned());
+        self.detail
+            .update(cx, |detail, cx| detail.stop_editing(document, window, cx));
+    }
+
+    /// The staged changes moved: marks them again, and forgets the last
+    /// apply's outcome.
+    fn staged(&mut self, cx: &mut Context<Self>) {
+        self.apply = ApplyState::Idle;
+        if self.staging.is_empty() {
+            self.show_changes = false;
+        }
+        self.mark(cx);
+        cx.notify();
+    }
+
+    /// Marks the staged changes on the rows of the documents they change.
+    fn mark(&mut self, cx: &mut Context<Self>) {
+        let marks = {
+            let rows = self.rows.borrow();
+            self.staging
+                .marks(rows.documents(), rows.columns(), self.language().render)
+        };
+        self.grid.update(cx, |grid, cx| {
+            let delegate = grid.delegate_mut();
+            delegate.clear_marks();
+            for mark in marks {
+                match mark {
+                    Mark::Edited { row, column, text } => delegate.mark_edit(row, column, text),
+                    Mark::Removed { row, column } => delegate.mark_removed(row, column),
+                    Mark::Deleted(row) => delegate.mark_deleted(row),
+                }
+            }
+            cx.notify();
+        });
+    }
+
+    fn unstage(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.applying() {
+            return;
+        }
+        self.staging.remove(index);
+        self.staged(cx);
+    }
+
+    fn discard(&mut self, cx: &mut Context<Self>) {
+        if self.applying() {
+            return;
+        }
+        self.staging.clear();
+        self.staged(cx);
+    }
+
+    /// Sends the staged changes through the write review, then applies
+    /// them on the tab's session that may write.
+    fn apply_staged(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.staging.is_empty() || self.applying() || !self.edits_offered() {
+            return;
+        }
+        if self.reload_first {
+            self.apply = ApplyState::Failed(document_write::RELOAD_FIRST.into());
+            cx.notify();
+            return;
+        }
+        let changes = self.staging.changes();
+        let generation = self.staging.generation();
+        let this = cx.entity().downgrade();
+        let approved = {
+            let changes = changes.clone();
+            move |_: &mut Window, cx: &mut App| {
+                let changes = changes.clone();
+                this.update(cx, |this, cx| this.run_apply(changes, generation, cx))
+                    .ok();
+            }
+        };
+        document_write::approve_changes(&self.db, &self.collection, &changes, window, cx, approved);
+    }
+
+    /// Applies approved changes, all or nothing where the engine has
+    /// transactions, and audits them as the statements they became.
+    /// `generation` is the staging's when they were reviewed.
+    fn run_apply(&mut self, changes: Vec<DocChange>, generation: u64, cx: &mut Context<Self>) {
+        if self.applying() {
+            return;
+        }
+        let language = self.language();
+        let statements: Vec<String> = changes
+            .iter()
+            .map(|change| (language.change)(&self.collection, change))
+            .collect();
+        // The staged changes moved, or writes stopped being allowed, while
+        // the review was open.
+        let refused = if self.staging.generation() != generation {
+            Some("The staged changes moved while they were reviewed: nothing was applied")
+        } else if self.reload_first {
+            Some(document_write::RELOAD_FIRST)
+        } else if !self.db.allows_writes() {
+            Some("Writes are no longer allowed on this connection: nothing was applied")
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
+            self.audit(&statements, format!("Refused: {refused}"), None, true, cx);
+            self.apply = ApplyState::Failed(refused.into());
+            cx.notify();
+            return;
+        }
+        self.apply = ApplyState::Applying;
+        let writer = self.writer.clone();
+        let opening = writer
+            .is_none()
+            .then(|| self.db.catalog.reopen(Access::ReadWrite));
+        let collection = self.collection.clone();
+        let count = changes.len();
+        self.apply_task = Some(cx.spawn(async move |this, cx| {
+            let writer = match (writer, opening) {
+                (Some(writer), _) => writer,
+                (None, Some(opening)) => match opening.await {
+                    Ok(writer) => {
+                        let kept = writer.clone();
+                        this.update(cx, |this, _| this.writer = Some(kept)).ok();
+                        writer
+                    }
+                    Err(error) => {
+                        let failure = format!(
+                            "Could not open a session that may write: {error}. Nothing was applied."
+                        );
+                        this.update(cx, |this, cx| {
+                            this.audit(&statements, failure.clone(), None, true, cx);
+                            this.applied_with(ApplyState::Failed(failure), 0, cx)
+                        })
+                        .ok();
+                        return;
+                    }
+                },
+                (None, None) => return,
+            };
+            let result = writer.apply(collection, changes).await;
+            this.update(cx, |this, cx| match result {
+                Ok(outcome) => {
+                    let done = document_write::applied(count, outcome);
+                    let changed = Some((count, document_write::changed(outcome)));
+                    this.audit(&statements, done.clone(), changed, false, cx);
+                    this.applied_with(ApplyState::Applied(done), count, cx);
+                }
+                Err(failure) => {
+                    let said = document_write::apply_failed(&failure, &statements);
+                    // What changed is unknown when an answer never came.
+                    let changed =
+                        (failure.unknown == 0).then_some((failure.applied, failure.applied as u64));
+                    this.audit(&statements, said.clone(), changed, true, cx);
+                    this.reload_first = failure.unknown > 0;
+                    this.applied_with(ApplyState::Failed(said), failure.applied, cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Unstages what applied, and reads the page again to show it, unless
+    /// what applied is unknown: the reload is then the user's to ask for.
+    fn applied_with(&mut self, state: ApplyState, applied: usize, cx: &mut Context<Self>) {
+        self.apply_task = None;
+        self.staging.applied(applied);
+        if self.staging.is_empty() {
+            self.show_changes = false;
+        }
+        self.apply = state;
+        if applied > 0 && !self.reload_first {
+            self.reload(cx);
+        } else {
+            self.mark(cx);
+        }
+        cx.notify();
+    }
+
+    /// Writes a record of applied changes to the audit log.
+    fn audit(
+        &mut self,
+        statements: &[String],
+        outcome: String,
+        changed: Option<(usize, u64)>,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let record = document_write::record_changes(
+            &self.db,
+            &self.project,
+            &self.collection,
+            statements,
+            outcome,
+            changed,
+            failed,
+        );
+        #[cfg(test)]
+        self.audited.push(record.clone());
+        audit::append_in_background(record, cx);
+    }
+
+    /// Whether the connection's server applies a batch all or nothing.
+    fn all_or_nothing(&self) -> bool {
+        matches!(
+            self.db.catalog.capabilities().transactions,
+            Transactions::Multi { .. }
+        )
     }
 
     // Exports --------------------------------------------------------------
@@ -918,6 +1371,22 @@ impl CollectionTab {
                             b.on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                         }),
                     )
+                    .when(self.edits_offered(), |row| {
+                        let enabled = ready && !self.applying();
+                        row.child(
+                            chrome::icon_button(
+                                "insert-document",
+                                IconName::Plus,
+                                "Insert Document",
+                                enabled,
+                            )
+                            .when(enabled, |b| {
+                                b.on_click(cx.listener(|this, _, window, cx| {
+                                    this.insert_document(window, cx)
+                                }))
+                            }),
+                        )
+                    })
                     .child(self.render_export_menu(ready, cx)),
             )
             .child(
@@ -989,6 +1458,141 @@ impl CollectionTab {
                     this.export_grid(cx)
                 }))
             })
+    }
+
+    /// The staged changes and the last apply's outcome, above the footer:
+    /// Review lists the changes as the statements they become.
+    fn render_changes(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let pending = self.staging.len();
+        let outcome = match &self.apply {
+            ApplyState::Applied(done) => Some((done.clone(), theme::TEXT_TERTIARY)),
+            ApplyState::Failed(error) => Some((error.clone(), theme::RED)),
+            ApplyState::Idle | ApplyState::Applying => None,
+        };
+        if pending == 0 && outcome.is_none() {
+            return None;
+        }
+        let applying = self.applying();
+        let language = self.language();
+        let mono = cx.theme().mono_font_family.clone();
+        let listed = self.show_changes.then(|| {
+            v_flex()
+                .id("staged-changes")
+                .max_h(px(160.))
+                .overflow_y_scroll()
+                .gap(px(2.))
+                .font_family(mono)
+                .text_size(px(11.5))
+                .children(
+                    self.staging
+                        .staged()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, staged)| {
+                            let statement = (language.change)(&self.collection, &staged.change());
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    chrome::icon_button(
+                                        ("unstage", index),
+                                        IconName::Close,
+                                        "Unstage",
+                                        !applying,
+                                    )
+                                    .when(!applying, |b| {
+                                        b.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.unstage(index, cx)
+                                        }))
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(color(theme::TEXT_SECONDARY))
+                                        .child(statement),
+                                )
+                        }),
+                )
+        });
+        let atomic = match self.all_or_nothing() {
+            true => "Applied all or nothing",
+            false => "Applied one by one, stopping at the first failure",
+        };
+        Some(
+            v_flex()
+                .px_3()
+                .py(px(6.))
+                .gap(px(6.))
+                .flex_shrink_0()
+                .border_t_1()
+                .border_color(color(theme::HAIRLINE))
+                .child(
+                    h_flex()
+                        .gap(px(10.))
+                        .text_size(px(12.))
+                        .when(pending > 0, |row| {
+                            row.child(
+                                chrome::pill()
+                                    .child(chrome::dot(theme::AMBER))
+                                    .child(div().text_color(color(0xc7c7cc)).child(match pending {
+                                        1 => "1 change staged".to_string(),
+                                        n => format!("{n} changes staged"),
+                                    }))
+                                    .child(
+                                        chrome::pill_button(
+                                            "review-changes",
+                                            if self.show_changes { "Hide" } else { "Review" },
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.show_changes = !this.show_changes;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        chrome::pill_button("discard-changes", "Discard", false)
+                                            .when(!applying, |b| {
+                                                b.on_click(
+                                                    cx.listener(|this, _, _, cx| this.discard(cx)),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        chrome::pill_button(
+                                            "apply-changes",
+                                            if applying { "Applying…" } else { "Apply" },
+                                            true,
+                                        )
+                                        .when(
+                                            !applying,
+                                            |b| {
+                                                b.on_click(cx.listener(|this, _, window, cx| {
+                                                    this.apply_staged(window, cx)
+                                                }))
+                                            },
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(color(theme::TEXT_TERTIARY))
+                                    .child(atomic),
+                            )
+                        })
+                        .children(outcome.map(|(text, tone)| {
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(color(tone))
+                                .child(text)
+                        })),
+                )
+                .children(listed),
+        )
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1083,6 +1687,17 @@ impl CollectionTab {
                         .child("Read-only view"),
                 )
             })
+            .when(
+                self.kind != ContainerKind::View && !self.edits_offered(),
+                |row| {
+                    row.child(
+                        h_flex()
+                            .gap(px(5.))
+                            .child(Icon::new(AppIcon::Lock).size(px(11.)))
+                            .child("Read-only user"),
+                    )
+                },
+            )
             .child(
                 chrome::icon_button("prev-page", IconName::ChevronLeft, "Previous Page", can_back)
                     .when(can_back, |b| {
@@ -1119,7 +1734,7 @@ impl Render for CollectionTab {
                         .min_w_0()
                         .child(DataTable::new(&self.grid).stripe(true).bordered(false)),
                 )
-                .when(self.selected.is_some(), |row| {
+                .when(self.selected.is_some() || self.editing.is_some(), |row| {
                     row.child(
                         div()
                             .w(px(380.))
@@ -1144,6 +1759,7 @@ impl Render for CollectionTab {
             }))
             .child(self.render_bar(cx))
             .child(div().flex_1().min_h_0().child(content))
+            .children(self.render_changes(cx))
             .child(self.render_footer(cx))
     }
 }
@@ -1171,10 +1787,31 @@ fn row_menu(tab: &WeakEntity<CollectionTab>, menu: PopupMenu, cell: &Cell, cx: &
         Some(_) => "Filter by This Value",
     };
     let filter = (state.language().field_filter)(&FieldPath::field(cell.column_name()), value);
+    let editable = state.edits_offered();
+    let menu = menu.item(item("Show Document", tab, move |tab, window, cx| {
+        tab.select_row(row, window, cx)
+    }));
+    let menu = match editable {
+        true => menu
+            .item(
+                item("Edit Document", tab, move |tab, window, cx| {
+                    tab.edit_row(row, window, cx)
+                })
+                .icon(AppIcon::Pencil),
+            )
+            .item(item("Duplicate Document", tab, move |tab, window, cx| {
+                tab.duplicate_row(row, window, cx)
+            }))
+            .item(
+                item("Delete Document", tab, move |tab, _, cx| {
+                    tab.delete_row(row, cx)
+                })
+                .icon(AppIcon::Trash),
+            )
+            .separator(),
+        false => menu,
+    };
     let menu = menu
-        .item(item("Show Document", tab, move |tab, window, cx| {
-            tab.select_row(row, window, cx)
-        }))
         .item(copy("Copy Document", literal))
         .item(copy(
             "Copy Document as Relaxed Extended JSON",
@@ -1492,6 +2129,32 @@ mod tests {
     fn open_orders(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui_kit::AnyWindowHandle, Entity<CollectionTab>) {
+        open_collection(cx, &["shop", "orders"])
+    }
+
+    /// A session of the dev MongoDB that may write.
+    fn dev_session() -> DocumentSession {
+        use std::sync::Arc;
+
+        use kuery_core::document::session::DocumentOpener;
+
+        let options = kuery_core::driver::ConnectOptions {
+            host: "127.0.0.1".into(),
+            port: 27019,
+            user: "kuery".into(),
+            password: Some("kuery".into()),
+            options: [("authSource".to_string(), "admin".to_string())].into(),
+            ..Default::default()
+        };
+        let opener: DocumentOpener =
+            Arc::new(move |access| (kuery_mongo::DRIVER.open)(&options, access));
+        futures::executor::block_on(DocumentSession::open(opener, Access::ReadWrite)).unwrap()
+    }
+
+    fn open_collection(
+        cx: &mut gpui::TestAppContext,
+        path: &[&str],
+    ) -> (gpui_kit::AnyWindowHandle, Entity<CollectionTab>) {
         use std::sync::Arc;
 
         use futures::executor::block_on;
@@ -1533,11 +2196,11 @@ mod tests {
                 ..Default::default()
             };
             let (window, tab) = gpui_kit::open_window(options, cx, |window, cx| {
-                let orders = CollectionRef::new(&["shop", "orders"]);
+                let collection = CollectionRef::new(path);
                 cx.new(|cx| {
                     CollectionTab::new(
                         db,
-                        orders,
+                        collection,
                         ContainerKind::Collection,
                         std::env::temp_dir(),
                         window,
@@ -1715,5 +2378,316 @@ mod tests {
             }
         });
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Runs a script that writes on `session`, to its end.
+    fn write(session: &DocumentSession, script: &str) {
+        use kuery_core::document::session::RunMode;
+
+        let events = session.run(
+            script.into(),
+            RunMode::Write,
+            Heavy::Refuse,
+            RunOptions::default(),
+        );
+        futures::executor::block_on(async {
+            while let Ok(event) = events.recv().await {
+                match event {
+                    DocEvent::Finished(_) => return,
+                    DocEvent::Failed(error) => panic!("{script}: {error}"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Stages the edit of the loaded row whose `_id` is `id`, with `edit`
+    /// applied to its literal.
+    fn stage_edit(
+        cx: &mut gpui::TestAppContext,
+        window: gpui_kit::AnyWindowHandle,
+        tab: &Entity<CollectionTab>,
+        id: i32,
+        edit: impl Fn(&str) -> String,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| {
+                let row = tab
+                    .rows
+                    .borrow()
+                    .documents()
+                    .iter()
+                    .position(|document| document.get("_id") == Some(&Value::Int32(id)))
+                    .unwrap();
+                tab.edit_row(row, window, cx);
+                let text = tab.detail.read(cx).text(cx);
+                tab.stage(&edit(&text), window, cx);
+                assert!(tab.editing.is_none(), "the edit was not staged");
+            })
+        })
+        .unwrap();
+    }
+
+    fn apply(
+        cx: &mut gpui::TestAppContext,
+        window: gpui_kit::AnyWindowHandle,
+        tab: &Entity<CollectionTab>,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| tab.apply_staged(window, cx))
+        })
+        .unwrap();
+        run_until(cx, tab, |tab| {
+            matches!(tab.apply, ApplyState::Applied(_) | ApplyState::Failed(_))
+                && matches!(tab.status, Status::Loaded { .. })
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_edits_keep_types_and_detect_concurrent_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let setup = dev_session();
+        write(
+            &setup,
+            r#"db.getSiblingDB("kuery_tab_edits").dropDatabase()"#,
+        );
+        write(
+            &setup,
+            r#"db.getSiblingDB("kuery_tab_edits").notes.insertMany([{_id: 1, qty: NumberLong("9007199254740993"), price: NumberDecimal("9.99"), note: "old"}, {_id: 2, qty: NumberLong(2)}, {_id: 3}])"#,
+        );
+        let (window, tab) = open_collection(cx, &["kuery_tab_edits", "notes"]);
+        run_until(cx, &tab, settled);
+
+        // An edit, a delete and an insert, staged and marked.
+        stage_edit(cx, window, &tab, 1, |text| {
+            text.replace(r#""old""#, r#""new""#)
+                .replace(r#"NumberDecimal("9.99")"#, r#"NumberDecimal("10.50")"#)
+        });
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.delete_row(2, cx);
+                tab.insert_document(window, cx);
+                tab.stage(r#"{_id: 4, qty: NumberLong(4)}"#, window, cx);
+            })
+        })
+        .unwrap();
+        tab.read_with(cx, |tab, _| {
+            assert!(tab.has_pending());
+            assert_eq!(tab.staging.len(), 3);
+        });
+
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                matches!(&tab.apply, ApplyState::Applied(done) if done.starts_with("Applied 3 changes")),
+                "{}",
+                match &tab.apply {
+                    ApplyState::Failed(error) => error.as_str(),
+                    _ => "",
+                }
+            );
+            assert!(!tab.has_pending());
+            let rows = tab.rows.borrow();
+            let ids: Vec<Option<&Value>> =
+                rows.documents().iter().map(|d| d.get("_id")).collect();
+            assert_eq!(
+                ids,
+                [Some(&Value::Int32(1)), Some(&Value::Int32(2)), Some(&Value::Int32(4))]
+            );
+            let edited = rows.document(0).unwrap();
+            // Untouched NumberLong stays Int64, the decimal stays Decimal128.
+            assert_eq!(edited.get("qty"), Some(&Value::Int64(9_007_199_254_740_993)));
+            assert_eq!(edited.get("price"), Some(&Value::Decimal("10.50".into())));
+            assert_eq!(edited.get("note"), Some(&Value::String("new".into())));
+            // Audited as the statements: the diff, not whole documents.
+            let [record] = tab.audited.as_slice() else {
+                panic!("{:?}", tab.audited);
+            };
+            assert!(record.sql.contains("$set"), "{}", record.sql);
+            assert!(!record.sql.contains("9007199254740993"), "{}", record.sql);
+            assert!(record.sql.contains("deleteOne({_id: 3})"), "{}", record.sql);
+            assert!(!record.failed);
+        });
+
+        // Someone else changes document 2 after it was loaded.
+        stage_edit(cx, window, &tab, 2, |text| {
+            text.replace(r#"NumberLong("2")"#, r#"NumberLong("3")"#)
+        });
+        write(
+            &setup,
+            r#"db.getSiblingDB("kuery_tab_edits").notes.updateOne({_id: 2}, {$set: {qty: NumberLong(5)}})"#,
+        );
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            let ApplyState::Failed(error) = &tab.apply else {
+                panic!("a stale edit applied");
+            };
+            assert!(
+                error.contains(
+                    "This document changed since you loaded it. Reload it and edit again."
+                ),
+                "{error}"
+            );
+            assert!(error.contains("Nothing was applied"), "{error}");
+            // It stays staged, and the document keeps the other change.
+            assert_eq!(tab.staging.len(), 1);
+            assert!(tab.audited.last().unwrap().failed);
+        });
+        let kept = futures::executor::block_on(setup.count(
+            CollectionRef::new(&["kuery_tab_edits", "notes"]),
+            Some("{_id: 2, qty: NumberLong(5)}".into()),
+            0,
+            Heavy::Refuse,
+        ));
+        assert_eq!(kept, Ok(Count::Exact(1)));
+        write(
+            &setup,
+            r#"db.getSiblingDB("kuery_tab_edits").dropDatabase()"#,
+        );
+    }
+
+    /// The grid's row of the loaded document whose `_id` is `id`.
+    fn row_of(tab: &CollectionTab, id: i32) -> usize {
+        tab.rows
+            .borrow()
+            .documents()
+            .iter()
+            .position(|document| document.get("_id") == Some(&Value::Int32(id)))
+            .unwrap()
+    }
+
+    fn failed(tab: &CollectionTab) -> &str {
+        match &tab.apply {
+            ApplyState::Failed(error) => error,
+            _ => "",
+        }
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_changes_apply_only_to_documents_as_loaded(cx: &mut gpui::TestAppContext) {
+        let setup = dev_session();
+        let db = r#"db.getSiblingDB("kuery_tab_checks")"#;
+        write(&setup, &format!("{db}.dropDatabase()"));
+        write(
+            &setup,
+            &format!(
+                "{db}.notes.insertMany([{{_id: 1, n: 1, ratio: NaN}}, {{_id: 2, n: 1}}, {{_id: 3, a: 1, b: 1}}])"
+            ),
+        );
+        let (window, tab) = open_collection(cx, &["kuery_tab_checks", "notes"]);
+        run_until(cx, &tab, settled);
+
+        // A document holding NaN, which is not equal to itself, applies.
+        stage_edit(cx, window, &tab, 1, |text| text.replace("n: 1,", "n: 2,"));
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                matches!(&tab.apply, ApplyState::Applied(_)),
+                "{}",
+                failed(tab)
+            );
+        });
+
+        // A delete of a document that gained a field since is refused.
+        cx.update_window(window, |_, _, cx| {
+            tab.update(cx, |tab, cx| tab.delete_row(row_of(tab, 2), cx))
+        })
+        .unwrap();
+        write(
+            &setup,
+            &format!("{db}.notes.updateOne({{_id: 2}}, {{$set: {{theirs: true}}}})"),
+        );
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                failed(tab).contains("This document changed since you loaded it"),
+                "{}",
+                failed(tab)
+            );
+            assert_eq!(tab.staging.len(), 1);
+            // The audit keeps to the key, not the whole document.
+            let record = tab.audited.last().unwrap();
+            assert!(
+                record.sql.ends_with("deleteOne({_id: 2})"),
+                "{}",
+                record.sql
+            );
+        });
+        cx.update_window(window, |_, _, cx| tab.update(cx, |tab, cx| tab.discard(cx)))
+            .unwrap();
+
+        // Someone else changes a document whose edit is staged, and the
+        // page reloads: editing it again is refused, since the editor would
+        // show the edit over what it held before. The staged edit still
+        // expects only what it changes, so it applies and keeps theirs.
+        stage_edit(cx, window, &tab, 3, |text| text.replace("a: 1", "a: 2"));
+        write(
+            &setup,
+            &format!("{db}.notes.updateOne({{_id: 3}}, {{$set: {{b: 5}}}})"),
+        );
+        tab.update(cx, |tab, cx| tab.reload(cx));
+        run_until(cx, &tab, |tab| matches!(tab.status, Status::Loaded { .. }));
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| {
+                let row = row_of(tab, 3);
+                tab.edit_row(row, window, cx);
+                assert!(tab.editing.is_none(), "a stale document opened to edit");
+                assert_eq!(failed(tab), document_edits::STALE);
+            })
+        })
+        .unwrap();
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            assert!(
+                matches!(&tab.apply, ApplyState::Applied(_)),
+                "{}",
+                failed(tab)
+            );
+        });
+        let kept = futures::executor::block_on(setup.count(
+            CollectionRef::new(&["kuery_tab_checks", "notes"]),
+            Some("{_id: 3, a: 2, b: 5}".into()),
+            0,
+            Heavy::Refuse,
+        ));
+        assert_eq!(kept, Ok(Count::Exact(1)), "their change was undone");
+
+        // After an apply whose outcome is unknown, Apply waits for a reload.
+        cx.update_window(window, |_, window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.insert_document(window, cx);
+                tab.stage("{n: 4}", window, cx);
+                tab.reload_first = true;
+            })
+        })
+        .unwrap();
+        let audited = tab.read_with(cx, |tab, _| tab.audited.len());
+        apply(cx, window, &tab);
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(failed(tab), document_write::RELOAD_FIRST);
+            assert_eq!(tab.audited.len(), audited, "it tried to apply");
+        });
+        tab.update(cx, |tab, cx| tab.reload(cx));
+        run_until(cx, &tab, |tab| matches!(tab.status, Status::Loaded { .. }));
+        tab.read_with(cx, |tab, _| assert!(!tab.reload_first));
+        write(&setup, &format!("{db}.dropDatabase()"));
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn collection_tab_views_offer_no_edits(cx: &mut gpui::TestAppContext) {
+        let (_window, tab) = open_orders(cx);
+        run_until(cx, &tab, settled);
+        tab.read_with(cx, |tab, _| assert!(tab.edits_offered()));
+        tab.update(cx, |tab, _| tab.kind = ContainerKind::View);
+        tab.update(cx, |tab, cx| tab.delete_row(0, cx));
+        tab.read_with(cx, |tab, _| {
+            assert!(!tab.edits_offered());
+            assert!(!tab.has_pending());
+            assert!(matches!(tab.apply, ApplyState::Failed(_)));
+        });
     }
 }
