@@ -80,6 +80,9 @@ pub struct OpInfo {
     pub heavy: bool,
     /// Whether its plan can be shown.
     pub explainable: bool,
+    /// The container the statements after it work in, for one that
+    /// changes it (`use shop` enters `["shop"]`).
+    pub enters: Option<Vec<String>>,
 }
 
 /// A statement of a script: where it is, and what it does.
@@ -148,6 +151,17 @@ pub struct Language {
     pub field_filter: fn(&FieldPath, Option<&Value>) -> Option<String>,
     /// What completion offers at a byte offset of the text.
     pub context: fn(&str, usize) -> CompletionContext,
+    /// The statement that makes the ones after it work in a container of
+    /// the tree (`use shop` for `["shop"]`); `None` when the language has
+    /// none for it.
+    pub enter: fn(&[String]) -> Option<String>,
+    /// What completion inserts for a collection where
+    /// [`CompletionContext::Collection`] asks for one: `orders`, or
+    /// `getCollection("order-lines")` for a name that does not read bare.
+    pub collection_ref: fn(&str) -> String,
+    /// A field's name as a document's key: bare where it reads so, quoted
+    /// otherwise (`status`, `"ship.city"`).
+    pub key: fn(&str) -> String,
     pub methods: &'static [&'static str],
     pub operators: &'static [&'static str],
     pub stages: &'static [&'static str],

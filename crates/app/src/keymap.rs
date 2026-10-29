@@ -75,6 +75,7 @@ pub fn reload(cx: &mut App) {
     bindings.extend(command_bindings);
     problems.extend(binding_problems);
     bindings.extend(crate::query_tab::bindings());
+    bindings.extend(crate::document_console::bindings());
     bindings.extend(palette::bindings());
 
     cx.clear_key_bindings();
@@ -443,6 +444,7 @@ mod tests {
         let (resolved, _) = resolve(&[]);
         bindings.extend(command_bindings(&resolved).0);
         bindings.extend(crate::query_tab::bindings());
+        bindings.extend(crate::document_console::bindings());
         let keymap = Keymap::new(bindings);
         let stack = ["Workspace", tab, "Input mode=editor"]
             .map(|context| KeyContext::parse(context).unwrap());
@@ -478,6 +480,37 @@ mod tests {
                 Some(action)
             );
         }
+    }
+
+    #[test]
+    fn the_document_console_runs_and_cancels_but_does_not_save_or_commit() {
+        for (keys, action) in [
+            ("secondary-enter", Some("kuery::RunQuery")),
+            ("secondary-alt-enter", Some("kuery::RunAll")),
+            ("secondary-.", Some("kuery::CancelQuery")),
+            ("secondary-shift-enter", Some("input::Enter")),
+            ("ctrl-space", Some("input::ShowCompletions")),
+            ("secondary-s", None),
+            ("secondary-shift-f", None),
+            ("secondary-e", None),
+            ("secondary-j", None),
+        ] {
+            assert_eq!(
+                action_in_editor(keys, "DocumentConsole").as_deref(),
+                action,
+                "{keys}"
+            );
+        }
+        // Nothing the query tab binds for commit or rollback reaches it.
+        let (resolved, _) = resolve(&[]);
+        for command in COMMANDS {
+            let in_console = command
+                .context
+                .is_some_and(|c| c.contains("DocumentConsole"));
+            let expected = matches!(command.id, "query.run" | "query.run_all" | "query.cancel");
+            assert_eq!(in_console, expected, "{}", command.id);
+        }
+        assert!(!resolved.is_empty());
     }
 
     /// What a keystroke runs with focus in `stack` (outermost context first),

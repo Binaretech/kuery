@@ -23,6 +23,7 @@ mod context_menus;
 mod data_file_tabs;
 mod definition;
 mod diagram_tab;
+mod document_console;
 mod document_detail;
 mod document_grid;
 mod drivers;

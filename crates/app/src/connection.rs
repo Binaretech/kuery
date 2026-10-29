@@ -319,6 +319,9 @@ pub struct DocDb {
     pub catalog: DocumentSession,
     /// `host:port/database`, without credentials.
     pub target: SharedString,
+    /// The container the form names (`["shop"]`), where a console starts;
+    /// empty for the driver's own default.
+    pub home: Vec<String>,
     /// The SSH tunnel the connection goes through, open while any clone is.
     _tunnel: Option<Arc<Tunnel>>,
 }
@@ -329,6 +332,7 @@ impl DocDb {
         environment: Environment,
         catalog: DocumentSession,
         target: SharedString,
+        home: Vec<String>,
         tunnel: Option<Arc<Tunnel>>,
     ) -> Self {
         Self {
@@ -336,6 +340,7 @@ impl DocDb {
             environment,
             catalog,
             target,
+            home,
             _tunnel: tunnel,
         }
     }

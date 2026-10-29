@@ -202,6 +202,14 @@ pub enum TabState {
         projection: String,
         sort: String,
     },
+    /// A document database's console, with its statements.
+    DocumentConsole {
+        connection: String,
+        /// The container its runs start in (`["shop"]`); empty for the
+        /// connection's own.
+        path: Vec<String>,
+        text: String,
+    },
     File {
         path: PathBuf,
     },
@@ -217,7 +225,8 @@ impl TabState {
             | TabState::Activity { connection }
             | TabState::RedisKey { connection, .. }
             | TabState::RedisConsole { connection, .. }
-            | TabState::Collection { connection, .. } => Some(connection),
+            | TabState::Collection { connection, .. }
+            | TabState::DocumentConsole { connection, .. } => Some(connection),
             TabState::File { .. } => None,
         }
     }
@@ -533,6 +542,22 @@ mod tests {
             ContainerKind::from(ContainerKindState::from(ContainerKind::Capped)),
             ContainerKind::Capped
         );
+    }
+
+    #[test]
+    fn a_document_console_keeps_its_database_and_statements() {
+        let tab = TabState::DocumentConsole {
+            connection: "docs".into(),
+            path: vec!["shop".into()],
+            text: "db.orders.find()\n".into(),
+        };
+        let text = serde_json::to_string(&tab).unwrap();
+        assert_eq!(
+            text,
+            r#"{"kind":"document_console","connection":"docs","path":["shop"],"text":"db.orders.find()\n"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabState>(&text).unwrap(), tab);
+        assert_eq!(tab.connection(), Some("docs"));
     }
 
     #[test]

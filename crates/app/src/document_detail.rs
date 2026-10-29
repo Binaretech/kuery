@@ -62,10 +62,9 @@ impl EventEmitter<DetailEvent> for DocumentDetail {}
 
 impl DocumentDetail {
     pub fn new(language: &'static Language, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // The engine's literals read close enough to JSON to highlight as it.
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language("json")
+                .language(language.editor)
                 .line_number(true)
                 .folding(true)
                 .indent_guides(true)

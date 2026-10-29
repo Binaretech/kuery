@@ -94,6 +94,12 @@ pub enum ExplorerEvent {
         collection: CollectionRef,
         kind: ContainerKind,
     },
+    /// A console on a document database, its runs starting in `path`
+    /// (empty for the connection's own container).
+    OpenDocumentConsole {
+        db: DocDb,
+        path: Vec<String>,
+    },
 }
 
 enum ConnectionState {
@@ -1203,6 +1209,12 @@ impl Explorer {
                     }))
                 } else if ready && family == Some(Family::Document) {
                     menu.item(item_icon(
+                        "Open Console",
+                        AppIcon::Code,
+                        &this,
+                        move |this, _, cx| this.open_document_console(index, None, cx),
+                    ))
+                    .item(item_icon(
                         "Refresh",
                         AppIcon::Reload,
                         &this,
@@ -2254,6 +2266,7 @@ mod tests {
             Environment::Development,
             catalog,
             "127.0.0.1:27019/".into(),
+            Vec::new(),
             None,
         )
     }

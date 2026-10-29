@@ -197,11 +197,16 @@ impl Driver {
                 let access = spec.environment().access();
                 let catalog =
                     open_document(document, &spec, password, tunnel.as_deref(), access).await?;
+                let home = Some(spec.database.trim().to_string())
+                    .filter(|database| !database.is_empty())
+                    .into_iter()
+                    .collect();
                 Ok(Connection::Document(DocDb::new(
                     spec.name.clone().into(),
                     spec.environment(),
                     catalog,
                     spec.target().into(),
+                    home,
                     tunnel,
                 )))
             }),

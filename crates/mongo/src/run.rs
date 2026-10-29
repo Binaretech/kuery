@@ -155,11 +155,20 @@ pub(crate) fn wait<T: Send + 'static>(
     ended
 }
 
+/// What a cursor's reader says after each batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wants {
+    More,
+    /// It holds all it takes: the read ends well, and the cursor closes.
+    Enough,
+}
+
 /// Runs a command that answers with a cursor and sends what it reads to
 /// `sink`, as it arrives. The cursor lives in a task on the runtime that
 /// hands documents over a channel; when the sink refuses more (its reader
-/// went away), the task is told to stop after the read it is in, which
-/// closes the cursor on the server. Returns how many documents it read.
+/// went away) or wants no more, the task is told to stop after the read it
+/// is in, which closes the cursor on the server. Returns how many
+/// documents the sink was given.
 pub(crate) fn stream(
     client: &Client,
     tag: &Tag,
@@ -167,7 +176,7 @@ pub(crate) fn stream(
     timeout: Option<Duration>,
     flush: usize,
     open: impl Future<Output = mongodb::error::Result<Cursor<Document>>> + Send + 'static,
-    sink: &mut dyn FnMut(Vec<Document>) -> Result<(), QueryError>,
+    sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     stop.start();
     let ended = stream_on(client, tag, stop, timeout, flush, open, sink);
@@ -182,9 +191,10 @@ fn stream_on(
     timeout: Option<Duration>,
     flush: usize,
     open: impl Future<Output = mongodb::error::Result<Cursor<Document>>> + Send + 'static,
-    sink: &mut dyn FnMut(Vec<Document>) -> Result<(), QueryError>,
+    sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     let (tx, mut rx) = mpsc::channel(1);
+    let mut given = 0;
     let mut task = runtime().spawn(read(open, flush.max(1), tx));
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     loop {
@@ -197,15 +207,28 @@ fn stream_on(
         });
         match next {
             Ok(Some(batch)) => {
-                if let Err(error) = sink(batch) {
-                    // The task ends at its next send.
-                    drop(rx);
-                    runtime().block_on(halt(client, tag, task, Stopped::Cancelled));
-                    return Err(error);
+                given += batch.len() as u64;
+                match sink(batch) {
+                    Ok(Wants::More) => {}
+                    Ok(Wants::Enough) => {
+                        // The task ends at its next send.
+                        drop(rx);
+                        runtime().block_on(close(client, tag, task));
+                        return Ok(given);
+                    }
+                    Err(error) => {
+                        drop(rx);
+                        runtime().block_on(halt(client, tag, task, Stopped::Cancelled));
+                        return Err(error);
+                    }
                 }
             }
             // The task is done sending: it ended, well or not.
-            Ok(None) => return runtime().block_on(async { joined_result((&mut task).await) }),
+            Ok(None) => {
+                return runtime()
+                    .block_on(async { joined_result((&mut task).await) })
+                    .map(|_| given);
+            }
             Err(stopped) => {
                 drop(rx);
                 return Err(runtime().block_on(halt(client, tag, task, stopped)));
@@ -255,6 +278,19 @@ async fn read(
         let _ = tx.send(pending).await;
     }
     Ok(read)
+}
+
+/// Ends a read whose sink wants no more: its task stops at its next send
+/// and drops the cursor, which closes it on the server. A task still
+/// waiting on the server after [`KILL_AGAIN`] is stopped there, like a
+/// cancel; either way the read ended well.
+async fn close(client: &Client, tag: &Tag, mut task: JoinHandle<mongodb::error::Result<u64>>) {
+    tokio::select! {
+        _ = &mut task => {}
+        () = tokio::time::sleep(KILL_AGAIN) => {
+            halt(client, tag, task, Stopped::Cancelled).await;
+        }
+    }
 }
 
 /// Stops an operation whose wait ended early: kills it on the server, and

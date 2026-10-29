@@ -543,3 +543,32 @@ fn filters_by_a_field_with_its_type() {
     );
     assert_eq!(filter("coupon", None), r#"{coupon: {$exists: false}}"#);
 }
+
+#[test]
+fn nesting_too_deep_is_an_error_not_a_crash() {
+    let error = refused(&"[".repeat(100_000));
+    assert_eq!(
+        (error.message.as_str(), error.span),
+        ("Values nest deeper than 200 levels here", 200..201)
+    );
+    let document = format!("{{a: {}", "{a: ".repeat(100_000));
+    let error = parse_document(&document).expect_err("too deep");
+    assert!(error.message.contains("200 levels"), "{error}");
+    assert!(check_filter(&document).is_err());
+    // As deep as the limit still reads.
+    let deepest = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+    assert!(parse_value(&deepest).is_ok());
+    let deeper = format!("[{deepest}]");
+    assert!(parse_value(&deeper).is_err());
+}
+
+#[test]
+fn finds_keys_at_any_depth_without_recursing() {
+    let mut deep = fields(&[("$where", Value::String("true".into()))]);
+    for _ in 0..100_000 {
+        deep = Value::Array(vec![deep]);
+    }
+    assert!(runs_javascript(&deep));
+    // Dropping a value this deep recurses: the test leaks it instead.
+    std::mem::forget(deep);
+}

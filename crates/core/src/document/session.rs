@@ -101,6 +101,7 @@ struct Shared {
     server: String,
     capabilities: Capabilities,
     notice: Option<String>,
+    home: Vec<String>,
     access: Access,
     opener: DocumentOpener,
 }
@@ -120,6 +121,7 @@ impl DocumentSession {
                 server: adapter.server(),
                 capabilities: adapter.capabilities(),
                 notice: adapter.notice(),
+                home: adapter.home(),
                 access,
                 opener: reopen,
             },
@@ -159,6 +161,12 @@ impl DocumentSession {
     /// (see [`DocumentAdapter::notice`]).
     pub fn notice(&self) -> Option<&str> {
         self.shared.notice.as_deref()
+    }
+
+    /// Where statements work when the connection opens (see
+    /// [`DocumentAdapter::home`]).
+    pub fn home(&self) -> &[String] {
+        &self.shared.home
     }
 
     pub fn access(&self) -> Access {
@@ -456,6 +464,7 @@ impl Worker<dyn DocumentAdapter> {
             if self.state.cancelled.load(Ordering::SeqCst) {
                 return Err(QueryError::Cancelled);
             }
+            stream.next_statement();
             let outcome = self
                 .adapter
                 .execute(statement, &mut stream)
@@ -592,6 +601,9 @@ struct Stream<'a> {
     batch: usize,
     /// Documents sent, by every statement.
     documents: usize,
+    /// Documents the statement that runs gave so far, up to
+    /// [`RunOptions::max_documents`].
+    taken: usize,
     first_batch_after: Option<Duration>,
     /// Whether a send failed because the receiver was dropped.
     reader_gone: Cell<bool>,
@@ -610,6 +622,7 @@ impl<'a> Stream<'a> {
             pending: Vec::new(),
             batch: options.first_batch_rows.max(1),
             documents: 0,
+            taken: 0,
             first_batch_after: None,
             reader_gone: Cell::new(false),
         }
@@ -627,6 +640,12 @@ impl<'a> Stream<'a> {
         self.first_batch_after
             .get_or_insert_with(|| self.started.elapsed());
         self.send(DocEvent::Documents(batch))
+    }
+
+    /// The next statement starts: it gets its own
+    /// [`RunOptions::max_documents`].
+    fn next_statement(&mut self) {
+        self.taken = 0;
     }
 
     /// Sends what is left.
@@ -650,7 +669,11 @@ impl<'a> Stream<'a> {
 }
 
 impl DocumentSink for Stream<'_> {
-    fn documents(&mut self, batch: Vec<Document>) -> Result<(), QueryError> {
+    fn documents(&mut self, mut batch: Vec<Document>) -> Result<(), QueryError> {
+        if let Some(cap) = self.options.max_documents {
+            batch.truncate(cap.saturating_sub(self.taken));
+        }
+        self.taken += batch.len();
         self.pending.extend(batch);
         while self.pending.len() >= self.batch {
             let rest = self.pending.split_off(self.batch);
@@ -659,6 +682,12 @@ impl DocumentSink for Stream<'_> {
             self.ship(full)?;
         }
         Ok(())
+    }
+
+    fn full(&self) -> bool {
+        self.options
+            .max_documents
+            .is_some_and(|cap| self.taken >= cap)
     }
 }
 
