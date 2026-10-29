@@ -232,8 +232,12 @@ jobs:
       # authentication, and a standalone server without it for what a
       # standalone lacks. Services cannot take their commands, so compose
       # starts them. The job waits until the seed's last collection is full on
-      # both, which also means the replica set has its users.
+      # both, which also means the replica set has its users. MongoDB 8.0
+      # refuses to start on Linux 6.19 and newer (SERVER-121912), the
+      # runner's kernel, so CI tests against 7.0.
       - name: MongoDB
+        env:
+          KUERY_MONGO_IMAGE_TAG: "7.0"
         run: |
           compose="docker compose -f dev/compose.yaml --profile standalone"
           $compose up -d mongo mongo-standalone

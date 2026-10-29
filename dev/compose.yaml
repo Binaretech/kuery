@@ -106,14 +106,14 @@ services:
     volumes:
       - ./seed-mssql.sql:/seed/seed-mssql.sql:ro
 
-  # MongoDB 8.0 as a single-node replica set (rs0, so it has transactions),
-  # with authentication and the sample shop in `shop`. Users kuery/kuery
-  # (root, authSource admin) and kuery_ro/kuery (read on shop, authSource
-  # shop); development only. mongod listens on 27019 inside too, so the
-  # member's name, localhost:27019, works from the host. The seed starts
-  # `shop` over on every start.
+  # MongoDB 8.0 (KUERY_MONGO_IMAGE_TAG picks another tag) as a single-node
+  # replica set (rs0, so it has transactions), with authentication and the
+  # sample shop in `shop`. Users kuery/kuery (root, authSource admin) and
+  # kuery_ro/kuery (read on shop, authSource shop); development only. mongod
+  # listens on 27019 inside too, so the member's name, localhost:27019,
+  # works from the host. The seed starts `shop` over on every start.
   mongo:
-    image: mongo:8.0
+    image: mongo:${KUERY_MONGO_IMAGE_TAG:-8.0}
     command:
       - sh
       - -c
@@ -150,7 +150,7 @@ services:
   # standalone server lacks (transactions, users): docker compose
   # --profile standalone up -d mongo-standalone. Anyone can write to it.
   mongo-standalone:
-    image: mongo:8.0
+    image: mongo:${KUERY_MONGO_IMAGE_TAG:-8.0}
     profiles: ["standalone"]
     command:
       - sh

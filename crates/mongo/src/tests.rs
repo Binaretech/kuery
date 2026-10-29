@@ -38,7 +38,7 @@ fn target() -> Target {
 fn connects_and_names_the_server() {
     let adapter = open(&target(), Access::ReadOnly).expect("connects to the dev MongoDB");
     let server = adapter.server();
-    assert!(server.starts_with("MongoDB 8.0"), "{server}");
+    assert!(server.starts_with("MongoDB "), "{server}");
     assert!(server.contains("replica set rs0"), "{server}");
 }
 
@@ -150,7 +150,7 @@ fn reaches_the_server_by_name_through_a_socks_proxy() {
         ..Target::from_options(&options).unwrap()
     };
     let adapter = open(&through, Access::ReadOnly).expect("connects through the proxy");
-    assert!(adapter.server().starts_with("MongoDB 8.0"));
+    assert!(adapter.server().starts_with("MongoDB "));
     // The proxy dials the name, as the SSH host would resolve it.
     let asked = asked.lock().unwrap();
     assert!(!asked.is_empty());
