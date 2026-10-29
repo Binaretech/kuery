@@ -236,6 +236,20 @@ fn collect(mongo: &mut Mongo, command: BsonDocument) -> Result<Vec<BsonDocument>
 }
 
 /// Operations still on the server with this adapter's tags.
+/// Waits for what [`left_behind`] finds to go: a cursor that stops early
+/// closes as the read ends, but on the server a moment later.
+fn nothing_left_behind(mongo: &mut Mongo) {
+    let started = std::time::Instant::now();
+    while !left_behind(mongo).is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            left_behind(mongo)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn left_behind(mongo: &mut Mongo) -> Vec<BsonDocument> {
     let mine = Tag::prefix(mongo.id);
     let mut found = Vec::new();
@@ -341,7 +355,7 @@ fn cancels_a_slow_find_and_keeps_working() {
         started.elapsed()
     );
     canceller.join().unwrap();
-    assert_eq!(left_behind(&mut mongo), Vec::<BsonDocument>::new());
+    nothing_left_behind(&mut mongo);
     mongo.command("admin", doc! { "ping": 1 }).unwrap();
     // A cancel that comes when nothing runs does not reach the next run.
     DocumentAdapter::canceller(&mongo)();
@@ -421,7 +435,7 @@ fn cancels_an_operation_that_had_not_reached_the_server_yet() {
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(left_behind(&mut mongo), Vec::<BsonDocument>::new());
+    nothing_left_behind(&mut mongo);
 }
 
 /// A relay to `to` that can stop passing bytes on, as a link that went
@@ -512,7 +526,7 @@ fn a_reader_that_goes_away_closes_the_cursor() {
     });
     assert_eq!(stopped, Err(QueryError::Cancelled));
     assert_eq!(seen, 10);
-    assert_eq!(left_behind(&mut mongo), Vec::<BsonDocument>::new());
+    nothing_left_behind(&mut mongo);
 }
 
 #[test]
