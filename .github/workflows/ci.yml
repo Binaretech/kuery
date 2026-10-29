@@ -231,28 +231,27 @@ jobs:
       # The dev services: a seeded single-node replica set with
       # authentication, and a standalone server without it for what a
       # standalone lacks. Services cannot take their commands, so compose
-      # starts them. The job waits for the replica set's healthcheck, then
-      # for the seed's last collection on both, which is still filling when
-      # the healthcheck first passes.
+      # starts them. The job waits until the seed's last collection is full on
+      # both, which also means the replica set has its users.
       - name: MongoDB
         run: |
-          docker compose -f dev/compose.yaml --profile standalone up -d mongo mongo-standalone
+          compose="docker compose -f dev/compose.yaml --profile standalone"
+          $compose up -d mongo mongo-standalone
+          count() {
+            $compose exec -T "$@" --quiet \
+              --eval 'db.getSiblingDB("shop").big.countDocuments()' 2> /dev/null || true
+          }
           for _ in $(seq 90); do
-            health=$(docker compose -f dev/compose.yaml ps --format json mongo | jq -r '.Health')
-            if [ "$health" = healthy ]; then
-              seeded=$(docker compose -f dev/compose.yaml exec -T mongo \
-                mongosh --port 27019 -u kuery -p kuery --authenticationDatabase admin --quiet \
-                --eval 'db.getSiblingDB("shop").big.countDocuments()' 2> /dev/null || true)
-              standalone=$(docker compose -f dev/compose.yaml exec -T mongo-standalone \
-                mongosh --quiet \
-                --eval 'db.getSiblingDB("shop").big.countDocuments()' 2> /dev/null || true)
-              if [ "$seeded" = 20000 ] && [ "$standalone" = 20000 ]; then
-                exit 0
-              fi
+            seeded=$(count mongo mongosh --port 27019 -u kuery -p kuery --authenticationDatabase admin)
+            standalone=$(count mongo-standalone mongosh)
+            if [ "$seeded" = 20000 ] && [ "$standalone" = 20000 ]; then
+              exit 0
             fi
+            echo "Waiting: replica set ${seeded:-not ready}, standalone ${standalone:-not ready}"
             sleep 2
           done
-          docker compose -f dev/compose.yaml logs mongo mongo-standalone
+          $compose ps -a
+          $compose logs mongo mongo-standalone
           exit 1
 
       - name: Toolchain
