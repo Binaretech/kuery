@@ -1336,6 +1336,60 @@ fn a_preview_is_checked_like_a_write_run() {
     );
 }
 
+/// Holds the session's worker in a job that runs nothing until it is
+/// released: the job has begun once the first receiver hears from it.
+fn hold(session: &DocumentSession) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    drop(session.handle.call(move |_| {
+        let _ = entered.send(());
+        let _ = released.recv();
+        Ok(())
+    }));
+    entering.recv().unwrap();
+    (entering, release)
+}
+
+#[test]
+fn a_preview_cancelled_before_it_starts_never_reaches_the_adapter() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let (_held, release) = hold(&session);
+    let previewed = session.preview_in(
+        &["shop".into()],
+        "write 1".into(),
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    session.cancel();
+    release.send(()).unwrap();
+    assert_eq!(block_on(previewed), Err(QueryError::Cancelled));
+    assert!(log.take().is_empty());
+    // The session goes on.
+    preview(&session, "write 1").unwrap();
+    assert_eq!(log.take(), ["begin", "write 1", "abort"]);
+}
+
+#[test]
+fn a_run_cancelled_before_it_starts_never_reaches_the_adapter() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let (_held, release) = hold(&session);
+    let rx = session.run_in(
+        &["shop".into()],
+        "write 1; write 2".into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    session.cancel();
+    release.send(()).unwrap();
+    let cancelled = drain(rx);
+    assert!(matches!(cancelled.end, Err(QueryError::Cancelled)));
+    assert_eq!(cancelled.left, [Left::NOTHING]);
+    assert!(cancelled.outcomes.is_empty());
+    assert!(log.take().is_empty());
+    run(&session, "write 1", RunMode::Write).end.unwrap();
+}
+
 #[test]
 fn explains_reads_measured_and_writes_only_planned() {
     let options = RunOptions::default;

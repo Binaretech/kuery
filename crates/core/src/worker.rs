@@ -1,7 +1,8 @@
 //! The thread a connection's adapter runs on, whichever the contract it
 //! speaks: one job at a time, a panic that ends the connection and not the
-//! app, a cancel that keeps at the running job and never reaches the next
-//! one, and streams that end even when their job never runs.
+//! app, a cancel that keeps at the running job (or, with none running,
+//! stops the runs queued before it) and never reaches a later one, and
+//! streams that end even when their job never runs.
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -49,6 +50,11 @@ pub(crate) struct State {
     /// A cancel came: some databases let a stopped statement end as if
     /// nothing happened, so the run checks this too.
     pub(crate) cancelled: AtomicBool,
+    /// How many jobs were queued: each job's number is its place in line.
+    sent: AtomicU64,
+    /// Jobs numbered up to this one were queued before a cancel that came
+    /// while nothing ran: none of them may begin a run.
+    cancel_before: AtomicU64,
     /// Held while a run begins, and while a cancel checks which run is on
     /// and stops it, so the next run cannot begin in between.
     gate: Mutex<()>,
@@ -67,6 +73,8 @@ pub(crate) struct Worker<A: ?Sized> {
     pub(crate) access: Access,
     pub(crate) state: Arc<State>,
     pub(crate) canceller: Canceller,
+    /// The number of the job on the thread now.
+    job: u64,
 }
 
 impl<A: ?Sized> Worker<A> {
@@ -84,12 +92,27 @@ impl<A: ?Sized> Worker<A> {
         self.state.in_transaction.store(false, Ordering::SeqCst);
     }
 
-    /// A job is running, for [`Handle::cancel`].
-    pub(crate) fn begin_run(&mut self) {
+    /// Refuses a run for a job queued before a cancel that came while
+    /// nothing ran: the cancel was for it.
+    pub(crate) fn may_run(&self) -> Result<(), QueryError> {
+        match self.job <= self.state.cancel_before.load(Ordering::SeqCst) {
+            true => Err(QueryError::Cancelled),
+            false => Ok(()),
+        }
+    }
+
+    /// A job is running, for [`Handle::cancel`]; refused, touching nothing,
+    /// when a cancel came for it before it began (see [`Self::may_run`]).
+    pub(crate) fn begin_run(&mut self) -> Result<(), QueryError> {
+        // A cancel takes the gate too: one that comes before this sees
+        // nothing running and refuses this job by its number, even when the
+        // job is already on the thread; one that comes after sees it run.
         let _gate = self.state.gate();
+        self.may_run()?;
         self.state.run.fetch_add(1, Ordering::SeqCst);
         self.state.cancelled.store(false, Ordering::SeqCst);
         self.state.running.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The run's outcome, as cancelled if a cancel came while it ran.
@@ -156,6 +179,7 @@ impl<A: ?Sized + Driven> Handle<A> {
                     access,
                     state,
                     canceller,
+                    job: 0,
                 };
                 while let Ok(job) = queue.recv() {
                     if panic::catch_unwind(AssertUnwindSafe(|| job(&mut worker))).is_err() {
@@ -182,6 +206,12 @@ impl<A: ?Sized + Driven> Handle<A> {
         self.state.in_transaction.load(Ordering::SeqCst)
     }
 
+    /// Numbers the next job. A cancel that reads the count after this
+    /// counts the job as queued before it.
+    fn number(&self) -> u64 {
+        self.state.sent.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     /// Runs `job` on the worker's thread.
     pub(crate) fn call<T, F>(
         &self,
@@ -192,7 +222,9 @@ impl<A: ?Sized + Driven> Handle<A> {
         F: FnOnce(&mut Worker<A>) -> Result<T, QueryError> + Send + 'static,
     {
         let (sent, received) = oneshot::channel();
+        let number = self.number();
         let queued = self.jobs.send(Box::new(move |worker: &mut Worker<A>| {
+            worker.job = number;
             let outcome = match panic::catch_unwind(AssertUnwindSafe(|| job(worker))) {
                 Ok(outcome) => outcome,
                 Err(payload) => {
@@ -220,10 +252,12 @@ impl<A: ?Sized + Driven> Handle<A> {
     {
         let (tx, rx) = async_channel::bounded(4);
         let unrun = Unrun(Some(tx.clone()));
+        let number = self.number();
         // Not queued, or dropped from the queue when the worker ends: `unrun`
         // still ends the stream.
         let _ = self.jobs.send(Box::new(move |worker: &mut Worker<A>| {
             unrun.disarm();
+            worker.job = number;
             let event = match panic::catch_unwind(AssertUnwindSafe(|| job(worker, &tx))) {
                 Ok(Ok(summary)) => E::finished(summary),
                 Ok(Err(error)) => E::failed(error),
@@ -241,11 +275,14 @@ impl<A: ?Sized + Driven> Handle<A> {
     /// Stops the running job, if any: now, and again every quarter second
     /// while it goes on. Each try checks the run and stops it behind the
     /// gate, so one that comes as the run ends never reaches the next.
+    /// With nothing running, the jobs queued before it never begin a run.
     pub(crate) fn cancel(&self) {
         let state = self.state.clone();
         let run = {
             let _gate = state.gate();
             if !state.running.load(Ordering::SeqCst) {
+                let sent = state.sent.load(Ordering::SeqCst);
+                state.cancel_before.store(sent, Ordering::SeqCst);
                 return;
             }
             state.cancelled.store(true, Ordering::SeqCst);

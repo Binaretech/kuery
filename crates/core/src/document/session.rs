@@ -533,7 +533,8 @@ impl DocumentSession {
     }
 
     /// Stops the running job, if any: now, and again every quarter second
-    /// while it goes on.
+    /// while it goes on. With none running, the runs and previews queued
+    /// before it fail as cancelled without reaching the database.
     pub fn cancel(&self) {
         self.handle.cancel();
     }
@@ -749,9 +750,11 @@ impl Worker<dyn DocumentAdapter> {
         execute: bool,
         options: &RunOptions,
     ) -> Result<String, QueryError> {
-        self.prepare(RunMode::Read, options, enter)?;
-        self.begin_run();
-        let planned = self.adapter.explain(statement, execute);
+        // Readied inside the run, as a run is.
+        self.begin_run()?;
+        let planned = self
+            .prepare(RunMode::Read, options, enter)
+            .and_then(|()| self.adapter.explain(statement, execute));
         self.end_run(planned)
     }
 
@@ -787,13 +790,17 @@ impl Worker<dyn DocumentAdapter> {
     ) -> Result<DocSummary, (QueryError, Left)> {
         let started = Instant::now();
         let nothing = |error| (error, Left::NOTHING);
-        self.prepare(mode, options, enter).map_err(nothing)?;
         let atomic = mode == RunMode::Write
             && all_or_nothing(transactions, statements.iter().map(|(_, info)| info));
-        if atomic {
-            self.adapter.begin().map_err(nothing)?;
+        // Readied inside the run: one cancelled before it begins touches
+        // nothing, and a cancel while it is readied still stops it.
+        self.begin_run().map_err(nothing)?;
+        let ready = self
+            .prepare(mode, options, enter)
+            .and_then(|()| if atomic { self.adapter.begin() } else { Ok(()) });
+        if let Err(error) = ready {
+            return self.end_run(Err(error)).map_err(nothing);
         }
-        self.begin_run();
         let mut partial = Some(Outcome::default());
         let outcome = self.run_statements(statements, options, tx, started, &mut partial);
         match (mode, atomic) {
@@ -848,14 +855,16 @@ impl Worker<dyn DocumentAdapter> {
         preview: Preview,
         options: &RunOptions,
     ) -> Result<Vec<Impact>, QueryError> {
-        self.prepare(RunMode::Write, options, enter)?;
-        self.begin_run();
+        // Readied inside the run, as a run is.
+        self.begin_run()?;
         let mut impacts = Vec::with_capacity(statements.len());
-        let previewed = match preview {
-            Preview::Undone => self.undone(statements, &mut impacts),
-            Preview::Estimated | Preview::None => Ok(None),
-        }
-        .and_then(|note| self.estimated(statements, preview, note, &mut impacts));
+        let previewed = self
+            .prepare(RunMode::Write, options, enter)
+            .and_then(|()| match preview {
+                Preview::Undone => self.undone(statements, &mut impacts),
+                Preview::Estimated | Preview::None => Ok(None),
+            })
+            .and_then(|note| self.estimated(statements, preview, note, &mut impacts));
         self.end_run(previewed).map(|()| impacts)
     }
 
@@ -1018,12 +1027,12 @@ impl Worker<dyn DocumentAdapter> {
         tx: &async_channel::Sender<DocEvent>,
     ) -> Result<DocSummary, QueryError> {
         let started = Instant::now();
-        self.adapter.limit(options)?;
-        self.begin_run();
+        self.begin_run()?;
         let mut stream = Stream::new(tx, options, started);
         let outcome = self
             .adapter
-            .browse(collection, spec, &mut stream)
+            .limit(options)
+            .and_then(|()| self.adapter.browse(collection, spec, &mut stream))
             .inspect_err(|error| stream.stop_on_the_server(error, &self.canceller))
             .and_then(|next| stream.flush().map(|()| next));
         let next = self.end_run(outcome)?;

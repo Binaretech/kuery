@@ -57,7 +57,7 @@ fn spin(
     tx: &async_channel::Sender<Tick>,
     at_most: Duration,
 ) -> Result<bool, QueryError> {
-    worker.begin_run();
+    worker.begin_run()?;
     let _ = tx.send_blocking(Tick::Started);
     let started = Instant::now();
     let stop = worker.adapter.stop.clone();
@@ -175,7 +175,7 @@ fn a_cancel_on_its_way_as_the_run_ends_never_reaches_the_next() {
     let handle = block_on(opened).unwrap().0;
     // Ends by itself while the canceller is still on its way.
     let first = handle.stream(|worker: &mut Worker<Late>, tx| {
-        worker.begin_run();
+        worker.begin_run()?;
         let _ = tx.send_blocking(Tick::Started);
         std::thread::sleep(Duration::from_millis(100));
         worker.end_run(Ok(false))
@@ -183,7 +183,7 @@ fn a_cancel_on_its_way_as_the_run_ends_never_reaches_the_next() {
     assert!(matches!(block_on(first.recv()), Ok(Tick::Started)));
     handle.cancel();
     let next = handle.stream(|worker: &mut Worker<Late>, tx| {
-        worker.begin_run();
+        worker.begin_run()?;
         // What an adapter does as it starts a statement: a stop from
         // before is forgotten.
         let stop = worker.adapter.stop.clone();
@@ -203,4 +203,113 @@ fn a_cancel_on_its_way_as_the_run_ends_never_reaches_the_next() {
     assert!(matches!(block_on(next.recv()), Ok(Tick::Started)));
     let event = block_on(next.recv());
     assert!(matches!(event, Ok(Tick::Finished(false))), "{event:?}");
+}
+
+/// Holds the worker in a job that runs nothing until it is released: the
+/// job has begun once the first receiver hears from it.
+fn hold(handle: &Handle<Ticker>) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered, entering) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    drop(handle.call(move |_| {
+        let _ = entered.send(());
+        let _ = released.recv();
+        Ok(())
+    }));
+    (entering, release)
+}
+
+/// A run that only says it ran.
+fn mark(
+    handle: &Handle<Ticker>,
+    ran: &Arc<AtomicBool>,
+) -> impl Future<Output = Result<(), QueryError>> + use<> {
+    let ran = ran.clone();
+    handle.call(move |worker| {
+        worker.begin_run()?;
+        ran.store(true, Ordering::SeqCst);
+        worker.end_run(Ok(()))
+    })
+}
+
+#[test]
+fn a_cancel_stops_a_run_queued_before_it_that_has_not_begun() {
+    let handle = open(Access::ReadOnly);
+    let (entered, release) = hold(&handle);
+    entered.recv().unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let queued = mark(&handle, &ran);
+    handle.cancel();
+    release.send(()).unwrap();
+    assert_eq!(block_on(queued), Err(QueryError::Cancelled));
+    assert!(!ran.load(Ordering::SeqCst), "the cancelled run ran");
+    // Nothing is left running or cancelled for what comes next.
+    assert!(!handle.state.running.load(Ordering::SeqCst));
+    assert!(!handle.state.cancelled.load(Ordering::SeqCst));
+    assert_eq!(block_on(mark(&handle, &ran)), Ok(()));
+    assert!(ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_cancel_stops_a_run_whose_job_began_before_its_run() {
+    let handle = open(Access::ReadOnly);
+    let (entered, entering) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let ran = Arc::new(AtomicBool::new(false));
+    let queued = handle.call({
+        let ran = ran.clone();
+        move |worker| {
+            let _ = entered.send(());
+            let _ = released.recv();
+            worker.begin_run()?;
+            ran.store(true, Ordering::SeqCst);
+            worker.end_run(Ok(()))
+        }
+    });
+    entering.recv().unwrap();
+    handle.cancel();
+    release.send(()).unwrap();
+    assert_eq!(block_on(queued), Err(QueryError::Cancelled));
+    assert!(!ran.load(Ordering::SeqCst), "the cancelled run ran");
+}
+
+#[test]
+fn a_cancel_with_nothing_queued_never_reaches_a_later_run() {
+    let handle = open(Access::ReadOnly);
+    handle.cancel();
+    let ran = Arc::new(AtomicBool::new(false));
+    assert_eq!(block_on(mark(&handle, &ran)), Ok(()));
+    assert!(ran.load(Ordering::SeqCst));
+
+    // Behind a job that holds the worker, queued after the cancel.
+    let (entered, release) = hold(&handle);
+    entered.recv().unwrap();
+    handle.cancel();
+    let ran = Arc::new(AtomicBool::new(false));
+    let queued = mark(&handle, &ran);
+    release.send(()).unwrap();
+    assert_eq!(block_on(queued), Ok(()));
+    assert!(ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_cancel_during_a_run_stops_only_that_run() {
+    let handle = open(Access::ReadOnly);
+    let first = handle.stream(|worker, tx| spin(worker, tx, Duration::from_secs(10)));
+    assert!(matches!(block_on(first.recv()), Ok(Tick::Started)));
+    // Queued behind the running run, before the cancel: a cancel stops
+    // what runs, not what waits.
+    let waiting = Arc::new(AtomicBool::new(false));
+    let behind = mark(&handle, &waiting);
+    handle.cancel();
+    let after = Arc::new(AtomicBool::new(false));
+    let next = mark(&handle, &after);
+    let event = block_on(first.recv());
+    assert!(
+        matches!(event, Ok(Tick::Failed(QueryError::Cancelled))),
+        "{event:?}"
+    );
+    assert_eq!(block_on(behind), Ok(()));
+    assert!(waiting.load(Ordering::SeqCst));
+    assert_eq!(block_on(next), Ok(()));
+    assert!(after.load(Ordering::SeqCst));
 }
