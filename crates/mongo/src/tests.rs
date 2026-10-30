@@ -2528,3 +2528,5 @@ fn a_schema_sample_of_big_documents_stops_at_its_size() {
     );
     assert!(sampled.label().ends_with("as many as fit in 16 MB"));
 }
+
+mod sql;

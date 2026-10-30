@@ -4401,6 +4401,7 @@ dependencies = [
  "mongodb",
  "proptest",
  "serde_json",
+ "sqlparser 0.63.0",
  "tokio",
 ]
 

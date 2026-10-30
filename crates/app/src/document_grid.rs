@@ -44,6 +44,27 @@ impl DocumentRows {
         }
     }
 
+    /// Flattens a batch into the columns `order` names, in that order,
+    /// whichever fields its documents have: a SQL statement's columns. The
+    /// first batch adds them all.
+    pub fn flatten_ordered(
+        columns: &[String],
+        batch: &[Document],
+        order: &[String],
+        render: fn(&Value, Style) -> String,
+    ) -> Flattened {
+        let new: Vec<String> = order
+            .iter()
+            .filter(|name| !columns.contains(name))
+            .cloned()
+            .collect();
+        let all: Vec<String> = columns.iter().chain(&new).cloned().collect();
+        Flattened {
+            new_columns: new.iter().map(|name| column_info(name, batch)).collect(),
+            batch: flatten::batch(batch, &all, render),
+        }
+    }
+
     /// Keeps a batch's documents, after the grid took its rows.
     pub fn push(&mut self, batch: Vec<Document>, flattened: &Flattened) {
         self.columns

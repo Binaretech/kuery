@@ -765,7 +765,7 @@ fn is_wrapper(document: &Document) -> bool {
 
 /// A number's text as a value: `42` is an Int32, an Int64 when it does not
 /// fit, and a Double beyond that; with a point or an exponent, a Double.
-fn number(text: &str) -> Value {
+pub(crate) fn number(text: &str) -> Value {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(digits) => (true, digits),
         None => (false, text),
@@ -799,7 +799,7 @@ fn integer(n: i128) -> Value {
 }
 
 /// A regular expression; its flags are stored sorted, as BSON wants them.
-fn regex(pattern: &str, flags: &str) -> Result<Value, String> {
+pub(crate) fn regex(pattern: &str, flags: &str) -> Result<Value, String> {
     let mut sorted: Vec<char> = flags.chars().collect();
     sorted.sort_unstable();
     sorted.dedup();
