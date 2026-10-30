@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::StatementKind;
 use crate::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
-use crate::document::capabilities::{Capabilities, Preview, Transactions};
+use crate::document::capabilities::{Capabilities, ExplainKind, Preview, Transactions};
 use crate::document::catalog::{CollectionInfo, Container};
 use crate::document::change::{BrowseSpec, Continuation, Count, DocChange, Expected};
 use crate::document::language::{Language, OpInfo, Statement, Style};
+use crate::document::schema::{self, SampleSink, Sampled};
 use crate::document::value::{CollectionRef, Document, Value};
 use crate::read_only::Rejection;
 use crate::session::{Access, QueryError, RunOptions};
@@ -381,6 +382,30 @@ impl DocumentSession {
         })
     }
 
+    /// The plan of one statement, starting in the container `start` (empty
+    /// for where the last run left off), as the engine's text that
+    /// [`crate::plan::parse`] reads. With `execute`, the engine measures it
+    /// by running it, which only a read may do; a statement that writes is
+    /// only ever planned, never run, and only on a session that may write.
+    /// Heavy work is refused as in a run when it would execute. Checked on
+    /// the session's thread, before the adapter sees it.
+    pub fn explain_in(
+        &self,
+        start: &[String],
+        text: String,
+        execute: bool,
+        heavy: Heavy,
+        options: RunOptions,
+    ) -> impl Future<Output = Result<String, QueryError>> + Send + use<> {
+        let enter = (self.language().enter)(start);
+        let (language, capabilities, access) =
+            (self.language(), self.capabilities().clone(), self.access());
+        self.handle.call(move |worker| {
+            let execute = check_explain(language, &capabilities, access, &text, execute, heavy)?;
+            worker.explain(enter.as_deref(), &text, execute, &options)
+        })
+    }
+
     /// Streams one page of a collection; the summary says where the next
     /// one starts. Its filter and projection are checked like a script's.
     pub fn browse(
@@ -422,7 +447,7 @@ impl DocumentSession {
             .call(move |worker| worker.catalog(|adapter| adapter.collection(&collection)))
     }
 
-    /// About `n` documents of the collection, to infer its schema.
+    /// About `n` documents of the collection.
     pub fn sample(
         &self,
         collection: CollectionRef,
@@ -433,6 +458,27 @@ impl DocumentSession {
                 let mut documents = Vec::new();
                 adapter.sample(&collection, n, &mut documents)?;
                 Ok(documents)
+            })
+        })
+    }
+
+    /// The schema of about `n` documents of the collection, or as many as
+    /// fit in [`schema::SAMPLE_BYTES`], sampled and inferred on the
+    /// session's thread.
+    pub fn schema(
+        &self,
+        collection: CollectionRef,
+        n: usize,
+    ) -> impl Future<Output = Result<Sampled, QueryError>> + Send + use<> {
+        self.handle.call(move |worker| {
+            worker.catalog(|adapter| {
+                let mut sink = SampleSink::default();
+                let sampling = adapter.sample(&collection, n, &mut sink)?;
+                Ok(Sampled {
+                    schema: schema::infer(&sink.documents),
+                    sampling,
+                    capped: sink.capped(),
+                })
             })
         })
     }
@@ -517,6 +563,68 @@ fn check(
         .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(text))))?;
     check_statements(capabilities, access, &statements, mode, heavy)?;
     Ok(statements)
+}
+
+/// Refuses what an explain of `text` may not do (see
+/// [`DocumentSession::explain_in`]). Whether it runs the statement: only
+/// when asked to and it reads.
+fn check_explain(
+    language: &Language,
+    capabilities: &Capabilities,
+    access: Access,
+    text: &str,
+    execute: bool,
+    heavy: Heavy,
+) -> Result<bool, QueryError> {
+    match capabilities.explain {
+        None => {
+            return Err(QueryError::Unsupported(format!(
+                "Kuery shows no plans for {} here",
+                language.name
+            )));
+        }
+        Some(ExplainKind::Estimated) if execute => {
+            return Err(QueryError::Unsupported(format!(
+                "{} here only says what it plans to do: explain without measuring",
+                language.name
+            )));
+        }
+        Some(_) => {}
+    }
+    let statements = (language.analyze)(text)
+        .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(text))))?;
+    let info = match statements.as_slice() {
+        [] => return Err(QueryError::Rejected(Rejection::Empty)),
+        [statement] => &statement.info,
+        _ => {
+            return Err(QueryError::Explain(
+                "Explain one statement at a time: put the cursor on it".into(),
+            ));
+        }
+    };
+    if !info.explainable {
+        return Err(QueryError::Explain(format!(
+            "{} has no plan to show",
+            info.summary
+        )));
+    }
+    let reads = info.kind == StatementKind::Read;
+    if !reads {
+        if execute {
+            return Err(QueryError::Explain(format!(
+                "Measuring a plan runs the statement, and {} writes: explain it without \
+                 measuring, which never runs it",
+                info.summary
+            )));
+        }
+        if access == Access::ReadOnly {
+            return Err(QueryError::WritesDisabled);
+        }
+    }
+    if execute && info.heavy && heavy == Heavy::Refuse {
+        return Err(QueryError::Rejected(Rejection::Heavy(info.summary.clone())));
+    }
+    Ok(execute && reads)
 }
 
 /// Refuses what a run of `statements` may not do.
@@ -630,6 +738,21 @@ impl Worker<dyn DocumentAdapter> {
     ) -> Result<T, QueryError> {
         self.adapter.limit(&RunOptions::default())?;
         job(self.adapter.as_mut())
+    }
+
+    /// The plan of one checked statement (see
+    /// [`DocumentSession::explain_in`]).
+    fn explain(
+        &mut self,
+        enter: Option<&str>,
+        statement: &str,
+        execute: bool,
+        options: &RunOptions,
+    ) -> Result<String, QueryError> {
+        self.prepare(RunMode::Read, options, enter)?;
+        self.begin_run();
+        let planned = self.adapter.explain(statement, execute);
+        self.end_run(planned)
     }
 
     /// Runs a script's statements (see [`DocumentSession::run_in`]); a

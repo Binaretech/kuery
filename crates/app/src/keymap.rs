@@ -483,16 +483,17 @@ mod tests {
     }
 
     #[test]
-    fn the_document_console_runs_and_cancels_but_does_not_save_or_commit() {
+    fn the_document_console_runs_cancels_and_explains_but_does_not_save_or_commit() {
         for (keys, action) in [
             ("secondary-enter", Some("kuery::RunQuery")),
             ("secondary-alt-enter", Some("kuery::RunAll")),
             ("secondary-.", Some("kuery::CancelQuery")),
             ("secondary-shift-enter", Some("input::Enter")),
             ("ctrl-space", Some("input::ShowCompletions")),
+            ("secondary-e", Some("kuery::ExplainQuery")),
+            ("secondary-alt-e", Some("kuery::ExplainAnalyze")),
             ("secondary-s", None),
             ("secondary-shift-f", None),
-            ("secondary-e", None),
             ("secondary-j", None),
         ] {
             assert_eq!(
@@ -507,7 +508,14 @@ mod tests {
             let in_console = command
                 .context
                 .is_some_and(|c| c.contains("DocumentConsole"));
-            let expected = matches!(command.id, "query.run" | "query.run_all" | "query.cancel");
+            let expected = matches!(
+                command.id,
+                "query.run"
+                    | "query.run_all"
+                    | "query.cancel"
+                    | "query.explain"
+                    | "query.explain_analyze"
+            );
             assert_eq!(in_console, expected, "{}", command.id);
         }
         assert!(!resolved.is_empty());

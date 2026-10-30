@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bson::{Bson, Document as BsonDocument, doc};
-use kuery_core::document::catalog::{CollectionInfo, Container, ContainerKind, DocIndex};
+use kuery_core::document::catalog::{
+    CollectionInfo, Container, ContainerKind, DocIndex, IndexUsage,
+};
 use kuery_core::document::value::CollectionRef;
 use kuery_core::session::QueryError;
 
@@ -140,10 +142,39 @@ impl Mongo {
             Ok(())
         })?;
         let sizes = self.index_sizes(database, name)?;
+        let usage = self.index_usage(database, name)?;
         Ok(listed
             .iter()
-            .map(|index| self::index(index, &sizes))
+            .map(|index| {
+                let mut read = self::index(index, &sizes);
+                read.usage = usage.get(&read.name).copied();
+                read
+            })
             .collect())
+    }
+
+    /// How often each index was used, from `$indexStats`, when the user
+    /// may read it; none otherwise.
+    fn index_usage(
+        &mut self,
+        database: &str,
+        name: &str,
+    ) -> Result<HashMap<String, IndexUsage>, QueryError> {
+        let command = doc! {
+            "aggregate": name,
+            "pipeline": [{ "$indexStats": {} }],
+            "cursor": {},
+        };
+        let mut stats = Vec::new();
+        let read = self.cursor(database, command, &mut |batch| {
+            stats.extend(batch);
+            Ok(())
+        });
+        match read {
+            Ok(_) => Ok(usage(&stats)),
+            Err(QueryError::Database { .. }) => Ok(HashMap::new()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Each index's size on disk, when the user may read the collection's
@@ -270,6 +301,35 @@ fn kind(info: &BsonDocument) -> ContainerKind {
     }
 }
 
+/// `$indexStats` by index: a sharded cluster answers once per shard, whose
+/// counts add up, counting since the earliest of them.
+fn usage(stats: &[BsonDocument]) -> HashMap<String, IndexUsage> {
+    let mut usage: HashMap<String, IndexUsage> = HashMap::new();
+    for stat in stats {
+        let Ok(name) = stat.get_str("name") else {
+            continue;
+        };
+        let accesses = stat.get_document("accesses").ok();
+        let operations = accesses
+            .and_then(|accesses| accesses.get("ops"))
+            .and_then(number)
+            .unwrap_or(0);
+        let since = accesses
+            .and_then(|accesses| accesses.get_datetime("since").ok())
+            .map(|since| since.timestamp_millis());
+        let entry = usage.entry(name.to_string()).or_insert(IndexUsage {
+            operations: 0,
+            since,
+        });
+        entry.operations += operations;
+        entry.since = match (entry.since, since) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    usage
+}
+
 fn index(index: &BsonDocument, sizes: &HashMap<String, u64>) -> DocIndex {
     let name = index.get_str("name").unwrap_or_default().to_string();
     let flag = |key: &str| index.get(key).is_some_and(truthy);
@@ -287,6 +347,7 @@ fn index(index: &BsonDocument, sizes: &HashMap<String, u64>) -> DocIndex {
         ttl: index.get("expireAfterSeconds").and_then(number),
         hidden: flag("hidden"),
         size: sizes.get(&name).copied(),
+        usage: None,
         name,
     }
 }
@@ -397,6 +458,70 @@ mod tests {
         assert!(read.unique && read.sparse && !read.hidden);
         assert!(read.partial.is_some());
         assert_eq!((read.ttl, read.size), (Some(3600), Some(20480)));
+    }
+
+    /// `listIndexes` as MongoDB 8.0 answers it for indexes of every kind
+    /// the tab shows.
+    #[test]
+    fn reads_indexes_of_every_kind_from_list_indexes() {
+        let listed = [
+            doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+            doc! { "v": 2, "key": { "status": 1, "date": -1 }, "name": "status_1_date_-1" },
+            doc! { "v": 2, "key": { "at": 1 }, "name": "at_1", "expireAfterSeconds": 86400_i64 },
+            doc! { "v": 2, "key": { "code": 1 }, "name": "code_1", "unique": true, "sparse": true },
+            doc! { "v": 2, "key": { "total": -1 }, "name": "total_-1", "hidden": true,
+            "partialFilterExpression": { "status": { "$eq": "paid" } } },
+            doc! { "v": 2, "key": { "_fts": "text", "_ftsx": 1 }, "name": "name_text",
+            "weights": { "name": 1 }, "default_language": "english", "textIndexVersion": 3 },
+        ];
+        let read: Vec<DocIndex> = listed
+            .iter()
+            .map(|index| self::index(index, &HashMap::new()))
+            .collect();
+        let names: Vec<&str> = read.iter().map(|index| index.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "_id_",
+                "status_1_date_-1",
+                "at_1",
+                "code_1",
+                "total_-1",
+                "name_text"
+            ]
+        );
+        let keys: Vec<&str> = read[1].keys.0.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["status", "date"], "in the order of the index");
+        assert_eq!(read[1].keys.get("date"), Some(&Value::Int32(-1)));
+        assert_eq!(read[2].ttl, Some(86_400));
+        assert!(read[3].unique && read[3].sparse);
+        assert!(read[4].hidden && read[4].partial.is_some() && !read[4].unique);
+        assert_eq!(
+            read[5].keys.get("_fts"),
+            Some(&Value::String("text".into()))
+        );
+        assert!(read.iter().all(|index| index.usage.is_none()));
+    }
+
+    #[test]
+    fn adds_up_index_usage_over_shards() {
+        use bson::DateTime;
+        let earlier = DateTime::from_millis(1_761_000_000_000);
+        let later = DateTime::from_millis(1_761_500_000_000);
+        let stats = [
+            doc! { "name": "status_1", "accesses": { "ops": 12_i64, "since": later }, "shard": "a" },
+            doc! { "name": "status_1", "accesses": { "ops": 30_i64, "since": earlier }, "shard": "b" },
+            doc! { "name": "_id_", "accesses": { "ops": 0_i64, "since": later } },
+        ];
+        let usage = usage(&stats);
+        assert_eq!(
+            usage["status_1"],
+            IndexUsage {
+                operations: 42,
+                since: Some(earlier.timestamp_millis()),
+            }
+        );
+        assert_eq!(usage["_id_"].operations, 0);
     }
 
     #[test]

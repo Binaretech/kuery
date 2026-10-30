@@ -1,5 +1,6 @@
 //! Query plans, made readable: PostgreSQL's `EXPLAIN (FORMAT JSON)` output
-//! as a tree of steps with plain titles ("Read all of orders" rather than
+//! (and SQL Server's showplan, and MongoDB's explain answer) as a tree of
+//! steps with plain titles ("Read all of orders" rather than
 //! "Seq Scan"), the time or cost each step takes by itself, and insights
 //! about what looks wrong (a full scan that throws most rows away, a badly
 //! wrong row estimate, a sort that spilled to disk…).
@@ -11,6 +12,7 @@ use serde_json::Value;
 
 use crate::script;
 
+mod mongo;
 mod showplan;
 
 /// PostgreSQL's block size, for turning buffer counts into bytes.
@@ -202,6 +204,13 @@ pub enum InsightKind {
     MissingIndex,
     /// A warning the database put in the plan.
     Warning,
+    /// A scan of a whole big collection (MongoDB).
+    FullScan,
+    /// A sort that holds every document in memory before the first is
+    /// returned (MongoDB).
+    SortInMemory,
+    /// The planner weighed other plans and rejected them (MongoDB).
+    RejectedPlans,
 }
 
 /// Something worth knowing about a plan.
@@ -222,6 +231,9 @@ pub struct Plan {
     pub execution_ms: Option<f64>,
     /// Whether times and rows were measured (EXPLAIN ANALYZE).
     pub analyzed: bool,
+    /// Whether the planner estimated rows and costs for each step, as SQL
+    /// databases do; MongoDB only says which steps it chose.
+    pub estimates: bool,
     pub insights: Vec<Insight>,
 }
 
@@ -265,14 +277,18 @@ impl Plan {
     }
 }
 
-/// Reads PostgreSQL's `EXPLAIN (FORMAT JSON)` output: `[{"Plan": …}]`, or
-/// SQL Server's showplan XML (what starts with `<`).
+/// Reads PostgreSQL's `EXPLAIN (FORMAT JSON)` output: `[{"Plan": …}]`,
+/// SQL Server's showplan XML (what starts with `<`), or MongoDB's explain
+/// answer (an object with `queryPlanner`, or an aggregation's `stages`).
 pub fn parse(json: &str) -> Result<Plan, String> {
     if json.trim_start().starts_with('<') {
         return showplan::parse(json);
     }
     let value: Value =
         serde_json::from_str(json.trim()).map_err(|error| format!("Not a JSON plan: {error}"))?;
+    if mongo::is_plan(&value) {
+        return mongo::parse(&value);
+    }
     let top = match &value {
         Value::Array(items) => items.first(),
         Value::Object(_) => Some(&value),
@@ -288,6 +304,7 @@ pub fn parse(json: &str) -> Result<Plan, String> {
         planning_ms: number(top, "Planning Time"),
         execution_ms: number(top, "Execution Time"),
         analyzed,
+        estimates: true,
         insights: Vec::new(),
     };
     plan.insights = insights(&plan);
