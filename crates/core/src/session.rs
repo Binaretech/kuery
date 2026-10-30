@@ -556,7 +556,7 @@ impl Worker<dyn Adapter> {
         typed: bool,
     ) -> Result<Summary, QueryError> {
         let started = Instant::now();
-        self.begin_run();
+        self.begin_run()?;
         let outcome = self.read_with(options, |worker| {
             worker.run_script(sql, options, tx, typed, started)
         });
@@ -571,10 +571,15 @@ impl Worker<dyn Adapter> {
     ) -> Result<Summary, QueryError> {
         self.writable()?;
         self.refuse_implicit_commits(sql, "inside a transaction; run it in Full write")?;
+        // The savepoint is set up outside the run, where a cancel cannot
+        // break it and the transaction with it: a run already cancelled
+        // sets up nothing.
+        self.may_run()?;
         let started = Instant::now();
         self.adapter.limit(options)?;
         let dialect = self.dialect();
-        if !self.state.in_transaction.load(Ordering::SeqCst) {
+        let opened = !self.state.in_transaction.load(Ordering::SeqCst);
+        if opened {
             self.exec(dialect.transactions.begin)?;
             self.state.in_transaction.store(true, Ordering::SeqCst);
         }
@@ -582,7 +587,17 @@ impl Worker<dyn Adapter> {
             self.lose_transaction();
             return Err(error);
         }
-        self.begin_run();
+        if let Err(cancelled) = self.begin_run() {
+            // Cancelled while it was set up: nothing ran, and the
+            // transaction is left as it was.
+            let undone = self
+                .exec(&dialect.rollback_to(RUN))
+                .and_then(|()| self.release(RUN));
+            if opened || undone.is_err() {
+                self.lose_transaction();
+            }
+            return Err(cancelled);
+        }
         let outcome = self.run_script(sql, options, tx, false, started);
         // Cancelled: undone, like any failure.
         let outcome = self.end_run(outcome);
@@ -619,18 +634,19 @@ impl Worker<dyn Adapter> {
             return Err(QueryError::TransactionOpen);
         }
         let started = Instant::now();
-        self.adapter.limit(options)?;
         let single = statements(self.dialect(), sql).len() <= 1;
+        self.begin_run()?;
+        let limited = self.adapter.limit(options);
         if single {
-            self.begin_run();
-            let outcome = self.run_script(sql, options, tx, false, started);
+            let outcome = limited.and_then(|()| self.run_script(sql, options, tx, false, started));
             // Kept or not, it ran: a late cancel does not undo it.
             self.state.running.store(false, Ordering::SeqCst);
             self.state.cancelled.store(false, Ordering::SeqCst);
             return outcome;
         }
-        self.exec(self.dialect().transactions.begin)?;
-        self.begin_run();
+        if let Err(error) = limited.and_then(|()| self.exec(self.dialect().transactions.begin)) {
+            return self.end_run(Err(error));
+        }
         let outcome = self.run_script(sql, options, tx, false, started);
         let outcome = self.end_run(outcome);
         let close = if outcome.is_ok() {
@@ -716,7 +732,7 @@ impl Worker<dyn Adapter> {
         if analyze {
             read_only::check_in(dialect, statement).map_err(QueryError::Rejected)?;
         }
-        self.begin_run();
+        self.begin_run()?;
         let outcome = self.read_with(options, |worker| worker.first_value(&sql));
         self.end_run(outcome)
     }
@@ -733,7 +749,7 @@ impl Worker<dyn Adapter> {
         })?;
         let sql = explain(statement, true).map_err(QueryError::Explain)?;
         self.refuse_implicit_commits(statement, "while measuring its plan")?;
-        self.begin_run();
+        self.begin_run()?;
         let outcome = self.undone(options, |worker| worker.first_value(&sql));
         self.end_run(outcome)
     }
