@@ -14,6 +14,7 @@ mod assets;
 mod audit;
 mod chrome;
 mod cli;
+mod collection_sections;
 mod collection_tab;
 mod commands;
 mod completion;

@@ -5,12 +5,18 @@
 //! a query tab follows [`WritePolicy`]; in production it needs writes allowed
 //! for the connection session first, which is never saved anywhere.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use gpui_kit::SharedString;
+use kuery_core::document::schema::Sampled;
 use kuery_core::document::session::DocumentSession;
-use kuery_core::session::{Access, Session};
+use kuery_core::document::value::CollectionRef;
+use kuery_core::session::{Access, QueryError, Session};
 
 use crate::theme;
 use crate::tunnel::Tunnel;
@@ -306,6 +312,12 @@ impl RedisDb {
     }
 }
 
+/// Documents sampled for a collection's schema.
+pub const SCHEMA_SAMPLE: usize = 1_000;
+
+/// A schema sample on its way, which every tab that asks for it waits for.
+type Sampling = Shared<BoxFuture<'static, Result<Arc<Sampled>, QueryError>>>;
+
 /// An open document connection. The sidebar uses `catalog`; each tab
 /// opened on it opens a session of its own from it
 /// ([`DocumentSession::reopen`]), sharing the driver's client, so the
@@ -323,6 +335,13 @@ pub struct DocDb {
     /// Production only: whether writes were allowed for this connection
     /// session. Shared by every tab on it, gone when it disconnects.
     writes_allowed: Arc<AtomicBool>,
+    /// The schemas sampled on this connection, by collection: one for every
+    /// tab on it (the collection tab's Schema, completion, the insert
+    /// template), gone when it disconnects.
+    schemas: Arc<Mutex<HashMap<CollectionRef, Arc<Sampled>>>>,
+    /// The samples on their way, by collection: whoever asks for one
+    /// meanwhile waits for it instead of sampling again.
+    sampling: Arc<Mutex<HashMap<CollectionRef, Sampling>>>,
     /// The SSH tunnel the connection goes through, open while any clone is.
     _tunnel: Option<Arc<Tunnel>>,
 }
@@ -343,8 +362,74 @@ impl DocDb {
             target,
             home,
             writes_allowed: Arc::new(AtomicBool::new(false)),
+            schemas: Arc::default(),
+            sampling: Arc::default(),
             _tunnel: tunnel,
         }
+    }
+
+    /// The collection's schema, if it was sampled on this connection.
+    pub fn cached_schema(&self, collection: &CollectionRef) -> Option<Arc<Sampled>> {
+        self.schemas.lock().ok()?.get(collection).cloned()
+    }
+
+    /// The collection's schema: the one sampled on this connection, or
+    /// (when there is none, or `again`) [`SCHEMA_SAMPLE`] documents sampled
+    /// and inferred on the catalog session, off the UI thread, and kept.
+    /// A sample already on its way is waited for, not run again. One that
+    /// found nothing (the collection is empty, or does not exist yet) is
+    /// not kept.
+    pub fn schema(
+        &self,
+        collection: CollectionRef,
+        again: bool,
+    ) -> impl Future<Output = Result<Arc<Sampled>, QueryError>> + 'static {
+        let cached = match again {
+            true => None,
+            false => self.cached_schema(&collection),
+        };
+        let sampling = cached.is_none().then(|| self.sampling(collection));
+        async move {
+            match (cached, sampling) {
+                (Some(cached), _) => Ok(cached),
+                (None, Some(sampling)) => sampling.await,
+                (None, None) => unreachable!("sampled when not cached"),
+            }
+        }
+    }
+
+    /// The sample of `collection` on its way, started if there is none.
+    fn sampling(&self, collection: CollectionRef) -> Sampling {
+        let Ok(mut on_way) = self.sampling.lock() else {
+            return self.sample(collection);
+        };
+        if let Some(sampling) = on_way.get(&collection) {
+            return sampling.clone();
+        }
+        let sampling = self.sample(collection.clone());
+        on_way.insert(collection, sampling.clone());
+        sampling
+    }
+
+    /// Samples `collection` and keeps what it found, once it is done.
+    fn sample(&self, collection: CollectionRef) -> Sampling {
+        let reading = self.catalog.schema(collection.clone(), SCHEMA_SAMPLE);
+        let (schemas, on_way) = (self.schemas.clone(), self.sampling.clone());
+        async move {
+            let sampled = reading.await.map(Arc::new);
+            if let Ok(mut on_way) = on_way.lock() {
+                on_way.remove(&collection);
+            }
+            if let Ok(sampled) = &sampled
+                && sampled.schema.documents > 0
+                && let Ok(mut schemas) = schemas.lock()
+            {
+                schemas.insert(collection, sampled.clone());
+            }
+            sampled
+        }
+        .boxed()
+        .shared()
     }
 
     /// Whether writes can run without allowing them first.

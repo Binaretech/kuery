@@ -1,0 +1,86 @@
+{
+  "explainVersion": "1",
+  "queryPlanner": {
+    "namespace": "kr_fix.big",
+    "parsedQuery": {
+      "$where": {
+        "$code": "sleep(1); return true"
+      }
+    },
+    "indexFilterSet": false,
+    "optimizationTimeMillis": 10,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "stage": "COLLSCAN",
+      "filter": {
+        "$where": {
+          "$code": "sleep(1); return true"
+        }
+      },
+      "direction": "forward"
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": false,
+    "errorMessage": "operation exceeded time limit",
+    "errorCode": 50,
+    "nReturned": 15,
+    "executionTimeMillis": 42,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 16,
+    "failed": true,
+    "executionStages": {
+      "isCached": false,
+      "stage": "COLLSCAN",
+      "filter": {
+        "$where": {
+          "$code": "sleep(1); return true"
+        }
+      },
+      "nReturned": 15,
+      "executionTimeMillisEstimate": 31,
+      "works": 16,
+      "advanced": 15,
+      "needTime": 0,
+      "needYield": 0,
+      "saveState": 2,
+      "restoreState": 2,
+      "failed": true,
+      "isEOF": 0,
+      "direction": "forward",
+      "docsExamined": 16
+    }
+  },
+  "queryShapeHash": "20FA8B7380FC807CE7C8535A8873E268D579523448D6D5E25653B7FCC48CD9A4",
+  "command": {
+    "find": "big",
+    "filter": {
+      "$where": "sleep(1); return true"
+    },
+    "$db": "kr_fix"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 104857600,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 104857600,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

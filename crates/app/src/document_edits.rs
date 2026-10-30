@@ -11,6 +11,7 @@ use kuery_core::document::change::DocChange;
 use kuery_core::document::diff::diff;
 use kuery_core::document::flatten;
 use kuery_core::document::language::{Language, Style};
+use kuery_core::document::schema::Schema;
 use kuery_core::document::value::{DocKey, Document, FieldPath, PathPart, Value};
 
 /// One staged change, with what it was made from.
@@ -300,56 +301,38 @@ fn parse(text: &str, language: &Language) -> Result<Document, String> {
     (language.parse_document)(text).map_err(|error| error.located(text))
 }
 
-/// A new document's starting point: the fields of the loaded documents,
-/// in the grid's order, each holding an empty value of the type most of
-/// them hold (`""`, `0`, `NumberLong("0")`, `[]`…); null where that type
-/// has no empty value. The key is left for the database to choose.
-pub fn template(documents: &[Document]) -> Document {
-    let fields = flatten::columns(documents)
-        .into_iter()
-        .filter(|name| name != "_id")
-        .map(|name| {
-            let empty = most_common(documents, &name).map_or(Value::Null, empty);
-            (name, empty)
+/// A new document's starting point: the top-level fields of the
+/// collection's schema (sampled, or read from the documents loaded), in
+/// the order they first appear, each holding an empty value of the type
+/// most documents hold there (`""`, `0`, `NumberLong("0")`, `[]`…); null
+/// where that type has no empty value. The key (`key_name`) is left for
+/// the database to choose.
+pub fn template(schema: &Schema, key_name: &str) -> Document {
+    let fields = schema
+        .top_level()
+        .filter_map(|field| Some((field.key()?, field)))
+        .filter(|(key, _)| *key != key_name)
+        .map(|(key, field)| {
+            let commonest = field.types.iter().find(|(name, _)| *name != "Null");
+            let empty = commonest.map_or(Value::Null, |(name, _)| empty(name));
+            (key.to_string(), empty)
         })
         .collect();
     Document(fields)
 }
 
-/// The value most documents hold in `field`, nulls aside.
-fn most_common<'a>(documents: &'a [Document], field: &str) -> Option<&'a Value> {
-    let mut counts: Vec<(&'static str, usize, &Value)> = Vec::new();
-    for value in documents.iter().filter_map(|document| document.get(field)) {
-        if *value == Value::Null {
-            continue;
-        }
-        match counts
-            .iter_mut()
-            .find(|(kind, _, _)| *kind == value.type_name())
-        {
-            Some((_, count, _)) => *count += 1,
-            None => counts.push((value.type_name(), 1, value)),
-        }
-    }
-    counts
-        .iter()
-        .rev()
-        .max_by_key(|(_, count, _)| *count)
-        .map(|(_, _, value)| *value)
-}
-
-/// An empty value of the same type.
-fn empty(value: &Value) -> Value {
-    match value {
-        Value::Bool(_) => Value::Bool(false),
-        Value::Int32(_) => Value::Int32(0),
-        Value::Int64(_) => Value::Int64(0),
-        Value::Double(_) => Value::Double(0.0),
-        Value::Decimal(_) => Value::Decimal("0".into()),
-        Value::String(_) => Value::String(String::new()),
-        Value::Array(_) => Value::Array(Vec::new()),
-        Value::Object(_) => Value::Object(Document::default()),
-        Value::Null | Value::Binary { .. } | Value::DateTime(_) | Value::Ext(_) => Value::Null,
+/// An empty value of a type, by the name [`Value::type_name`] gives it.
+fn empty(type_name: &str) -> Value {
+    match type_name {
+        "Boolean" => Value::Bool(false),
+        "Int32" => Value::Int32(0),
+        "Int64" => Value::Int64(0),
+        "Double" => Value::Double(0.0),
+        "Decimal128" => Value::Decimal("0".into()),
+        "String" => Value::String(String::new()),
+        "Array" => Value::Array(Vec::new()),
+        "Object" => Value::Object(Document::default()),
+        _ => Value::Null,
     }
 }
 
@@ -384,6 +367,7 @@ mod tests {
     use std::time::Duration;
 
     use kuery_core::document::capabilities::{Preview, Sampling, Transactions};
+    use kuery_core::document::schema::infer;
     use kuery_core::document::value::FieldPath;
 
     use super::*;
@@ -673,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_document_starts_from_the_fields_loaded() {
+    fn a_new_document_starts_from_the_schema() {
         let documents = vec![
             order(),
             doc(&[
@@ -685,16 +669,28 @@ mod tests {
             ]),
         ];
         assert_eq!(
-            template(&documents),
+            template(&infer(&documents), "_id"),
             doc(&[
                 ("qty", Value::Int64(0)),
-                ("note", Value::String(String::new())),
                 ("total", Value::Decimal("0".into())),
+                ("note", Value::String(String::new())),
                 ("tags", Value::Array(Vec::new())),
                 ("when", Value::Null),
             ])
         );
-        assert_eq!(template(&[]), Document::default());
+        assert_eq!(template(&infer(&[]), "_id"), Document::default());
+        // A name with a dot of its own stays a field of its own.
+        let dotted = doc(&[
+            ("a.b", Value::Int32(1)),
+            ("a", Value::Object(doc(&[("b", Value::String("s".into()))]))),
+        ]);
+        assert_eq!(
+            template(&infer(&[dotted]), "_id"),
+            doc(&[
+                ("a.b", Value::Int32(0)),
+                ("a", Value::Object(Document::default())),
+            ])
+        );
         assert_eq!(duplicate(&order()).get("_id"), None);
         assert_eq!(duplicate(&order()).0.len(), 3);
     }

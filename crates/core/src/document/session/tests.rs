@@ -23,7 +23,7 @@ use futures::executor::block_on;
 
 use super::*;
 use crate::adapter::Canceller;
-use crate::document::capabilities::{Enforcement, Preview, Sampling};
+use crate::document::capabilities::{Enforcement, ExplainKind, Preview, Sampling};
 use crate::document::catalog::ContainerKind;
 use crate::document::language::{CompletionContext, FilterCheck, OpInfo, ParseError, Statement};
 use crate::document::value::DocKey;
@@ -72,7 +72,7 @@ fn analyze(text: &str) -> Result<Vec<Statement>, ParseError> {
                 summary: trimmed.to_string(),
                 dangers: Vec::new(),
                 heavy: trimmed == "heavy",
-                explainable: false,
+                explainable: !trimmed.starts_with("show"),
                 enters: None,
             },
         });
@@ -125,7 +125,7 @@ fn capabilities(transactions: Transactions, preview: Preview) -> Capabilities {
         transactions,
         read_only: Enforcement::ClientOnly("it is a fake"),
         preview,
-        explain: None,
+        explain: Some(ExplainKind::Measured),
         activity: false,
         kill: false,
         sampling: Sampling::FirstN,
@@ -272,6 +272,10 @@ impl DocumentAdapter for FakeDocs {
 
     /// `write N` touches N documents, `write fail` cannot be counted, and
     /// nothing else can be told.
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.plan(statement, execute)
+    }
+
     fn estimate(
         &mut self,
         statement: &str,
@@ -344,10 +348,11 @@ impl DocumentAdapter for FakeDocs {
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Sampling, QueryError> {
         self.log
             .push(format!("sample {n} of {}", collection.display()));
-        sink.documents(numbered(0..n))
+        sink.documents(numbered(0..n))?;
+        Ok(Sampling::FirstN)
     }
 
     fn browse(
@@ -403,6 +408,13 @@ impl DocumentAdapter for FakeDocs {
                 ..Outcome::default()
             },
         })
+    }
+}
+
+impl FakeDocs {
+    fn plan(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.log.push(format!("explain {statement} {execute}"));
+        Ok(format!("{{\"plan\": \"{statement}\"}}"))
     }
 }
 
@@ -738,6 +750,11 @@ fn reads_the_catalog() {
     assert_eq!(sample.len(), 5);
     let count = block_on(session.count(orders(), None, 1000, Heavy::Refuse));
     assert_eq!(count, Ok(Count::Exact(42)));
+    // Inferred where it was sampled, and labelled as the adapter picked.
+    let sampled = block_on(session.schema(orders(), 3)).unwrap();
+    assert_eq!(sampled.schema.documents, 3);
+    assert_eq!(sampled.label(), "First 3 documents");
+    assert_eq!(sampled.schema.fields[0].path, "n");
     assert_eq!(
         log.take(),
         [
@@ -745,7 +762,8 @@ fn reads_the_catalog() {
             "children of [\"shop\"]",
             "collection shop.orders",
             "sample 5 of shop.orders",
-            "count shop.orders None"
+            "count shop.orders None",
+            "sample 3 of shop.orders",
         ]
     );
     assert_eq!(session.capabilities().levels, ["Database", "Collection"]);
@@ -1370,4 +1388,82 @@ fn a_run_cancelled_before_it_starts_never_reaches_the_adapter() {
     assert!(cancelled.outcomes.is_empty());
     assert!(log.take().is_empty());
     run(&session, "write 1", RunMode::Write).end.unwrap();
+}
+
+#[test]
+fn explains_reads_measured_and_writes_only_planned() {
+    let options = RunOptions::default;
+    let explain = |session: &DocumentSession, text: &str, execute: bool, heavy: Heavy| {
+        block_on(session.explain_in(&["shop".into()], text.into(), execute, heavy, options()))
+    };
+    let (reader, log) = open(Access::ReadOnly);
+    // A read is measured by running it, where it starts.
+    assert_eq!(
+        explain(&reader, "read 1", true, Heavy::Refuse).unwrap(),
+        "{\"plan\": \"read 1\"}"
+    );
+    assert_eq!(log.take(), ["enter shop", "explain read 1 true"]);
+    // A write is never planned on a read-only session, and never run.
+    assert_eq!(
+        explain(&reader, "write 1", false, Heavy::Refuse),
+        Err(QueryError::WritesDisabled)
+    );
+    assert!(matches!(
+        explain(&reader, "write 1", true, Heavy::Refuse),
+        Err(QueryError::Explain(message)) if message.contains("write 1 writes")
+    ));
+    // Heavy work runs only where allowed, and only matters when measured.
+    assert_eq!(
+        explain(&reader, "heavy", true, Heavy::Refuse),
+        Err(QueryError::Rejected(Rejection::Heavy("heavy".into())))
+    );
+    explain(&reader, "heavy", false, Heavy::Refuse).unwrap();
+    explain(&reader, "heavy", true, Heavy::Allow).unwrap();
+    // One explainable statement at a time.
+    assert!(matches!(
+        explain(&reader, "read 1; read 2", false, Heavy::Refuse),
+        Err(QueryError::Explain(_))
+    ));
+    assert!(matches!(
+        explain(&reader, "show things", false, Heavy::Refuse),
+        Err(QueryError::Explain(message)) if message == "show things has no plan to show"
+    ));
+    assert_eq!(
+        log.take(),
+        [
+            "enter shop",
+            "explain heavy false",
+            "enter shop",
+            "explain heavy true"
+        ]
+    );
+
+    // An engine that only plans is never asked to measure.
+    let mut planner = capabilities(Transactions::None, Preview::None);
+    planner.explain = Some(ExplainKind::Estimated);
+    assert_eq!(
+        check_explain(
+            &FAKE,
+            &planner,
+            Access::ReadOnly,
+            "read 1",
+            false,
+            Heavy::Refuse
+        ),
+        Ok(false)
+    );
+    assert!(matches!(
+        check_explain(&FAKE, &planner, Access::ReadOnly, "read 1", true, Heavy::Refuse),
+        Err(QueryError::Unsupported(message)) if message.contains("explain without measuring")
+    ));
+
+    // A session that may write plans a write, without running it.
+    let (writer, log) = open(Access::ReadWrite);
+    explain(&writer, "write 1", false, Heavy::Refuse).unwrap();
+    assert_eq!(log.take(), ["enter shop", "explain write 1 false"]);
+    assert!(explain(&writer, "write 1", true, Heavy::Refuse).is_err());
+    assert!(
+        log.take().is_empty(),
+        "a measured write never reached the driver"
+    );
 }

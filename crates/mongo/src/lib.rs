@@ -23,6 +23,7 @@ mod detect;
 mod edit;
 mod estimate;
 mod execute;
+mod explain;
 pub mod literal;
 mod run;
 pub mod shell;
@@ -41,7 +42,7 @@ use bson::{Bson, Document as BsonDocument, doc};
 
 use kuery_core::adapter::Canceller;
 use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
-use kuery_core::document::capabilities::Capabilities;
+use kuery_core::document::capabilities::{Capabilities, Sampling};
 use kuery_core::document::catalog::{CollectionInfo, Container};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use kuery_core::document::language::Language;
@@ -1028,6 +1029,10 @@ impl DocumentAdapter for Mongo {
         self.estimate_statement(statement, sample)
     }
 
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.explain_statement(statement, execute)
+    }
+
     fn children(&mut self, parent: &[String]) -> Result<Vec<Container>, QueryError> {
         match parent {
             [] => self.databases(),
@@ -1047,16 +1052,16 @@ impl DocumentAdapter for Mongo {
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Sampling, QueryError> {
         let (database, name) = catalog::split(collection)?;
         let size = i64::try_from(n).unwrap_or(i64::MAX);
-        let stage = match self.is_view(collection)? {
-            true => doc! { "$limit": size },
-            false => doc! { "$sample": { "size": size } },
+        let (stage, sampling) = match self.is_view(collection)? {
+            true => (doc! { "$limit": size }, Sampling::FirstN),
+            false => (doc! { "$sample": { "size": size } }, Sampling::Random),
         };
         let command = doc! { "aggregate": name, "pipeline": [stage], "cursor": {} };
         self.cursor_into(database, command, sink)?;
-        Ok(())
+        Ok(sampling)
     }
 
     fn browse(

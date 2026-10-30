@@ -24,8 +24,15 @@
 //! waits while a script is read, previewed or run, and Cancel stops each.
 //! Every write, every one refused or failed, and every preview goes to the
 //! audit log. Scripts are read off the UI thread. It has its own key
-//! context (`DocumentConsole`), so the query tab's Save, Format, Explain
-//! and Commit are not bound here to do nothing.
+//! context (`DocumentConsole`), so the query tab's Save, Format and Commit
+//! are not bound here to do nothing.
+//!
+//! Explain (`secondary-e`) and Explain with Statistics (`secondary-alt-e`)
+//! show the plan of the statement under the cursor in the Plan tab, the
+//! query tab's plan view. Only a read is measured, by running it; a write
+//! is only planned, never run, and only in Write, through the session that
+//! may write. Measuring work the language marks heavy follows the same
+//! rule as running it.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -48,10 +55,11 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, px,
 };
 use kuery_core::document::adapter::Outcome;
+use kuery_core::document::capabilities::ExplainKind;
 use kuery_core::document::export::{Ejson, document_ejson};
 use kuery_core::document::language::{Language, ParseError, Statement, Style};
 use kuery_core::document::session::{DocEvent, DocumentSession, Heavy, Left, RunMode};
-use kuery_core::document::value::{Document, Value};
+use kuery_core::document::value::{CollectionRef, Document, Value};
 use kuery_core::read_only::Rejection;
 use kuery_core::session::{Access, QueryError, RunOptions};
 
@@ -59,14 +67,17 @@ use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
 use crate::chrome;
 use crate::collection_tab::{open_export, plural_documents, write_batch};
-use crate::completion::{DocumentCompletions, SharedNames};
+use crate::completion::{DocumentCompletions, SharedNames, WantFields};
 use crate::connection::{DocDb, Environment};
 use crate::context_menus::{Cell, copy, item};
 use crate::document_detail::{DetailEvent, DocumentDetail};
 use crate::document_grid::{DocumentRows, Flattened};
 use crate::document_write::{self, Reviewing, Script};
 use crate::grid::BrowseDelegate;
-use crate::query_tab::{CancelQuery, RunAll, RunQuery, describe_error};
+use crate::plan_view::{PlanEvent, PlanLabels, PlanPanel};
+use crate::query_tab::{
+    CancelQuery, ExplainAnalyze, ExplainQuery, RunAll, RunQuery, describe_error,
+};
 use crate::theme::{self, color};
 use crate::ui::{format_duration, thousands};
 
@@ -105,6 +116,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 enum Panel {
     Results,
     Output,
+    Plan,
 }
 
 /// One statement in the Output log.
@@ -185,6 +197,10 @@ pub struct DocumentConsole {
     selected: Option<usize>,
     detail: Entity<DocumentDetail>,
     output: Vec<OutputEntry>,
+    plan: Entity<PlanPanel>,
+    /// The explain on its way, and the session it runs on, for Cancel.
+    plan_task: Option<Task<()>>,
+    plan_session: Option<DocumentSession>,
     panel: Panel,
     status: Status,
     shown: Option<Shown>,
@@ -211,6 +227,12 @@ impl DocumentConsole {
     ) -> Self {
         let language = db.catalog.language();
         let names = SharedNames::default();
+        let wanting = cx.entity().downgrade();
+        let want_fields: WantFields = Rc::new(move |collection, cx| {
+            wanting
+                .update(cx, |console, cx| console.want_fields(collection, cx))
+                .ok();
+        });
         let editor = cx.new(|cx| {
             let mut editor = EditorState::new(window, cx)
                 .language(language.editor)
@@ -219,8 +241,9 @@ impl DocumentConsole {
                     "Statements in {}, one per line or ended with ;. ⌘↵ runs the one under the cursor, ⌥⌘↵ all of them.",
                     language.name
                 ));
-            editor.lsp_mut().completion_provider =
-                Some(Rc::new(DocumentCompletions::new(language, names.clone())));
+            editor.lsp_mut().completion_provider = Some(Rc::new(
+                DocumentCompletions::new(language, names.clone()).wanting_fields(want_fields),
+            ));
             editor
         });
         cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
@@ -256,6 +279,21 @@ impl DocumentConsole {
                 this.select_row(*row, window, cx);
             }
         })
+        .detach();
+        let measures = db.catalog.capabilities().explain == Some(ExplainKind::Measured);
+        let plan = cx.new(|_| {
+            PlanPanel::with_labels(PlanLabels::DOCUMENTS)
+                .measuring(measures)
+                .cancellable()
+        });
+        cx.subscribe_in(
+            &plan,
+            window,
+            |this, _, event: &PlanEvent, window, cx| match event {
+                PlanEvent::Explain { analyze } => this.explain(*analyze, window, cx),
+                PlanEvent::Cancel => this.cancel_now(cx),
+            },
+        )
         .detach();
         let detail = cx.new(|cx| DocumentDetail::new(language, window, cx));
         cx.subscribe_in(&detail, window, |this, _, event: &DetailEvent, _, cx| {
@@ -317,6 +355,9 @@ impl DocumentConsole {
             selected: None,
             detail,
             output: Vec::new(),
+            plan,
+            plan_task: None,
+            plan_session: None,
             panel: Panel::Results,
             status: Status::Idle,
             shown: None,
@@ -420,6 +461,18 @@ impl DocumentConsole {
         self.run_task.is_some() || self.checking.is_some() || self.previewing()
     }
 
+    /// Whether Cancel has something to stop: a script on its way, or an
+    /// explain.
+    fn cancellable(&self) -> bool {
+        self.busy() || self.plan_task.is_some()
+    }
+
+    /// Whether the engine measures plans, so Explain with Statistics is
+    /// offered.
+    fn measures(&self) -> bool {
+        self.db.catalog.capabilities().explain == Some(ExplainKind::Measured)
+    }
+
     /// Switches to Write (allowing writes for the connection session first
     /// on production) or back to Read-only. Write opens a session of its
     /// own that may write; Read-only drops it.
@@ -489,10 +542,32 @@ impl DocumentConsole {
         }
     }
 
+    /// Reads the schema of a collection where runs start, sampled once on
+    /// the connection, for completion to offer its fields.
+    fn want_fields(&mut self, collection: String, cx: &mut Context<Self>) {
+        let mut path = match (&self.session, self.path.is_empty()) {
+            (_, false) => self.path.clone(),
+            (SessionState::Ready(reader), true) => reader.home().to_vec(),
+            _ => return,
+        };
+        path.push(collection.clone());
+        let reading = self.db.schema(CollectionRef { path }, false);
+        let names = self.names.clone();
+        cx.spawn(async move |_, _| {
+            if let Ok(sampled) = reading.await {
+                names
+                    .borrow_mut()
+                    .learn_paths(&collection, sampled.schema.query_paths());
+            }
+        })
+        .detach();
+    }
+
     /// Where runs start, and the collections completion offers there.
     fn set_path(&mut self, path: Vec<String>, cx: &mut Context<Self>) {
         self.path = path.clone();
         self.names.borrow_mut().collections.clear();
+        self.names.borrow_mut().asked.clear();
         if !path.is_empty() {
             let listing = self.db.catalog.children(path.clone());
             cx.spawn(async move |this, cx| {
@@ -612,9 +687,94 @@ impl DocumentConsole {
         self.cancel_now(cx);
     }
 
+    fn explain_query(&mut self, _: &ExplainQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.explain(false, window, cx);
+    }
+
+    fn explain_analyze(&mut self, _: &ExplainAnalyze, window: &mut Window, cx: &mut Context<Self>) {
+        if self.measures() {
+            self.explain(true, window, cx);
+        }
+    }
+
+    /// Shows the plan of the selection, or of the statement under the
+    /// cursor (found off the UI thread), in the Plan tab: planned, or with
+    /// `measure` measured by running it, which only a read may do. In
+    /// Write it goes through the session that may write, which also plans
+    /// writes; in Read-only, through the one that only reads.
+    fn explain(&mut self, measure: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let SessionState::Ready(reader) = &self.session else {
+            return;
+        };
+        if self.plan_task.is_some() {
+            return;
+        }
+        let session = match &self.writing {
+            Writing::On(writer) => writer.clone(),
+            Writing::Off | Writing::Connecting => reader.clone(),
+        };
+        let writing = self.is_writing();
+        let start = match self.path.is_empty() {
+            true => reader.home().to_vec(),
+            false => self.path.clone(),
+        };
+        let heavy = self.heavy();
+        let editor = self.editor.read(cx);
+        let text = editor.text().to_string();
+        let selected = editor.selected_range();
+        let cursor = editor.cursor();
+        let language = self.language();
+        self.panel = Panel::Plan;
+        self.plan.update(cx, |plan, cx| plan.loading(measure, cx));
+        self.plan_session = Some(session.clone());
+        self.plan_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let statement = cx
+                .background_spawn(async move {
+                    match selected.is_empty() {
+                        true => statement_at(language, &text, cursor)
+                            .map(|range| text[range].to_string()),
+                        false => text
+                            .get(selected.start.min(text.len())..selected.end.min(text.len()))
+                            .map(str::to_string),
+                    }
+                })
+                .await;
+            let planned = match statement.filter(|s| !s.trim().is_empty()) {
+                Some(statement) => {
+                    let options = RunOptions {
+                        statement_timeout: Duration::from_secs(60),
+                        ..RunOptions::default()
+                    };
+                    session
+                        .explain_in(&start, statement, measure, heavy, options)
+                        .await
+                }
+                None => Err(QueryError::Explain(
+                    "There is no statement under the cursor to explain".into(),
+                )),
+            };
+            this.update(cx, |this, cx| {
+                this.plan_task = None;
+                this.plan_session = None;
+                this.plan.update(cx, |plan, cx| match planned {
+                    Ok(json) => plan.show(json, cx),
+                    Err(error) => plan.fail(explain_error(error, writing), cx),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     /// Stops what is on its way: reading the script, its preview, or its
     /// run (on the server, or before it gets there).
     fn cancel_now(&mut self, cx: &mut Context<Self>) {
+        if self.plan_task.is_some()
+            && let Some(session) = &self.plan_session
+        {
+            session.cancel();
+        }
         if self.checking.take().is_some() {
             self.status = Status::Failed(QueryError::Cancelled.to_string());
             cx.notify();
@@ -1262,14 +1422,34 @@ impl DocumentConsole {
                     "doc-console-cancel",
                     IconName::Square,
                     "Cancel  ⌘.",
-                    running,
+                    self.cancellable(),
                 )
-                .when(running, |button| {
+                .when(self.cancellable(), |button| {
                     button.on_click(
                         cx.listener(|this, _, window, cx| this.cancel(&CancelQuery, window, cx)),
                     )
                 }),
             )
+            .child({
+                let can = ready && self.plan_task.is_none();
+                let measures = self.measures();
+                chrome::icon_button(
+                    "doc-console-explain",
+                    AppIcon::Plan,
+                    match measures {
+                        true => "Explain the statement under the cursor  ⌘E (⌥⌘E with statistics)",
+                        false => "Explain the statement under the cursor  ⌘E",
+                    },
+                    can,
+                )
+                .when(can, |button| {
+                    button.on_click(cx.listener(
+                        move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                            this.explain(measures && event.modifiers().alt, window, cx)
+                        },
+                    ))
+                })
+            })
             .child(chrome::toolbar_divider())
             .when(!containers.is_empty() || !current.is_empty(), |row| {
                 row.child(
@@ -1388,6 +1568,10 @@ impl DocumentConsole {
                     )
                 })
                 .into_any_element(),
+            Panel::Plan => div()
+                .size_full()
+                .child(self.plan.clone())
+                .into_any_element(),
             Panel::Output if self.output.is_empty() => div()
                 .size_full()
                 .flex()
@@ -1456,6 +1640,7 @@ impl DocumentConsole {
                     .gap_1()
                     .child(tab("doc-console-results", "Results", Panel::Results, cx))
                     .child(tab("doc-console-output-tab", "Output", Panel::Output, cx))
+                    .child(tab("doc-console-plan-tab", "Plan", Panel::Plan, cx))
                     .child(div().flex_1())
                     .children(export_note.map(|(note, tone)| {
                         div()
@@ -1497,6 +1682,19 @@ impl DocumentConsole {
                     }),
             )
             .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+/// Why a plan could not be shown, in the console's words: a write needs
+/// Write to be planned at all.
+fn explain_error(error: QueryError, writing: bool) -> String {
+    match error {
+        QueryError::WritesDisabled if !writing => {
+            "This statement writes: switch to Write to see its plan. Explaining a write never \
+             runs it."
+                .into()
+        }
+        error => describe_error(error),
     }
 }
 
@@ -1844,6 +2042,8 @@ impl Render for DocumentConsole {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::explain_query))
+            .on_action(cx.listener(Self::explain_analyze))
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -2836,6 +3036,139 @@ mod tests {
         console.read_with(cx, |console, _| {
             assert!(!console.is_writing());
             assert!(!console.db.allows_writes());
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn document_console_explains_reads_and_only_plans_writes(cx: &mut gpui::TestAppContext) {
+        let console = open_console(cx, Environment::Development, &["shop"]);
+        let explain = |cx: &mut gpui::TestAppContext, text: &str, measure: bool| {
+            let text = text.to_string();
+            in_window(cx, &console, move |console, window, cx| {
+                console.set_text(text, window, cx);
+                console.explain(measure, window, cx);
+            });
+            run_until(cx, &console, |console| console.plan_task.is_none());
+        };
+
+        // A read, measured by running it, in the Plan tab.
+        explain(cx, "db.big.find({n: {$lt: 5}}).sort({label: 1})", true);
+        console.read_with(cx, |console, cx| {
+            assert_eq!(console.panel, Panel::Plan);
+            let plan = console.plan.read(cx);
+            let plan = plan
+                .plan()
+                .unwrap_or_else(|| panic!("{:?}", plan.failure()));
+            assert!(plan.analyzed);
+            assert_eq!(plan.root.actual_rows(), Some(1000.0));
+            assert_eq!(plan.root.children[0].title, "Read all of big");
+        });
+
+        // A write, in Read-only: not even planned.
+        explain(cx, "db.orders.deleteMany({})", false);
+        console.read_with(cx, |console, cx| {
+            let failure = console
+                .plan
+                .read(cx)
+                .failure()
+                .unwrap_or_default()
+                .to_string();
+            assert!(failure.contains("switch to Write"), "{failure}");
+        });
+
+        // In Write it is planned, and never run, measured or not.
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(true, window, cx)
+        });
+        run_until(cx, &console, |console| {
+            matches!(console.writing, Writing::On(_))
+        });
+        explain(cx, "db.orders.deleteMany({})", true);
+        console.read_with(cx, |console, cx| {
+            let failure = console
+                .plan
+                .read(cx)
+                .failure()
+                .unwrap_or_default()
+                .to_string();
+            assert!(failure.contains("deleteMany orders writes"), "{failure}");
+        });
+        explain(cx, "db.orders.deleteMany({})", false);
+        console.read_with(cx, |console, cx| {
+            let plan = console.plan.read(cx).plan().expect("the write's plan");
+            assert!(!plan.analyzed);
+            assert_eq!(plan.root.title, "Delete documents of orders");
+        });
+        in_window(cx, &console, |console, window, cx| {
+            console.set_writing(false, window, cx);
+            console.run("db.orders.estimatedDocumentCount()".into(), window, cx)
+        });
+        run_until(cx, &console, ended);
+        console.read_with(cx, |console, _| {
+            let rows = console.rows.borrow();
+            assert_eq!(
+                rows.document(0).and_then(|d| d.get("count")).cloned(),
+                Some(Value::Int32(500)),
+                "nothing was deleted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn document_console_cancels_an_explain_on_its_way(cx: &mut gpui::TestAppContext) {
+        let console = open_console(cx, Environment::Development, &["shop"]);
+        // MongoDB measures plans, so Explain with Statistics is offered.
+        console.read_with(cx, |console, _| assert!(console.measures()));
+        // A read of 500 orders at 100 ms each, measured.
+        in_window(cx, &console, |console, window, cx| {
+            console.set_text(
+                "db.orders.find({$where: 'sleep(100); return true'})".into(),
+                window,
+                cx,
+            );
+            console.explain(true, window, cx);
+        });
+        console.read_with(cx, |console, _| {
+            assert!(!console.busy());
+            assert!(console.cancellable(), "Cancel stops an explain too");
+        });
+        for _ in 0..50 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // As the Plan tab's Cancel does.
+        let plan = console.read_with(cx, |console, _| console.plan.clone());
+        plan.update(cx, |_, cx| cx.emit(PlanEvent::Cancel));
+        run_until(cx, &console, |console| console.plan_task.is_none());
+        console.read_with(cx, |console, cx| {
+            let failure = console.plan.read(cx).failure().unwrap_or_default();
+            assert!(failure.to_lowercase().contains("cancel"), "{failure}");
+            assert!(!console.cancellable());
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "needs the dev MongoDB"]
+    fn document_console_completes_the_fields_of_a_sampled_schema(cx: &mut gpui::TestAppContext) {
+        let console = open_console(cx, Environment::Development, &["shop"]);
+        console.update(cx, |console, cx| console.want_fields("orders".into(), cx));
+        run_until(cx, &console, |console| {
+            console.names.borrow().fields.contains_key("orders")
+        });
+        console.read_with(cx, |console, _| {
+            let names = console.names.borrow();
+            let orders = &names.fields["orders"];
+            // Four levels deep, arrays named as filters name them.
+            assert!(orders.contains("items.sku"), "{orders:?}");
+            assert!(orders.contains("coupon"), "{orders:?}");
+            assert!(!orders.iter().any(|path| path.contains("[]")), "{orders:?}");
+            // Kept for the connection: the collection tab finds it there.
+            let cached = console
+                .db
+                .cached_schema(&CollectionRef::new(&["shop", "orders"]));
+            assert!(cached.is_some());
         });
     }
 }
