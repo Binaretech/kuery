@@ -100,6 +100,15 @@ pub enum ExplorerEvent {
         db: DocDb,
         path: Vec<String>,
     },
+    /// A History entry of a document database, in a console of its own:
+    /// in `language` when it is not the engine's own (`SQL`), starting in
+    /// `path` (the connection's own container when `None`).
+    OpenDocumentHistory {
+        db: DocDb,
+        language: Option<String>,
+        path: Option<Vec<String>>,
+        text: String,
+    },
 }
 
 enum ConnectionState {
@@ -1642,13 +1651,26 @@ impl Explorer {
             .into_any_element()
     }
 
-    /// Opens a History entry's SQL in a new tab on its connection.
-    fn open_history(&mut self, connection: &str, sql: &str, cx: &mut Context<Self>) {
-        let db = self
+    /// Opens a History entry's statement in a new tab on its connection: a
+    /// query tab, or a console for a document database.
+    fn open_history(&mut self, entry: &HistoryEntry, cx: &mut Context<Self>) {
+        let (connection, sql) = (entry.connection.as_str(), entry.sql.as_str());
+        let index = self
             .connections
             .iter()
-            .position(|c| c.spec.name == connection)
-            .and_then(|index| self.db(index));
+            .position(|c| c.spec.name == connection);
+        if let Some(ConnectionState::DocumentReady { db }) =
+            index.map(|index| &self.connections[index].state)
+        {
+            cx.emit(ExplorerEvent::OpenDocumentHistory {
+                db: db.clone(),
+                language: entry.language.clone(),
+                path: entry.path.clone(),
+                text: sql.to_string(),
+            });
+            return;
+        }
+        let db = index.and_then(|index| self.db(index));
         if let Some(db) = db {
             cx.emit(ExplorerEvent::OpenQuery {
                 db,
@@ -1678,8 +1700,9 @@ impl Explorer {
                     .find(|line| !line.is_empty() && !line.starts_with("--"))
                     .unwrap_or("")
                     .to_string();
-                let connection = entry.connection.clone();
                 let sql = entry.sql.clone();
+                let native = entry.native.clone();
+                let opened = entry.clone();
                 v_flex()
                     .id(("history", position))
                     .px_2()
@@ -1694,6 +1717,14 @@ impl Explorer {
                             .truncate()
                             .child(first_line),
                     )
+                    .children(native.clone().map(|native| {
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(11.))
+                            .text_color(color(theme::TEXT_QUIET))
+                            .truncate()
+                            .child(format!("→ {native}"))
+                    }))
                     .child(
                         h_flex()
                             .gap_2()
@@ -1716,20 +1747,23 @@ impl Explorer {
                             ),
                     )
                     .on_click({
-                        let (connection, sql) = (connection.clone(), sql.clone());
-                        cx.listener(move |this, _, _, cx| this.open_history(&connection, &sql, cx))
+                        let opened = opened.clone();
+                        cx.listener(move |this, _, _, cx| this.open_history(&opened, cx))
                     })
                     .context_menu({
                         let this = cx.entity().downgrade();
                         move |menu, _, _| {
-                            let (connection, open) = (connection.clone(), sql.clone());
+                            let opened = opened.clone();
                             menu.item(item_icon(
                                 "Open in New Tab",
                                 AppIcon::Code,
                                 &this,
-                                move |this, _, cx| this.open_history(&connection, &open, cx),
+                                move |this, _, cx| this.open_history(&opened, cx),
                             ))
                             .item(copy("Copy SQL", sql.clone()))
+                            .when_some(native.clone(), |menu, native| {
+                                menu.item(copy("Copy What It Ran As", native))
+                            })
                             .separator()
                             .item(item(
                                 "Remove from History",

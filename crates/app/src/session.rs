@@ -209,6 +209,14 @@ pub enum TabState {
         /// connection's own.
         path: Vec<String>,
         text: String,
+        /// The language its statements are in, by name (`SQL`); empty for
+        /// the engine's own.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        language: String,
+        /// How its results show, once chosen; the language's own default
+        /// (see [`ConsoleView::default_for`]) when not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ConsoleView>,
     },
     File {
         path: PathBuf,
@@ -228,6 +236,28 @@ impl TabState {
             | TabState::Collection { connection, .. }
             | TabState::DocumentConsole { connection, .. } => Some(connection),
             TabState::File { .. } => None,
+        }
+    }
+}
+
+/// How a document console shows the documents a statement returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleView {
+    /// Rows: the columns a SQL statement names, in its order and by its
+    /// names; the documents' fields for the engine's own language.
+    Table,
+    /// The documents as the engine returned them, each shown whole beside
+    /// the grid when picked.
+    Documents,
+}
+
+impl ConsoleView {
+    /// SQL shows rows, the engine's own language documents.
+    pub fn default_for(frontend: bool) -> ConsoleView {
+        match frontend {
+            true => ConsoleView::Table,
+            false => ConsoleView::Documents,
         }
     }
 }
@@ -550,6 +580,8 @@ mod tests {
             connection: "docs".into(),
             path: vec!["shop".into()],
             text: "db.orders.find()\n".into(),
+            language: String::new(),
+            view: None,
         };
         let text = serde_json::to_string(&tab).unwrap();
         assert_eq!(
@@ -558,6 +590,38 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<TabState>(&text).unwrap(), tab);
         assert_eq!(tab.connection(), Some("docs"));
+    }
+
+    #[test]
+    fn a_document_console_keeps_its_language_and_view() {
+        let tab = TabState::DocumentConsole {
+            connection: "docs".into(),
+            path: Vec::new(),
+            text: "SELECT * FROM orders".into(),
+            language: "SQL".into(),
+            view: Some(ConsoleView::Documents),
+        };
+        let text = serde_json::to_string(&tab).unwrap();
+        assert_eq!(
+            text,
+            r#"{"kind":"document_console","connection":"docs","path":[],"text":"SELECT * FROM orders","language":"SQL","view":"documents"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabState>(&text).unwrap(), tab);
+        // A console saved before it had either is in the engine's language,
+        // with that language's view.
+        let old = r#"{"kind":"document_console","connection":"docs","path":["shop"],"text":"db.orders.find()"}"#;
+        assert_eq!(
+            serde_json::from_str::<TabState>(old).unwrap(),
+            TabState::DocumentConsole {
+                connection: "docs".into(),
+                path: vec!["shop".into()],
+                text: "db.orders.find()".into(),
+                language: String::new(),
+                view: None,
+            }
+        );
+        assert_eq!(ConsoleView::default_for(true), ConsoleView::Table);
+        assert_eq!(ConsoleView::default_for(false), ConsoleView::Documents);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
-use crate::document_console::DocumentConsole;
+use crate::document_console::{DocumentConsole, OpenNative};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::file_query_tab::FileQueryTab;
 use crate::file_tab::FileTab;
@@ -206,6 +206,8 @@ impl Tab {
                     connection: console.db().name.to_string(),
                     path: console.path().to_vec(),
                     text: console.text(cx),
+                    language: console.frontend_name().unwrap_or_default().to_string(),
+                    view: console.chosen_view(),
                 }
             }
             Tab::FileQuery(_) => return None,
@@ -395,7 +397,21 @@ impl WorkspaceView {
                     cx.notify();
                 }
                 ExplorerEvent::OpenDocumentConsole { db, path } => {
-                    this.open_document_console(db.clone(), path.clone(), window, cx)
+                    this.open_document_console(db.clone(), path.clone(), window, cx);
+                }
+                ExplorerEvent::OpenDocumentHistory {
+                    db,
+                    language,
+                    path,
+                    text,
+                } => {
+                    // Where its run started, else the connection's own.
+                    let path = path.clone().unwrap_or_else(|| db.home.clone());
+                    let console = this.open_document_console(db.clone(), path, window, cx);
+                    console.update(cx, |console, cx| {
+                        console.set_language_named(language.as_deref().unwrap_or(""), window, cx);
+                        console.set_text(text.clone(), window, cx);
+                    });
                 }
                 ExplorerEvent::OpenCollection {
                     db,
@@ -663,9 +679,19 @@ impl WorkspaceView {
                     }
                     tab
                 }
-                TabState::DocumentConsole { path, text, .. } => {
+                TabState::DocumentConsole {
+                    path,
+                    text,
+                    language,
+                    view,
+                    ..
+                } => {
                     let console = self.new_document_console_tab(db.clone(), path, window, cx);
-                    console.update(cx, |console, cx| console.set_text(text, window, cx));
+                    console.update(cx, |console, cx| {
+                        console.set_language_named(&language, window, cx);
+                        console.set_view(view, cx);
+                        console.set_text(text, window, cx);
+                    });
                     Tab::DocumentConsole(console)
                 }
                 TabState::Query { .. }
@@ -1057,11 +1083,12 @@ impl WorkspaceView {
         path: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Entity<DocumentConsole> {
         let console = self.new_document_console_tab(db, path, window, cx);
-        self.tabs.push(Tab::DocumentConsole(console));
+        self.tabs.push(Tab::DocumentConsole(console.clone()));
         let index = self.tabs.len() - 1;
         self.activate(index, window, cx);
+        console
     }
 
     fn new_document_console_tab(
@@ -1072,9 +1099,25 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Entity<DocumentConsole> {
         let project = self.model.read(cx).project.root.clone();
-        let console = cx.new(|cx| DocumentConsole::new(db, path, project, window, cx));
+        let console = cx.new(|cx| DocumentConsole::new(db.clone(), path, project, window, cx));
         // The status bar shows what runs.
         cx.observe(&console, |_, _, cx| cx.notify()).detach();
+        let explorer = self.explorer.clone();
+        cx.subscribe(&console, move |_, _, QueryRan(entry), cx| {
+            explorer.update(cx, |explorer, cx| explorer.record(entry.clone(), cx));
+        })
+        .detach();
+        // Open in mongosh: what a statement ran as, in a console of its own.
+        cx.subscribe_in(
+            &console,
+            window,
+            move |this, _, open: &OpenNative, window, cx| {
+                let OpenNative { text, path } = open;
+                let console = this.open_document_console(db.clone(), path.clone(), window, cx);
+                console.update(cx, |console, cx| console.set_text(text.clone(), window, cx));
+            },
+        )
+        .detach();
         console
     }
 

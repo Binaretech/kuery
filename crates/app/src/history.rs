@@ -16,7 +16,20 @@ pub const LIMIT: usize = 200;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub connection: String,
+    /// The statement as it was written.
     pub sql: String,
+    /// The language it was written in when that is not the connection's
+    /// own (`SQL` in a document console).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// What it was translated into and ran as, for a statement in such a
+    /// language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<String>,
+    /// Where a document console's run started (`["shop"]`), which the
+    /// entry opens in again; the connection's own when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<String>>,
     pub outcome: String,
     pub failed: bool,
     /// When it ran, in seconds since the Unix epoch.
@@ -28,6 +41,9 @@ impl HistoryEntry {
         Self {
             connection: connection.to_string(),
             sql: sql.to_string(),
+            language: None,
+            native: None,
+            path: None,
             outcome,
             failed,
             at: unix_now(),
@@ -115,6 +131,9 @@ mod tests {
         HistoryEntry {
             connection: "local".into(),
             sql: sql.into(),
+            language: None,
+            native: None,
+            path: None,
             outcome: "1 rows · 2 ms".into(),
             failed: false,
             at: 1_700_000_000,
@@ -132,6 +151,37 @@ mod tests {
         write(&path, Path::new("/some/project"), &entries).unwrap();
         assert_eq!(read(&path), entries);
         assert!(!path.with_extension("toml.partial").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keeps_both_texts_of_a_translated_statement() {
+        let dir = std::env::temp_dir().join(format!("kuery-history-{}", crate::project::new_id()));
+        let path = dir.join("history.toml");
+        let translated = HistoryEntry {
+            language: Some("SQL".into()),
+            native: Some("db.orders.aggregate([{$limit: 1}])".into()),
+            path: Some(vec!["shop".into()]),
+            ..entry("SELECT * FROM orders LIMIT 1")
+        };
+        let entries = vec![translated, entry("select 2")];
+        write(&path, Path::new("/p"), &entries).unwrap();
+        assert_eq!(read(&path), entries);
+        // A file written before entries had them reads without them.
+        std::fs::write(
+            &path,
+            "project = \"/p\"\n[[entries]]\nconnection = \"local\"\nsql = \"select 1\"\noutcome = \"1 rows\"\nfailed = false\nat = 1\n",
+        )
+        .unwrap();
+        let old = read(&path);
+        assert_eq!(
+            (
+                old[0].language.clone(),
+                old[0].native.clone(),
+                old[0].path.clone()
+            ),
+            (None, None, None)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

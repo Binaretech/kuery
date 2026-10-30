@@ -208,14 +208,17 @@ impl Driver {
                     .filter(|database| !database.is_empty())
                     .into_iter()
                     .collect();
-                Ok(Connection::Document(DocDb::new(
-                    spec.name.clone().into(),
-                    spec.environment(),
-                    catalog,
-                    spec.target().into(),
-                    home,
-                    tunnel,
-                )))
+                Ok(Connection::Document(
+                    DocDb::new(
+                        spec.name.clone().into(),
+                        spec.environment(),
+                        catalog,
+                        spec.target().into(),
+                        home,
+                        tunnel,
+                    )
+                    .with_frontends(document.frontends),
+                ))
             }),
         }
     }

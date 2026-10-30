@@ -16,6 +16,7 @@ use gpui_kit::SharedString;
 use kuery_core::document::schema::Sampled;
 use kuery_core::document::session::DocumentSession;
 use kuery_core::document::value::CollectionRef;
+use kuery_core::driver::QueryFrontend;
 use kuery_core::session::{Access, QueryError, Session};
 
 use crate::theme;
@@ -332,6 +333,9 @@ pub struct DocDb {
     /// The container the form names (`["shop"]`), where a console starts;
     /// empty for the driver's own default.
     pub home: Vec<String>,
+    /// The languages its consoles offer besides the engine's own (read-only
+    /// SQL), each translated into the engine's before it runs.
+    pub frontends: &'static [QueryFrontend],
     /// Production only: whether writes were allowed for this connection
     /// session. Shared by every tab on it, gone when it disconnects.
     writes_allowed: Arc<AtomicBool>,
@@ -361,11 +365,18 @@ impl DocDb {
             catalog,
             target,
             home,
+            frontends: &[],
             writes_allowed: Arc::new(AtomicBool::new(false)),
             schemas: Arc::default(),
             sampling: Arc::default(),
             _tunnel: tunnel,
         }
+    }
+
+    /// The same connection, its consoles offering `frontends` too.
+    pub fn with_frontends(mut self, frontends: &'static [QueryFrontend]) -> Self {
+        self.frontends = frontends;
+        self
     }
 
     /// The collection's schema, if it was sampled on this connection.

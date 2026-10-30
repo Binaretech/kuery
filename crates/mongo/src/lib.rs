@@ -27,6 +27,7 @@ mod explain;
 pub mod literal;
 mod run;
 pub mod shell;
+pub mod sql;
 mod uri;
 mod wire;
 
@@ -420,7 +421,7 @@ pub static DRIVER: DocumentDriver = DocumentDriver {
         ssh_route: Some(ssh_route),
     },
     language: &LANGUAGE,
-    frontends: &[],
+    frontends: &[sql::FRONTEND],
     open: |options, access| open(&Target::from_options(options)?, access),
 };
 
