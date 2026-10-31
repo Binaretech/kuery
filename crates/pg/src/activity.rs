@@ -62,6 +62,7 @@ pub(crate) fn activity(adapter: &mut Postgres) -> Result<Activity, QueryError> {
     Ok(Activity {
         backends,
         max_connections,
+        notice: None,
     })
 }
 

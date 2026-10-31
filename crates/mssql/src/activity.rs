@@ -126,6 +126,7 @@ pub(crate) fn activity(adapter: &mut Mssql) -> Result<Activity, QueryError> {
     Ok(Activity {
         backends,
         max_connections,
+        notice: None,
     })
 }
 
