@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::activity::{Activity, Signal};
+use crate::activity::{Activity, BackendId, Signal};
 use crate::catalog::{
     CatalogColumn, CatalogOverview, ForeignKey, FunctionInfo, TableDefinition, TableRef,
 };
@@ -116,8 +116,8 @@ pub trait Adapter: Send + 'static {
 
     /// Cancels another session's query, or ends it; `false` when there was
     /// no such session.
-    fn signal(&mut self, pid: i32, signal: Signal) -> Result<bool, QueryError> {
-        let _ = (pid, signal);
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        let _ = (id, signal);
         Err(QueryError::Unsupported(format!(
             "Kuery cannot signal {} sessions",
             self.dialect().name

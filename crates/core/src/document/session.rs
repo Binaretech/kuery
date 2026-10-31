@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::activity::{Activity, BackendId, Signal};
 use crate::analysis::StatementKind;
 use crate::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
 use crate::document::capabilities::{Capabilities, ExplainKind, Preview, Transactions};
@@ -530,6 +531,24 @@ impl DocumentSession {
                 })
             })
         }
+    }
+
+    /// The server's running operations (see
+    /// [`DocumentAdapter::activity`]).
+    pub fn activity(&self) -> impl Future<Output = Result<Activity, QueryError>> + Send + use<> {
+        self.handle
+            .call(|worker| worker.catalog(|adapter| adapter.activity()))
+    }
+
+    /// Stops operation `id`, or ends its session; `false` when it was
+    /// already gone. It changes no data, so a read-only session may send it.
+    pub fn signal(
+        &self,
+        id: BackendId,
+        signal: Signal,
+    ) -> impl Future<Output = Result<bool, QueryError>> + Send + use<> {
+        self.handle
+            .call(move |worker| worker.catalog(|adapter| adapter.signal(&id, signal)))
     }
 
     /// Stops the running job, if any: now, and again every quarter second

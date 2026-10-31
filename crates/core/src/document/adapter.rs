@@ -13,6 +13,7 @@
 //! thread of its own, and a driver over an async client waits on its own
 //! runtime there.
 
+use crate::activity::{Activity, BackendId, Signal};
 use crate::adapter::Canceller;
 use crate::document::capabilities::{Capabilities, Sampling};
 use crate::document::catalog::{CollectionInfo, Container};
@@ -221,6 +222,19 @@ pub trait DocumentAdapter: Send + 'static {
     fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
         let _ = (statement, execute);
         unsupported("plans")
+    }
+
+    /// The server's running operations, where the connection may list
+    /// them (see [`Capabilities::activity`]).
+    fn activity(&mut self) -> Result<Activity, QueryError> {
+        unsupported("activity to show")
+    }
+
+    /// Stops one of them, or ends its session, where the engine can (see
+    /// [`Capabilities::kill`]); `false` when it was already gone.
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        let _ = (id, signal);
+        unsupported("operations to stop")
     }
 }
 

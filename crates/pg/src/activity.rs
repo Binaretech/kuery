@@ -2,7 +2,7 @@
 //! blocks it (`pg_blocking_pids`) and the lock it waits for, and signals to
 //! cancel a session's query or end the session.
 
-use kuery_core::activity::{Activity, Backend, Signal, State, parse_pids};
+use kuery_core::activity::{Activity, Backend, BackendId, Signal, State, parse_ids};
 use kuery_core::adapter::fetch;
 
 use crate::catalog::rows;
@@ -42,7 +42,7 @@ pub(crate) fn activity(adapter: &mut Postgres) -> Result<Activity, QueryError> {
             max_connections = max_connections.or_else(|| row.text(14).parse().ok());
             let seconds = |column| row.optional(column).and_then(|s| s.parse::<f64>().ok());
             Backend {
-                pid: row.text(0).parse().unwrap_or_default(),
+                id: BackendId(row.text(0)),
                 user: row.text(1),
                 application: row.text(2),
                 client: row.text(3),
@@ -52,7 +52,7 @@ pub(crate) fn activity(adapter: &mut Postgres) -> Result<Activity, QueryError> {
                 query_seconds: seconds(7),
                 transaction_seconds: seconds(8),
                 query: row.text(9),
-                blocked_by: parse_pids(&row.text(10)),
+                blocked_by: parse_ids(&row.text(10)),
                 kind: row.text(11),
                 own: row.flag(12),
                 waiting_for: row.optional(13),
@@ -62,12 +62,20 @@ pub(crate) fn activity(adapter: &mut Postgres) -> Result<Activity, QueryError> {
     Ok(Activity {
         backends,
         max_connections,
+        notice: None,
     })
 }
 
-/// Sends `signal` to session `pid`; `false` when there was no such session
-/// to signal.
-pub(crate) fn signal(adapter: &mut Postgres, pid: i32, signal: Signal) -> Result<bool, QueryError> {
+/// Sends `signal` to session `id`; `false` when there was no such session
+/// to signal, which an id that is not a pid never names.
+pub(crate) fn signal(
+    adapter: &mut Postgres,
+    id: &BackendId,
+    signal: Signal,
+) -> Result<bool, QueryError> {
+    let Ok(pid) = id.0.parse::<i32>() else {
+        return Ok(false);
+    };
     let sql = match signal {
         Signal::Cancel => format!("select pg_catalog.pg_cancel_backend({pid})"),
         Signal::Terminate => format!("select pg_catalog.pg_terminate_backend({pid})"),

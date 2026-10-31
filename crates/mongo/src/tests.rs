@@ -369,6 +369,72 @@ fn cancels_a_slow_find_and_keeps_working() {
 
 #[test]
 #[ignore = "needs the dev MongoDB"]
+fn watches_a_slow_operation_and_stops_it() {
+    let mut worker = connect(&target(), Access::ReadWrite).unwrap();
+    // Other tests leave slow operations of their own to end on the server.
+    let marker = bson::oid::ObjectId::new().to_hex();
+    let filter = format!("sleep(100) || '{marker}' == ''");
+    let slow = std::thread::spawn(move || {
+        let slow = doc! { "find": "big", "filter": { "$where": filter } };
+        collect(&mut worker, slow)
+    });
+    // The Activity tab watches on a read-only connection of its own.
+    let mut monitor = connect(&target(), Access::ReadOnly).unwrap();
+    assert!(monitor.capabilities().activity && monitor.capabilities().kill);
+    let started = std::time::Instant::now();
+    let found = loop {
+        let activity = DocumentAdapter::activity(&mut monitor).unwrap();
+        assert_eq!(activity.notice, None);
+        assert!(activity.backends.iter().any(|b| b.own), "{activity:?}");
+        if let Some(found) = activity
+            .backends
+            .into_iter()
+            .find(|b| b.query.contains(&marker))
+        {
+            break found;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(found.is_client() && !found.own, "{found:?}");
+    assert_eq!(found.state, kuery_core::activity::State::Active);
+    assert_eq!(found.database, "shop");
+    assert_eq!(found.user, "kuery");
+    assert!(matches!(
+        DocumentAdapter::signal(&mut monitor, &found.id, Signal::Terminate),
+        Err(QueryError::Unsupported(_))
+    ));
+    assert_eq!(
+        DocumentAdapter::signal(&mut monitor, &found.id, Signal::Cancel),
+        Ok(true)
+    );
+    assert_eq!(slow.join().unwrap(), Err(QueryError::Cancelled));
+    assert_eq!(
+        DocumentAdapter::signal(&mut monitor, &found.id, Signal::Cancel),
+        Ok(false)
+    );
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
+fn a_read_user_watches_only_its_own_operations() {
+    let mut monitor = connect(&reader(), Access::ReadOnly).unwrap();
+    let activity = DocumentAdapter::activity(&mut monitor).unwrap();
+    assert!(
+        activity
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("inprog")),
+        "{activity:?}"
+    );
+    assert!(
+        activity.backends.iter().all(|b| b.user == "kuery_ro"),
+        "{activity:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs the dev MongoDB"]
 fn a_cancel_reaches_no_operation_of_another_kuery() {
     let mut mongo = connect(&target(), Access::ReadOnly).unwrap();
     // Another Kuery signed in as the same user numbers its adapters and
