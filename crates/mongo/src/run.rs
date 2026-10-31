@@ -199,6 +199,15 @@ pub(crate) enum Wants {
     Enough,
 }
 
+/// How a cursor hands its documents over.
+pub(crate) struct Handover {
+    /// How many documents go to the sink at once.
+    pub(crate) flush: usize,
+    /// The cursor reads in a transaction, which killing its `getMore` would
+    /// abort.
+    pub(crate) in_transaction: bool,
+}
+
 /// Runs a command that answers with a cursor and sends what it reads to
 /// `sink`, as it arrives. The cursor lives in a task on the runtime that
 /// hands documents over a channel; when the sink refuses more (its reader
@@ -210,12 +219,12 @@ pub(crate) fn stream(
     tag: &Tag,
     stop: &Stop,
     timeout: Option<Duration>,
-    flush: usize,
+    handover: Handover,
     open: impl Future<Output = mongodb::error::Result<Reading>> + Send + 'static,
     sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     stop.start();
-    let ended = stream_on(client, tag, stop, timeout, flush, open, sink);
+    let ended = stream_on(client, tag, stop, timeout, handover, open, sink);
     stop.end();
     ended
 }
@@ -225,13 +234,19 @@ fn stream_on(
     tag: &Tag,
     stop: &Stop,
     timeout: Option<Duration>,
-    flush: usize,
+    handover: Handover,
     open: impl Future<Output = mongodb::error::Result<Reading>> + Send + 'static,
     sink: &mut dyn FnMut(Vec<Document>) -> Result<Wants, QueryError>,
 ) -> Result<u64, QueryError> {
     let (tx, mut rx) = mpsc::channel(1);
     let mut given = 0;
-    let mut task = runtime().spawn(read(open, flush.max(1), tx));
+    let mut task = runtime().spawn(read(open, handover.flush.max(1), tx));
+    // Killing a transaction's `getMore` aborts it: there, the read in
+    // flight gets the grace to end on its own.
+    let patience = match handover.in_transaction {
+        true => GRACE,
+        false => KILL_AGAIN,
+    };
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     loop {
         let next = runtime().block_on(async {
@@ -249,7 +264,7 @@ fn stream_on(
                     Ok(Wants::Enough) => {
                         // The task ends at its next send.
                         drop(rx);
-                        runtime().block_on(close(client, tag, task));
+                        runtime().block_on(close(client, tag, task, patience));
                         return Ok(given);
                     }
                     Err(error) => {
@@ -321,12 +336,17 @@ async fn read(
 
 /// Ends a read whose sink wants no more: its task stops at its next send
 /// and drops the cursor, which closes it on the server. A task still
-/// waiting on the server after [`KILL_AGAIN`] is stopped there, like a
-/// cancel; either way the read ended well.
-async fn close(client: &Client, tag: &Tag, mut task: JoinHandle<mongodb::error::Result<u64>>) {
+/// waiting on the server after `patience` is stopped there, like a cancel;
+/// either way the read ended well.
+async fn close(
+    client: &Client,
+    tag: &Tag,
+    mut task: JoinHandle<mongodb::error::Result<u64>>,
+    patience: Duration,
+) {
     tokio::select! {
         _ = &mut task => {}
-        () = tokio::time::sleep(KILL_AGAIN) => {
+        () = tokio::time::sleep(patience) => {
             let _ = halt(client, tag, task, Stopped::Cancelled).await;
         }
     }

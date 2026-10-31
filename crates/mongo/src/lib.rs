@@ -873,12 +873,16 @@ impl Mongo {
         let comment = Bson::String(tag.as_str().into());
         let batch = u32::try_from(self.limits.max_batch).unwrap_or(u32::MAX);
         let transaction = self.transaction.clone();
+        let handover = run::Handover {
+            flush: self.limits.first_batch,
+            in_transaction: transaction.is_some(),
+        };
         run::stream(
             &self.pool.client,
             &tag,
             &self.stop,
             self.patience(),
-            self.limits.first_batch,
+            handover,
             async move {
                 let command = db
                     .run_cursor_command(command)
