@@ -24,7 +24,7 @@ use kuery_core::catalog::{TableInfo, TableRef};
 use kuery_core::document::catalog::ContainerKind;
 use kuery_core::document::value::CollectionRef;
 
-use crate::activity_tab::{ActivityEvent, ActivityTab};
+use crate::activity_tab::{ActivityEvent, ActivitySource, ActivityTab};
 use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
@@ -91,7 +91,7 @@ impl Tab {
             Tab::Query(query) => Some(query.read(cx).db().meta()),
             Tab::Table(table) => Some(table.read(cx).db().meta()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().meta()),
-            Tab::Activity(activity) => Some(activity.read(cx).db().meta()),
+            Tab::Activity(activity) => Some(activity.read(cx).source().meta()),
             Tab::RedisKey(key) => Some(key.read(cx).db().meta()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().meta()),
             Tab::Collection(collection) => Some(collection.read(cx).db().meta()),
@@ -167,7 +167,7 @@ impl Tab {
                 }
             }
             Tab::Activity(activity) => TabState::Activity {
-                connection: activity.read(cx).db().name.to_string(),
+                connection: activity.read(cx).source().name().to_string(),
             },
             Tab::RedisKey(key) => {
                 let key = key.read(cx);
@@ -220,7 +220,10 @@ impl Tab {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
-            Tab::Activity(activity) => Some(activity.read(cx).db().clone()),
+            Tab::Activity(activity) => match activity.read(cx).source() {
+                ActivitySource::Sql(db) => Some(db.clone()),
+                ActivitySource::Document(_) => None,
+            },
             Tab::RedisKey(_)
             | Tab::RedisConsole(_)
             | Tab::Collection(_)
@@ -615,7 +618,9 @@ impl WorkspaceView {
                 TabState::Diagram { schema, .. } => {
                     self.new_diagram_tab(db.clone(), schema, window, cx)
                 }
-                TabState::Activity { .. } => self.new_activity_tab(db.clone(), window, cx),
+                TabState::Activity { .. } => {
+                    self.new_activity_tab(ActivitySource::Sql(db.clone()), window, cx)
+                }
                 TabState::RedisKey { .. }
                 | TabState::RedisConsole { .. }
                 | TabState::Collection { .. }
@@ -693,6 +698,9 @@ impl WorkspaceView {
                         console.set_text(text, window, cx);
                     });
                     Tab::DocumentConsole(console)
+                }
+                TabState::Activity { .. } if db.catalog.capabilities().activity => {
+                    self.new_activity_tab(ActivitySource::Document(db.clone()), window, cx)
                 }
                 TabState::Query { .. }
                 | TabState::Table { .. }
@@ -955,31 +963,46 @@ impl WorkspaceView {
 
     /// Opens a connection's server activity, or shows the tab it is already
     /// open in.
-    fn open_activity(&mut self, db: Db, window: &mut Window, cx: &mut Context<Self>) {
-        let name = db.name.clone();
+    fn open_activity(
+        &mut self,
+        source: ActivitySource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = source.name().clone();
         self.focus_or_open(
-            |tab, cx| matches!(tab, Tab::Activity(tab) if tab.read(cx).db().name == name),
-            |this, window, cx| this.new_activity_tab(db, window, cx),
+            |tab, cx| matches!(tab, Tab::Activity(tab) if *tab.read(cx).source().name() == name),
+            |this, window, cx| this.new_activity_tab(source, window, cx),
             window,
             cx,
         );
     }
 
-    fn new_activity_tab(&self, db: Db, window: &mut Window, cx: &mut Context<Self>) -> Tab {
+    fn new_activity_tab(
+        &self,
+        source: ActivitySource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
         let project = self.model.read(cx).project.root.clone();
-        let tab = cx.new(|cx| ActivityTab::new(db.clone(), project, cx));
+        let tab = cx.new(|cx| ActivityTab::new(source.clone(), project, cx));
         cx.subscribe_in(
             &tab,
             window,
-            move |this, _, event: &ActivityEvent, window, cx| match event {
-                ActivityEvent::OpenQuery(sql) => this.open_query(
+            move |this, _, ActivityEvent::OpenQuery(text), window, cx| match &source {
+                ActivitySource::Sql(db) => this.open_query(
                     db.clone(),
                     Some("Session query".into()),
-                    Some(sql.clone()),
+                    Some(text.clone()),
                     None,
                     window,
                     cx,
                 ),
+                ActivitySource::Document(db) => {
+                    let console =
+                        this.open_document_console(db.clone(), db.home.clone(), window, cx);
+                    console.update(cx, |console, cx| console.set_text(text.clone(), window, cx));
+                }
             },
         )
         .detach();
@@ -993,9 +1016,27 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(db) = self.active_db(cx).filter(|db| db.session.has_activity()) {
-            self.open_activity(db, window, cx);
+        if let Some(source) = self.active_activity_source(cx) {
+            self.open_activity(source, window, cx);
         }
+    }
+
+    /// The connection of the active tab, or the sidebar's, when its
+    /// server's activity can be watched.
+    fn active_activity_source(&self, cx: &App) -> Option<ActivitySource> {
+        let from_tab = match self.tabs.get(self.active) {
+            Some(Tab::File(_) | Tab::FileQuery(_)) => return None,
+            Some(Tab::Activity(tab)) => Some(tab.read(cx).source().clone()),
+            Some(Tab::Collection(tab)) => Some(ActivitySource::Document(tab.read(cx).db().clone())),
+            Some(Tab::DocumentConsole(tab)) => {
+                Some(ActivitySource::Document(tab.read(cx).db().clone()))
+            }
+            Some(tab) => tab.db(cx).map(ActivitySource::Sql),
+            None => None,
+        };
+        from_tab
+            .or_else(|| self.explorer.read(cx).current_activity_source())
+            .filter(ActivitySource::watchable)
     }
 
     /// The palette's Open Schema Diagram: the schema of the table in view,
@@ -1888,7 +1929,7 @@ impl WorkspaceView {
             }
             Some(Tab::Activity(activity)) => {
                 let tab = activity.read(cx);
-                left = left.child(format!("Server activity of {}", tab.db().name));
+                left = left.child(format!("Server activity of {}", tab.source().name()));
                 right = h_flex()
                     .gap_4()
                     .flex_shrink_0()

@@ -38,6 +38,7 @@ use kuery_core::document::value::CollectionRef;
 use kuery_core::driver::Family;
 use kuery_core::sql::{Dialect, POSTGRES};
 
+use crate::activity_tab::ActivitySource;
 use crate::app;
 use crate::assets::AppIcon;
 use crate::connection::{ConnMeta, Db, DocDb, RedisDb};
@@ -68,8 +69,8 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
-    /// The server's sessions and locks.
-    OpenActivity(Db),
+    /// The server's sessions and locks, or its running operations.
+    OpenActivity(ActivitySource),
     /// A schema's diagram.
     OpenDiagram {
         db: Db,
@@ -823,8 +824,31 @@ impl Explorer {
     }
 
     fn open_activity(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(db) = self.db(index) {
-            cx.emit(ExplorerEvent::OpenActivity(db));
+        if let Some(source) = self.activity_source(index) {
+            cx.emit(ExplorerEvent::OpenActivity(source));
+        }
+    }
+
+    /// The connection at `index`, when its server's activity can be watched.
+    fn activity_source(&self, index: usize) -> Option<ActivitySource> {
+        let source = match &self.connections.get(index)?.state {
+            ConnectionState::Ready { db, .. } => ActivitySource::Sql(db.clone()),
+            ConnectionState::DocumentReady { db } => ActivitySource::Document(db.clone()),
+            _ => return None,
+        };
+        source.watchable().then_some(source)
+    }
+
+    /// The selected connection, else the first one open, whose server's
+    /// activity can be watched.
+    pub fn current_activity_source(&self) -> Option<ActivitySource> {
+        let selected = self
+            .selected
+            .as_ref()
+            .and_then(|key| key.split('/').next()?.parse::<usize>().ok());
+        match selected {
+            Some(index) => self.activity_source(index),
+            None => (0..self.connections.len()).find_map(|index| self.activity_source(index)),
         }
     }
 
@@ -1097,10 +1121,7 @@ impl Explorer {
                 | ConnectionState::RedisReady { .. }
                 | ConnectionState::DocumentReady { .. }
         );
-        let activity = matches!(
-            &node.state,
-            ConnectionState::Ready { db, .. } if db.session.has_activity()
-        );
+        let activity = self.activity_source(index).is_some();
         // The environment's color: filled once connected, an outline before;
         // amber while connecting, red when it failed.
         let dot = match &node.state {
@@ -1229,6 +1250,14 @@ impl Explorer {
                         &this,
                         move |this, _, cx| this.open_document_console(index, None, cx),
                     ))
+                    .when(activity, |menu| {
+                        menu.item(item_icon(
+                            "Server Activity",
+                            AppIcon::Activity,
+                            &this,
+                            move |this, _, cx| this.open_activity(index, cx),
+                        ))
+                    })
                     .item(item_icon(
                         "Refresh",
                         AppIcon::Reload,

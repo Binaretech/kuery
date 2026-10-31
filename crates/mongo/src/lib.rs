@@ -14,6 +14,7 @@
 //! operation on the server and keeps waiting. Every adapter opened with the
 //! same [`Target`] shares one `Client`, so one connection pool.
 
+mod activity;
 mod browse;
 mod catalog;
 pub mod classify;
@@ -41,6 +42,7 @@ use std::time::Duration;
 
 use bson::{Bson, Document as BsonDocument, doc};
 
+use kuery_core::activity::{Activity, BackendId, Signal};
 use kuery_core::adapter::Canceller;
 use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
 use kuery_core::document::capabilities::{Capabilities, Sampling};
@@ -1032,6 +1034,14 @@ impl DocumentAdapter for Mongo {
 
     fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
         self.explain_statement(statement, execute)
+    }
+
+    fn activity(&mut self) -> Result<Activity, QueryError> {
+        self.activity_now()
+    }
+
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        self.kill_operation(id, signal)
     }
 
     fn children(&mut self, parent: &[String]) -> Result<Vec<Container>, QueryError> {

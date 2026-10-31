@@ -1413,3 +1413,16 @@ fn explains_reads_measured_and_writes_only_planned() {
         "a measured write never reached the driver"
     );
 }
+
+#[test]
+fn an_engine_without_activity_says_so() {
+    let (session, _) = open(Access::ReadOnly);
+    assert!(matches!(
+        block_on(session.activity()),
+        Err(QueryError::Unsupported(message)) if message.contains("activity")
+    ));
+    assert!(matches!(
+        block_on(session.signal("7".into(), Signal::Cancel)),
+        Err(QueryError::Unsupported(message)) if message.contains("operations to stop")
+    ));
+}

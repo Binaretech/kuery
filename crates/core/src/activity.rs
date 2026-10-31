@@ -213,6 +213,9 @@ pub struct Activity {
     pub backends: Vec<Backend>,
     /// `max_connections`.
     pub max_connections: Option<u32>,
+    /// What the list leaves out, such as other users' sessions the
+    /// monitor may not see.
+    pub notice: Option<String>,
 }
 
 /// A session that blocks others without being blocked itself, and every
@@ -415,6 +418,7 @@ mod tests {
                 vacuum,
             ],
             max_connections: Some(100),
+            notice: None,
         }
     }
 
@@ -442,6 +446,7 @@ mod tests {
                 backend(2, "active", 2., &[1]),
             ],
             max_connections: None,
+            notice: None,
         };
         let roots: Vec<BackendId> = activity.blockers().into_iter().map(|b| b.id).collect();
         assert_eq!(roots, ids(&[1, 2]));
