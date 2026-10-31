@@ -662,6 +662,11 @@ const REFUSALS: &[(&str, &str, &str)] = &[
         "Run one statement at a time",
         "SELECT * FROM b",
     ),
+    (
+        "SELECT * FROM orders WHERE a = 1e400",
+        "1e400 is too large for a Double",
+        "1e400",
+    ),
 ];
 
 #[test]

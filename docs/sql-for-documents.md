@@ -433,4 +433,5 @@ db.orders.aggregate([{$match: {a: {$not: {$type: "array"}, $eq: NumberLong("-922
 | `SELECT * FROM orders WHERE a = 'open` | Unterminated string literal | `'` |
 | `SELECT * FROM orders WHERE` | Expected: an expression, found: EOF | `E` |
 | `SELECT * FROM orders; SELECT * FROM b` | Run one statement at a time | `SELECT * FROM b` |
+| `SELECT * FROM orders WHERE a = 1e400` | 1e400 is too large for a Double: write DECIMAL '1e400' | `1e400` |
 <!-- examples end -->

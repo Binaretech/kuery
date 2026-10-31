@@ -754,7 +754,7 @@ impl Lowering<'_> {
 
     /// A number as written: a whole one an Int32 or an Int64, refused past
     /// that rather than rounded into a Double; one with a point or an
-    /// exponent a Double.
+    /// exponent a Double, refused when a Double cannot hold it.
     fn number(&self, text: &str, at: Range<usize>) -> Result<Value> {
         let value = literal::number(text);
         let whole = !text.contains(['.', 'e', 'E']);
@@ -764,6 +764,12 @@ impl Lowering<'_> {
                 format!(
                     "{text} does not fit in a 64-bit integer, and as a Double it would lose digits: write DECIMAL '{text}'"
                 ),
+            );
+        }
+        if matches!(value, Value::Double(double) if !double.is_finite()) {
+            return self.error(
+                at,
+                format!("{text} is too large for a Double: write DECIMAL '{text}'"),
             );
         }
         Ok(value)
