@@ -410,7 +410,7 @@ impl Lowering<'_> {
             [database, collection]
                 if database.quote_style.is_some() || collection.quote_style.is_some() =>
             {
-                if !database_name(&database.value) {
+                if !shell::database_name(&database.value) {
                     let at = self.ident_span(database);
                     return self.error(at, format!("{} is not a database's name", database.value));
                 }
@@ -1806,11 +1806,6 @@ fn plain_wildcard(options: &sqlparser::ast::WildcardAdditionalOptions) -> bool {
         && options.opt_replace.is_none()
         && options.opt_rename.is_none()
         && options.opt_alias.is_none()
-}
-
-/// Whether MongoDB takes `name` for a database.
-fn database_name(name: &str) -> bool {
-    !name.is_empty() && name.len() < 64 && !name.contains(['/', '\\', '.', ' ', '"', '$', '\0'])
 }
 
 fn push_sort_and_limits(
