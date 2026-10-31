@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::activity::{Activity, Signal};
+use crate::activity::{Activity, BackendId, Signal};
 use crate::adapter::{Adapter, Discard, RowSink, Rows};
 use crate::analysis::{self, StatementKind};
 use crate::catalog::{CatalogOverview, FunctionInfo, TableDefinition, TableRef};
@@ -428,12 +428,12 @@ impl Session {
 
     pub fn signal(
         &self,
-        pid: i32,
+        id: BackendId,
         signal: Signal,
     ) -> impl Future<Output = Result<bool, QueryError>> + Send + use<> {
         self.call(move |worker| {
             worker.adapter.limit(&RunOptions::default())?;
-            worker.adapter.signal(pid, signal)
+            worker.adapter.signal(&id, signal)
         })
     }
 }

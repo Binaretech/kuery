@@ -4,6 +4,58 @@
 //! monitor works out from it: which sessions need attention, the chains of
 //! blocked sessions and their roots, and short durations.
 
+use std::cmp::Ordering;
+use std::fmt;
+
+/// A session's id as its server names it: the pid for PostgreSQL and SQL
+/// Server, an operation id for MongoDB (`shard:opid` through mongos).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BackendId(pub String);
+
+impl BackendId {
+    /// The id as a number, for servers that number their sessions.
+    pub fn number(&self) -> Option<i64> {
+        self.0.parse().ok()
+    }
+}
+
+impl From<i32> for BackendId {
+    fn from(pid: i32) -> Self {
+        BackendId(pid.to_string())
+    }
+}
+
+impl From<&str> for BackendId {
+    fn from(id: &str) -> Self {
+        BackendId(id.to_string())
+    }
+}
+
+impl fmt::Display for BackendId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Numbers first, in their order (so `9` before `10`), then the rest as
+/// text.
+impl Ord for BackendId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.number(), other.number()) {
+            (Some(a), Some(b)) => a.cmp(&b).then_with(|| self.0.cmp(&other.0)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => self.0.cmp(&other.0),
+        }
+    }
+}
+
+impl PartialOrd for BackendId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// What a session is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -58,7 +110,7 @@ impl State {
 /// One session (a server process) and what it is doing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Backend {
-    pub pid: i32,
+    pub id: BackendId,
     pub user: String,
     pub application: String,
     /// The client's address, empty for a local socket or a background
@@ -74,7 +126,7 @@ pub struct Backend {
     pub transaction_seconds: Option<f64>,
     pub query: String,
     /// The sessions that hold the locks it waits for.
-    pub blocked_by: Vec<i32>,
+    pub blocked_by: Vec<BackendId>,
     /// `client backend`, `autovacuum worker`…
     pub kind: String,
     /// The monitor's own session.
@@ -94,10 +146,10 @@ pub enum Signal {
 
 impl Signal {
     /// For the audit log: `cancel 4521`, `terminate 4521`.
-    pub fn describe(self, pid: i32) -> String {
+    pub fn describe(self, id: &BackendId) -> String {
         match self {
-            Signal::Cancel => format!("cancel {pid}"),
-            Signal::Terminate => format!("terminate {pid}"),
+            Signal::Cancel => format!("cancel {id}"),
+            Signal::Terminate => format!("terminate {id}"),
         }
     }
 }
@@ -167,36 +219,36 @@ pub struct Activity {
 /// session waiting on it, directly or down a chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Blocker {
-    pub pid: i32,
-    pub waiting: Vec<i32>,
+    pub id: BackendId,
+    pub waiting: Vec<BackendId>,
 }
 
 impl Activity {
-    pub fn backend(&self, pid: i32) -> Option<&Backend> {
-        self.backends.iter().find(|b| b.pid == pid)
+    pub fn backend(&self, id: &BackendId) -> Option<&Backend> {
+        self.backends.iter().find(|b| b.id == *id)
     }
 
     /// Client sessions, and the active, blocked and blocking ones of any
     /// kind; busy ones first, the longest at it first.
     pub fn shown(&self, all: bool) -> Vec<&Backend> {
-        let blocking = self.blocking_pids();
+        let blocking = self.blocking_ids();
         let mut shown: Vec<&Backend> = self
             .backends
             .iter()
             .filter(|b| {
                 all || (b.is_busy() && (b.is_client() || !b.blocked_by.is_empty()))
-                    || blocking.contains(&b.pid)
+                    || blocking.contains(&b.id)
             })
             .collect();
-        let rank =
-            |b: &Backend| match (&b.state, b.blocked_by.is_empty(), blocking.contains(&b.pid)) {
-                (_, _, true) => 0,
-                (_, false, _) => 1,
-                (State::Active, ..) => 2,
-                (State::IdleInTransaction | State::IdleInFailedTransaction, ..) => 3,
-                (State::Idle, ..) => 4,
-                _ => 5,
-            };
+        let rank = |b: &Backend| match (&b.state, b.blocked_by.is_empty(), blocking.contains(&b.id))
+        {
+            (_, _, true) => 0,
+            (_, false, _) => 1,
+            (State::Active, ..) => 2,
+            (State::IdleInTransaction | State::IdleInFailedTransaction, ..) => 3,
+            (State::Idle, ..) => 4,
+            _ => 5,
+        };
         shown.sort_by(|a, b| {
             rank(a)
                 .cmp(&rank(b))
@@ -205,35 +257,35 @@ impl Activity {
                         .unwrap_or(0.)
                         .total_cmp(&a.seconds().unwrap_or(0.))
                 })
-                .then_with(|| a.pid.cmp(&b.pid))
+                .then_with(|| a.id.cmp(&b.id))
         });
         shown
     }
 
     /// Sessions others wait for.
-    pub fn blocking_pids(&self) -> Vec<i32> {
-        let mut pids: Vec<i32> = self
+    pub fn blocking_ids(&self) -> Vec<BackendId> {
+        let mut ids: Vec<BackendId> = self
             .backends
             .iter()
-            .flat_map(|b| b.blocked_by.iter().copied())
+            .flat_map(|b| b.blocked_by.iter().cloned())
             .collect();
-        pids.sort_unstable();
-        pids.dedup();
-        pids
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
-    /// Pids waiting on `pid`, directly or through others.
-    pub fn waiting_on(&self, pid: i32) -> Vec<i32> {
-        let mut found: Vec<i32> = Vec::new();
-        let mut frontier = vec![pid];
+    /// Sessions waiting on `id`, directly or through others.
+    pub fn waiting_on(&self, id: &BackendId) -> Vec<BackendId> {
+        let mut found: Vec<BackendId> = Vec::new();
+        let mut frontier = vec![id.clone()];
         while let Some(current) = frontier.pop() {
             for backend in &self.backends {
                 if backend.blocked_by.contains(&current)
-                    && backend.pid != pid
-                    && !found.contains(&backend.pid)
+                    && backend.id != *id
+                    && !found.contains(&backend.id)
                 {
-                    found.push(backend.pid);
-                    frontier.push(backend.pid);
+                    found.push(backend.id.clone());
+                    frontier.push(backend.id.clone());
                 }
             }
         }
@@ -245,25 +297,25 @@ impl Activity {
     /// nobody (or only on each other, in a deadlock about to be broken),
     /// those holding up the most first.
     pub fn blockers(&self) -> Vec<Blocker> {
-        let blocking = self.blocking_pids();
+        let blocking = self.blocking_ids();
         let mut roots: Vec<Blocker> = blocking
             .iter()
-            .filter(|pid| {
-                self.backend(**pid)
+            .filter(|id| {
+                self.backend(id)
                     .is_none_or(|b| b.blocked_by.iter().all(|other| !blocking.contains(other)))
             })
-            .map(|pid| Blocker {
-                pid: *pid,
-                waiting: self.waiting_on(*pid),
+            .map(|id| Blocker {
+                id: id.clone(),
+                waiting: self.waiting_on(id),
             })
             .collect();
         if roots.is_empty() {
             // Everyone blocking is also waiting: a cycle. Show each.
             roots = blocking
                 .iter()
-                .map(|pid| Blocker {
-                    pid: *pid,
-                    waiting: self.waiting_on(*pid),
+                .map(|id| Blocker {
+                    id: id.clone(),
+                    waiting: self.waiting_on(id),
                 })
                 .collect();
         }
@@ -271,7 +323,7 @@ impl Activity {
             b.waiting
                 .len()
                 .cmp(&a.waiting.len())
-                .then(a.pid.cmp(&b.pid))
+                .then_with(|| a.id.cmp(&b.id))
         });
         roots
     }
@@ -313,10 +365,11 @@ pub fn duration(seconds: f64) -> String {
     }
 }
 
-/// `pg_blocking_pids` joined with commas → pids.
-pub fn parse_pids(text: &str) -> Vec<i32> {
+/// `pg_blocking_pids` joined with commas → session ids.
+pub fn parse_ids(text: &str) -> Vec<BackendId> {
     text.split(',')
-        .filter_map(|pid| pid.trim().parse().ok())
+        .filter_map(|pid| pid.trim().parse::<i32>().ok())
+        .map(BackendId::from)
         .collect()
 }
 
@@ -324,9 +377,13 @@ pub fn parse_pids(text: &str) -> Vec<i32> {
 mod tests {
     use super::*;
 
+    fn ids(pids: &[i32]) -> Vec<BackendId> {
+        pids.iter().copied().map(BackendId::from).collect()
+    }
+
     fn backend(pid: i32, state: &str, seconds: f64, blocked_by: &[i32]) -> Backend {
         Backend {
-            pid,
+            id: pid.into(),
             user: "app".into(),
             application: "web".into(),
             client: "10.0.0.5".into(),
@@ -336,7 +393,7 @@ mod tests {
             query_seconds: Some(seconds),
             transaction_seconds: Some(seconds),
             query: format!("query of {pid}"),
-            blocked_by: blocked_by.to_vec(),
+            blocked_by: ids(blocked_by),
             kind: "client backend".into(),
             own: false,
             waiting_for: None,
@@ -364,13 +421,13 @@ mod tests {
     #[test]
     fn finds_the_root_of_a_blocking_chain() {
         let activity = busy();
-        assert_eq!(activity.blocking_pids(), [10, 20]);
-        assert_eq!(activity.waiting_on(10), [20, 30]);
+        assert_eq!(activity.blocking_ids(), ids(&[10, 20]));
+        assert_eq!(activity.waiting_on(&10.into()), ids(&[20, 30]));
         assert_eq!(
             activity.blockers(),
             [Blocker {
-                pid: 10,
-                waiting: vec![20, 30]
+                id: 10.into(),
+                waiting: ids(&[20, 30])
             }]
         );
         assert_eq!(activity.counts(), (3, 1, 2));
@@ -386,29 +443,29 @@ mod tests {
             ],
             max_connections: None,
         };
-        let roots: Vec<i32> = activity.blockers().iter().map(|b| b.pid).collect();
-        assert_eq!(roots, [1, 2]);
+        let roots: Vec<BackendId> = activity.blockers().into_iter().map(|b| b.id).collect();
+        assert_eq!(roots, ids(&[1, 2]));
     }
 
     #[test]
     fn shows_blockers_first_then_the_blocked_then_the_longest_running() {
         let activity = busy();
-        let pids: Vec<i32> = activity.shown(false).iter().map(|b| b.pid).collect();
+        let shown: Vec<BackendId> = activity.shown(false).iter().map(|b| b.id.clone()).collect();
         // Idle 50 and the autovacuum are left out unless everything is shown.
-        assert_eq!(pids, [10, 20, 30, 40]);
-        let all: Vec<i32> = activity.shown(true).iter().map(|b| b.pid).collect();
-        assert_eq!(all, [10, 20, 30, 40, 50, 60]);
+        assert_eq!(shown, ids(&[10, 20, 30, 40]));
+        let all: Vec<BackendId> = activity.shown(true).iter().map(|b| b.id.clone()).collect();
+        assert_eq!(all, ids(&[10, 20, 30, 40, 50, 60]));
     }
 
     #[test]
     fn says_what_needs_attention() {
         let activity = busy();
-        let concern = |pid| activity.backend(pid).unwrap().concern();
+        let concern = |pid: i32| activity.backend(&pid.into()).unwrap().concern();
         assert_eq!(concern(10), Some(Concern::IdleTransaction));
         assert_eq!(concern(20), Some(Concern::Blocked));
         assert_eq!(concern(40), Some(Concern::LongQuery));
         assert_eq!(concern(50), None);
-        assert_eq!(activity.backend(10).unwrap().seconds(), Some(300.));
+        assert_eq!(activity.backend(&10.into()).unwrap().seconds(), Some(300.));
     }
 
     #[test]
@@ -426,14 +483,31 @@ mod tests {
     }
 
     #[test]
+    fn orders_numbered_ids_as_numbers() {
+        let mut shuffled = vec![
+            BackendId("shard01:12".into()),
+            10.into(),
+            BackendId("shard00:7".into()),
+            9.into(),
+        ];
+        shuffled.sort();
+        let sorted: Vec<String> = shuffled.into_iter().map(|id| id.0).collect();
+        assert_eq!(sorted, ["9", "10", "shard00:7", "shard01:12"]);
+        assert_eq!(
+            Signal::Cancel.describe(&"shard01:12".into()),
+            "cancel shard01:12"
+        );
+    }
+
+    #[test]
     fn writes_short_durations() {
         assert_eq!(duration(0.42), "0.4 s");
         assert_eq!(duration(12.7), "12 s");
         assert_eq!(duration(192.), "3 m 12 s");
         assert_eq!(duration(7_500.), "2 h 5 m");
         assert_eq!(duration(273_600.), "3 d 4 h");
-        assert_eq!(parse_pids("12, 7,"), [12, 7]);
-        assert!(parse_pids("").is_empty());
+        assert_eq!(parse_ids("12, 7,"), ids(&[12, 7]));
+        assert!(parse_ids("").is_empty());
         assert_eq!(
             State::from_postgres("idle in transaction (aborted)").label(),
             "idle in failed transaction"
