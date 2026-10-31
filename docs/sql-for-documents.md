@@ -70,7 +70,7 @@ alias does, and the collection's name is then an ordinary field.
 | `= NULL`, `<> NULL`, `< NULL` | Refused: they are never true. Write `IS NULL` or `IS NOT NULL`. |
 | `IN` and `NOT IN` | `NULL` in an `IN` list is dropped; `NOT IN` with a `NULL` in its list is never true. |
 | Arrays | A comparison with a value never matches an array, nor goes through one on the way down a path (`ship.city` when `ship` is an array). `IS NOT NULL` is true for an array. Paths reach fields by name only: `a.0` and `a[0]` are refused. |
-| Types | Values of different types are never equal, and `<`, `>` and `BETWEEN` between different types are unknown, as in MongoDB's comparisons. |
+| Types | Numbers compare by value whatever their BSON type (`a = 5` matches `5.0`, `NumberLong(5)` and `NumberDecimal('5')`). Other values of different types are never equal, and `<`, `>` and `BETWEEN` between them are unknown, as in MongoDB's comparisons. |
 | `ORDER BY` | MongoDB's order: null and missing first ascending, last descending, and the collection's collation for text. `NULLS FIRST` or `NULLS LAST` against that order is refused. |
 | `LIKE` | The whole value must match, across lines; `ILIKE` ignores case. A collection's collation applies to `=` but not to `LIKE`, which the strip notes. |
 | `GROUP BY` | Null and missing values are one group. |
