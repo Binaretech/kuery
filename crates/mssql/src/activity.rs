@@ -4,7 +4,7 @@
 //! its own sessions and refuses the transaction, lock, connection and query
 //! text views, so the monitor then reads without those columns.
 
-use kuery_core::activity::{Activity, Backend, Signal, State};
+use kuery_core::activity::{Activity, Backend, BackendId, Signal, State};
 use kuery_core::adapter::{Adapter as _, Discard, fetch};
 
 use crate::{Mssql, QueryError, lacks_permission};
@@ -99,7 +99,7 @@ pub(crate) fn activity(adapter: &mut Mssql) -> Result<Activity, QueryError> {
             let number = |column| set.get(row, column).and_then(|s| s.parse::<f64>().ok());
             let blocker = number(10).map_or(0, |pid| pid as i32);
             Backend {
-                pid: number(0).map_or(0, |pid| pid as i32),
+                id: number(0).map_or(0, |pid| pid as i32).into(),
                 user: set.text(row, 1),
                 application: set.text(row, 2),
                 client: set.text(row, 3),
@@ -109,7 +109,11 @@ pub(crate) fn activity(adapter: &mut Mssql) -> Result<Activity, QueryError> {
                 query_seconds: number(7),
                 transaction_seconds: number(8),
                 query: set.text(row, 9),
-                blocked_by: if blocker > 0 { vec![blocker] } else { vec![] },
+                blocked_by: if blocker > 0 {
+                    vec![blocker.into()]
+                } else {
+                    vec![]
+                },
                 kind: match set.get(row, 11) {
                     Some("1") => "client backend".into(),
                     _ => "background".into(),
@@ -125,9 +129,17 @@ pub(crate) fn activity(adapter: &mut Mssql) -> Result<Activity, QueryError> {
     })
 }
 
-/// Ends session `pid` (SQL Server cannot stop just its query), rolling back
-/// its transaction; `false` when there was no such session (error 6106).
-pub(crate) fn signal(adapter: &mut Mssql, pid: i32, _signal: Signal) -> Result<bool, QueryError> {
+/// Ends session `id` (SQL Server cannot stop just its query), rolling back
+/// its transaction; `false` when there was no such session (error 6106),
+/// which an id that is not a session number never names.
+pub(crate) fn signal(
+    adapter: &mut Mssql,
+    id: &BackendId,
+    _signal: Signal,
+) -> Result<bool, QueryError> {
+    let Ok(pid) = id.0.parse::<i32>() else {
+        return Ok(false);
+    };
     match adapter.execute(&format!("kill {pid}"), &mut Discard) {
         Ok(_) => Ok(true),
         Err(QueryError::Database { code, .. }) if code == "6106" => Ok(false),

@@ -21,7 +21,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::activity::Signal;
-use kuery_core::activity::{Activity, Backend, Concern, State, duration};
+use kuery_core::activity::{Activity, Backend, BackendId, Concern, State, duration};
 use kuery_core::session::Access;
 use kuery_core::session::Session;
 
@@ -55,7 +55,7 @@ pub struct ActivityTab {
     /// Every session, idle ones and background processes included.
     all: bool,
     paused: bool,
-    selected: Option<i32>,
+    selected: Option<BackendId>,
     fetching: bool,
     /// What the last cancel or terminate did.
     notice: Option<(String, u32)>,
@@ -168,18 +168,18 @@ impl ActivityTab {
         .detach();
     }
 
-    fn select(&mut self, pid: i32, cx: &mut Context<Self>) {
-        self.selected = if self.selected == Some(pid) {
+    fn select(&mut self, id: BackendId, cx: &mut Context<Self>) {
+        self.selected = if self.selected.as_ref() == Some(&id) {
             None
         } else {
-            Some(pid)
+            Some(id)
         };
         cx.notify();
     }
 
     /// Cancel or terminate: on production allow writes first, then confirm.
-    fn ask(&mut self, pid: i32, signal: Signal, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(backend) = self.activity.as_ref().and_then(|a| a.backend(pid)).cloned() else {
+    fn ask(&mut self, id: &BackendId, signal: Signal, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backend) = self.activity.as_ref().and_then(|a| a.backend(id)).cloned() else {
             return;
         };
         let weak = cx.entity().downgrade();
@@ -211,7 +211,7 @@ impl ActivityTab {
         let cancel_note = self.db.session.dialect().cancel_note;
         let (title, ok, what) = match signal {
             Signal::Cancel => (
-                format!("Cancel the query of session {}?", backend.pid),
+                format!("Cancel the query of session {}?", backend.id),
                 "Cancel Query",
                 cancel_note.unwrap_or(
                     "Stops the query it runs now. The session stays connected; if it is in a \
@@ -219,7 +219,7 @@ impl ActivityTab {
                 ),
             ),
             Signal::Terminate => (
-                format!("End session {}?", backend.pid),
+                format!("End session {}?", backend.id),
                 "End Session",
                 "Closes the session: its open transaction rolls back, its locks are \
                  released and its application loses the connection.",
@@ -244,7 +244,7 @@ impl ActivityTab {
         let connection = format!("{} ({})", self.db.name, self.db.environment.label());
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let weak = weak.clone();
-            let pid = backend.pid;
+            let id = backend.id.clone();
             alert
                 .title(title.clone())
                 .description(
@@ -277,38 +277,39 @@ impl ActivityTab {
                         .cancel_text("Keep It"),
                 )
                 .on_ok(move |_, _, cx| {
-                    weak.update(cx, |this, cx| this.send(pid, signal, cx)).ok();
+                    weak.update(cx, |this, cx| this.send(id.clone(), signal, cx))
+                        .ok();
                     true
                 })
         });
     }
 
-    fn send(&mut self, pid: i32, signal: Signal, cx: &mut Context<Self>) {
+    fn send(&mut self, id: BackendId, signal: Signal, cx: &mut Context<Self>) {
         let Monitor::Ready(session) = &self.monitor else {
             return;
         };
-        let sent = session.signal(pid, signal);
+        let sent = session.signal(id.clone(), signal);
         let pending = AuditRecord::new(
             &self.project,
             self.db.name.as_ref(),
             self.db.environment,
             "Server activity",
             AuditAction::Run,
-            signal.describe(pid),
+            signal.describe(&id),
         );
         cx.spawn(async move |this, cx| {
             let result = sent.await;
             let (message, tone, failed) = match (&result, signal) {
                 (Ok(true), Signal::Cancel) => (
-                    format!("Cancelled the query of session {pid}"),
+                    format!("Cancelled the query of session {id}"),
                     theme::GREEN,
                     false,
                 ),
                 (Ok(true), Signal::Terminate) => {
-                    (format!("Ended session {pid}"), theme::GREEN, false)
+                    (format!("Ended session {id}"), theme::GREEN, false)
                 }
                 (Ok(false), _) => (
-                    format!("Session {pid} was already gone"),
+                    format!("Session {id} was already gone"),
                     theme::TEXT_TERTIARY,
                     false,
                 ),
@@ -418,8 +419,8 @@ impl ActivityTab {
                 .border_b_1()
                 .border_color(color(theme::HAIRLINE))
                 .children(blockers.into_iter().map(|blocker| {
-                    let pid = blocker.pid;
-                    let holder = activity.backend(pid);
+                    let id = blocker.id.clone();
+                    let holder = activity.backend(&id);
                     let how = holder
                         .map(|b| {
                             format!(
@@ -450,7 +451,7 @@ impl ActivityTab {
                                 .truncate()
                                 .text_color(color(theme::TEXT))
                                 .child(format!(
-                                    "Session {pid}{how} blocks {} {}: {waiting}",
+                                    "Session {id}{how} blocks {} {}: {waiting}",
                                     blocker.waiting.len(),
                                     if blocker.waiting.len() == 1 {
                                         "session"
@@ -461,28 +462,31 @@ impl ActivityTab {
                         )
                         .child(
                             div()
-                                .id(("activity-select-blocker", pid as u64))
+                                .id(SharedString::from(format!("activity-select-blocker-{id}")))
                                 .px_2()
                                 .rounded(px(5.))
                                 .text_color(color(theme::TEXT_SECONDARY))
                                 .hover(|s| s.bg(color(theme::ACTIVE)))
                                 .child("Show")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected = Some(pid);
-                                    cx.notify();
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _, cx| {
+                                        this.selected = Some(id.clone());
+                                        cx.notify();
+                                    }
                                 })),
                         )
                         .when(holder.is_some_and(|b| !b.own), |row| {
                             row.child(
                                 div()
-                                    .id(("activity-end-blocker", pid as u64))
+                                    .id(SharedString::from(format!("activity-end-blocker-{id}")))
                                     .px_2()
                                     .rounded(px(5.))
                                     .text_color(color(theme::RED))
                                     .hover(|s| s.bg(color(theme::ACTIVE)))
                                     .child("End Session…")
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.ask(pid, Signal::Terminate, window, cx)
+                                        this.ask(&id, Signal::Terminate, window, cx)
                                     })),
                             )
                         })
@@ -493,7 +497,7 @@ impl ActivityTab {
 
     fn render_rows(&self, activity: &Activity, cx: &mut Context<Self>) -> AnyElement {
         let mono = cx.theme().mono_font_family.clone();
-        let blocking = activity.blocking_pids();
+        let blocking = activity.blocking_ids();
         let shown = activity.shown(self.all);
         if shown.is_empty() {
             return div()
@@ -521,10 +525,10 @@ impl ActivityTab {
             .child(div().w(px(150.)).child("WAITING FOR"))
             .child(div().flex_1().child("QUERY"));
         let rows = shown.into_iter().map(|backend| {
-            let pid = backend.pid;
-            let selected = self.selected == Some(pid);
+            let id = backend.id.clone();
+            let selected = self.selected.as_ref() == Some(&id);
             let concern = backend.concern();
-            let blocks = blocking.contains(&pid);
+            let blocks = blocking.contains(&id);
             let (state_tone, flag) = match (blocks, concern) {
                 (true, _) => (theme::RED, Some("blocking")),
                 (_, Some(Concern::Blocked)) => (theme::AMBER, Some("blocked")),
@@ -557,7 +561,7 @@ impl ActivityTab {
                 .take(300)
                 .collect();
             h_flex()
-                .id(("activity-row", pid as u64))
+                .id(SharedString::from(format!("activity-row-{id}")))
                 .h(px(30.))
                 .flex_shrink_0()
                 .px_3()
@@ -572,7 +576,7 @@ impl ActivityTab {
                         .w(px(64.))
                         .font_family(mono.clone())
                         .text_color(color(theme::TEXT_SECONDARY))
-                        .child(format!("{pid}{}", if backend.own { " ·me" } else { "" })),
+                        .child(format!("{id}{}", if backend.own { " ·me" } else { "" })),
                 )
                 .child(
                     h_flex()
@@ -631,7 +635,7 @@ impl ActivityTab {
                         .text_color(color(theme::TEXT_SECONDARY))
                         .child(query),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.select(pid, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
         });
         v_flex()
             .flex_1()
@@ -650,12 +654,12 @@ impl ActivityTab {
 
     /// The selected session in full, and what can be done to it.
     fn render_details(&self, activity: &Activity, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let backend = activity.backend(self.selected?)?.clone();
-        let pid = backend.pid;
+        let backend = activity.backend(self.selected.as_ref()?)?.clone();
+        let id = backend.id.clone();
         let mono = cx.theme().mono_font_family.clone();
-        let waiting_on_it = activity.waiting_on(pid);
+        let waiting_on_it = activity.waiting_on(&id);
         let mut facts = vec![
-            format!("Session {pid}"),
+            format!("Session {id}"),
             backend.kind.clone(),
             if backend.database.is_empty() {
                 String::new()
@@ -743,17 +747,18 @@ impl ActivityTab {
                         })
                         .when(!backend.own && backend.is_client(), |bar| {
                             bar.when(backend.state == State::Active, |bar| {
+                                let id = id.clone();
                                 bar.child(
                                     action("activity-cancel", "Cancel Query…", theme::AMBER)
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.ask(pid, Signal::Cancel, window, cx)
+                                            this.ask(&id, Signal::Cancel, window, cx)
                                         })),
                                 )
                             })
                             .child(
                                 action("activity-terminate", "End Session…", theme::RED).on_click(
                                     cx.listener(move |this, _, window, cx| {
-                                        this.ask(pid, Signal::Terminate, window, cx)
+                                        this.ask(&id, Signal::Terminate, window, cx)
                                     }),
                                 ),
                             )
