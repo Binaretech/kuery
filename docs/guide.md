@@ -206,7 +206,7 @@ Building needs a C compiler (for `ring` and `aws-lc-sys`, the two rustls crypto 
 
 
 ```bash
-docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, SQL Server 2022 (`mssql` and `mssql-seed`; amd64, emulated on Apple silicon, port 14339, user `sa`, development-only password in `.env.example`), a seeded Redis and an SSH bastion
+docker compose -p kuery-dev -f dev/compose.yaml up -d   # Postgres with 1,000,000 orders and an analytics database, MySQL with a shop, SQL Server 2022 (`mssql` and `mssql-seed`; amd64, emulated on Apple silicon, port 14339, user `sa`, development-only password in `.env.example`), a seeded Redis, a MongoDB replica set and an SSH bastion
 cargo run -p kuery-sqlite --example seed                # dev/shop.sqlite, for the local-sqlite connection
 cargo run -p kuery -- .                                 # the app, on this repo's project
 cargo test --workspace --locked                         # tests without a database
@@ -214,6 +214,7 @@ cargo test -p kuery-pg -- --ignored                     # tests against the dev 
 cargo test -p kuery-redis -- --ignored                  # tests against the dev Redis
 cargo test -p kuery-mysql -- --ignored                  # tests against the dev MySQL
 cargo test -p kuery-mssql -- --ignored                  # tests against the dev SQL Server
+cargo test -p kuery-mongo -- --ignored --test-threads=1 # tests against the dev MongoDB
 cargo test -p kuery -- --ignored                        # SSH tunnels through the dev bastion
 cargo run --release -p kuery-pg --example stream_bench  # streaming without a UI
 ```
@@ -335,7 +336,10 @@ Adding a SQL database means a crate with an adapter, its dialect and its
 checks every driver runs against its real database, so behaving like the
 others is tested, not promised. The session's own rules are tested once,
 against a fake adapter. Redis is the key-value family, with its own session,
-sidebar and tabs.
+sidebar and tabs. [MongoDB](#mongodb) is the document family: a
+`DocumentAdapter` (`kuery_core::document`) driven by a `DocumentSession`
+that owns its rules the same way, so a second document database is a crate
+and one line in `drivers.rs`, checked by `kuery_core::document::conformance`.
 
 ### MySQL and MariaDB
 
@@ -490,6 +494,196 @@ expire, 1,500 products to page through and a second database; the repo's
 project has a `local-cache` connection to it, and `prod-cache`, the same
 server marked as production, to try the production rules.
 
+## MongoDB
+
+MongoDB is the document family's first driver. Atlas, Amazon DocumentDB,
+Azure Cosmos DB (its MongoDB API), FerretDB and Percona Server for MongoDB
+are the same driver under other names (aliases in the driver list): what a
+connection can do (transactions, plans, activity, who keeps it from
+writing) is detected when it opens, never assumed from the product.
+
+### Connecting
+
+The host is one server, or a replica set's members as `a:27017,b:27017`
+(the port field is the default for members without one, 27017 when
+empty). The database is the one the console starts in; without one, it
+starts in `test`, as mongosh does. TLS is on for SRV and off otherwise
+unless you pick Require (which checks the server's certificate) or
+Disable. The other options are form fields, and only these are kept:
+
+| Option | What it does |
+| --- | --- |
+| SRV | The host names a cluster whose members come from DNS (`mongodb+srv://`), as Atlas does. |
+| Auth database | `authSource`: where the user is defined (`admin` for most). |
+| Mechanism | `SCRAM-SHA-256`, `SCRAM-SHA-1` or `MONGODB-X509`. |
+| Replica set | `replicaSet`, such as `rs0`. |
+| Direct | Talk to the one host named instead of discovering the replica set from it. By default, direct for a single host without a replica set. |
+| Read preference | Where reads go. It is not a protection: writes still reach the primary. |
+| CA file | `tlsCAFile`, for a private CA such as Amazon DocumentDB's bundle. |
+| Client certificate | `tlsCertificateKeyFile`, the certificate and its key in one file, for X.509. |
+| Invalid certificates | Connects without checking the server's certificate. Not offered on production connections, which refuse it. |
+
+Pasting a `mongodb://` or `mongodb+srv://` connection string into the host
+field fills the form: hosts, database, user, TLS and options, with the
+password moved to the system keychain, never into `project.toml`. Options
+Kuery does not keep are refused by name; `retryWrites`, `w=majority` and
+`appName` are the client's defaults and are dropped. A `/` in the user or
+password is written `%2F`. Key file passwords are never options.
+
+Through an SSH host, Kuery reaches a single member: one host, without SRV,
+connected to directly (`directConnection=true`). A host list or SRV is
+refused with "Through SSH, Kuery reaches a single member". With TLS, the
+tunnel is a SOCKS proxy that dials the member by its name, so the
+certificate is checked against that name.
+
+### Read-only
+
+MongoDB has no read-only session, so Kuery refuses writes itself, twice:
+each console statement is read (never run) and only reads go through on a
+read-only connection; then the command Kuery is about to send is checked
+again, apart from that reading, and only read commands, aggregations
+without `$out` or `$merge` at any depth (in `$facet`, `$lookup` and
+`$unionWith` too) and the explains of those leave. For a guarantee, connect
+as a user with only the `read` role: Kuery says the server refuses writes
+only when at least one user is signed in and none of the privileges the
+server reports for it, at connect time, is a write. Otherwise the status
+bar's notice says that only Kuery refuses them, and why: a server without
+authentication, a connection without a user, or a user that may write.
+Other notices: connected to a secondary, a standalone server (no
+transactions, so a script's writes are not all or nothing), and a user who
+cannot stop its operations on the server (cancelling then only stops
+waiting).
+
+### Browsing
+
+In the sidebar a connection lists its databases, then each one's
+collections and views with their document counts, and a collection opens
+(by its chevron) to its indexes. Its menu has Open Console, Server
+Activity (where the user may list operations), Refresh and Disconnect.
+
+A collection opens in a tab, a page at a time (100 documents unless the
+bar's limit says otherwise), with a filter bar like Compass's: Filter,
+Projection, Sort and Limit, in mongosh's literal syntax (`{status:
+"paid", total: {$gt: 100}}`). Columns are the documents' top-level fields,
+`_id` first, up to 200; a field first seen in a later page adds a column
+without starting over. A field a document lacks shows as a dimmed `—`,
+an explicit `null` as NULL. Without a sort, pages follow `_id`; with one,
+they skip what came before, and the footer warns that documents that
+move can repeat or be missed. The count stops at 10,000 ("more than") and
+gives up after a few seconds rather than hold the tab. Views open
+read-only, with their pipeline under the bar.
+
+The selected document shows beside the grid as a typed literal that reads
+back the same (`NumberLong("5")`, `ObjectId("…")`) or as a tree of its
+fields and types, whose menu copies a path or value and filters the
+collection by it. The row menu copies the document as a literal, relaxed
+Extended JSON or canonical Extended JSON. Export Documents writes every
+document the bar matches, as NDJSON (or one JSON array for a `.json`
+file), reading through the cursor rather than the loaded page.
+
+The tab also shows the collection's schema, sampled (1,000 documents, or
+16 MB of them) and kept for every tab on the connection, beside the
+validator the collection declares, and its indexes, with how often each
+is used where the user may read it.
+
+### Editing documents
+
+Edit opens the document's literal for editing, Insert starts from the
+sampled schema, Duplicate copies a document without its `_id`, and Delete
+marks the row. Each change is staged and marked on the grid until Apply,
+which sends them through the write review on a session of their own and
+logs them to the audit log. An edit is the typed difference between the
+document as loaded and as edited: changed fields are `$set`, removed
+fields are `$unset` (never turned into `null`), and every other field
+keeps its type (`NumberLong` stays a 64-bit integer, `NumberDecimal` a
+decimal, and `42.0` a double, where mongosh would store `42.0` as an
+integer). Each change applies only to a document that still holds what it
+had when loaded (a field that was missing must still be missing); one
+that changed meanwhile is reported and left alone. Changing `_id` is
+refused: duplicate the document instead. Where the server has
+transactions (a replica set or a sharded cluster), Apply is all or
+nothing; on a standalone server it stops at the first failure and keeps
+the rest staged. Views, and users the server keeps from writing, offer no
+edits.
+
+### The console
+
+The console runs mongosh's commands one per statement (statements end at
+`;` or at the end of a line outside brackets), read and never evaluated:
+
+- `use <db>`, `show dbs`, `show collections`;
+- reads: `find` and `findOne` with `.sort`, `.limit`, `.skip`,
+  `.projection`, `.hint`, `.collation`, `.maxTimeMS`, `.batchSize` and
+  `.explain()`, and `aggregate`, `countDocuments`,
+  `estimatedDocumentCount`, `distinct`, `getIndexes`, `stats`;
+- writes: `insertOne`, `insertMany`, `updateOne`, `updateMany`,
+  `replaceOne`, `deleteOne`, `deleteMany`, the `findOneAnd…` methods and
+  `bulkWrite`; schema changes: `createIndex(es)`, `dropIndex(es)`, `drop`,
+  `renameCollection`, `db.createCollection`, `db.createView` and
+  `db.dropDatabase`;
+- `db.getCollection("a.b")` and `db.getSiblingDB("x")`, and
+  `db.runCommand({…})` and `db.adminCommand({…})`, where only `ping`,
+  `hello`, `buildInfo`, `serverStatus`, `dbStats`, `collStats`,
+  `listCollections`, `listIndexes`, `connectionStatus` and `hostInfo`
+  count as reads.
+
+Literals are JSON5 (unquoted keys, single quotes, trailing commas),
+`/regex/flags`, `ObjectId()`, `ISODate()`, `new Date()`, `NumberInt()`,
+`NumberLong()`, `NumberDecimal()`, `UUID()`, `BinData()`, `Timestamp()`,
+`MinKey()`, `MaxKey()` and Extended JSON. `42` is a 32-bit integer (64-bit
+when it does not fit) and `42.0` a double. JavaScript is refused with
+"Kuery runs MongoDB commands, not JavaScript: one command per statement":
+variables, functions, loops, `forEach`, `load()`, `db.eval`, `mapReduce`
+and `Mongo()`. Server-side JavaScript (`$where`, `$function`,
+`$accumulator`), index builds, `validate` and `compact` are heavy and run
+on development connections only.
+
+`secondary-enter` runs the statement under the cursor or the selection,
+`secondary-alt-enter` all of them, `secondary-.` stops what runs: the
+operation is killed on the server and the console keeps working.
+Completion offers collections after `db.`, methods after a collection,
+operators and pipeline stages after `$`, and the sampled field paths. The
+last statement that returned documents fills the grid, and every
+statement's outcome goes to the Output log; Export All runs it again to
+write every document it returns.
+
+Explain (`secondary-e`) shows the statement's plan in the Plan tab, and
+Explain with Statistics (`secondary-alt-e`) measures it by running it,
+which only a read may do: a write is only planned, never run.
+
+The language picker switches the console to Kuery's read-only SQL, which
+is translated into the `aggregate` it runs; see
+[Kuery's SQL for documents](sql-for-documents.md).
+
+### Writing from the console
+
+The console starts in Read-only. In Write it runs on a session of its own,
+and each script that writes goes through the write review first, with a
+preview of what each statement would change: exact on a replica set or a
+sharded cluster, where the script runs in a transaction that is undone;
+estimated on a standalone server, counted from each statement's filter;
+unknown for the rest, which makes the statement dangerous. There is no
+transactional write mode: a script applies when it runs, all of it or
+nothing where the server has transactions, else stopping at the first
+failure, and there is no Roll Back. Writes follow the environment as in
+[write mode](#write-mode): development asks before dangerous statements
+(`updateMany` or `deleteMany` with an empty filter, `drop`,
+`dropDatabase`, `dropIndexes("*")`, `$out` onto a collection that exists,
+`renameCollection` with `dropTarget`, `replaceOne` without `_id` in its
+filter, and user or role commands), staging before every write, and
+production needs writes allowed for the connection session first. Every
+write, every one refused or failed, and every preview goes to the audit
+log.
+
+The dev compose starts a MongoDB 8.0 single-node replica set (`rs0`) on
+port 27019 with authentication and the sample `shop` database: root user
+`kuery`/`kuery` (auth database `admin`) and read-only user
+`kuery_ro`/`kuery` (`read` on `shop`, auth database `shop`), development
+only. Its connection string is in `.env.example`. A standalone server
+without authentication, for what a standalone lacks, starts with `docker
+compose -f dev/compose.yaml --profile standalone up -d mongo-standalone`
+on port 27029.
+
 ## Diagrams
 
 A schema's diagram opens from its menu in the sidebar ("Open Diagram") or
@@ -528,8 +722,9 @@ Mermaid `erDiagram` (`.mmd`) or DBML (`.dbml`), to a file or the clipboard.
 
 ## Server activity
 
-"Server Activity" in a Postgres connection's menu (or "Show Server
-Activity" in the command palette) opens a tab with the server's sessions:
+"Server Activity" in a Postgres or SQL Server connection's menu (or "Show
+Server Activity" in the command palette) opens a tab with the server's
+sessions:
 state, how long each has been at it (its query, or its open transaction
 when idle in one), user and application, the lock it waits for and its
 query. It refreshes every two seconds on a connection of its own, so a long
@@ -544,6 +739,17 @@ which keep their locks. Selecting a session shows its query in full, to
 copy or open in a query tab, and offers to cancel its query or end the
 session. Both are confirmed first; on production they need writes allowed
 for the connection session, like any write, and both go to the audit log.
+
+On a MongoDB connection the tab lists running operations (`$currentOp`)
+instead: every user's when the user has the `inprog` privilege (the
+`clusterMonitor` role has it), else only its own, which the tab says.
+Each shows its user, client, database, how long it has run, whether it
+waits for a lock, and the command it runs (for a `getMore`, the command
+that opened its cursor); "All operations" adds the server's own threads.
+MongoDB does not say who holds the lock an operation waits for. Stop
+Operation sends `killOp`, confirmed and allowed as above and logged to the
+audit log; stopping other users' operations needs the `killop` privilege.
+There is no End Session: MongoDB stops operations, not sessions.
 
 ## Write mode
 
@@ -856,7 +1062,10 @@ the functions but not file and line yet.
 
 `.github/workflows/ci.yml` runs `cargo fmt`, `clippy -D warnings` and
 `cargo test --workspace` on macOS, Windows and Linux, plus the ignored
-`kuery-pg` tests against `postgres:16` (and a second Postgres with TLS) on Linux.
+`kuery-pg` tests against `postgres:16` (and a second Postgres with TLS) on Linux,
+and the ignored `kuery-mongo` tests against the dev compose's MongoDB 7.0
+replica set and standalone server (8.0 does not start on the runner's
+kernel). A check also keeps `kuery-mongo` on rustls with `ring` alone.
 The Rust toolchain is pinned in `rust-toolchain.toml` (gpui uses APIs stabilized after Rust 1.93).
 
 `.github/workflows/release.yml` builds release binaries for Linux (x86_64),

@@ -19,8 +19,8 @@
 </p>
 
 Kuery brings database administration and file analytics into one desktop app.
-Work with PostgreSQL, MySQL, MariaDB, SQL Server, SQLite and Redis, or open CSV, JSON and
-Parquet files without a database connection. The same results grid and Profile
+Work with PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB, or open CSV,
+JSON and Parquet files without a database connection. The same results grid and Profile
 views help you move from a query to an explanation of the data.
 
 Built in Rust with [GPUI Kit](https://crates.io/crates/gpui-kit),
@@ -47,6 +47,7 @@ Windows and Linux.
 | **Query plans** | Explore supported EXPLAIN output as a tree or graph, inspect step details and compare plans. PostgreSQL plans include timing, row-estimate comparisons and insights. |
 | **Schema diagrams** | Explore tables and foreign keys with crow's-foot relationships, keys-only views and saved card positions. |
 | **Controlled writes** | Start in read-only mode. Use explicit SQL write modes, transaction commit/rollback and impact previews where supported. Table edits are staged and checked before saving. Environment policies govern development, staging and production. |
+| **MongoDB tools** | Browse databases and collections, page through documents with a filter bar, see their sampled schema, indexes and plans, and run mongosh's commands in a console that reads them without evaluating JavaScript. Edit documents with a typed diff, query with read-only SQL translated to the `aggregate` it runs, and watch or stop running operations. |
 | **Redis tools** | Browse keys with SCAN, inspect strings/JSON, hashes, lists, sets, sorted sets and streams, and run commands in a dedicated console. Writes use explicit environment-aware controls. |
 | **Projects & navigation** | Keep connection definitions, saved SQL and diagram positions in a folder-based project. Use recent projects, the command palette, contextual menus, history and configurable shortcuts. |
 | **Connectivity** | Use driver-specific TLS settings and OpenSSH tunnels. Connection passwords are stored in the operating system's credential store rather than the project file. |
@@ -100,6 +101,7 @@ For additional views, see the [query plan](docs/screenshots/plan-tree.png),
 | **SQL Server** | Databases, schemas, tables, views and routines | SQL editor with `GO` batches, read-only reads, explicit write modes | Query plans and server activity. SQL Server logins only; see the guide for the read-only guarantee. |
 | **SQLite** | Local database files, tables, views and definitions | SQL editor, query-only reads, explicit write modes | Existing files only; missing paths do not create an empty database. |
 | **Redis** | Standalone databases and keys, including streams | Dedicated command console | Read-only by default. Redis writes apply immediately and cannot be rolled back. |
+| **MongoDB** | Databases, collections, views and indexes; documents a page at a time | mongosh's commands (parsed, never evaluated) and [read-only SQL](docs/sql-for-documents.md) | Atlas, DocumentDB, Cosmos DB and FerretDB through the same driver. MongoDB has no read-only session: Kuery refuses writes itself; connect with a `read` user for a guarantee. |
 | **CSV / TSV** | File preview, inferred schema and Profile | Polars SQL | Comma, semicolon or tab; header and NULL options. |
 | **JSON / JSONL / NDJSON** | Object records, inferred schema and Profile | Polars SQL | JSON is an array of objects; JSONL/NDJSON has one object per nonblank line. |
 | **Parquet** | File preview, native schema and Profile | Polars SQL | Preserves native schema metadata; nested and binary values have readable representations. |
@@ -247,9 +249,13 @@ my-project/
     └── diagrams/         # Diagram positions
 ```
 
+A MongoDB connection also takes a pasted `mongodb://` or `mongodb+srv://`
+connection string in its host field, which fills the form and moves the
+password to the credential store; see the [MongoDB guide](docs/guide.md#mongodb).
+
 The sample database stack is optional. The
 [development guide](docs/guide.md#development) covers the seeded PostgreSQL,
-MySQL, SQL Server, Redis, SQLite and SSH examples.
+MySQL, SQL Server, Redis, MongoDB, SQLite and SSH examples.
 
 ## Shortcuts
 
@@ -293,7 +299,9 @@ with **Open Keymap File**, then apply edits with **Reload Keymap**.
   discards the result; an active Polars worker may continue until it finishes.
 - **Writes:** database capabilities differ. Read the
   [write-mode guide](docs/guide.md#write-mode) before using explicit write modes.
-  Redis changes have no rollback.
+  Redis changes have no rollback. MongoDB scripts apply as they run, all or
+  nothing only where the server has transactions; through SSH, Kuery reaches
+  a single member.
 
 ## Architecture
 
@@ -311,6 +319,7 @@ Profile.
 | [`kuery-mssql`](crates/mssql) | SQL Server adapter and database-specific behavior. |
 | [`kuery-sqlite`](crates/sqlite) | SQLite adapter and local database access. |
 | [`kuery-redis`](crates/redis) | Redis runtime, key browsing, value handling and console commands. |
+| [`kuery-mongo`](crates/mongo) | MongoDB driver: connection strings, the mongosh command parser and classifier, the read-only guard, and the SQL translator. |
 | [`kuery-files`](crates/files) | Polars readers, schema metadata, bounded previews and read-only file SQL. |
 | [`kuery-update`](crates/update) | Release checks, verified downloads and in-place installs for the in-app updater, with no UI dependencies. |
 
