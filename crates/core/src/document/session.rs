@@ -485,7 +485,8 @@ impl DocumentSession {
     }
 
     /// How many documents match `filter`, counting no further than `cap`
-    /// when it costs time. The filter is checked like the filter bar's.
+    /// when it costs time. The filter is checked like the filter bar's, and
+    /// [`Self::cancel`] stops the count.
     pub fn count(
         &self,
         collection: CollectionRef,
@@ -499,7 +500,7 @@ impl DocumentSession {
         };
         let counted = checked.map(|()| {
             self.handle.call(move |worker| {
-                worker.catalog(|adapter| adapter.count(&collection, filter.as_deref(), cap))
+                worker.stoppable(|adapter| adapter.count(&collection, filter.as_deref(), cap))
             })
         });
         async move { counted?.await }
@@ -758,6 +759,17 @@ impl Worker<dyn DocumentAdapter> {
     ) -> Result<T, QueryError> {
         self.adapter.limit(&RunOptions::default())?;
         job(self.adapter.as_mut())
+    }
+
+    /// A catalog job that a cancel stops, as it stops a run.
+    fn stoppable<T>(
+        &mut self,
+        job: impl FnOnce(&mut dyn DocumentAdapter) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        self.adapter.limit(&RunOptions::default())?;
+        self.begin_run()?;
+        let outcome = job(self.adapter.as_mut());
+        self.end_run(outcome)
     }
 
     /// The plan of one checked statement (see
