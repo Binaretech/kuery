@@ -24,8 +24,9 @@ pub const CONTROL_BORDER: u32 = 0x2e2e33;
 /// A selected segment or an active list row.
 pub const ACTIVE: u32 = 0x2a2a2e;
 pub const ACTIVE_STRONG: u32 = 0x34343a;
-/// Text a step below secondary: muted counts, line numbers.
-pub const TEXT_QUIET: u32 = 0x6e6e73;
+/// Text a step below secondary: muted counts, line numbers. At least 4.5:1
+/// on the ground, sidebar and toolbars, so it stays readable at 11–12px.
+pub const TEXT_QUIET: u32 = 0x86868b;
 pub const GREEN: u32 = 0x32d74b;
 pub const AMBER: u32 = 0xffb340;
 pub const RED: u32 = 0xff453a;

@@ -1,5 +1,7 @@
 //! SQL over a named set of local files, using the shared SQL editor and grid.
 use crate::{
+    assets::AppIcon,
+    chrome,
     completion::{SharedCatalog, SqlCompletions},
     file_jobs,
     profile_view::ProfilePanel,
@@ -9,17 +11,18 @@ use crate::{
     theme::{self, color},
     ui::{format_duration, thousands},
 };
-use gpui_kit::component::Disableable as _;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    h_flex,
+    Icon, IconName, h_flex,
     input::{Editor, EditorState},
     table::TableState,
+    tooltip::Tooltip,
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Task, Window, div, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::{
     catalog::{TableKind, TableRef},
@@ -298,6 +301,148 @@ impl FileQueryTab {
         });
     }
 }
+impl FileQueryTab {
+    /// Run, Cancel and Format as in a database query tab, then the tables
+    /// this tab can read. The status bar says it is Polars SQL and read only.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mac = cfg!(target_os = "macos");
+        h_flex()
+            .h(px(46.))
+            .px_3()
+            .gap(px(6.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(color(theme::HAIRLINE))
+            .child(
+                chrome::primary_button(
+                    "file-sql-run",
+                    IconName::Play,
+                    if self.running { "Running" } else { "Run" },
+                    Some(if mac { "⌘↵" } else { "Ctrl+↵" }),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.run(&RunQuery, window, cx))),
+            )
+            .child(
+                chrome::icon_button(
+                    "file-sql-cancel",
+                    IconName::Square,
+                    if mac {
+                        "Cancel  ⌘."
+                    } else {
+                        "Cancel  Ctrl+."
+                    },
+                    self.running,
+                )
+                .when(self.running, |b| {
+                    b.on_click(
+                        cx.listener(|this, _, window, cx| this.cancel(&CancelQuery, window, cx)),
+                    )
+                }),
+            )
+            .child(
+                chrome::icon_button(
+                    "file-sql-format",
+                    AppIcon::Format,
+                    if mac {
+                        "Format SQL  ⌘⇧F"
+                    } else {
+                        "Format SQL  Ctrl+Shift+F"
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.format(&FormatSql, window, cx))),
+            )
+            .child(chrome::toolbar_divider())
+            .child(h_flex().min_w_0().gap(px(6.)).overflow_hidden().children(
+                self.sources.iter().enumerate().map(|(i, source)| {
+                    // The path and options are fixed when the tab opens.
+                    let path: SharedString = format!(
+                        "{} · fixed when this tab opened",
+                        source.file.source.path.display()
+                    )
+                    .into();
+                    h_flex()
+                        .id(("file-sql-source", i))
+                        .h(px(24.))
+                        .flex_shrink_0()
+                        .gap(px(5.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .bg(color(theme::CONTROL))
+                        .text_size(px(12.))
+                        .text_color(color(theme::TEXT_SECONDARY))
+                        .child(Icon::new(AppIcon::Table).size(px(12.)))
+                        .child(source.file.name.clone())
+                        .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+                }),
+            ))
+    }
+
+    /// Results and Profile, as tabs; the run's figures are in the status bar.
+    fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let results = self.table.read(cx).delegate().results();
+        let count = (!results.columns().is_empty()).then(|| thousands(results.rows() as u64));
+        let tab = |id: &'static str,
+                   icon: AppIcon,
+                   label: &'static str,
+                   count: Option<String>,
+                   profile: bool,
+                   cx: &mut Context<Self>| {
+            let active = self.show_profile == profile;
+            h_flex()
+                .id(id)
+                .h(px(26.))
+                .gap(px(6.))
+                .px(px(10.))
+                .rounded(px(6.))
+                .font_weight(FontWeight::MEDIUM)
+                .when(active, |t| {
+                    t.bg(color(theme::ACTIVE)).text_color(color(theme::TEXT))
+                })
+                .when(!active, |t| {
+                    t.text_color(color(theme::TEXT_TERTIARY))
+                        .hover(|s| s.text_color(color(theme::TEXT)))
+                })
+                .child(Icon::new(icon).size(px(13.)))
+                .child(label)
+                .children(count.map(|count| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(color(theme::TEXT_TERTIARY))
+                        .child(count)
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.show_profile = profile;
+                    cx.notify();
+                }))
+        };
+        h_flex()
+            .h(px(36.))
+            .px_2()
+            .gap(px(2.))
+            .flex_shrink_0()
+            .border_t_1()
+            .border_b_1()
+            .border_color(color(theme::HAIRLINE))
+            .text_size(px(12.5))
+            .child(tab(
+                "file-sql-results",
+                AppIcon::Table,
+                "Results",
+                count,
+                false,
+                cx,
+            ))
+            .child(tab(
+                "file-sql-profile",
+                AppIcon::Chart,
+                "Profile",
+                None,
+                true,
+                cx,
+            ))
+    }
+}
 impl Focusable for FileQueryTab {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -312,93 +457,14 @@ impl Render for FileQueryTab {
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::format))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(color(theme::HAIRLINE))
-                    .child(
-                        Button::new("file-sql-run")
-                            .label("Run SQL")
-                            .disabled(self.running)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.run(&RunQuery, window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("file-sql-cancel")
-                            .ghost()
-                            .label("Cancel")
-                            .disabled(!self.running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel(&CancelQuery, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("file-sql-format")
-                            .ghost()
-                            .label("Format")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.format(&FormatSql, window, cx)
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child("Polars SQL · read only"),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_size(px(12.))
-                    .text_color(color(theme::TEXT_SECONDARY))
-                    .child(format!(
-                        "Tables: {} · sources/options fixed when this SQL tab opens",
-                        self.sources
-                            .iter()
-                            .map(|s| format!(
-                                "\"{}\" = {}",
-                                s.file.name,
-                                s.file.source.path.display()
-                            ))
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    )),
-            )
+            .child(self.render_toolbar(cx))
             .child(
                 div()
                     .h(px(240.))
                     .flex_shrink_0()
                     .child(Editor::new(&self.editor).h_full().bordered(false)),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_y_1()
-                    .border_color(color(theme::HAIRLINE))
-                    .child(
-                        Button::new("file-sql-results")
-                            .ghost()
-                            .label("Results")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_profile = false;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("file-sql-profile")
-                            .ghost()
-                            .label("Profile")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_profile = true;
-                                cx.notify();
-                            })),
-                    )
-                    .child(self.status.clone()),
-            )
+            .child(self.render_panel_header(cx))
             .children(
                 self.error
                     .clone()
