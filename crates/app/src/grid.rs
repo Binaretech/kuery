@@ -10,6 +10,7 @@ use std::rc::Rc;
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, Styled as _, Window, div, px,
@@ -74,6 +75,17 @@ impl BrowseDelegate {
 
     pub fn set_row_json(&mut self, row_json: Option<RowJson>) {
         self.row_json = row_json;
+    }
+
+    /// Whether a column holds numbers, which sit right-aligned in figures
+    /// of one width.
+    fn is_numeric(&self, column: usize) -> bool {
+        self.page_index
+            .get(column)
+            .copied()
+            .flatten()
+            .and_then(|index| self.page.kinds().get(index))
+            .is_some_and(|kind| kind.is_numeric())
     }
 
     /// What the cell shows: its staged edit if there is one.
@@ -226,11 +238,13 @@ impl TableDelegate for BrowseDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let numeric = self.is_numeric(col_ix);
         let info = &self.columns[col_ix];
         h_flex()
             .size_full()
             .gap_1()
             .overflow_hidden()
+            .when(numeric, |th| th.justify_end())
             .children(info.primary_key.then(|| {
                 Icon::new(AppIcon::Key)
                     .size(px(12.))
@@ -286,11 +300,14 @@ impl TableDelegate for BrowseDelegate {
         let deleted = self.deleted.contains(&row_ix);
         let edited = self.edits.get(&(row_ix, col_ix));
         let value = self.shown(row_ix, col_ix);
+        let numeric = self.is_numeric(col_ix);
+        let mono = cx.theme().mono_font_family.clone();
         let mut cell = div()
             .size_full()
             .flex()
             .items_center()
             .overflow_hidden()
+            .when(numeric, |cell| cell.justify_end())
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |table, _, _, _| {
@@ -314,6 +331,7 @@ impl TableDelegate for BrowseDelegate {
         let content: AnyElement = match value {
             Some(Some(text)) => div()
                 .truncate()
+                .when(numeric, |value| value.font_family(mono))
                 .child(SharedString::from(text.to_owned()))
                 .into_any_element(),
             Some(None) if self.removed.contains(&(row_ix, col_ix)) => div()

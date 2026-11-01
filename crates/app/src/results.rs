@@ -123,6 +123,13 @@ impl ResultsDelegate {
         &self.set
     }
 
+    fn is_numeric(&self, column: usize) -> bool {
+        self.set
+            .kinds()
+            .get(column)
+            .is_some_and(|kind| kind.is_numeric())
+    }
+
     fn cell(&self, row: usize, column: usize) -> Cell {
         Cell {
             row,
@@ -149,6 +156,22 @@ impl TableDelegate for ResultsDelegate {
         self.columns[col_ix].clone()
     }
 
+    /// Numeric columns' headers sit right, over their figures.
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .when(self.is_numeric(col_ix), |th| th.justify_end())
+            .child(div().truncate().child(self.columns[col_ix].name.clone()))
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -157,19 +180,16 @@ impl TableDelegate for ResultsDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
-        let numeric = self
-            .set
-            .kinds()
-            .get(col_ix)
-            .is_some_and(|kind| kind.is_numeric());
+        let numeric = self.is_numeric(col_ix);
+        // Numbers in figures of one width; text in the interface face, as in
+        // a table's data grid.
         let cell: AnyElement = match self.set.cell(row_ix, col_ix) {
             Some(Some(text)) => div()
-                .font_family(mono)
+                .when(numeric, |value| value.font_family(mono))
                 .truncate()
                 .child(cell_preview(text))
                 .into_any_element(),
             Some(None) => div()
-                .font_family(mono)
                 .italic()
                 .text_color(cx.theme().muted_foreground)
                 .child("NULL")
