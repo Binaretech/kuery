@@ -2072,16 +2072,34 @@ impl WorkspaceView {
             }
             None => {}
         }
+        // On production the whole bar turns amber, like the line under the
+        // title bar, so the two ends of the window say it.
+        let production = connection
+            .as_ref()
+            .is_some_and(|connection| connection.environment == Environment::Production);
         h_flex()
             .h(px(26.))
             .flex_shrink_0()
             .px_3()
             .gap_4()
-            .bg(color(theme::TOOLBAR))
+            .bg(if production {
+                color(theme::AMBER).opacity(0.16)
+            } else {
+                color(theme::TOOLBAR)
+            })
             .border_t_1()
-            .border_color(color(theme::HAIRLINE))
+            .border_color(if production {
+                color(theme::AMBER).opacity(0.5)
+            } else {
+                color(theme::HAIRLINE)
+            })
             .text_size(px(11.5))
-            .text_color(color(theme::TEXT_TERTIARY))
+            // Tertiary grey falls under 4.5:1 on the amber tint.
+            .text_color(color(if production {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_TERTIARY
+            }))
             .child(left.flex_1())
             .child(right)
             .child(crate::updates::status_item(cx))
