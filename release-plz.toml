@@ -51,6 +51,11 @@ changelog_update = false
 name = "kuery-mongo"
 version_group = "kuery"
 changelog_update = false
+# kuery-mongo is new since v0.4.5, and release-plz compares each package
+# with its last tag's tree, where this one does not exist. A tag name that
+# matches nothing makes it an initial release instead. Remove this once a
+# release tag includes kuery-mongo, or each release repeats its history.
+git_tag_name = "kuery-mongo-v{{ version }}"
 
 [[package]]
 name = "kuery-mssql"
