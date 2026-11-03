@@ -719,7 +719,10 @@ mod tests {
                 .iter()
                 .any(|f| f.function.as_deref() == Some("kuery::grid::paint"))
         );
-        let text = serde_json::to_string(&event).unwrap();
+        // Without the random event id, which can hold any digits, "4111" too.
+        let mut fixed = event.clone();
+        fixed.event_id = Default::default();
+        let text = serde_json::to_string(&fixed).unwrap();
         assert!(!text.contains("someone"), "{text}");
         assert!(!text.contains("4111"), "{text}");
     }
