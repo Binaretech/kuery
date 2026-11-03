@@ -1050,6 +1050,30 @@ frames are dropped, so the trace ends where the panic happened. Sending goes
 through the workspace `reqwest`; the `sentry` crate is only used for the
 event types and backtrace parsing.
 
+### Log messages in a report
+
+`crates/app/src/diagnostics.rs` is Kuery's log: `diagnostics::info`, `warn`
+and `error` print a line to stderr and keep the latest 100 in memory. The
+panic hook copies them into the report, and **Send Report** sends them in the
+same envelope as Sentry logs, with the event's trace id (so Sentry shows them
+on the crash), the `sentry.release` attribute and the OpenTelemetry severity
+number. Their messages and text attributes are scrubbed like the panic
+message. Nothing is sent without a report the user agreed to send.
+
+Write a log message as a fixed sentence and put what varies in attributes,
+named after the OpenTelemetry conventions where one fits:
+
+```rust
+crate::diagnostics::error("Connection failed", &[("db.system.name", spec.driver.clone().into())]);
+crate::diagnostics::warn("Could not read the saved session", &[("error.type", "Io".into())]);
+```
+
+Never log queries, values, hosts, user names or full paths: scrubbing only
+catches what it recognizes. `diagnostics::io_error_type` gives an I/O error's
+kind (`PermissionDenied`) for `error.type`, without the path. Use `info` for
+something that happened, `warn` for a failure Kuery works around and `error`
+for one the user will notice.
+
 The DSN is compiled in from `KUERY_SENTRY_DSN` (`option_env!`). The Release
 workflow sets it from the repository secret of the same name; builds without
 it, or with it empty, never send and drop the report on the next start. To

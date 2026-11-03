@@ -24,6 +24,7 @@ mod context_menus;
 mod crash_report;
 mod data_file_tabs;
 mod definition;
+mod diagnostics;
 mod diagram_tab;
 mod document_console;
 mod document_detail;
@@ -217,12 +218,13 @@ fn log_panics() {
         default(info);
         let thread = std::thread::current();
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-        let report = crash_report::Report::new(
+        let mut report = crash_report::Report::new(
             info.payload_as_str().unwrap_or("Box<dyn Any>"),
             info.location().map(ToString::to_string),
             thread.name().unwrap_or("unnamed"),
             &backtrace,
         );
+        report.logs = diagnostics::recent();
         if let Err(error) = crash_report::record(&pending, &report) {
             eprintln!("kuery: could not write {}: {error}", pending.display());
         }
