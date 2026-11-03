@@ -1,0 +1,192 @@
+{
+  "explainVersion": "1",
+  "queryPlanner": {
+    "namespace": "kr_scratch.big",
+    "parsedQuery": {
+      "n": {
+        "$gte": 0
+      }
+    },
+    "indexFilterSet": false,
+    "optimizationTimeMillis": 1,
+    "optimizedPipeline": true,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "stage": "PROJECTION_DEFAULT",
+      "transformBy": {
+        "_id": true,
+        "x": {
+          "$convert": {
+            "input": "$s",
+            "to": {
+              "$const": "int"
+            }
+          }
+        }
+      },
+      "inputStage": {
+        "stage": "FETCH",
+        "inputStage": {
+          "stage": "IXSCAN",
+          "keyPattern": {
+            "n": 1,
+            "k": 1
+          },
+          "indexName": "n_1_k_1",
+          "isMultiKey": false,
+          "multiKeyPaths": {
+            "n": [],
+            "k": []
+          },
+          "isUnique": false,
+          "isSparse": false,
+          "isPartial": false,
+          "indexVersion": 2,
+          "direction": "forward",
+          "indexBounds": {
+            "n": [
+              "[0, inf.0]"
+            ],
+            "k": [
+              "[MinKey, MaxKey]"
+            ]
+          }
+        }
+      }
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": false,
+    "errorMessage": "Failed to parse number 'x0' in $convert with no onError value: Did not consume whole string.",
+    "errorCode": 241,
+    "nReturned": 0,
+    "executionTimeMillis": 4,
+    "totalKeysExamined": 1,
+    "totalDocsExamined": 1,
+    "failed": true,
+    "executionStages": {
+      "isCached": false,
+      "stage": "PROJECTION_DEFAULT",
+      "nReturned": 0,
+      "executionTimeMillisEstimate": 2,
+      "works": 1,
+      "advanced": 0,
+      "needTime": 0,
+      "needYield": 0,
+      "saveState": 0,
+      "restoreState": 0,
+      "failed": true,
+      "isEOF": 0,
+      "transformBy": {
+        "_id": true,
+        "x": {
+          "$convert": {
+            "input": "$s",
+            "to": {
+              "$const": "int"
+            }
+          }
+        }
+      },
+      "inputStage": {
+        "stage": "FETCH",
+        "nReturned": 1,
+        "executionTimeMillisEstimate": 0,
+        "works": 1,
+        "advanced": 1,
+        "needTime": 0,
+        "needYield": 0,
+        "saveState": 0,
+        "restoreState": 0,
+        "isEOF": 0,
+        "docsExamined": 1,
+        "alreadyHasObj": 0,
+        "inputStage": {
+          "stage": "IXSCAN",
+          "nReturned": 1,
+          "executionTimeMillisEstimate": 0,
+          "works": 1,
+          "advanced": 1,
+          "needTime": 0,
+          "needYield": 0,
+          "saveState": 0,
+          "restoreState": 0,
+          "isEOF": 0,
+          "keyPattern": {
+            "n": 1,
+            "k": 1
+          },
+          "indexName": "n_1_k_1",
+          "isMultiKey": false,
+          "multiKeyPaths": {
+            "n": [],
+            "k": []
+          },
+          "isUnique": false,
+          "isSparse": false,
+          "isPartial": false,
+          "indexVersion": 2,
+          "direction": "forward",
+          "indexBounds": {
+            "n": [
+              "[0, inf.0]"
+            ],
+            "k": [
+              "[MinKey, MaxKey]"
+            ]
+          },
+          "keysExamined": 1,
+          "seeks": 1,
+          "dupsTested": 0,
+          "dupsDropped": 0
+        }
+      }
+    }
+  },
+  "queryShapeHash": "3F3023C266B048C7E72A27E8EB2D75FB471C475753413F4B27A9573C08A7354E",
+  "command": {
+    "aggregate": "big",
+    "pipeline": [
+      {
+        "$match": {
+          "n": {
+            "$gte": 0
+          }
+        }
+      },
+      {
+        "$project": {
+          "x": {
+            "$toInt": "$s"
+          }
+        }
+      }
+    ],
+    "cursor": {},
+    "$db": "kr_scratch"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 104857600,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 104857600,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

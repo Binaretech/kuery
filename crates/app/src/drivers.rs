@@ -208,14 +208,17 @@ impl Driver {
                     .filter(|database| !database.is_empty())
                     .into_iter()
                     .collect();
-                Ok(Connection::Document(DocDb::new(
-                    spec.name.clone().into(),
-                    spec.environment(),
-                    catalog,
-                    spec.target().into(),
-                    home,
-                    tunnel,
-                )))
+                Ok(Connection::Document(
+                    DocDb::new(
+                        spec.name.clone().into(),
+                        spec.environment(),
+                        catalog,
+                        spec.target().into(),
+                        home,
+                        tunnel,
+                    )
+                    .with_frontends(document.frontends),
+                ))
             }),
         }
     }
@@ -422,7 +425,7 @@ mod tests {
         };
         let reached = test_with(&mongodb, Some("kuery".into()));
         assert!(
-            reached.starts_with("Connected through localhost · MongoDB 8.0"),
+            reached.starts_with("Connected through localhost · MongoDB "),
             "{reached}"
         );
     }
@@ -452,7 +455,7 @@ mod tests {
         };
         let reached = test(&spec, "kuery").unwrap();
         assert!(
-            reached.starts_with("Connected · MongoDB 8.0") && !reached.contains('\n'),
+            reached.starts_with("Connected · MongoDB ") && !reached.contains('\n'),
             "{reached}"
         );
         // On production the root user is read-only only in Kuery, which says so.

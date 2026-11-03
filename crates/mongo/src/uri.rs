@@ -99,6 +99,10 @@ pub const OPTIONS: &[OptionField] = &[
 const UNESCAPED: &str =
     "The connection string has an @ after its first /: a / in the user or password is written %2F";
 
+/// Why a string with an `@` only after its first `?` is refused: a `?` in
+/// the password ended the hosts, and the rest of it would pass for options.
+const UNESCAPED_QUERY: &str = "The connection string has an @ after its first ?: a ? in the user or password is written %3F, and an @ in an option %40";
+
 /// The authentication mechanisms Kuery connects with.
 const MECHANISMS: &[&str] = &["SCRAM-SHA-256", "SCRAM-SHA-1", "MONGODB-X509"];
 
@@ -130,6 +134,9 @@ pub fn parse(uri: &str) -> Result<ParsedUri, String> {
         return Err("A MongoDB connection string starts with mongodb:// or mongodb+srv://".into());
     };
     let (address, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if !address.contains('@') && query.contains('@') {
+        return Err(UNESCAPED_QUERY.into());
+    }
     let (authority, database) = address.split_once('/').unwrap_or((address, ""));
     let (credentials, hosts) = match authority.rsplit_once('@') {
         Some((credentials, hosts)) => (Some(credentials), hosts),
@@ -474,6 +481,17 @@ mod tests {
             let refused = parse(uri).unwrap_err();
             assert_eq!(refused, UNESCAPED, "{uri}");
         }
+        // A `?` ends the hosts early too, and the rest would pass for options.
+        for uri in [
+            "mongodb://alice:se?cret@db.example.com/shop",
+            "mongodb://kuery:123?abc@h/shop",
+            "mongodb://u:a/b?c@h",
+        ] {
+            let refused = parse(uri).unwrap_err();
+            assert_eq!(refused, UNESCAPED_QUERY, "{uri}");
+        }
+        let escaped = parse("mongodb://alice:se%3Fcret@h/shop?appName=a%40b").unwrap();
+        assert_eq!(escaped.password.as_deref(), Some("se?cret"));
         // Escaped, the same password is read whole.
         let escaped = parse("mongodb://u:2024%2Fx@h/db").unwrap();
         assert_eq!(

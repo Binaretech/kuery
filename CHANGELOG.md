@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Binaretech/kuery/compare/v0.4.5...v0.5.0) - 2026-11-01
+
+### Added
+
+- watch and stop running MongoDB operations
+- query MongoDB with read-only SQL and see the native query it runs
+- show MongoDB schemas, indexes and query plans
+- edit, insert and delete MongoDB documents with review
+- write to MongoDB from the console with review and audit
+- query MongoDB in a console with completion
+- connect to MongoDB and browse its databases and collections
+- *(app)* offer to send a crash report after Kuery closes unexpectedly
+
+### Changed
+
+- *(core)* identify server sessions by an opaque id
+- add the document database contract, read-only by default
+- *(app)* share the connection status and write review between families
+- *(core)* run sessions on a worker any driver contract can share
+- *(mongo)* keep one check for database names and plain names
+
+### Fixed
+
+- *(app)* redact more secret keys and slashed URL passwords in crash reports
+- *(app)* remove the Windows home folder from crash reports
+- refuse writes on production Redis connections in the driver too
+- *(core)* stop a collection's count when another one starts
+- *(core)* stop a run cancelled before it starts instead of letting it run
+- *(mongo)* refuse SQL numbers too large for a Double
+- *(mongo)* keep a script's transaction when a read in it stops early
+- *(mongo)* refuse a pasted connection string whose password holds a bare ?
+
+### Other
+
+- Merge main into fix/console-preview-cancel
+
 ## [0.4.5](https://github.com/Binaretech/kuery/compare/v0.4.4...v0.4.5) - 2026-10-28
 
 ### Changed

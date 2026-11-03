@@ -10,7 +10,7 @@ use crate::shell::{Op, Show};
 /// `op`.
 pub fn print(op: &Op) -> String {
     match op {
-        Op::Use(database) => match bare(database) {
+        Op::Use(database) => match plain(database) {
             true => format!("use {database}"),
             false => format!("use {}", text(database)),
         },
@@ -81,18 +81,10 @@ fn text(text: &str) -> String {
     render(&Value::String(text.into()), Style::Compact)
 }
 
-/// Whether a collection's name reads after `db.` as it is.
+/// Whether a collection's name reads after `db.` as it is, and a
+/// database's after `use` without quotes (`a-0b` would not: `0b` reads as
+/// a number).
 fn plain(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Whether a database's name reads after `use` without quotes (`a-0b`
-/// would not: `0b` reads as a number).
-fn bare(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()

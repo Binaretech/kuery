@@ -24,7 +24,7 @@ use kuery_core::catalog::{TableInfo, TableRef};
 use kuery_core::document::catalog::ContainerKind;
 use kuery_core::document::value::CollectionRef;
 
-use crate::activity_tab::{ActivityEvent, ActivityTab};
+use crate::activity_tab::{ActivityEvent, ActivitySource, ActivityTab};
 use crate::assets::AppIcon;
 use crate::audit::OpenAuditLog;
 use crate::chrome;
@@ -39,7 +39,7 @@ use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
-use crate::document_console::DocumentConsole;
+use crate::document_console::{DocumentConsole, OpenNative};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
 use crate::file_query_tab::FileQueryTab;
 use crate::file_tab::FileTab;
@@ -91,7 +91,7 @@ impl Tab {
             Tab::Query(query) => Some(query.read(cx).db().meta()),
             Tab::Table(table) => Some(table.read(cx).db().meta()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().meta()),
-            Tab::Activity(activity) => Some(activity.read(cx).db().meta()),
+            Tab::Activity(activity) => Some(activity.read(cx).source().meta()),
             Tab::RedisKey(key) => Some(key.read(cx).db().meta()),
             Tab::RedisConsole(console) => Some(console.read(cx).db().meta()),
             Tab::Collection(collection) => Some(collection.read(cx).db().meta()),
@@ -107,8 +107,8 @@ impl Tab {
             Tab::Query(query) => query.read(cx).is_dirty() || query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::Collection(collection) => collection.read(cx).has_pending(),
             Tab::RedisConsole(_)
-            | Tab::Collection(_)
             | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
@@ -124,8 +124,8 @@ impl Tab {
             Tab::Query(query) => query.read(cx).in_transaction(),
             Tab::Table(table) => table.read(cx).has_pending(),
             Tab::RedisKey(key) => key.read(cx).has_pending(),
+            Tab::Collection(collection) => collection.read(cx).has_pending(),
             Tab::RedisConsole(_)
-            | Tab::Collection(_)
             | Tab::DocumentConsole(_)
             | Tab::Diagram(_)
             | Tab::Activity(_)
@@ -167,7 +167,7 @@ impl Tab {
                 }
             }
             Tab::Activity(activity) => TabState::Activity {
-                connection: activity.read(cx).db().name.to_string(),
+                connection: activity.read(cx).source().name().to_string(),
             },
             Tab::RedisKey(key) => {
                 let key = key.read(cx);
@@ -206,6 +206,8 @@ impl Tab {
                     connection: console.db().name.to_string(),
                     path: console.path().to_vec(),
                     text: console.text(cx),
+                    language: console.frontend_name().unwrap_or_default().to_string(),
+                    view: console.chosen_view(),
                 }
             }
             Tab::FileQuery(_) => return None,
@@ -218,7 +220,10 @@ impl Tab {
             Tab::Query(query) => Some(query.read(cx).db().clone()),
             Tab::Table(table) => Some(table.read(cx).db().clone()),
             Tab::Diagram(diagram) => Some(diagram.read(cx).db().clone()),
-            Tab::Activity(activity) => Some(activity.read(cx).db().clone()),
+            Tab::Activity(activity) => match activity.read(cx).source() {
+                ActivitySource::Sql(db) => Some(db.clone()),
+                ActivitySource::Document(_) => None,
+            },
             Tab::RedisKey(_)
             | Tab::RedisConsole(_)
             | Tab::Collection(_)
@@ -395,7 +400,21 @@ impl WorkspaceView {
                     cx.notify();
                 }
                 ExplorerEvent::OpenDocumentConsole { db, path } => {
-                    this.open_document_console(db.clone(), path.clone(), window, cx)
+                    this.open_document_console(db.clone(), path.clone(), window, cx);
+                }
+                ExplorerEvent::OpenDocumentHistory {
+                    db,
+                    language,
+                    path,
+                    text,
+                } => {
+                    // Where its run started, else the connection's own.
+                    let path = path.clone().unwrap_or_else(|| db.home.clone());
+                    let console = this.open_document_console(db.clone(), path, window, cx);
+                    console.update(cx, |console, cx| {
+                        console.set_language_named(language.as_deref().unwrap_or(""), window, cx);
+                        console.set_text(text.clone(), window, cx);
+                    });
                 }
                 ExplorerEvent::OpenCollection {
                     db,
@@ -452,7 +471,8 @@ impl WorkspaceView {
     }
 
     /// Whether closing the window now would lose work: a query with unsaved
-    /// edits or an open transaction, or a table with pending row changes.
+    /// edits or an open transaction, or a table or collection with staged
+    /// changes.
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
         self.tabs.iter().any(|tab| tab.needs_attention(cx))
     }
@@ -598,7 +618,9 @@ impl WorkspaceView {
                 TabState::Diagram { schema, .. } => {
                     self.new_diagram_tab(db.clone(), schema, window, cx)
                 }
-                TabState::Activity { .. } => self.new_activity_tab(db.clone(), window, cx),
+                TabState::Activity { .. } => {
+                    self.new_activity_tab(ActivitySource::Sql(db.clone()), window, cx)
+                }
                 TabState::RedisKey { .. }
                 | TabState::RedisConsole { .. }
                 | TabState::Collection { .. }
@@ -662,10 +684,23 @@ impl WorkspaceView {
                     }
                     tab
                 }
-                TabState::DocumentConsole { path, text, .. } => {
+                TabState::DocumentConsole {
+                    path,
+                    text,
+                    language,
+                    view,
+                    ..
+                } => {
                     let console = self.new_document_console_tab(db.clone(), path, window, cx);
-                    console.update(cx, |console, cx| console.set_text(text, window, cx));
+                    console.update(cx, |console, cx| {
+                        console.set_language_named(&language, window, cx);
+                        console.set_view(view, cx);
+                        console.set_text(text, window, cx);
+                    });
                     Tab::DocumentConsole(console)
+                }
+                TabState::Activity { .. } if db.catalog.capabilities().activity => {
+                    self.new_activity_tab(ActivitySource::Document(db.clone()), window, cx)
                 }
                 TabState::Query { .. }
                 | TabState::Table { .. }
@@ -928,31 +963,46 @@ impl WorkspaceView {
 
     /// Opens a connection's server activity, or shows the tab it is already
     /// open in.
-    fn open_activity(&mut self, db: Db, window: &mut Window, cx: &mut Context<Self>) {
-        let name = db.name.clone();
+    fn open_activity(
+        &mut self,
+        source: ActivitySource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = source.name().clone();
         self.focus_or_open(
-            |tab, cx| matches!(tab, Tab::Activity(tab) if tab.read(cx).db().name == name),
-            |this, window, cx| this.new_activity_tab(db, window, cx),
+            |tab, cx| matches!(tab, Tab::Activity(tab) if *tab.read(cx).source().name() == name),
+            |this, window, cx| this.new_activity_tab(source, window, cx),
             window,
             cx,
         );
     }
 
-    fn new_activity_tab(&self, db: Db, window: &mut Window, cx: &mut Context<Self>) -> Tab {
+    fn new_activity_tab(
+        &self,
+        source: ActivitySource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Tab {
         let project = self.model.read(cx).project.root.clone();
-        let tab = cx.new(|cx| ActivityTab::new(db.clone(), project, cx));
+        let tab = cx.new(|cx| ActivityTab::new(source.clone(), project, cx));
         cx.subscribe_in(
             &tab,
             window,
-            move |this, _, event: &ActivityEvent, window, cx| match event {
-                ActivityEvent::OpenQuery(sql) => this.open_query(
+            move |this, _, ActivityEvent::OpenQuery(text), window, cx| match &source {
+                ActivitySource::Sql(db) => this.open_query(
                     db.clone(),
                     Some("Session query".into()),
-                    Some(sql.clone()),
+                    Some(text.clone()),
                     None,
                     window,
                     cx,
                 ),
+                ActivitySource::Document(db) => {
+                    let console =
+                        this.open_document_console(db.clone(), db.home.clone(), window, cx);
+                    console.update(cx, |console, cx| console.set_text(text.clone(), window, cx));
+                }
             },
         )
         .detach();
@@ -966,9 +1016,27 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(db) = self.active_db(cx).filter(|db| db.session.has_activity()) {
-            self.open_activity(db, window, cx);
+        if let Some(source) = self.active_activity_source(cx) {
+            self.open_activity(source, window, cx);
         }
+    }
+
+    /// The connection of the active tab, or the sidebar's, when its
+    /// server's activity can be watched.
+    fn active_activity_source(&self, cx: &App) -> Option<ActivitySource> {
+        let from_tab = match self.tabs.get(self.active) {
+            Some(Tab::File(_) | Tab::FileQuery(_)) => return None,
+            Some(Tab::Activity(tab)) => Some(tab.read(cx).source().clone()),
+            Some(Tab::Collection(tab)) => Some(ActivitySource::Document(tab.read(cx).db().clone())),
+            Some(Tab::DocumentConsole(tab)) => {
+                Some(ActivitySource::Document(tab.read(cx).db().clone()))
+            }
+            Some(tab) => tab.db(cx).map(ActivitySource::Sql),
+            None => None,
+        };
+        from_tab
+            .or_else(|| self.explorer.read(cx).current_activity_source())
+            .filter(ActivitySource::watchable)
     }
 
     /// The palette's Open Schema Diagram: the schema of the table in view,
@@ -1056,11 +1124,12 @@ impl WorkspaceView {
         path: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Entity<DocumentConsole> {
         let console = self.new_document_console_tab(db, path, window, cx);
-        self.tabs.push(Tab::DocumentConsole(console));
+        self.tabs.push(Tab::DocumentConsole(console.clone()));
         let index = self.tabs.len() - 1;
         self.activate(index, window, cx);
+        console
     }
 
     fn new_document_console_tab(
@@ -1071,9 +1140,25 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Entity<DocumentConsole> {
         let project = self.model.read(cx).project.root.clone();
-        let console = cx.new(|cx| DocumentConsole::new(db, path, project, window, cx));
+        let console = cx.new(|cx| DocumentConsole::new(db.clone(), path, project, window, cx));
         // The status bar shows what runs.
         cx.observe(&console, |_, _, cx| cx.notify()).detach();
+        let explorer = self.explorer.clone();
+        cx.subscribe(&console, move |_, _, QueryRan(entry), cx| {
+            explorer.update(cx, |explorer, cx| explorer.record(entry.clone(), cx));
+        })
+        .detach();
+        // Open in mongosh: what a statement ran as, in a console of its own.
+        cx.subscribe_in(
+            &console,
+            window,
+            move |this, _, open: &OpenNative, window, cx| {
+                let OpenNative { text, path } = open;
+                let console = this.open_document_console(db.clone(), path.clone(), window, cx);
+                console.update(cx, |console, cx| console.set_text(text.clone(), window, cx));
+            },
+        )
+        .detach();
         console
     }
 
@@ -1123,6 +1208,9 @@ impl WorkspaceView {
                 self.activate(index, window, cx);
             }
             Some(Tab::RedisKey(key)) if key.read(cx).has_pending() => {
+                self.activate(index, window, cx);
+            }
+            Some(Tab::Collection(collection)) if collection.read(cx).has_pending() => {
                 self.activate(index, window, cx);
             }
             Some(Tab::Query(query)) if query.read(cx).in_transaction() => {
@@ -1223,7 +1311,7 @@ impl WorkspaceView {
             (
                 "Close the window without saving?",
                 format!(
-                    "{tabs} unsaved SQL, staged row changes or an open transaction. \
+                    "{tabs} unsaved SQL, staged changes or an open transaction. \
                      They will be lost, and open transactions rolled back."
                 ),
                 "Close Without Saving",
@@ -1841,7 +1929,7 @@ impl WorkspaceView {
             }
             Some(Tab::Activity(activity)) => {
                 let tab = activity.read(cx);
-                left = left.child(format!("Server activity of {}", tab.db().name));
+                left = left.child(format!("Server activity of {}", tab.source().name()));
                 right = h_flex()
                     .gap_4()
                     .flex_shrink_0()
@@ -1984,16 +2072,34 @@ impl WorkspaceView {
             }
             None => {}
         }
+        // On production the whole bar turns amber, like the line under the
+        // title bar, so the two ends of the window say it.
+        let production = connection
+            .as_ref()
+            .is_some_and(|connection| connection.environment == Environment::Production);
         h_flex()
             .h(px(26.))
             .flex_shrink_0()
             .px_3()
             .gap_4()
-            .bg(color(theme::TOOLBAR))
+            .bg(if production {
+                color(theme::AMBER).opacity(0.16)
+            } else {
+                color(theme::TOOLBAR)
+            })
             .border_t_1()
-            .border_color(color(theme::HAIRLINE))
+            .border_color(if production {
+                color(theme::AMBER).opacity(0.5)
+            } else {
+                color(theme::HAIRLINE)
+            })
             .text_size(px(11.5))
-            .text_color(color(theme::TEXT_TERTIARY))
+            // Tertiary grey falls under 4.5:1 on the amber tint.
+            .text_color(color(if production {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_TERTIARY
+            }))
             .child(left.flex_1())
             .child(right)
             .child(crate::updates::status_item(cx))
@@ -2044,7 +2150,7 @@ impl WorkspaceView {
                         ContainerKind::View => AppIcon::Code,
                         _ => AppIcon::Table,
                     };
-                    (icon, collection.title(), false)
+                    (icon, collection.title(), collection.has_pending())
                 }
                 Tab::Diagram(diagram) => (AppIcon::Link, diagram.read(cx).title(), false),
                 Tab::Activity(activity) => (AppIcon::Activity, activity.read(cx).title(), false),

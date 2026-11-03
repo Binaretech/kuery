@@ -6,7 +6,7 @@
 //! [`DocumentCompletions`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -139,15 +139,26 @@ impl CompletionProvider for RedisCompletions {
 }
 
 /// What a document console completes from: the collections of the
-/// database it works in, and the fields of the documents it has shown, by
-/// collection. The console fills it; the provider reads it.
+/// database it works in, and the fields of the documents it has shown and
+/// of the schemas sampled, by collection. The console fills it; the
+/// provider reads it.
 #[derive(Debug, Default)]
 pub struct DocumentNames {
     pub collections: Vec<String>,
     pub fields: HashMap<String, BTreeSet<String>>,
+    /// Collections whose schema completion asked for, so it asks once.
+    pub asked: HashSet<String>,
 }
 
 impl DocumentNames {
+    /// Keeps paths a filter names fields by (`items.sku`), from a schema.
+    pub fn learn_paths(&mut self, collection: &str, paths: impl IntoIterator<Item = String>) {
+        self.fields
+            .entry(collection.to_string())
+            .or_default()
+            .extend(paths);
+    }
+
     /// Keeps the fields of documents a statement on `collection` returned:
     /// the top-level ones and the paths into nested documents.
     pub fn learn(&mut self, collection: &str, documents: &[Document]) {
@@ -184,16 +195,32 @@ fn field_paths(document: &Document, prefix: &str, depth: usize, out: &mut BTreeS
 
 pub type SharedNames = Rc<RefCell<DocumentNames>>;
 
+/// Asks for a collection's fields (its schema), which arrive later in the
+/// names; called once a collection, outside the editor's update.
+pub type WantFields = Rc<dyn Fn(String, &mut App)>;
+
 /// Completes a document console from what its language reads at the
 /// cursor (see [`Language::context`]).
 pub struct DocumentCompletions {
     language: &'static Language,
     names: SharedNames,
+    want_fields: Option<WantFields>,
 }
 
 impl DocumentCompletions {
     pub fn new(language: &'static Language, names: SharedNames) -> Self {
-        Self { language, names }
+        Self {
+            language,
+            names,
+            want_fields: None,
+        }
+    }
+
+    /// Asks for the fields of a collection completion has none of the
+    /// schema of yet.
+    pub fn wanting_fields(mut self, want: WantFields) -> Self {
+        self.want_fields = Some(want);
+        self
     }
 }
 
@@ -300,12 +327,24 @@ impl CompletionProvider for DocumentCompletions {
         offset: usize,
         trigger: CompletionContext,
         _: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let text = rope.to_string();
         let offset = offset.min(text.len());
         let invoked = trigger.trigger_kind == CompletionTriggerKind::INVOKED;
         let context = (self.language.context)(&text, offset);
+        if let (
+            language::CompletionContext::Field {
+                collection: Some(collection),
+                ..
+            },
+            Some(want),
+        ) = (&context, &self.want_fields)
+            && self.names.borrow_mut().asked.insert(collection.clone())
+        {
+            let (want, collection) = (want.clone(), collection.clone());
+            cx.defer(move |cx| want(collection, cx));
+        }
         let (typed, suggestions) =
             document_suggestions(self.language, &self.names.borrow(), &context, invoked);
         let range = lsp_types::Range {
@@ -501,5 +540,30 @@ mod tests {
         assert!(field(false).is_empty());
         assert_eq!(field(true).len(), 8);
         assert!(labels(Context::Nothing, true).is_empty());
+    }
+
+    #[test]
+    fn completes_the_paths_of_a_sampled_schema() {
+        let mut names = names();
+        let documents = [kuery_mongo::literal::parse_document(
+            r#"{_id: 1, lines: [{sku: "a", extra: {deep: 1}}]}"#,
+        )
+        .unwrap()];
+        let schema = kuery_core::document::schema::infer(&documents);
+        names.learn_paths("orders", schema.query_paths());
+        let fields = document_suggestions(
+            &kuery_mongo::LANGUAGE,
+            &names,
+            &Context::Field {
+                collection: Some("orders".into()),
+                prefix: "lines".into(),
+            },
+            false,
+        )
+        .1
+        .into_iter()
+        .map(|suggestion| suggestion.label)
+        .collect::<Vec<_>>();
+        assert_eq!(fields, ["lines.extra", "lines.extra.deep", "lines.sku"]);
     }
 }

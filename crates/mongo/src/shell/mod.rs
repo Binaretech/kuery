@@ -22,6 +22,7 @@ mod tests;
 use kuery_core::document::value::{CollectionRef, Document, Value};
 
 pub use complete::context;
+pub(crate) use parse::database_name;
 pub use parse::statements;
 pub use print::{collection_ref, print};
 

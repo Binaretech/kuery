@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::document::adapter::DocumentAdapter;
+use crate::document::catalog::CollectionInfo;
 use crate::document::language::{Language, ParseError};
+use crate::document::schema::Schema;
+use crate::document::value::CollectionRef;
 use crate::session::Access;
 
 /// Which tools a driver gets: the sidebar tree and the tabs it opens.
@@ -378,20 +381,69 @@ pub struct DocumentDriver {
 
 /// Another language a document console accepts (read-only SQL, say). It
 /// never runs by itself: each statement is translated into the driver's own
-/// language first, and that text is what the session checks and runs.
+/// language first, and that text, which the console shows, is what the
+/// session checks and runs.
 pub struct QueryFrontend {
+    /// `SQL`, for the console's language picker.
     pub name: &'static str,
     /// The editor's highlighting (`"sql"`).
     pub editor: &'static str,
     /// Where each statement of a script is, without reading it further.
     pub split: fn(&str) -> Vec<Range<usize>>,
-    /// The native statement a statement stands for; `None` while the
-    /// driver cannot translate yet.
-    pub translate: Option<Translate>,
+    /// The native statement one statement stands for, or why it has none:
+    /// each refusal with the bytes of the statement at fault.
+    pub translate: fn(&str, &TranslateContext) -> Result<Translation, Vec<ParseError>>,
 }
 
-/// Translates a statement of a [`QueryFrontend`] into the native one.
-pub type Translate = fn(&str) -> Result<String, ParseError>;
+/// What the console knows about the collection a statement reads, when it
+/// knows it: a translation never depends on it, but warns and notes by it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranslateContext {
+    /// A sample of its documents.
+    pub schema: Option<Schema>,
+    /// Its indexes and options (a collation).
+    pub collection: Option<CollectionInfo>,
+}
+
+/// A statement of a [`QueryFrontend`] as the native statement that runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Translation {
+    /// The native statement, exactly as it runs.
+    pub native: String,
+    /// The collection it reads, from where the run starts (`["orders"]`).
+    pub target: CollectionRef,
+    /// The columns of its rows, in order: the field of the native
+    /// statement's documents each comes from, and the name it shows. Empty
+    /// when it returns whole documents (`SELECT *`).
+    pub columns: Vec<OutputColumn>,
+    /// What the sample says may not be what was meant: a run asks before
+    /// it goes ahead.
+    pub warnings: Vec<Warning>,
+    /// What is worth knowing and needs no answer (a collation it follows).
+    pub notes: Vec<String>,
+    /// It reads the whole collection: no filter or order an index serves,
+    /// and no `LIMIT`. Only said when the indexes are known.
+    pub full_scan: bool,
+    /// A cheaper statement that answers nearly the same, from the
+    /// engine's bookkeeping instead of the documents (a count).
+    pub estimate: Option<Box<Translation>>,
+}
+
+/// One column of a [`Translation`]'s rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputColumn {
+    /// The top-level field of the native statement's documents.
+    pub field: String,
+    /// What the column is called: its alias, or the expression as written.
+    pub label: String,
+}
+
+/// Something about a statement worth a second look, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub span: Range<usize>,
+    pub message: String,
+}
 
 pub const REDIS: DriverInfo = DriverInfo {
     id: "redis",

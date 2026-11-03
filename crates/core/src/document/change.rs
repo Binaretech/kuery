@@ -30,6 +30,8 @@ pub enum DocChange {
     Insert {
         document: Document,
     },
+    /// `expect` as an update's; an empty path expects the whole document,
+    /// so one that gained a field does not match either.
     Delete {
         key: DocKey,
         version: Option<Value>,

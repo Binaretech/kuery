@@ -1,0 +1,138 @@
+{
+  "explainVersion": "2",
+  "queryPlanner": {
+    "namespace": "kr_scratch.big",
+    "parsedQuery": {},
+    "indexFilterSet": false,
+    "queryHash": "8FDC7D28",
+    "planCacheShapeHash": "8FDC7D28",
+    "planCacheKey": "22B76A58",
+    "optimizationTimeMillis": 0,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "queryPlan": {
+        "stage": "SORT",
+        "planNodeId": 2,
+        "sortPattern": {
+          "t": 1,
+          "n": -1
+        },
+        "memLimit": 100000,
+        "type": "simple",
+        "inputStage": {
+          "stage": "COLLSCAN",
+          "planNodeId": 1,
+          "filter": {},
+          "direction": "forward"
+        }
+      },
+      "slotBasedPlan": {
+        "slots": "$$RESULT=s3 env: {  }",
+        "stages": "[2] sort [s6, s7] [asc, desc] [s3] \n[2] project [s5 = ((!((isArray(s2) ?: false)) || !((isArray(s1) ?: false))) || fail(2, \"cannot sort with keys that are parallel arrays\")), s6 = getSortKeyAsc(s2), s7 = getSortKeyDesc(s1)] \n[1] scan s3 s4 none none none none none none lowPriority [s1 = n, s2 = t] @\"68418a6f-737c-49c0-8b02-3bd61d16e92e\" true false "
+      }
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": true,
+    "nReturned": 20000,
+    "executionTimeMillis": 93,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 20000,
+    "executionStages": {
+      "stage": "sort",
+      "planNodeId": 2,
+      "nReturned": 20000,
+      "executionTimeMillisEstimate": 90,
+      "opens": 1,
+      "closes": 1,
+      "saveState": 2,
+      "restoreState": 2,
+      "isEOF": 1,
+      "memLimit": 100000,
+      "totalDataSizeSorted": 4600658,
+      "usedDisk": true,
+      "spills": 104,
+      "spilledDataStorageSize": 4034442,
+      "orderBySlots": {
+        "6": "asc",
+        "7": "desc"
+      },
+      "outputSlots": [
+        3
+      ],
+      "inputStage": {
+        "stage": "project",
+        "planNodeId": 2,
+        "nReturned": 20000,
+        "executionTimeMillisEstimate": 1,
+        "opens": 1,
+        "closes": 1,
+        "saveState": 2,
+        "restoreState": 2,
+        "isEOF": 1,
+        "projections": {
+          "5": "((!((isArray(s2) ?: false)) || !((isArray(s1) ?: false))) || fail(2, \"cannot sort with keys that are parallel arrays\")) ",
+          "6": "getSortKeyAsc(s2) ",
+          "7": "getSortKeyDesc(s1) "
+        },
+        "inputStage": {
+          "stage": "scan",
+          "planNodeId": 1,
+          "nReturned": 20000,
+          "executionTimeMillisEstimate": 1,
+          "opens": 1,
+          "closes": 1,
+          "saveState": 2,
+          "restoreState": 2,
+          "isEOF": 1,
+          "numReads": 20000,
+          "recordSlot": 3,
+          "recordIdSlot": 4,
+          "scanFieldNames": [
+            "n",
+            "t"
+          ],
+          "scanFieldSlots": [
+            1,
+            2
+          ]
+        }
+      }
+    }
+  },
+  "queryShapeHash": "9DCF7C3977F5AA0F23BE1E76B40169B13CAF246978E10B758D55AC3E341B5BCC",
+  "command": {
+    "find": "big",
+    "filter": {},
+    "sort": {
+      "t": 1,
+      "n": -1
+    },
+    "allowDiskUse": true,
+    "$db": "kr_scratch"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 100000,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 100000,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeEngine",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

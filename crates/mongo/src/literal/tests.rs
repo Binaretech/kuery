@@ -174,6 +174,43 @@ fn reads_json5() {
 }
 
 #[test]
+fn a_document_that_looks_like_a_wrapper_reads_back_as_itself() {
+    for lookalike in [
+        fields(&[("$numberLong", Value::String("5".into()))]),
+        fields(&[("$oid", Value::String("65f0c0ffee0000000000beef".into()))]),
+        // Not even valid as the wrapper it looks like.
+        fields(&[("$date", Value::String("x".into()))]),
+        fields(&[
+            ("$type", Value::String("00".into())),
+            ("$binary", Value::Int32(1)),
+        ]),
+    ] {
+        for style in [Style::Compact, Style::Pretty] {
+            let text = render(&lookalike, style);
+            assert_eq!(read(&text), lookalike, "{text}");
+        }
+    }
+    assert_eq!(
+        render(
+            &fields(&[("$numberLong", Value::String("5".into()))]),
+            Style::Compact
+        ),
+        r#"{"\u0024numberLong": "5"}"#
+    );
+    // Any escape of the `$` makes it a field; written plainly, a wrapper.
+    assert_eq!(
+        read(r#"{"\$numberLong": "5"}"#),
+        fields(&[("$numberLong", Value::String("5".into()))])
+    );
+    assert_eq!(read(r#"{$numberLong: "5"}"#), Value::Int64(5));
+    // Other keys that start with `$` print as they are.
+    assert_eq!(
+        render(&fields(&[("$gt", Value::Int32(1))]), Style::Compact),
+        "{$gt: 1}"
+    );
+}
+
+#[test]
 fn reads_extended_json() {
     assert_eq!(read(r#"{"$numberLong": "5"}"#), Value::Int64(5));
     assert_eq!(read(r#"{$numberInt: "5"}"#), Value::Int32(5));
@@ -472,19 +509,45 @@ fn leaf() -> impl Strategy<Value = Value> {
     ]
 }
 
-/// Field names: plain, and any text but a `$` first, which could read as
-/// an Extended JSON wrapper (see the module's note).
+/// Field names: plain, any text, and the keys of Extended JSON wrappers.
 fn name() -> impl Strategy<Value = String> {
     prop_oneof![
         prop_oneof![Just("_id"), Just("status"), Just("total"), Just("a")].prop_map(String::from),
-        "[a-zA-Z_][a-zA-Z0-9_$]{0,8}",
-        c_text().prop_filter("not a wrapper", |name| !name.starts_with('$')),
+        "[a-zA-Z_$][a-zA-Z0-9_$]{0,8}",
+        c_text(),
+        wrapper_key(),
     ]
+}
+
+fn wrapper_key() -> impl Strategy<Value = String> {
+    let keys: Vec<&str> = WRAPPERS
+        .iter()
+        .flat_map(|keys| keys.iter().copied())
+        .collect();
+    proptest::sample::select(keys).prop_map(String::from)
+}
+
+/// A document that only looks like an Extended JSON wrapper: the keys of
+/// one, holding any values.
+fn lookalike(inner: impl Strategy<Value = Value> + Clone) -> impl Strategy<Value = Value> {
+    (
+        proptest::sample::select(WRAPPERS),
+        proptest::collection::vec(inner, 2),
+    )
+        .prop_map(|(keys, values)| {
+            Value::Object(Document(
+                keys.iter()
+                    .zip(values)
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+            ))
+        })
 }
 
 fn value() -> impl Strategy<Value = Value> {
     leaf().prop_recursive(4, 48, 6, |inner| {
         prop_oneof![
+            lookalike(inner.clone()),
             proptest::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
             proptest::collection::vec((name(), inner), 0..6).prop_map(|fields| {
                 let mut unique: Vec<(String, Value)> = Vec::new();

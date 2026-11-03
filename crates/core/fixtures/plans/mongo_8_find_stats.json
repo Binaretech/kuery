@@ -1,0 +1,119 @@
+{
+  "explainVersion": "1",
+  "queryPlanner": {
+    "namespace": "shop.big",
+    "parsedQuery": {
+      "n": {
+        "$lt": 5
+      }
+    },
+    "indexFilterSet": false,
+    "queryHash": "2E976EF9",
+    "planCacheShapeHash": "2E976EF9",
+    "planCacheKey": "861DD7FD",
+    "optimizationTimeMillis": 0,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "stage": "SORT",
+      "sortPattern": {
+        "label": 1
+      },
+      "memLimit": 104857600,
+      "type": "simple",
+      "inputStage": {
+        "stage": "COLLSCAN",
+        "filter": {
+          "n": {
+            "$lt": 5
+          }
+        },
+        "direction": "forward"
+      }
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": true,
+    "nReturned": 1000,
+    "executionTimeMillis": 9,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 20000,
+    "executionStages": {
+      "isCached": false,
+      "stage": "SORT",
+      "nReturned": 1000,
+      "executionTimeMillisEstimate": 2,
+      "works": 21002,
+      "advanced": 1000,
+      "needTime": 20001,
+      "needYield": 0,
+      "saveState": 0,
+      "restoreState": 0,
+      "isEOF": 1,
+      "sortPattern": {
+        "label": 1
+      },
+      "memLimit": 104857600,
+      "type": "simple",
+      "totalDataSizeSorted": 73440,
+      "usedDisk": false,
+      "spills": 0,
+      "spilledDataStorageSize": 0,
+      "inputStage": {
+        "stage": "COLLSCAN",
+        "filter": {
+          "n": {
+            "$lt": 5
+          }
+        },
+        "nReturned": 1000,
+        "executionTimeMillisEstimate": 2,
+        "works": 20001,
+        "advanced": 1000,
+        "needTime": 19000,
+        "needYield": 0,
+        "saveState": 0,
+        "restoreState": 0,
+        "isEOF": 1,
+        "direction": "forward",
+        "docsExamined": 20000
+      }
+    }
+  },
+  "queryShapeHash": "A5A8360AF4D7B2A3DE397163931B679FB1634A4DE99319F232C729C28D3D6E77",
+  "command": {
+    "find": "big",
+    "filter": {
+      "n": {
+        "$lt": 5
+      }
+    },
+    "sort": {
+      "label": 1
+    },
+    "$db": "shop"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 104857600,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 104857600,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

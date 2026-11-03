@@ -1172,19 +1172,19 @@ fn sees_a_blocker() {
     let mut seen = None;
     for _ in 0..50 {
         let activity = monitor.activity().unwrap();
-        if let Some(backend) = activity.backend(waiter)
+        if let Some(backend) = activity.backend(&waiter.into())
             && !backend.blocked_by.is_empty()
         {
             seen = Some((
                 backend.clone(),
-                activity.backend(blocking.holder_pid).cloned(),
+                activity.backend(&blocking.holder_pid.into()).cloned(),
             ));
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let (blocked, holder) = seen.expect("the waiting update shows as blocked");
-    assert_eq!(blocked.blocked_by, [blocking.holder_pid]);
+    assert_eq!(blocked.blocked_by, [blocking.holder_pid.into()]);
     assert!(blocked.is_client() && !blocked.own);
     assert!(blocked.waiting_for.is_some(), "{blocked:?}");
     assert!(
@@ -1196,8 +1196,8 @@ fn sees_a_blocker() {
     assert!(holder.transaction_seconds.is_some());
     let activity = monitor.activity().unwrap();
     // Other tests of the suite may block each other meanwhile.
-    let roots: Vec<i32> = activity.blockers().iter().map(|b| b.pid).collect();
-    assert!(roots.contains(&blocking.holder_pid), "{roots:?}");
+    let roots: Vec<BackendId> = activity.blockers().into_iter().map(|b| b.id).collect();
+    assert!(roots.contains(&blocking.holder_pid.into()), "{roots:?}");
     assert!(
         activity
             .backends
@@ -1218,15 +1218,18 @@ fn kills_a_session() {
         .parse()
         .unwrap();
     let mut monitor = adapter();
-    assert_eq!(monitor.signal(pid, Signal::Terminate), Ok(true));
+    assert_eq!(monitor.signal(&pid.into(), Signal::Terminate), Ok(true));
     // The victim finds out on its next statement.
     assert!(victim.execute("select 1", &mut Discard).is_err());
     drop(victim);
     // A session that does not exist: not the victim's number, which another
     // connection may already have taken.
     let backends = monitor.activity().unwrap().backends;
-    let missing = backends.iter().map(|b| b.pid).max().unwrap() + 1000;
-    assert_eq!(monitor.signal(missing, Signal::Terminate), Ok(false));
+    let missing = backends.iter().filter_map(|b| b.id.number()).max().unwrap() + 1000;
+    assert_eq!(
+        monitor.signal(&BackendId(missing.to_string()), Signal::Terminate),
+        Ok(false)
+    );
 }
 
 /// Drops `login` if it exists, after ending the sessions it still has.

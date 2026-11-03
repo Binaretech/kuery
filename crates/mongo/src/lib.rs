@@ -14,17 +14,21 @@
 //! operation on the server and keeps waiting. Every adapter opened with the
 //! same [`Target`] shares one `Client`, so one connection pool.
 
+mod activity;
 mod browse;
 mod catalog;
 pub mod classify;
 mod command;
 pub mod convert;
 mod detect;
+mod edit;
 mod estimate;
 mod execute;
+mod explain;
 pub mod literal;
 mod run;
 pub mod shell;
+pub mod sql;
 mod uri;
 mod wire;
 
@@ -38,9 +42,10 @@ use std::time::Duration;
 
 use bson::{Bson, Document as BsonDocument, doc};
 
+use kuery_core::activity::{Activity, BackendId, Signal};
 use kuery_core::adapter::Canceller;
-use kuery_core::document::adapter::{CommitError, DocumentAdapter, DocumentSink, Outcome};
-use kuery_core::document::capabilities::Capabilities;
+use kuery_core::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
+use kuery_core::document::capabilities::{Capabilities, Sampling};
 use kuery_core::document::catalog::{CollectionInfo, Container};
 use kuery_core::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use kuery_core::document::language::Language;
@@ -418,7 +423,7 @@ pub static DRIVER: DocumentDriver = DocumentDriver {
         ssh_route: Some(ssh_route),
     },
     language: &LANGUAGE,
-    frontends: &[],
+    frontends: &[sql::FRONTEND],
     open: |options, access| open(&Target::from_options(options)?, access),
 };
 
@@ -480,6 +485,8 @@ pub static LANGUAGE: Language = Language {
     },
     collection_ref: shell::collection_ref,
     key: literal::key,
+    change: edit::statement,
+    check_change: edit::check,
     key_name: "_id",
     methods: METHODS,
     operators: OPERATORS,
@@ -866,12 +873,16 @@ impl Mongo {
         let comment = Bson::String(tag.as_str().into());
         let batch = u32::try_from(self.limits.max_batch).unwrap_or(u32::MAX);
         let transaction = self.transaction.clone();
+        let handover = run::Handover {
+            flush: self.limits.first_batch,
+            in_transaction: transaction.is_some(),
+        };
         run::stream(
             &self.pool.client,
             &tag,
             &self.stop,
             self.patience(),
-            self.limits.first_batch,
+            handover,
             async move {
                 let command = db
                     .run_cursor_command(command)
@@ -986,9 +997,9 @@ impl DocumentAdapter for Mongo {
     /// Ends the transaction, which is gone whether or not it commits. A
     /// commit out of time, or one the server or the driver marks
     /// `UnknownTransactionCommitResult`, may have applied.
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&mut self) -> Result<(), WriteError> {
         let session = self.transaction.take().ok_or_else(|| {
-            CommitError::Undone(QueryError::Unsupported("No transaction is open".into()))
+            WriteError::Undone(QueryError::Unsupported("No transaction is open".into()))
         })?;
         let committed = self.settle(async move {
             let committed = session.lock_owned().await.commit_transaction().await;
@@ -1000,11 +1011,11 @@ impl DocumentAdapter for Mongo {
         match committed {
             Ok(Ok(())) => Ok(()),
             Ok(Err((unknown, error))) if unknown || run::out_of_time(&error) => {
-                Err(CommitError::Unknown(error))
+                Err(WriteError::Unknown(error))
             }
-            Ok(Err((_, error))) => Err(CommitError::Undone(error)),
+            Ok(Err((_, error))) => Err(WriteError::Undone(error)),
             // Waiting for the answer stopped: it may still apply.
-            Err(error) => Err(CommitError::Unknown(error)),
+            Err(error) => Err(WriteError::Unknown(error)),
         }
     }
 
@@ -1023,6 +1034,18 @@ impl DocumentAdapter for Mongo {
     ) -> Result<Option<Count>, QueryError> {
         self.writable()?;
         self.estimate_statement(statement, sample)
+    }
+
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.explain_statement(statement, execute)
+    }
+
+    fn activity(&mut self) -> Result<Activity, QueryError> {
+        self.activity_now()
+    }
+
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        self.kill_operation(id, signal)
     }
 
     fn children(&mut self, parent: &[String]) -> Result<Vec<Container>, QueryError> {
@@ -1044,16 +1067,16 @@ impl DocumentAdapter for Mongo {
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Sampling, QueryError> {
         let (database, name) = catalog::split(collection)?;
         let size = i64::try_from(n).unwrap_or(i64::MAX);
-        let stage = match self.is_view(collection)? {
-            true => doc! { "$limit": size },
-            false => doc! { "$sample": { "size": size } },
+        let (stage, sampling) = match self.is_view(collection)? {
+            true => (doc! { "$limit": size }, Sampling::FirstN),
+            false => (doc! { "$sample": { "size": size } }, Sampling::Random),
         };
         let command = doc! { "aggregate": name, "pipeline": [stage], "cursor": {} };
         self.cursor_into(database, command, sink)?;
-        Ok(())
+        Ok(sampling)
     }
 
     fn browse(
@@ -1106,14 +1129,42 @@ impl DocumentAdapter for Mongo {
         }
     }
 
-    /// Refused on a read-only connection whatever the session checked.
+    /// One `update`, `insert` or `delete` command, in the open transaction
+    /// if there is one. A delete counts what it found as matched, as every
+    /// other change does. Refused on a read-only connection whatever the
+    /// session checked. Whether a change that failed was applied is unknown
+    /// when the answer never came (a lost connection, a wait that ran out,
+    /// a cancel), and when the server applied it but could not confirm it
+    /// was kept (a write concern error).
     fn apply(
         &mut self,
-        _collection: &CollectionRef,
-        _change: &DocChange,
-    ) -> Result<Outcome, QueryError> {
-        self.writable()?;
-        later()
+        collection: &CollectionRef,
+        change: &DocChange,
+    ) -> Result<Outcome, WriteError> {
+        self.writable().map_err(WriteError::Undone)?;
+        let (database, name) = catalog::split(collection).map_err(WriteError::Undone)?;
+        let database = database.to_string();
+        let (command, write) = edit::command(name, change).map_err(WriteError::Undone)?;
+        let answer = self
+            .command(&database, command)
+            .map_err(|error| match error {
+                QueryError::Connection(_) | QueryError::Cancelled => WriteError::Unknown(error),
+                // The server's own time limit, or the wait for its answer.
+                QueryError::Database { ref code, .. } if code == "50" => WriteError::Unknown(error),
+                error => WriteError::Undone(error),
+            })?;
+        execute::failed(&answer).map_err(|error| match answer.contains_key("writeErrors") {
+            true => WriteError::Undone(error),
+            false => WriteError::Unknown(error),
+        })?;
+        let outcome = execute::written(write, &answer);
+        Ok(match write {
+            command::Write::Delete => Outcome {
+                matched: outcome.deleted,
+                ..outcome
+            },
+            _ => outcome,
+        })
     }
 }
 
@@ -1126,12 +1177,6 @@ fn one(statement: &str) -> Result<Op, QueryError> {
         1 => Ok(statements.remove(0).1),
         n => Err(QueryError::Rejected(Rejection::MultipleStatements(n))),
     }
-}
-
-fn later<T>() -> Result<T, QueryError> {
-    Err(QueryError::Unsupported(
-        "Kuery does not change MongoDB documents yet".into(),
-    ))
 }
 
 #[cfg(test)]

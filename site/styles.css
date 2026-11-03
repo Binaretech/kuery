@@ -112,7 +112,7 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .brow .bf{font-size:var(--t-body);color:var(--muted);padding-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .brow .b1{grid-column:6/8}.brow .b2{grid-column:8/10}.brow .b3{grid-column:10/12}
 .brow .bs{grid-column:12/13;justify-self:end;padding:6px 10px;font-size:var(--t-small);font-weight:500;color:var(--on);white-space:nowrap}
-.bs.file{background:var(--ok)}.bs.db{background:var(--ink)}.bs.kv{background:var(--warn)}
+.bs.file{background:var(--ok)}.bs.db{background:var(--ink)}.bs.kv{background:var(--warn)}.bs.doc{background:var(--accent)}
 .bd{grid-column:1/9;margin-top:36px;display:flex;flex-direction:column;gap:6px;font-size:var(--t-body);opacity:0;transition:opacity .4s .1s}
 .brow.open{height:216px;background:var(--accent);color:var(--on)}
 .brow.open .bf{color:var(--on)}

@@ -16,7 +16,7 @@ mod tls;
 use std::sync::{Arc, OnceLock};
 
 use futures::{TryStreamExt as _, pin_mut};
-use kuery_core::activity::{Activity, Signal};
+use kuery_core::activity::{Activity, BackendId, Signal};
 use kuery_core::adapter::{Adapter, Canceller, RowSink};
 use kuery_core::catalog::{
     CatalogColumn, CatalogOverview, ForeignKey, FunctionInfo, TableDefinition, TableRef,
@@ -328,8 +328,8 @@ impl Adapter for Postgres {
         activity::activity(self)
     }
 
-    fn signal(&mut self, pid: i32, signal: Signal) -> Result<bool, QueryError> {
-        activity::signal(self, pid, signal)
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        activity::signal(self, id, signal)
     }
 }
 

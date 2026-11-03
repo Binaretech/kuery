@@ -1,12 +1,14 @@
-//! Writes on a document database, from its console. Before a script that
-//! writes runs, [`approve`] hands its statements to the shared write
-//! review (see [`write_review`]) with a preview of what each would change:
-//! exact where the engine runs the script in a transaction and undoes it,
-//! estimated where it counts what each statement would touch, and unknown
-//! elsewhere, which makes the statement dangerous. The review says whether
-//! the script runs all or nothing. Every write that runs, every one
-//! refused or failed, and every preview goes to the audit log
-//! ([`record`]).
+//! Writes on a document database, from its console and its collection
+//! tabs. Before a script that writes runs, [`approve`] hands its
+//! statements to the shared write review (see [`write_review`]) with a
+//! preview of what each would change: exact where the engine runs the
+//! script in a transaction and undoes it, estimated where it counts what
+//! each statement would touch, and unknown elsewhere, which makes the
+//! statement dangerous. The review says whether the script runs all or
+//! nothing. Changes staged in a collection tab go through the same review
+//! with [`approve_changes`], each shown as the statement it becomes. Every
+//! write that runs, every one refused or failed, and every preview goes to
+//! the audit log ([`record`], [`record_changes`]).
 
 use std::cell::Cell;
 use std::path::Path;
@@ -17,10 +19,10 @@ use gpui_kit::{App, Window};
 use kuery_core::analysis::StatementKind;
 use kuery_core::document::adapter::Outcome;
 use kuery_core::document::capabilities::Transactions;
-use kuery_core::document::change::Count;
+use kuery_core::document::change::{Count, DocChange};
 use kuery_core::document::language::{Language, Statement, Style};
-use kuery_core::document::session::{DocumentSession, Estimate, Heavy, Impact};
-use kuery_core::document::value::Value;
+use kuery_core::document::session::{ApplyFailure, DocumentSession, Estimate, Heavy, Impact};
+use kuery_core::document::value::{CollectionRef, Value};
 use kuery_core::session::{QueryError, RunOptions};
 
 use crate::audit::{AuditAction, AuditRecord};
@@ -125,18 +127,8 @@ pub fn approve(
     let request = Request {
         connection: db.name.clone(),
         environment: db.environment,
-        allows: Rc::new({
-            let db = db.clone();
-            move || db.allows_writes()
-        }),
-        unlock: Rc::new({
-            let db = db.clone();
-            move |window, cx, allowed| {
-                write_mode::allow_document_writes(db.clone(), window, cx, move |window, cx| {
-                    allowed(window, cx)
-                })
-            }
-        }),
+        allows: allows(db),
+        unlock: unlock(db),
         heading: heading(
             &script.place(),
             script.statements.len(),
@@ -186,6 +178,175 @@ pub fn approve(
         stopped: Rc::new(move || reviewing.stopped.get()),
     };
     write_review::approve(request, window, cx, approved);
+}
+
+/// Whether writes on the connection run without allowing them first.
+fn allows(db: &DocDb) -> Rc<dyn Fn() -> bool> {
+    let db = db.clone();
+    Rc::new(move || db.allows_writes())
+}
+
+/// Allows writes on the connection (typing its name, on production).
+fn unlock(db: &DocDb) -> write_review::Unlock {
+    let db = db.clone();
+    Rc::new(move |window, cx, allowed| {
+        write_mode::allow_document_writes(db.clone(), window, cx, move |window, cx| {
+            allowed(window, cx)
+        })
+    })
+}
+
+/// Calls `approved` once the changes staged in a collection tab may apply,
+/// asking first what the environment's policy asks for: the review shows
+/// each change as the statement it becomes, and says whether they apply
+/// all or nothing. Nothing happens if the user cancels.
+pub fn approve_changes(
+    db: &DocDb,
+    collection: &CollectionRef,
+    changes: &[DocChange],
+    window: &mut Window,
+    cx: &mut App,
+    approved: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let language = db.catalog.language();
+    let steps = changes_planned(language, collection, changes);
+    let request = Request {
+        connection: db.name.clone(),
+        environment: db.environment,
+        allows: allows(db),
+        unlock: unlock(db),
+        heading: changes_heading(
+            &collection.display(),
+            changes.len(),
+            db.catalog.capabilities().transactions,
+        ),
+        planned: Rc::new(steps),
+        // The statements say all there is: each touches one document, and
+        // only if it still holds what was loaded.
+        preview: Rc::new(|planned| {
+            let none = vec![Vec::new(); planned.len()];
+            async move { Ok(none) }.boxed_local()
+        }),
+        stopped: Rc::new(|| false),
+    };
+    write_review::approve(request, window, cx, approved);
+}
+
+/// The review's steps for staged changes: each as the statement it
+/// becomes.
+pub fn changes_planned(
+    language: &Language,
+    collection: &CollectionRef,
+    changes: &[DocChange],
+) -> Vec<Planned> {
+    changes
+        .iter()
+        .map(|change| {
+            let line = (language.change)(collection, change);
+            Planned {
+                shown: line.clone(),
+                line,
+                writes: true,
+                danger: None,
+            }
+        })
+        .collect()
+}
+
+/// The review's subtitle for staged changes: where they apply, that each
+/// applies only to a document still as it was loaded, and whether they
+/// apply all or nothing.
+pub fn changes_heading(place: &str, changes: usize, transactions: Transactions) -> String {
+    let checked = "Each applies only to a document that still holds what you loaded.";
+    match (transactions, changes > 1) {
+        (Transactions::Multi { .. }, true) => format!(
+            "In {place}, in this order. {checked} They apply in one transaction: all of them or \
+             none."
+        ),
+        (_, false) => format!("In {place}. {checked}"),
+        (Transactions::None, true) => format!(
+            "In {place}, in this order. {checked} This server has no transactions, so they are \
+             not all or nothing: each applies as soon as it runs, and Apply stops at the first \
+             failure, keeping the rest staged."
+        ),
+    }
+}
+
+/// What applying staged changes did, in one line: `Applied 2 changes ·
+/// matched 1 · modified 1 · inserted 1`.
+pub fn applied(changes: usize, outcome: Outcome) -> String {
+    let what = match changes {
+        1 => "Applied 1 change".to_string(),
+        n => format!("Applied {n} changes"),
+    };
+    match counts(outcome) {
+        Some(counts) => format!("{what} · {counts}"),
+        None => what,
+    }
+}
+
+/// Why applying staged changes stopped, and what it kept: a document that
+/// changed since it was loaded says so, with the change it stopped at, and
+/// changes whose answer never came may have applied, which only a reload
+/// tells. `statements` are the changes as they were sent, in order.
+pub fn apply_failed(failure: &ApplyFailure, statements: &[String]) -> String {
+    let mut why = match &failure.error {
+        QueryError::RowMismatch { sql, .. } => {
+            format!("{sql}: This document changed since you loaded it. Reload it and edit again.")
+        }
+        error => describe_error(error.clone()),
+    };
+    if !why.ends_with('.') {
+        why.push('.');
+    }
+    let applied = failure.applied.min(statements.len());
+    let unknown = &statements[applied..(applied + failure.unknown).min(statements.len())];
+    let mut said = vec![why];
+    match applied {
+        0 if unknown.is_empty() => said.push("Nothing was applied.".into()),
+        0 => {}
+        n => said.push(format!(
+            "Applied {} of {}, which are no longer staged: {}.",
+            n,
+            statements.len(),
+            statements[..n].join("; ")
+        )),
+    }
+    match unknown {
+        [] => {}
+        [one] if statements.len() > 1 => said.push(format!(
+            "{one} may have applied: reload before applying again."
+        )),
+        [_] => said.push("It may have applied: reload before applying again.".into()),
+        _ => said.push("They may have applied: reload before applying again.".into()),
+    }
+    said.join(" ")
+}
+
+/// Why Apply waits after an apply whose outcome is unknown.
+pub const RELOAD_FIRST: &str =
+    "The last Apply may have applied: reload before applying again, or it could apply twice";
+
+/// The audit record of staged changes applied to a collection: the
+/// statements they became, which hold the diff, not whole documents.
+pub fn record_changes(
+    db: &DocDb,
+    project: &Path,
+    collection: &CollectionRef,
+    statements: &[String],
+    outcome: String,
+    changed: Option<(usize, u64)>,
+    failed: bool,
+) -> AuditRecord {
+    AuditRecord::new(
+        project,
+        format!("{} ({})", db.name, collection.display()),
+        db.environment,
+        MODE,
+        AuditAction::Apply,
+        statements.join("\n"),
+    )
+    .finished(outcome, changed, failed)
 }
 
 /// What the audit log says of a preview, and whether it failed.
@@ -594,6 +755,128 @@ mod tests {
         assert_eq!(details[1][0].subject, "Unknown");
         assert!(details[1][0].danger.is_some());
         assert!(details[1][0].text.starts_with("The preview failed"));
+    }
+
+    #[test]
+    fn staged_changes_are_reviewed_as_their_statements() {
+        let orders = CollectionRef::new(&["shop", "orders"]);
+        let changes = [
+            DocChange::Insert {
+                document: Document(vec![("a".into(), Value::Int32(1))]),
+            },
+            DocChange::Delete {
+                key: kuery_core::document::value::DocKey(Value::Int32(7)),
+                version: None,
+                expect: Vec::new(),
+            },
+        ];
+        let planned = changes_planned(MONGO, &orders, &changes);
+        let lines: Vec<&str> = planned.iter().map(|step| step.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "db.orders.insertOne({a: 1})",
+                "db.orders.deleteOne({_id: 7})"
+            ]
+        );
+        assert!(
+            planned
+                .iter()
+                .all(|step| step.writes && step.danger.is_none())
+        );
+
+        let atomic = changes_heading("shop.orders", 2, MULTI);
+        assert!(atomic.contains("all of them or none"), "{atomic}");
+        let standalone = changes_heading("shop.orders", 2, Transactions::None);
+        assert!(
+            standalone.contains("not all or nothing") && standalone.contains("keeping the rest"),
+            "{standalone}"
+        );
+        assert!(changes_heading("shop.orders", 1, MULTI).contains("still holds what you loaded"));
+    }
+
+    #[test]
+    fn says_what_an_apply_kept() {
+        let statements = vec![
+            "db.a.insertOne({})".to_string(),
+            "db.a.deleteOne({_id: 1})".into(),
+        ];
+        let changed = ApplyFailure {
+            applied: 0,
+            unknown: 0,
+            error: QueryError::RowMismatch {
+                sql: "update of 7 (qty)".into(),
+                expected: 1,
+                actual: 0,
+            },
+        };
+        assert_eq!(
+            apply_failed(&changed, &statements),
+            "update of 7 (qty): This document changed since you loaded it. Reload it and edit \
+             again. Nothing was applied."
+        );
+        let partial = ApplyFailure {
+            applied: 1,
+            unknown: 0,
+            error: QueryError::Database {
+                code: "11000".into(),
+                message: "E11000 duplicate key".into(),
+            },
+        };
+        let said = apply_failed(&partial, &statements);
+        assert!(
+            said.contains("Applied 1 of 2") && said.contains("db.a.insertOne({})"),
+            "{said}"
+        );
+        assert!(!said.contains("may have applied"), "{said}");
+        assert_eq!(
+            applied(
+                2,
+                Outcome {
+                    matched: 1,
+                    modified: 1,
+                    inserted: 1,
+                    ..Outcome::default()
+                }
+            ),
+            "Applied 2 changes · matched 1 · modified 1 · inserted 1"
+        );
+    }
+
+    #[test]
+    fn an_apply_without_an_answer_says_what_may_have_applied() {
+        let statements = vec![
+            "db.a.insertOne({})".to_string(),
+            "db.a.deleteOne({_id: 1})".into(),
+        ];
+        let lost = |applied, unknown| ApplyFailure {
+            applied,
+            unknown,
+            error: QueryError::Connection("no answer".into()),
+        };
+        // The first one got no answer: never "Nothing was applied".
+        assert_eq!(
+            apply_failed(&lost(0, 1), &statements),
+            "Connection lost: no answer. db.a.insertOne({}) may have applied: reload before \
+             applying again."
+        );
+        let second = apply_failed(&lost(1, 1), &statements);
+        assert!(
+            second.contains("Applied 1 of 2")
+                && second.ends_with(
+                    "db.a.deleteOne({_id: 1}) may have applied: reload before applying again."
+                ),
+            "{second}"
+        );
+        // A commit that did not say leaves all of them unknown.
+        assert!(
+            apply_failed(&lost(0, 2), &statements)
+                .ends_with("They may have applied: reload before applying again."),
+        );
+        assert!(
+            apply_failed(&lost(0, 1), &statements[..1])
+                .ends_with(" It may have applied: reload before applying again."),
+        );
     }
 
     #[test]

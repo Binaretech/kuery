@@ -759,7 +759,7 @@ fn sees_who_blocks_whom_and_ends_the_blocker() {
             let ours = now.blockers().into_iter().find(|root| {
                 root.waiting
                     .iter()
-                    .any(|pid| now.backend(*pid).is_some_and(|b| b.query.contains(&table)))
+                    .any(|id| now.backend(id).is_some_and(|b| b.query.contains(&table)))
             });
             if let Some(root) = ours {
                 seen = Some((now, root));
@@ -770,8 +770,8 @@ fn sees_who_blocks_whom_and_ends_the_blocker() {
         let (now, root) = seen.expect("sees the waiter blocked");
         assert!(now.max_connections.is_some_and(|max| max > 0));
         assert!(now.backends.iter().any(|b| b.own));
-        let blocked = now.backend(root.waiting[0]).unwrap();
-        assert_eq!(blocked.blocked_by, [root.pid]);
+        let blocked = now.backend(&root.waiting[0]).unwrap();
+        assert_eq!(blocked.blocked_by, std::slice::from_ref(&root.id));
         assert!(
             blocked
                 .waiting_for
@@ -783,10 +783,15 @@ fn sees_who_blocks_whom_and_ends_the_blocker() {
         assert!(blocked.query.contains("set n = 3"));
 
         // Ending the holder lets the waiter through.
-        assert!(monitor.signal(root.pid, Signal::Terminate).await.unwrap());
+        assert!(monitor.signal(root.id, Signal::Terminate).await.unwrap());
         finish(waiting).await.unwrap();
         waiter.rollback().await.unwrap();
-        assert!(!monitor.signal(999_999, Signal::Cancel).await.unwrap());
+        assert!(
+            !monitor
+                .signal(999_999.into(), Signal::Cancel)
+                .await
+                .unwrap()
+        );
 
         finish(setup.run_in_transaction(format!("drop table {table}"), options))
             .await

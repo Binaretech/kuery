@@ -3,6 +3,10 @@
 //! reads back the same (`NumberLong("5")`, `ObjectId("…")`), or as a tree of
 //! its fields with their types, whose menu copies a field's path or value
 //! and filters the collection by it.
+//!
+//! Where its tab edits documents, the literal opens for editing (an edit,
+//! a new document, a copy), and Stage hands the text back to the tab,
+//! which reads and diffs it; what it cannot stage shows above the text.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -12,6 +16,7 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement, ParentElement as _,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div,
@@ -37,6 +42,20 @@ pub enum DetailEvent {
     /// documents holding a field's value (see [`Language::field_filter`]).
     FilterBy(String),
     Close,
+    /// Edit the document shown.
+    Edit,
+    /// Stage the edited literal.
+    Stage(String),
+    /// Leave the edit without staging it.
+    CancelEdit,
+}
+
+/// The literal open for editing.
+struct Editing {
+    /// `Edit Document 7`, `New Document`.
+    title: String,
+    /// Why the last Stage was refused.
+    error: Option<String>,
 }
 
 /// A field of the tree, by its node's id.
@@ -55,6 +74,9 @@ pub struct DocumentDetail {
     tree: Entity<TreeState>,
     /// The tree's fields, by node id; replaced with each document.
     nodes: Rc<HashMap<SharedString, Node>>,
+    /// Whether its tab edits documents, which shows Edit.
+    editable: bool,
+    editing: Option<Editing>,
     weak: WeakEntity<Self>,
 }
 
@@ -77,16 +99,66 @@ impl DocumentDetail {
             editor,
             tree,
             nodes: Rc::new(HashMap::new()),
+            editable: false,
+            editing: None,
             weak: cx.entity().downgrade(),
         }
     }
 
+    /// Shows Edit, or hides it.
+    pub fn set_editable(&mut self, editable: bool, cx: &mut Context<Self>) {
+        self.editable = editable;
+        cx.notify();
+    }
+
+    /// Opens `text` for editing, as the literal of the document it becomes.
+    pub fn edit(
+        &mut self,
+        title: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_value(text, window, cx));
+        self.editing = Some(Editing { title, error: None });
+        self.mode = DetailMode::Text;
+        cx.notify();
+    }
+
+    /// The editor's text, as Stage would hand it over.
+    #[cfg(test)]
+    pub fn text(&self, cx: &gpui_kit::App) -> String {
+        self.editor.read(cx).value().to_string()
+    }
+
+    /// Says why the edit could not be staged; it stays open.
+    pub fn refuse(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(editing) = self.editing.as_mut() {
+            editing.error = Some(error);
+        }
+        cx.notify();
+    }
+
+    /// Closes the edit and shows `document` again.
+    pub fn stop_editing(
+        &mut self,
+        document: Option<Document>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing = None;
+        self.show(document, window, cx);
+    }
+
+    /// Shows a document, leaving an edit under way, if any.
     pub fn show(
         &mut self,
         document: Option<Document>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.editing = None;
         let render = self.language.render;
         let text = document
             .as_ref()
@@ -198,9 +270,67 @@ impl DocumentDetail {
     }
 }
 
+impl DocumentDetail {
+    /// The literal open for editing, with Cancel and Stage above it.
+    fn render_editing(&self, editing: &Editing, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .h(px(40.))
+                    .px_3()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(color(theme::HAIRLINE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(editing.title.clone()),
+                    )
+                    .child(
+                        chrome::pill_button("cancel-edit", "Cancel", false)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DetailEvent::CancelEdit))),
+                    )
+                    .child(
+                        chrome::pill_button("stage-edit", "Stage", true).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                let text = this.editor.read(cx).value().to_string();
+                                cx.emit(DetailEvent::Stage(text));
+                            },
+                        )),
+                    ),
+            )
+            .children(editing.error.clone().map(|error| {
+                div()
+                    .px_3()
+                    .py(px(6.))
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(color(theme::RED))
+                    .border_b_1()
+                    .border_color(color(theme::HAIRLINE))
+                    .child(error)
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(Editor::new(&self.editor).bordered(false).h_full()),
+            )
+    }
+}
+
 impl Render for DocumentDetail {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(editing) = &self.editing {
+            return self.render_editing(editing, cx).into_any_element();
+        }
         let text = self.mode == DetailMode::Text;
+        let editable = self.editable && self.document.is_some();
         let body = match (&self.document, self.mode) {
             (None, _) => placeholder("No document"),
             (Some(_), DetailMode::Text) => Editor::new(&self.editor)
@@ -256,12 +386,24 @@ impl Render for DocumentDetail {
                                 )),
                             ),
                     )
+                    .when(editable, |row| {
+                        row.child(
+                            chrome::icon_button(
+                                "edit-document",
+                                AppIcon::Pencil,
+                                "Edit Document",
+                                true,
+                            )
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DetailEvent::Edit))),
+                        )
+                    })
                     .child(
                         chrome::icon_button("close-detail", IconName::Close, "Close", true)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DetailEvent::Close))),
                     ),
             )
             .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 }
 

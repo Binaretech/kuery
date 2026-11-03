@@ -49,6 +49,18 @@ pub struct DocIndex {
     /// Kept up to date but not used by queries.
     pub hidden: bool,
     pub size: Option<u64>,
+    /// How often queries used it, when the user may read that.
+    pub usage: Option<IndexUsage>,
+}
+
+/// How often an index was used, as the engine counted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexUsage {
+    /// Operations that used it.
+    pub operations: u64,
+    /// Since when it counts (milliseconds since 1970, UTC), when the
+    /// engine said: counts start over when the server restarts.
+    pub since: Option<i64>,
 }
 
 /// What Kuery knows about one collection.

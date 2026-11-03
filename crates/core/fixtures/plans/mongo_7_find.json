@@ -1,0 +1,135 @@
+{
+  "explainVersion": "1",
+  "queryPlanner": {
+    "namespace": "shop.orders",
+    "indexFilterSet": false,
+    "parsedQuery": {
+      "$and": [
+        {
+          "customer": {
+            "$eq": {
+              "$oid": "6ae3c8278d8e54e5dfc88069"
+            }
+          }
+        },
+        {
+          "status": {
+            "$eq": "paid"
+          }
+        }
+      ]
+    },
+    "queryHash": "D890AA17",
+    "planCacheKey": "0EE82605",
+    "optimizationTimeMillis": 3,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "winningPlan": {
+      "stage": "SORT",
+      "sortPattern": {
+        "date": -1
+      },
+      "memLimit": 104857600,
+      "type": "simple",
+      "inputStage": {
+        "stage": "FETCH",
+        "filter": {
+          "status": {
+            "$eq": "paid"
+          }
+        },
+        "inputStage": {
+          "stage": "IXSCAN",
+          "keyPattern": {
+            "customer": 1
+          },
+          "indexName": "customer_1",
+          "isMultiKey": false,
+          "multiKeyPaths": {
+            "customer": []
+          },
+          "isUnique": false,
+          "isSparse": false,
+          "isPartial": false,
+          "indexVersion": 2,
+          "direction": "forward",
+          "indexBounds": {
+            "customer": [
+              "[ObjectId('6ae3c8278d8e54e5dfc88069'), ObjectId('6ae3c8278d8e54e5dfc88069')]"
+            ]
+          }
+        }
+      }
+    },
+    "rejectedPlans": [
+      {
+        "stage": "FETCH",
+        "filter": {
+          "customer": {
+            "$eq": {
+              "$oid": "6ae3c8278d8e54e5dfc88069"
+            }
+          }
+        },
+        "inputStage": {
+          "stage": "IXSCAN",
+          "keyPattern": {
+            "status": 1,
+            "date": -1
+          },
+          "indexName": "status_1_date_-1",
+          "isMultiKey": false,
+          "multiKeyPaths": {
+            "status": [],
+            "date": []
+          },
+          "isUnique": false,
+          "isSparse": false,
+          "isPartial": false,
+          "indexVersion": 2,
+          "direction": "forward",
+          "indexBounds": {
+            "status": [
+              "[\"paid\", \"paid\"]"
+            ],
+            "date": [
+              "[MaxKey, MinKey]"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "command": {
+    "find": "orders",
+    "filter": {
+      "status": "paid",
+      "customer": {
+        "$oid": "6ae3c8278d8e54e5dfc88069"
+      }
+    },
+    "sort": {
+      "date": -1
+    },
+    "$db": "shop"
+  },
+  "serverInfo": {
+    "host": "91963880977d",
+    "port": 27017,
+    "version": "7.0.45",
+    "gitVersion": "a52313e13ab55c9bddf7c3ff91dab286fa381796"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 104857600,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 104857600,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "forceClassicEngine"
+  },
+  "ok": 1
+}

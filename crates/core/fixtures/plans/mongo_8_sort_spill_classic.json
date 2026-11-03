@@ -1,0 +1,105 @@
+{
+  "explainVersion": "1",
+  "queryPlanner": {
+    "namespace": "kr_scratch.big",
+    "parsedQuery": {},
+    "indexFilterSet": false,
+    "queryHash": "16A29F40",
+    "planCacheShapeHash": "16A29F40",
+    "planCacheKey": "2D391FA0",
+    "optimizationTimeMillis": 0,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "stage": "SORT",
+      "sortPattern": {
+        "t": 1,
+        "n": -1
+      },
+      "memLimit": 100000,
+      "type": "simple",
+      "inputStage": {
+        "stage": "COLLSCAN",
+        "direction": "forward"
+      }
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": true,
+    "nReturned": 20000,
+    "executionTimeMillis": 96,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 20000,
+    "executionStages": {
+      "isCached": false,
+      "stage": "SORT",
+      "nReturned": 20000,
+      "executionTimeMillisEstimate": 96,
+      "works": 40002,
+      "advanced": 20000,
+      "needTime": 20001,
+      "needYield": 0,
+      "saveState": 2,
+      "restoreState": 2,
+      "isEOF": 1,
+      "sortPattern": {
+        "t": 1,
+        "n": -1
+      },
+      "memLimit": 100000,
+      "type": "simple",
+      "totalDataSizeSorted": 5918000,
+      "usedDisk": true,
+      "spills": 135,
+      "spilledDataStorageSize": 4450948,
+      "inputStage": {
+        "stage": "COLLSCAN",
+        "nReturned": 20000,
+        "executionTimeMillisEstimate": 0,
+        "works": 20001,
+        "advanced": 20000,
+        "needTime": 0,
+        "needYield": 0,
+        "saveState": 2,
+        "restoreState": 2,
+        "isEOF": 1,
+        "direction": "forward",
+        "docsExamined": 20000
+      }
+    }
+  },
+  "queryShapeHash": "9DCF7C3977F5AA0F23BE1E76B40169B13CAF246978E10B758D55AC3E341B5BCC",
+  "command": {
+    "find": "big",
+    "filter": {},
+    "sort": {
+      "t": 1,
+      "n": -1
+    },
+    "allowDiskUse": true,
+    "$db": "kr_scratch"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 100000,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 100000,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

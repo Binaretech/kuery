@@ -13,13 +13,13 @@
 //! thread of its own, and a driver over an async client waits on its own
 //! runtime there.
 
+use crate::activity::{Activity, BackendId, Signal};
 use crate::adapter::Canceller;
-use crate::document::capabilities::Capabilities;
+use crate::document::capabilities::{Capabilities, Sampling};
 use crate::document::catalog::{CollectionInfo, Container};
 use crate::document::change::{BrowseSpec, Continuation, Count, DocChange};
 use crate::document::language::Language;
 use crate::document::value::{CollectionRef, Document};
-use crate::plan::Plan;
 use crate::session::{QueryError, RunOptions};
 use crate::worker::Driven;
 
@@ -81,21 +81,22 @@ impl Outcome {
     }
 }
 
-/// Why a transaction did not commit.
+/// Why a write that keeps what it does as soon as it ends (a transaction's
+/// commit, a change applied on its own) did not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommitError {
+pub enum WriteError {
     /// It was not applied: nothing of it was kept.
     Undone(QueryError),
-    /// The engine did not say whether it was applied, as when the commit
-    /// ran out of time or its connection broke.
+    /// The engine did not say whether it was applied, as when it ran out
+    /// of time or its connection broke before the answer came.
     Unknown(QueryError),
 }
 
-impl CommitError {
-    /// The error, whatever the commit left.
+impl WriteError {
+    /// The error, whatever the write left.
     pub fn error(self) -> QueryError {
         match self {
-            CommitError::Undone(error) | CommitError::Unknown(error) => error,
+            WriteError::Undone(error) | WriteError::Unknown(error) => error,
         }
     }
 }
@@ -148,8 +149,8 @@ pub trait DocumentAdapter: Send + 'static {
     }
 
     /// Ends the transaction, applying it; it is gone either way.
-    fn commit(&mut self) -> Result<(), CommitError> {
-        unsupported("transactions").map_err(CommitError::Undone)
+    fn commit(&mut self) -> Result<(), WriteError> {
+        unsupported("transactions").map_err(WriteError::Undone)
     }
 
     fn abort(&mut self) -> Result<(), QueryError> {
@@ -164,13 +165,14 @@ pub trait DocumentAdapter: Send + 'static {
     fn collection(&mut self, collection: &CollectionRef) -> Result<CollectionInfo, QueryError>;
 
     /// About `n` documents of the collection, picked as
-    /// [`Capabilities::sampling`] says.
+    /// [`Capabilities::sampling`] says where the collection allows it.
+    /// Returns how they were picked: a view, say, may only give its first.
     fn sample(
         &mut self,
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError>;
+    ) -> Result<Sampling, QueryError>;
 
     /// One page of the collection; returns where the next one starts, or
     /// `None` when this was the last.
@@ -191,12 +193,13 @@ pub trait DocumentAdapter: Send + 'static {
     ) -> Result<Count, QueryError>;
 
     /// Applies one change, only to a document that still holds what the
-    /// change expects; the counts say whether it found one.
+    /// change expects; the counts say whether it found one. A failure says
+    /// whether the change may have been applied all the same.
     fn apply(
         &mut self,
         collection: &CollectionRef,
         change: &DocChange,
-    ) -> Result<Outcome, QueryError>;
+    ) -> Result<Outcome, WriteError>;
 
     /// How many documents a write would touch, without running it and
     /// without changing anything, when the engine can tell; the first of
@@ -211,11 +214,27 @@ pub trait DocumentAdapter: Send + 'static {
         Ok(None)
     }
 
-    /// A statement's plan: estimated, or measured by running it when
-    /// `execute`.
-    fn explain(&mut self, statement: &str, execute: bool) -> Result<Plan, QueryError> {
+    /// A statement's plan, as the engine's own text that
+    /// [`crate::plan::parse`] reads (JSON): what the planner chose, or,
+    /// when `execute`, also measured by running it. The session asks to
+    /// execute only reads; an adapter refuses to execute anything else all
+    /// the same.
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
         let _ = (statement, execute);
         unsupported("plans")
+    }
+
+    /// The server's running operations, where the connection may list
+    /// them (see [`Capabilities::activity`]).
+    fn activity(&mut self) -> Result<Activity, QueryError> {
+        unsupported("activity to show")
+    }
+
+    /// Stops one of them, or ends its session, where the engine can (see
+    /// [`Capabilities::kill`]); `false` when it was already gone.
+    fn signal(&mut self, id: &BackendId, signal: Signal) -> Result<bool, QueryError> {
+        let _ = (id, signal);
+        unsupported("operations to stop")
     }
 }
 

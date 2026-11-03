@@ -73,7 +73,7 @@ pub(crate) fn ends_line(text: &str, before: &Token, after: &Token) -> bool {
 /// 64 bytes, and none of `/\. "$` or NUL, which the server refuses on
 /// every platform (Windows also refuses `*<>:|?`, which only its own
 /// server checks).
-fn database_name(name: &str) -> bool {
+pub(crate) fn database_name(name: &str) -> bool {
     !name.is_empty() && name.len() < 64 && !name.contains(['/', '\\', '.', ' ', '"', '$', '\0'])
 }
 

@@ -38,6 +38,7 @@ use kuery_core::document::value::CollectionRef;
 use kuery_core::driver::Family;
 use kuery_core::sql::{Dialect, POSTGRES};
 
+use crate::activity_tab::ActivitySource;
 use crate::app;
 use crate::assets::AppIcon;
 use crate::connection::{ConnMeta, Db, DocDb, RedisDb};
@@ -68,8 +69,8 @@ pub enum ExplorerEvent {
     NewQuery(Db),
     NewConnection,
     EditConnection(String),
-    /// The server's sessions and locks.
-    OpenActivity(Db),
+    /// The server's sessions and locks, or its running operations.
+    OpenActivity(ActivitySource),
     /// A schema's diagram.
     OpenDiagram {
         db: Db,
@@ -99,6 +100,15 @@ pub enum ExplorerEvent {
     OpenDocumentConsole {
         db: DocDb,
         path: Vec<String>,
+    },
+    /// A History entry of a document database, in a console of its own:
+    /// in `language` when it is not the engine's own (`SQL`), starting in
+    /// `path` (the connection's own container when `None`).
+    OpenDocumentHistory {
+        db: DocDb,
+        language: Option<String>,
+        path: Option<Vec<String>>,
+        text: String,
     },
 }
 
@@ -821,8 +831,31 @@ impl Explorer {
     }
 
     fn open_activity(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(db) = self.db(index) {
-            cx.emit(ExplorerEvent::OpenActivity(db));
+        if let Some(source) = self.activity_source(index) {
+            cx.emit(ExplorerEvent::OpenActivity(source));
+        }
+    }
+
+    /// The connection at `index`, when its server's activity can be watched.
+    fn activity_source(&self, index: usize) -> Option<ActivitySource> {
+        let source = match &self.connections.get(index)?.state {
+            ConnectionState::Ready { db, .. } => ActivitySource::Sql(db.clone()),
+            ConnectionState::DocumentReady { db } => ActivitySource::Document(db.clone()),
+            _ => return None,
+        };
+        source.watchable().then_some(source)
+    }
+
+    /// The selected connection, else the first one open, whose server's
+    /// activity can be watched.
+    pub fn current_activity_source(&self) -> Option<ActivitySource> {
+        let selected = self
+            .selected
+            .as_ref()
+            .and_then(|key| key.split('/').next()?.parse::<usize>().ok());
+        match selected {
+            Some(index) => self.activity_source(index),
+            None => (0..self.connections.len()).find_map(|index| self.activity_source(index)),
         }
     }
 
@@ -1065,6 +1098,12 @@ impl Explorer {
                 depth,
                 expanded,
             } => self.document_row(*index, path, *item, *depth, *expanded, cx)?,
+            Row::DocumentIndex {
+                index,
+                collection,
+                item,
+                depth,
+            } => self.document_index_row(*index, collection, *item, *depth)?,
             Row::DocumentMore {
                 index,
                 parent,
@@ -1089,10 +1128,7 @@ impl Explorer {
                 | ConnectionState::RedisReady { .. }
                 | ConnectionState::DocumentReady { .. }
         );
-        let activity = matches!(
-            &node.state,
-            ConnectionState::Ready { db, .. } if db.session.has_activity()
-        );
+        let activity = self.activity_source(index).is_some();
         // The environment's color: filled once connected, an outline before;
         // amber while connecting, red when it failed.
         let dot = match &node.state {
@@ -1221,6 +1257,14 @@ impl Explorer {
                         &this,
                         move |this, _, cx| this.open_document_console(index, None, cx),
                     ))
+                    .when(activity, |menu| {
+                        menu.item(item_icon(
+                            "Server Activity",
+                            AppIcon::Activity,
+                            &this,
+                            move |this, _, cx| this.open_activity(index, cx),
+                        ))
+                    })
                     .item(item_icon(
                         "Refresh",
                         AppIcon::Reload,
@@ -1643,13 +1687,26 @@ impl Explorer {
             .into_any_element()
     }
 
-    /// Opens a History entry's SQL in a new tab on its connection.
-    fn open_history(&mut self, connection: &str, sql: &str, cx: &mut Context<Self>) {
-        let db = self
+    /// Opens a History entry's statement in a new tab on its connection: a
+    /// query tab, or a console for a document database.
+    fn open_history(&mut self, entry: &HistoryEntry, cx: &mut Context<Self>) {
+        let (connection, sql) = (entry.connection.as_str(), entry.sql.as_str());
+        let index = self
             .connections
             .iter()
-            .position(|c| c.spec.name == connection)
-            .and_then(|index| self.db(index));
+            .position(|c| c.spec.name == connection);
+        if let Some(ConnectionState::DocumentReady { db }) =
+            index.map(|index| &self.connections[index].state)
+        {
+            cx.emit(ExplorerEvent::OpenDocumentHistory {
+                db: db.clone(),
+                language: entry.language.clone(),
+                path: entry.path.clone(),
+                text: sql.to_string(),
+            });
+            return;
+        }
+        let db = index.and_then(|index| self.db(index));
         if let Some(db) = db {
             cx.emit(ExplorerEvent::OpenQuery {
                 db,
@@ -1679,8 +1736,9 @@ impl Explorer {
                     .find(|line| !line.is_empty() && !line.starts_with("--"))
                     .unwrap_or("")
                     .to_string();
-                let connection = entry.connection.clone();
                 let sql = entry.sql.clone();
+                let native = entry.native.clone();
+                let opened = entry.clone();
                 v_flex()
                     .id(("history", position))
                     .px_2()
@@ -1695,6 +1753,14 @@ impl Explorer {
                             .truncate()
                             .child(first_line),
                     )
+                    .children(native.clone().map(|native| {
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(11.))
+                            .text_color(color(theme::TEXT_QUIET))
+                            .truncate()
+                            .child(format!("→ {native}"))
+                    }))
                     .child(
                         h_flex()
                             .gap_2()
@@ -1717,20 +1783,23 @@ impl Explorer {
                             ),
                     )
                     .on_click({
-                        let (connection, sql) = (connection.clone(), sql.clone());
-                        cx.listener(move |this, _, _, cx| this.open_history(&connection, &sql, cx))
+                        let opened = opened.clone();
+                        cx.listener(move |this, _, _, cx| this.open_history(&opened, cx))
                     })
                     .context_menu({
                         let this = cx.entity().downgrade();
                         move |menu, _, _| {
-                            let (connection, open) = (connection.clone(), sql.clone());
+                            let opened = opened.clone();
                             menu.item(item_icon(
                                 "Open in New Tab",
                                 AppIcon::Code,
                                 &this,
-                                move |this, _, cx| this.open_history(&connection, &open, cx),
+                                move |this, _, cx| this.open_history(&opened, cx),
                             ))
                             .item(copy("Copy SQL", sql.clone()))
+                            .when_some(native.clone(), |menu, native| {
+                                menu.item(copy("Copy What It Ran As", native))
+                            })
                             .separator()
                             .item(item(
                                 "Remove from History",
@@ -1799,16 +1868,29 @@ fn tree_row(
     selected: bool,
 ) -> Stateful<gpui_kit::Div> {
     let chevron = match expanded {
-        Some(true) => Icon::new(IconName::ChevronDown)
-            .size(px(11.))
-            .text_color(color(theme::TEXT_TERTIARY))
-            .into_any_element(),
-        Some(false) => Icon::new(IconName::ChevronRight)
-            .size(px(11.))
-            .text_color(color(theme::TEXT_TERTIARY))
-            .into_any_element(),
+        Some(expanded) => chevron(expanded).into_any_element(),
         None => div().w(px(11.)).into_any_element(),
     };
+    tree_row_with(id, depth, chevron, selected)
+}
+
+/// A row's open or closed chevron.
+fn chevron(expanded: bool) -> Icon {
+    Icon::new(match expanded {
+        true => IconName::ChevronDown,
+        false => IconName::ChevronRight,
+    })
+    .size(px(11.))
+    .text_color(color(theme::TEXT_TERTIARY))
+}
+
+/// A tree row with its own chevron, such as one clicked apart from the row.
+fn tree_row_with(
+    id: SharedString,
+    depth: usize,
+    chevron: AnyElement,
+    selected: bool,
+) -> Stateful<gpui_kit::Div> {
     h_flex()
         .id(id)
         .h(px(ROW_HEIGHT))

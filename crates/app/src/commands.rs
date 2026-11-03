@@ -254,7 +254,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ExplainQuery),
         defaults: &["secondary-e"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || DocumentConsole"),
     },
     Command {
         id: "query.explain_analyze",
@@ -262,7 +262,7 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ExplainAnalyze),
         defaults: &["secondary-alt-e"],
-        context: Some("QueryTab"),
+        context: Some("QueryTab || DocumentConsole"),
     },
     Command {
         id: "query.export",

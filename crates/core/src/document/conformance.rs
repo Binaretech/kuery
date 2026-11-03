@@ -13,13 +13,15 @@ use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
 
+use crate::document::adapter::WriteError;
 use crate::document::capabilities::{Enforcement, Preview, Transactions};
 use crate::document::change::{BrowseSpec, Count, DocChange};
+use crate::document::diff::diff;
 use crate::document::session::{
     ApplyFailure, DocEvent, DocSummary, DocumentOpener, DocumentSession, Estimate, Heavy, Left,
     RunMode,
 };
-use crate::document::value::{CollectionRef, Document, Value};
+use crate::document::value::{CollectionRef, DocKey, Document, FieldPath, Value};
 use crate::session::{Access, QueryError, RunOptions};
 
 /// How to reach the database under test.
@@ -66,6 +68,7 @@ pub fn run(fixture: &Fixture) {
     cancels_the_slow_statement(fixture);
     applies_all_or_nothing(fixture);
     previews_change_nothing(fixture);
+    applies_changes_checking_each_one(fixture);
 }
 
 fn open(fixture: &Fixture, access: Access) -> DocumentSession {
@@ -152,6 +155,7 @@ pub fn refuses_writes_twice_when_reading(fixture: &Fixture) {
         refused,
         Err(ApplyFailure {
             applied: 0,
+            unknown: 0,
             error: QueryError::WritesDisabled
         })
     );
@@ -166,7 +170,11 @@ pub fn refuses_writes_twice_when_reading(fixture: &Fixture) {
     // writes even when nothing analysed them first.
     let mut adapter = (fixture.opener)(Access::ReadOnly).expect("opens the database");
     let applied = adapter.apply(&fixture.collection, &insert);
-    assert_eq!(applied, Err(QueryError::WritesDisabled), "the driver wrote");
+    assert_eq!(
+        applied,
+        Err(WriteError::Undone(QueryError::WritesDisabled)),
+        "the driver wrote"
+    );
     assert!(
         adapter.begin().is_err(),
         "the driver began a transaction on a read-only connection"
@@ -400,4 +408,137 @@ pub fn previews_change_nothing(fixture: &Fixture) {
         ),
         Preview::None => assert_eq!(estimate, &Estimate::Unknown),
     }
+}
+
+/// Edits apply only to a document that still holds what was loaded, keep
+/// the types of what they set, remove what was removed (never set it to
+/// null), and a batch with a stale change keeps none of it where the
+/// engine has transactions, and what came before it where it has none. A
+/// delete that expects the whole document refuses one that changed in any
+/// way, a field added included.
+pub fn applies_changes_checking_each_one(fixture: &Fixture) {
+    let Some(writes) = &fixture.writes else {
+        return;
+    };
+    let session = open(fixture, Access::ReadWrite);
+    write(&session, &writes.clear).expect("clears the written collection");
+    let apply =
+        |changes: Vec<DocChange>| block_on(session.apply(writes.collection.clone(), changes));
+    let loaded = Document(vec![
+        ("_id".into(), Value::String("kuery-edit".into())),
+        ("n".into(), Value::Int64(1)),
+        ("price".into(), Value::Decimal("9.99".into())),
+        ("note".into(), Value::String("gone soon".into())),
+    ]);
+    let inserted = apply(vec![DocChange::Insert {
+        document: loaded.clone(),
+    }])
+    .expect("inserts a document");
+    assert_eq!(inserted.inserted, 1);
+
+    let mut edited = loaded.clone();
+    edited.0[1].1 = Value::Int64(2);
+    edited.0.retain(|(name, _)| name != "note");
+    edited.0.push(("added".into(), Value::Null));
+    let change = diff(&loaded, &edited)
+        .expect("the key stayed")
+        .expect("something changed");
+    let updated = apply(vec![change.clone()]).expect("applies the edit");
+    assert_eq!(updated.matched, 1);
+    let (stored, _) = page(&session, &writes.collection, BrowseSpec::default());
+    assert_eq!(stored, [edited.clone()], "the edit was not stored as made");
+
+    // The same edit again expects what the document no longer holds.
+    let stale = apply(vec![change.clone()]);
+    assert!(
+        matches!(
+            &stale,
+            Err(ApplyFailure {
+                applied: 0,
+                unknown: 0,
+                error: QueryError::RowMismatch { .. }
+            })
+        ),
+        "a stale edit applied: {stale:?}"
+    );
+
+    let other = Document(vec![("_id".into(), Value::String("kuery-edit-2".into()))]);
+    let batch = apply(vec![
+        DocChange::Insert {
+            document: other.clone(),
+        },
+        change,
+    ]);
+    let (stored, _) = page(&session, &writes.collection, BrowseSpec::default());
+    let (applied, kept) = match session.capabilities().transactions {
+        Transactions::Multi { .. } => (0, vec![edited.clone()]),
+        Transactions::None => (1, vec![edited.clone(), other]),
+    };
+    assert!(
+        matches!(
+            &batch,
+            Err(ApplyFailure { applied: said, unknown: 0, error: QueryError::RowMismatch { .. } }) if *said == applied
+        ),
+        "a batch with a stale change said {batch:?}"
+    );
+    assert_eq!(
+        stored, kept,
+        "a batch with a stale change kept the wrong part"
+    );
+
+    let key = DocKey(Value::String("kuery-edit".into()));
+    let delete = |n| DocChange::Delete {
+        key: key.clone(),
+        version: None,
+        expect: vec![(FieldPath::field("n"), Some(Value::Int64(n)))],
+    };
+    let refused = apply(vec![delete(1)]);
+    assert!(
+        matches!(
+            &refused,
+            Err(ApplyFailure {
+                error: QueryError::RowMismatch { .. },
+                ..
+            })
+        ),
+        "a stale delete applied: {refused:?}"
+    );
+    let deleted = apply(vec![delete(2)]).expect("deletes the document");
+    assert_eq!(deleted.matched, 1);
+
+    // A delete that expects the whole document as loaded refuses one that
+    // gained a field since.
+    let loaded = Document(vec![
+        ("_id".into(), Value::String("kuery-delete".into())),
+        ("n".into(), Value::Int64(1)),
+    ]);
+    apply(vec![DocChange::Insert {
+        document: loaded.clone(),
+    }])
+    .expect("inserts a document");
+    let whole = |document: &Document| DocChange::Delete {
+        key: DocKey(Value::String("kuery-delete".into())),
+        version: None,
+        expect: vec![(FieldPath(Vec::new()), Some(Value::Object(document.clone())))],
+    };
+    let mut theirs = loaded.clone();
+    theirs.0.push(("added".into(), Value::Bool(true)));
+    let added = diff(&loaded, &theirs)
+        .expect("the key stayed")
+        .expect("something changed");
+    apply(vec![added]).expect("adds a field");
+    let refused = apply(vec![whole(&loaded)]);
+    assert!(
+        matches!(
+            &refused,
+            Err(ApplyFailure {
+                error: QueryError::RowMismatch { .. },
+                ..
+            })
+        ),
+        "a delete of a document that gained a field applied: {refused:?}"
+    );
+    let deleted = apply(vec![whole(&theirs)]).expect("deletes the document as it is");
+    assert_eq!(deleted.matched, 1);
+    write(&session, &writes.clear).expect("clears the written collection");
 }

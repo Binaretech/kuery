@@ -13,7 +13,8 @@
 //! `write lost`, the commit does not say whether it applied. Entering a
 //! container runs `enter <name>`. The fake holds documents with keys 1 to
 //! 3: changes to other keys find nothing, and an insert of `{_id: 0}`
-//! inserts nothing.
+//! inserts nothing. A change to key 5 gets no answer, and after an insert
+//! of `{_id: 6}` the commit does not say whether it applied.
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -22,7 +23,7 @@ use futures::executor::block_on;
 
 use super::*;
 use crate::adapter::Canceller;
-use crate::document::capabilities::{Enforcement, Preview, Sampling};
+use crate::document::capabilities::{Enforcement, ExplainKind, Preview, Sampling};
 use crate::document::catalog::ContainerKind;
 use crate::document::language::{CompletionContext, FilterCheck, OpInfo, ParseError, Statement};
 use crate::document::value::DocKey;
@@ -71,7 +72,7 @@ fn analyze(text: &str) -> Result<Vec<Statement>, ParseError> {
                 summary: trimmed.to_string(),
                 dangers: Vec::new(),
                 heavy: trimmed == "heavy",
-                explainable: false,
+                explainable: !trimmed.starts_with("show"),
                 enters: None,
             },
         });
@@ -110,6 +111,8 @@ static FAKE: Language = Language {
     enter: |path| path.first().map(|name| format!("enter {name}")),
     collection_ref: |name| name.to_string(),
     key: |name| name.to_string(),
+    change: |_, change| change.describe(render),
+    check_change: |_| Ok(()),
     key_name: "_id",
     methods: &[],
     operators: &[],
@@ -122,7 +125,7 @@ fn capabilities(transactions: Transactions, preview: Preview) -> Capabilities {
         transactions,
         read_only: Enforcement::ClientOnly("it is a fake"),
         preview,
-        explain: None,
+        explain: Some(ExplainKind::Measured),
         activity: false,
         kill: false,
         sampling: Sampling::FirstN,
@@ -269,6 +272,10 @@ impl DocumentAdapter for FakeDocs {
 
     /// `write N` touches N documents, `write fail` cannot be counted, and
     /// nothing else can be told.
+    fn explain(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.plan(statement, execute)
+    }
+
     fn estimate(
         &mut self,
         statement: &str,
@@ -295,10 +302,10 @@ impl DocumentAdapter for FakeDocs {
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&mut self) -> Result<(), WriteError> {
         self.log.push("commit");
         match std::mem::take(&mut self.lost) {
-            true => Err(CommitError::Unknown(QueryError::Connection(
+            true => Err(WriteError::Unknown(QueryError::Connection(
                 "no answer".into(),
             ))),
             false => Ok(()),
@@ -341,10 +348,11 @@ impl DocumentAdapter for FakeDocs {
         collection: &CollectionRef,
         n: usize,
         sink: &mut dyn DocumentSink,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Sampling, QueryError> {
         self.log
             .push(format!("sample {n} of {}", collection.display()));
-        sink.documents(numbered(0..n))
+        sink.documents(numbered(0..n))?;
+        Ok(Sampling::FirstN)
     }
 
     fn browse(
@@ -370,9 +378,20 @@ impl DocumentAdapter for FakeDocs {
         Ok(Count::Exact(42))
     }
 
-    fn apply(&mut self, _: &CollectionRef, change: &DocChange) -> Result<Outcome, QueryError> {
+    fn apply(&mut self, _: &CollectionRef, change: &DocChange) -> Result<Outcome, WriteError> {
         self.log.push(change.describe(render));
         let found = |key| u64::from(FakeDocs::holds(key));
+        match change {
+            DocChange::Update { key, .. } if *key == DocKey(Value::Int32(5)) => {
+                return Err(WriteError::Unknown(QueryError::Connection(
+                    "no answer".into(),
+                )));
+            }
+            DocChange::Insert { document } if document.key() == Some(DocKey(Value::Int32(6))) => {
+                self.lost = true;
+            }
+            _ => {}
+        }
         Ok(match change {
             DocChange::Insert { document } => Outcome {
                 inserted: u64::from(document.key() != Some(DocKey(Value::Int32(0)))),
@@ -389,6 +408,13 @@ impl DocumentAdapter for FakeDocs {
                 ..Outcome::default()
             },
         })
+    }
+}
+
+impl FakeDocs {
+    fn plan(&mut self, statement: &str, execute: bool) -> Result<String, QueryError> {
+        self.log.push(format!("explain {statement} {execute}"));
+        Ok(format!("{{\"plan\": \"{statement}\"}}"))
     }
 }
 
@@ -531,6 +557,7 @@ fn rejects_writes_on_a_read_only_session_before_the_adapter_sees_them() {
         applied,
         Err(ApplyFailure {
             applied: 0,
+            unknown: 0,
             error: QueryError::WritesDisabled
         })
     );
@@ -723,6 +750,11 @@ fn reads_the_catalog() {
     assert_eq!(sample.len(), 5);
     let count = block_on(session.count(orders(), None, 1000, Heavy::Refuse));
     assert_eq!(count, Ok(Count::Exact(42)));
+    // Inferred where it was sampled, and labelled as the adapter picked.
+    let sampled = block_on(session.schema(orders(), 3)).unwrap();
+    assert_eq!(sampled.schema.documents, 3);
+    assert_eq!(sampled.label(), "First 3 documents");
+    assert_eq!(sampled.schema.fields[0].path, "n");
     assert_eq!(
         log.take(),
         [
@@ -730,7 +762,8 @@ fn reads_the_catalog() {
             "children of [\"shop\"]",
             "collection shop.orders",
             "sample 5 of shop.orders",
-            "count shop.orders None"
+            "count shop.orders None",
+            "sample 3 of shop.orders",
         ]
     );
     assert_eq!(session.capabilities().levels, ["Database", "Collection"]);
@@ -1004,6 +1037,45 @@ fn apply_without_transactions_says_what_was_kept() {
 }
 
 #[test]
+fn apply_says_which_changes_may_have_applied_when_no_answer_came() {
+    // Without transactions, the change whose answer never came may have
+    // applied; those before it did.
+    let (session, log) = open(Access::ReadWrite);
+    let failure = block_on(session.apply(orders(), vec![update(1), update(5), update(2)]));
+    assert_eq!(
+        failure,
+        Err(ApplyFailure {
+            applied: 1,
+            unknown: 1,
+            error: QueryError::Connection("no answer".into()),
+        })
+    );
+    assert_eq!(log.take().len(), 2, "it stops at the change");
+    // A refused change is known not to have applied.
+    let failure = block_on(session.apply(orders(), vec![update(9)]));
+    assert_eq!(failure.map_err(|failure| failure.unknown), Err(0));
+
+    // In a transaction, a change without an answer is undone with it…
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let failure = block_on(session.apply(orders(), vec![update(1), update(5)]));
+    assert_eq!(
+        failure.map_err(|failure| (failure.applied, failure.unknown)),
+        Err((0, 0))
+    );
+    assert_eq!(log.take().last().map(String::as_str), Some("abort"));
+    // …but a commit that does not say leaves every change unknown.
+    let failure = block_on(session.apply(orders(), vec![update(1), insert(6)]));
+    assert_eq!(
+        failure,
+        Err(ApplyFailure {
+            applied: 0,
+            unknown: 2,
+            error: QueryError::Connection("no answer".into()),
+        })
+    );
+}
+
+#[test]
 fn a_job_that_panics_ends_the_session_and_says_so() {
     let (session, _) = open(Access::ReadWrite);
     let outcome = run(&session, "write panic", RunMode::Write).end;
@@ -1020,6 +1092,7 @@ fn a_job_that_panics_ends_the_session_and_says_so() {
         applied,
         Err(ApplyFailure {
             applied: 0,
+            unknown: 1,
             error: QueryError::Connection(_)
         })
     ));
@@ -1261,4 +1334,149 @@ fn a_preview_is_checked_like_a_write_run() {
         session.check("write 1", RunMode::Read, Heavy::Refuse),
         Err(QueryError::Rejected(Rejection::Statement("write 1".into())))
     );
+}
+
+/// Holds the session's worker in a job that runs nothing until it is
+/// released: the job has begun once the first receiver hears from it.
+fn hold(session: &DocumentSession) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    drop(session.handle.call(move |_| {
+        let _ = entered.send(());
+        let _ = released.recv();
+        Ok(())
+    }));
+    entering.recv().unwrap();
+    (entering, release)
+}
+
+#[test]
+fn a_preview_cancelled_before_it_starts_never_reaches_the_adapter() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let (_held, release) = hold(&session);
+    let previewed = session.preview_in(
+        &["shop".into()],
+        "write 1".into(),
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    session.cancel();
+    release.send(()).unwrap();
+    assert_eq!(block_on(previewed), Err(QueryError::Cancelled));
+    assert!(log.take().is_empty());
+    // The session goes on.
+    preview(&session, "write 1").unwrap();
+    assert_eq!(log.take(), ["begin", "write 1", "abort"]);
+}
+
+#[test]
+fn a_run_cancelled_before_it_starts_never_reaches_the_adapter() {
+    let (session, log) = open_with(MULTI, Access::ReadWrite);
+    let (_held, release) = hold(&session);
+    let rx = session.run_in(
+        &["shop".into()],
+        "write 1; write 2".into(),
+        RunMode::Write,
+        Heavy::Refuse,
+        RunOptions::default(),
+    );
+    session.cancel();
+    release.send(()).unwrap();
+    let cancelled = drain(rx);
+    assert!(matches!(cancelled.end, Err(QueryError::Cancelled)));
+    assert_eq!(cancelled.left, [Left::NOTHING]);
+    assert!(cancelled.outcomes.is_empty());
+    assert!(log.take().is_empty());
+    run(&session, "write 1", RunMode::Write).end.unwrap();
+}
+
+#[test]
+fn explains_reads_measured_and_writes_only_planned() {
+    let options = RunOptions::default;
+    let explain = |session: &DocumentSession, text: &str, execute: bool, heavy: Heavy| {
+        block_on(session.explain_in(&["shop".into()], text.into(), execute, heavy, options()))
+    };
+    let (reader, log) = open(Access::ReadOnly);
+    // A read is measured by running it, where it starts.
+    assert_eq!(
+        explain(&reader, "read 1", true, Heavy::Refuse).unwrap(),
+        "{\"plan\": \"read 1\"}"
+    );
+    assert_eq!(log.take(), ["enter shop", "explain read 1 true"]);
+    // A write is never planned on a read-only session, and never run.
+    assert_eq!(
+        explain(&reader, "write 1", false, Heavy::Refuse),
+        Err(QueryError::WritesDisabled)
+    );
+    assert!(matches!(
+        explain(&reader, "write 1", true, Heavy::Refuse),
+        Err(QueryError::Explain(message)) if message.contains("write 1 writes")
+    ));
+    // Heavy work runs only where allowed, and only matters when measured.
+    assert_eq!(
+        explain(&reader, "heavy", true, Heavy::Refuse),
+        Err(QueryError::Rejected(Rejection::Heavy("heavy".into())))
+    );
+    explain(&reader, "heavy", false, Heavy::Refuse).unwrap();
+    explain(&reader, "heavy", true, Heavy::Allow).unwrap();
+    // One explainable statement at a time.
+    assert!(matches!(
+        explain(&reader, "read 1; read 2", false, Heavy::Refuse),
+        Err(QueryError::Explain(_))
+    ));
+    assert!(matches!(
+        explain(&reader, "show things", false, Heavy::Refuse),
+        Err(QueryError::Explain(message)) if message == "show things has no plan to show"
+    ));
+    assert_eq!(
+        log.take(),
+        [
+            "enter shop",
+            "explain heavy false",
+            "enter shop",
+            "explain heavy true"
+        ]
+    );
+
+    // An engine that only plans is never asked to measure.
+    let mut planner = capabilities(Transactions::None, Preview::None);
+    planner.explain = Some(ExplainKind::Estimated);
+    assert_eq!(
+        check_explain(
+            &FAKE,
+            &planner,
+            Access::ReadOnly,
+            "read 1",
+            false,
+            Heavy::Refuse
+        ),
+        Ok(false)
+    );
+    assert!(matches!(
+        check_explain(&FAKE, &planner, Access::ReadOnly, "read 1", true, Heavy::Refuse),
+        Err(QueryError::Unsupported(message)) if message.contains("explain without measuring")
+    ));
+
+    // A session that may write plans a write, without running it.
+    let (writer, log) = open(Access::ReadWrite);
+    explain(&writer, "write 1", false, Heavy::Refuse).unwrap();
+    assert_eq!(log.take(), ["enter shop", "explain write 1 false"]);
+    assert!(explain(&writer, "write 1", true, Heavy::Refuse).is_err());
+    assert!(
+        log.take().is_empty(),
+        "a measured write never reached the driver"
+    );
+}
+
+#[test]
+fn an_engine_without_activity_says_so() {
+    let (session, _) = open(Access::ReadOnly);
+    assert!(matches!(
+        block_on(session.activity()),
+        Err(QueryError::Unsupported(message)) if message.contains("activity")
+    ));
+    assert!(matches!(
+        block_on(session.signal("7".into(), Signal::Cancel)),
+        Err(QueryError::Unsupported(message)) if message.contains("operations to stop")
+    ));
 }

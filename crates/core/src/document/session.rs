@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::activity::{Activity, BackendId, Signal};
 use crate::analysis::StatementKind;
-use crate::document::adapter::{CommitError, DocumentAdapter, DocumentSink, Outcome};
-use crate::document::capabilities::{Capabilities, Preview, Transactions};
+use crate::document::adapter::{DocumentAdapter, DocumentSink, Outcome, WriteError};
+use crate::document::capabilities::{Capabilities, ExplainKind, Preview, Transactions};
 use crate::document::catalog::{CollectionInfo, Container};
 use crate::document::change::{BrowseSpec, Continuation, Count, DocChange, Expected};
 use crate::document::language::{Language, OpInfo, Statement, Style};
+use crate::document::schema::{self, SampleSink, Sampled};
 use crate::document::value::{CollectionRef, Document, Value};
 use crate::read_only::Rejection;
 use crate::session::{Access, QueryError, RunOptions};
@@ -102,11 +104,15 @@ pub struct DocSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyFailure {
     /// Changes kept before the failure: none where the engine has
-    /// transactions, which undo them all, nor when the connection itself
-    /// failed (what it kept then is unknown). A [`QueryError::RowMismatch`]
+    /// transactions, which undo them all. A [`QueryError::RowMismatch`]
     /// says on its own that nothing was applied, so say what this kept
     /// instead of showing that error as it is.
     pub applied: usize,
+    /// Changes after those that may have been applied all the same, since
+    /// the engine's answer never came: the one it stopped at, or every one
+    /// when a transaction's commit did not say (or the session itself
+    /// failed). Applying them again could apply them twice.
+    pub unknown: usize,
     pub error: QueryError,
 }
 
@@ -377,6 +383,30 @@ impl DocumentSession {
         })
     }
 
+    /// The plan of one statement, starting in the container `start` (empty
+    /// for where the last run left off), as the engine's text that
+    /// [`crate::plan::parse`] reads. With `execute`, the engine measures it
+    /// by running it, which only a read may do; a statement that writes is
+    /// only ever planned, never run, and only on a session that may write.
+    /// Heavy work is refused as in a run when it would execute. Checked on
+    /// the session's thread, before the adapter sees it.
+    pub fn explain_in(
+        &self,
+        start: &[String],
+        text: String,
+        execute: bool,
+        heavy: Heavy,
+        options: RunOptions,
+    ) -> impl Future<Output = Result<String, QueryError>> + Send + use<> {
+        let enter = (self.language().enter)(start);
+        let (language, capabilities, access) =
+            (self.language(), self.capabilities().clone(), self.access());
+        self.handle.call(move |worker| {
+            let execute = check_explain(language, &capabilities, access, &text, execute, heavy)?;
+            worker.explain(enter.as_deref(), &text, execute, &options)
+        })
+    }
+
     /// Streams one page of a collection; the summary says where the next
     /// one starts. Its filter and projection are checked like a script's.
     pub fn browse(
@@ -418,7 +448,7 @@ impl DocumentSession {
             .call(move |worker| worker.catalog(|adapter| adapter.collection(&collection)))
     }
 
-    /// About `n` documents of the collection, to infer its schema.
+    /// About `n` documents of the collection.
     pub fn sample(
         &self,
         collection: CollectionRef,
@@ -433,8 +463,30 @@ impl DocumentSession {
         })
     }
 
+    /// The schema of about `n` documents of the collection, or as many as
+    /// fit in [`schema::SAMPLE_BYTES`], sampled and inferred on the
+    /// session's thread.
+    pub fn schema(
+        &self,
+        collection: CollectionRef,
+        n: usize,
+    ) -> impl Future<Output = Result<Sampled, QueryError>> + Send + use<> {
+        self.handle.call(move |worker| {
+            worker.catalog(|adapter| {
+                let mut sink = SampleSink::default();
+                let sampling = adapter.sample(&collection, n, &mut sink)?;
+                Ok(Sampled {
+                    schema: schema::infer(&sink.documents),
+                    sampling,
+                    capped: sink.capped(),
+                })
+            })
+        })
+    }
+
     /// How many documents match `filter`, counting no further than `cap`
-    /// when it costs time. The filter is checked like the filter bar's.
+    /// when it costs time. The filter is checked like the filter bar's, and
+    /// [`Self::cancel`] stops the count.
     pub fn count(
         &self,
         collection: CollectionRef,
@@ -448,7 +500,7 @@ impl DocumentSession {
         };
         let counted = checked.map(|()| {
             self.handle.call(move |worker| {
-                worker.catalog(|adapter| adapter.count(&collection, filter.as_deref(), cap))
+                worker.stoppable(|adapter| adapter.count(&collection, filter.as_deref(), cap))
             })
         });
         async move { counted?.await }
@@ -456,8 +508,9 @@ impl DocumentSession {
 
     /// Applies document changes, each to a document that still holds what
     /// it expects. Where the engine has transactions, all of them or none;
-    /// elsewhere they stop at the first failure, and the failure says how
-    /// many were kept.
+    /// elsewhere they stop at the first failure. The failure says how many
+    /// were kept, and how many more may have been when the engine's answer
+    /// never came.
     pub fn apply(
         &self,
         collection: CollectionRef,
@@ -465,18 +518,43 @@ impl DocumentSession {
     ) -> impl Future<Output = Result<Outcome, ApplyFailure>> + Send + use<> {
         let transactions = self.shared.capabilities.transactions;
         let render = self.shared.language.render;
+        let count = changes.len();
         let applied = self
             .handle
             .call(move |worker| Ok(worker.apply(&collection, &changes, transactions, render)));
         async move {
-            applied
-                .await
-                .unwrap_or_else(|error| Err(ApplyFailure { applied: 0, error }))
+            // The session failed on its way: what it applied is unknown.
+            applied.await.unwrap_or_else(|error| {
+                Err(ApplyFailure {
+                    applied: 0,
+                    unknown: count,
+                    error,
+                })
+            })
         }
     }
 
+    /// The server's running operations (see
+    /// [`DocumentAdapter::activity`]).
+    pub fn activity(&self) -> impl Future<Output = Result<Activity, QueryError>> + Send + use<> {
+        self.handle
+            .call(|worker| worker.catalog(|adapter| adapter.activity()))
+    }
+
+    /// Stops operation `id`, or ends its session; `false` when it was
+    /// already gone. It changes no data, so a read-only session may send it.
+    pub fn signal(
+        &self,
+        id: BackendId,
+        signal: Signal,
+    ) -> impl Future<Output = Result<bool, QueryError>> + Send + use<> {
+        self.handle
+            .call(move |worker| worker.catalog(|adapter| adapter.signal(&id, signal)))
+    }
+
     /// Stops the running job, if any: now, and again every quarter second
-    /// while it goes on.
+    /// while it goes on. With none running, the runs and previews queued
+    /// before it fail as cancelled without reaching the database.
     pub fn cancel(&self) {
         self.handle.cancel();
     }
@@ -506,6 +584,68 @@ fn check(
         .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(text))))?;
     check_statements(capabilities, access, &statements, mode, heavy)?;
     Ok(statements)
+}
+
+/// Refuses what an explain of `text` may not do (see
+/// [`DocumentSession::explain_in`]). Whether it runs the statement: only
+/// when asked to and it reads.
+fn check_explain(
+    language: &Language,
+    capabilities: &Capabilities,
+    access: Access,
+    text: &str,
+    execute: bool,
+    heavy: Heavy,
+) -> Result<bool, QueryError> {
+    match capabilities.explain {
+        None => {
+            return Err(QueryError::Unsupported(format!(
+                "Kuery shows no plans for {} here",
+                language.name
+            )));
+        }
+        Some(ExplainKind::Estimated) if execute => {
+            return Err(QueryError::Unsupported(format!(
+                "{} here only says what it plans to do: explain without measuring",
+                language.name
+            )));
+        }
+        Some(_) => {}
+    }
+    let statements = (language.analyze)(text)
+        .map_err(|error| QueryError::Rejected(Rejection::Parse(error.located(text))))?;
+    let info = match statements.as_slice() {
+        [] => return Err(QueryError::Rejected(Rejection::Empty)),
+        [statement] => &statement.info,
+        _ => {
+            return Err(QueryError::Explain(
+                "Explain one statement at a time: put the cursor on it".into(),
+            ));
+        }
+    };
+    if !info.explainable {
+        return Err(QueryError::Explain(format!(
+            "{} has no plan to show",
+            info.summary
+        )));
+    }
+    let reads = info.kind == StatementKind::Read;
+    if !reads {
+        if execute {
+            return Err(QueryError::Explain(format!(
+                "Measuring a plan runs the statement, and {} writes: explain it without \
+                 measuring, which never runs it",
+                info.summary
+            )));
+        }
+        if access == Access::ReadOnly {
+            return Err(QueryError::WritesDisabled);
+        }
+    }
+    if execute && info.heavy && heavy == Heavy::Refuse {
+        return Err(QueryError::Rejected(Rejection::Heavy(info.summary.clone())));
+    }
+    Ok(execute && reads)
 }
 
 /// Refuses what a run of `statements` may not do.
@@ -621,6 +761,34 @@ impl Worker<dyn DocumentAdapter> {
         job(self.adapter.as_mut())
     }
 
+    /// A catalog job that a cancel stops, as it stops a run.
+    fn stoppable<T>(
+        &mut self,
+        job: impl FnOnce(&mut dyn DocumentAdapter) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        self.adapter.limit(&RunOptions::default())?;
+        self.begin_run()?;
+        let outcome = job(self.adapter.as_mut());
+        self.end_run(outcome)
+    }
+
+    /// The plan of one checked statement (see
+    /// [`DocumentSession::explain_in`]).
+    fn explain(
+        &mut self,
+        enter: Option<&str>,
+        statement: &str,
+        execute: bool,
+        options: &RunOptions,
+    ) -> Result<String, QueryError> {
+        // Readied inside the run, as a run is.
+        self.begin_run()?;
+        let planned = self
+            .prepare(RunMode::Read, options, enter)
+            .and_then(|()| self.adapter.explain(statement, execute));
+        self.end_run(planned)
+    }
+
     /// Runs a script's statements (see [`DocumentSession::run_in`]); a
     /// write run that fails says what it left first.
     fn run(
@@ -653,13 +821,17 @@ impl Worker<dyn DocumentAdapter> {
     ) -> Result<DocSummary, (QueryError, Left)> {
         let started = Instant::now();
         let nothing = |error| (error, Left::NOTHING);
-        self.prepare(mode, options, enter).map_err(nothing)?;
         let atomic = mode == RunMode::Write
             && all_or_nothing(transactions, statements.iter().map(|(_, info)| info));
-        if atomic {
-            self.adapter.begin().map_err(nothing)?;
+        // Readied inside the run: one cancelled before it begins touches
+        // nothing, and a cancel while it is readied still stops it.
+        self.begin_run().map_err(nothing)?;
+        let ready = self
+            .prepare(mode, options, enter)
+            .and_then(|()| if atomic { self.adapter.begin() } else { Ok(()) });
+        if let Err(error) = ready {
+            return self.end_run(Err(error)).map_err(nothing);
         }
-        self.begin_run();
         let mut partial = Some(Outcome::default());
         let outcome = self.run_statements(statements, options, tx, started, &mut partial);
         match (mode, atomic) {
@@ -668,14 +840,14 @@ impl Worker<dyn DocumentAdapter> {
                 // Cancelled: undone, like any failure.
                 let ended = match self.end_run(outcome) {
                     Ok(summary) => self.adapter.commit().map(|()| summary),
-                    Err(error) => Err(CommitError::Undone(error)),
+                    Err(error) => Err(WriteError::Undone(error)),
                 };
                 ended.map_err(|error| {
                     // Whatever the failure, nothing is left open.
                     let _ = self.adapter.abort();
                     match error {
-                        CommitError::Undone(error) => (error, Left::Undone),
-                        CommitError::Unknown(error) => (error, Left::Unknown),
+                        WriteError::Undone(error) => (error, Left::Undone),
+                        WriteError::Unknown(error) => (error, Left::Unknown),
                     }
                 })
             }
@@ -714,14 +886,16 @@ impl Worker<dyn DocumentAdapter> {
         preview: Preview,
         options: &RunOptions,
     ) -> Result<Vec<Impact>, QueryError> {
-        self.prepare(RunMode::Write, options, enter)?;
-        self.begin_run();
+        // Readied inside the run, as a run is.
+        self.begin_run()?;
         let mut impacts = Vec::with_capacity(statements.len());
-        let previewed = match preview {
-            Preview::Undone => self.undone(statements, &mut impacts),
-            Preview::Estimated | Preview::None => Ok(None),
-        }
-        .and_then(|note| self.estimated(statements, preview, note, &mut impacts));
+        let previewed = self
+            .prepare(RunMode::Write, options, enter)
+            .and_then(|()| match preview {
+                Preview::Undone => self.undone(statements, &mut impacts),
+                Preview::Estimated | Preview::None => Ok(None),
+            })
+            .and_then(|note| self.estimated(statements, preview, note, &mut impacts));
         self.end_run(previewed).map(|()| impacts)
     }
 
@@ -884,12 +1058,12 @@ impl Worker<dyn DocumentAdapter> {
         tx: &async_channel::Sender<DocEvent>,
     ) -> Result<DocSummary, QueryError> {
         let started = Instant::now();
-        self.adapter.limit(options)?;
-        self.begin_run();
+        self.begin_run()?;
         let mut stream = Stream::new(tx, options, started);
         let outcome = self
             .adapter
-            .browse(collection, spec, &mut stream)
+            .limit(options)
+            .and_then(|()| self.adapter.browse(collection, spec, &mut stream))
             .inspect_err(|error| stream.stop_on_the_server(error, &self.canceller))
             .and_then(|next| stream.flush().map(|()| next));
         let next = self.end_run(outcome)?;
@@ -913,7 +1087,11 @@ impl Worker<dyn DocumentAdapter> {
         transactions: Transactions,
         render: fn(&Value, Style) -> String,
     ) -> Result<Outcome, ApplyFailure> {
-        let none_kept = |error| ApplyFailure { applied: 0, error };
+        let none_kept = |error| ApplyFailure {
+            applied: 0,
+            unknown: 0,
+            error,
+        };
         self.writable().map_err(none_kept)?;
         if changes.is_empty() {
             return Ok(Outcome::default());
@@ -932,21 +1110,32 @@ impl Worker<dyn DocumentAdapter> {
         for (kept, change) in changes.iter().enumerate() {
             match self.apply_one(collection, change, render) {
                 Ok(outcome) => total.add(outcome),
+                // Undone with the transaction, whatever it did.
                 Err(error) if atomic => {
                     let _ = self.adapter.abort();
-                    return Err(none_kept(error));
+                    return Err(none_kept(error.error()));
                 }
                 Err(error) => {
+                    let unknown = usize::from(matches!(error, WriteError::Unknown(_)));
                     return Err(ApplyFailure {
                         applied: kept,
-                        error,
+                        unknown,
+                        error: error.error(),
                     });
                 }
             }
         }
         if atomic && let Err(error) = self.adapter.commit() {
             let _ = self.adapter.abort();
-            return Err(none_kept(error.error()));
+            let unknown = match error {
+                WriteError::Unknown(_) => changes.len(),
+                WriteError::Undone(_) => 0,
+            };
+            return Err(ApplyFailure {
+                applied: 0,
+                unknown,
+                error: error.error(),
+            });
         }
         Ok(total)
     }
@@ -957,18 +1146,18 @@ impl Worker<dyn DocumentAdapter> {
         collection: &CollectionRef,
         change: &DocChange,
         render: fn(&Value, Style) -> String,
-    ) -> Result<Outcome, QueryError> {
+    ) -> Result<Outcome, WriteError> {
         let outcome = self.adapter.apply(collection, change)?;
         let (expected, actual) = match change.expected() {
             Expected::Matched(expected) => (expected, outcome.matched),
             Expected::Inserted(expected) => (expected, outcome.inserted),
         };
         if actual != expected {
-            return Err(QueryError::RowMismatch {
+            return Err(WriteError::Undone(QueryError::RowMismatch {
                 sql: change.describe(render),
                 expected,
                 actual,
-            });
+            }));
         }
         Ok(outcome)
     }

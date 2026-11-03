@@ -2,14 +2,16 @@
 //! lists under each node (a MongoDB server's databases, then each one's
 //! collections), read when a node first opens and named by the levels the
 //! driver reports (`Database`, `Collection`). Collections show their kind
-//! and how many documents they hold, counted as they are listed. Names are
-//! filtered as typed, among those read so far.
+//! and how many documents they hold, counted as they are listed, and open
+//! (by their chevron) to their indexes. Names are filtered as typed, among
+//! those read so far.
 
 use gpui_kit::{AnyElement, Task};
-use kuery_core::document::catalog::{Container, ContainerKind};
+use kuery_core::document::catalog::{Container, ContainerKind, DocIndex};
 use kuery_core::document::change::Count;
+use kuery_core::document::language::Style;
 use kuery_core::document::session::Heavy;
-use kuery_core::document::value::CollectionRef;
+use kuery_core::document::value::{CollectionRef, Value};
 
 use super::rows::{Row, Tree, error_row, note};
 use super::*;
@@ -32,6 +34,8 @@ pub(super) enum Children {
         counting: Option<Task<()>>,
     },
     Failed(String),
+    /// A collection's indexes, read when it first opens.
+    Indexes(Vec<DocIndex>),
 }
 
 /// The tree key of the node at `path`: `0/d:shop/d:orders`.
@@ -47,6 +51,25 @@ fn child(path: &[String], name: &str) -> Vec<String> {
     let mut path = path.to_vec();
     path.push(name.to_string());
     path
+}
+
+/// What an index row shows besides its name: `unique`, `TTL`…
+pub(super) fn index_traits(index: &DocIndex) -> Vec<&'static str> {
+    [
+        (index.unique, "unique"),
+        (index.sparse, "sparse"),
+        (index.partial.is_some(), "partial"),
+        (index.ttl.is_some(), "TTL"),
+        (index.hidden, "hidden"),
+    ]
+    .into_iter()
+    .filter_map(|(has, name)| has.then_some(name))
+    .collect()
+}
+
+/// Whether a collection opens to its indexes: a view has none of its own.
+fn has_indexes(node: &Container) -> bool {
+    node.leaf && node.kind != ContainerKind::View
 }
 
 /// What the tree shows for a kind besides its name.
@@ -155,6 +178,44 @@ impl Explorer {
         }));
     }
 
+    /// Reads a collection's indexes again, on the catalog session.
+    pub(super) fn load_indexes(
+        &mut self,
+        index: usize,
+        collection: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.doc_db(index) else {
+            return;
+        };
+        let place = (self.connections[index].spec.id.clone(), collection.clone());
+        let load = db.catalog.collection(CollectionRef { path: collection });
+        let key = place.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                if !matches!(this.documents.get(&key), Some(Children::Loading(_))) {
+                    return;
+                }
+                let indexes = match result {
+                    Ok(info) => Children::Indexes(info.indexes),
+                    Err(error) => Children::Failed(describe_error(error)),
+                };
+                this.documents.insert(key, indexes);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.documents.insert(place, Children::Loading(task));
+        cx.notify();
+    }
+
+    /// Whether `path` names a collection: as deep as the driver's levels.
+    fn is_collection(&self, index: usize, path: &[String]) -> bool {
+        self.doc_db(index)
+            .is_some_and(|db| db.catalog.capabilities().levels.len() == path.len())
+    }
+
     /// Reads every node of a connection read so far again.
     pub(super) fn refresh_documents(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(id) = self.connections.get(index).map(|node| node.spec.id.clone()) else {
@@ -170,7 +231,10 @@ impl Explorer {
             read.push(Vec::new());
         }
         for path in read {
-            self.load_children(index, path, cx);
+            match self.is_collection(index, &path) {
+                true => self.load_indexes(index, path, cx),
+                false => self.load_children(index, path, cx),
+            }
         }
     }
 
@@ -183,7 +247,10 @@ impl Explorer {
         self.expanded.insert(key);
         let id = self.connections[index].spec.id.clone();
         if !self.documents.contains_key(&(id, path.clone())) {
-            self.load_children(index, path, cx);
+            match self.is_collection(index, &path) {
+                true => self.load_indexes(index, path, cx),
+                false => self.load_children(index, path, cx),
+            }
         }
         cx.notify();
     }
@@ -266,12 +333,24 @@ impl Explorer {
                 (Icon::from(AppIcon::Table), 0x4da3ff)
             }
         };
-        let row = tree_row(
-            SharedString::from(format!("document-{key}")),
-            depth,
-            (!node.leaf).then_some(expanded),
-            selected,
-        )
+        let id = SharedString::from(format!("document-{key}"));
+        let row = match has_indexes(&node) {
+            // A collection's chevron opens its indexes; the row opens the
+            // collection.
+            true => {
+                let toggle = path.clone();
+                let opens = div()
+                    .id(SharedString::from(format!("document-indexes-{key}")))
+                    .flex_shrink_0()
+                    .child(chevron(expanded))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_document_node(index, toggle.clone(), cx)
+                    }));
+                tree_row_with(id, depth, opens.into_any_element(), selected)
+            }
+            false => tree_row(id, depth, (!node.leaf).then_some(expanded), selected),
+        }
         .child(
             glyph
                 .size(px(13.))
@@ -331,6 +410,51 @@ impl Explorer {
             })
         };
         Some(row.into_any_element())
+    }
+
+    /// An index of a collection the tree has open.
+    pub(super) fn document_index_row(
+        &self,
+        index: usize,
+        collection: &[String],
+        item: usize,
+        depth: usize,
+    ) -> Option<AnyElement> {
+        let id = self.connections.get(index)?.spec.id.clone();
+        let Some(Children::Indexes(indexes)) = self.documents.get(&(id, collection.to_vec()))
+        else {
+            return None;
+        };
+        let found = indexes.get(item)?.clone();
+        let render = self.doc_db(index)?.catalog.language().render;
+        let keys = render(&Value::Object(found.keys.clone()), Style::Compact);
+        let traits = index_traits(&found);
+        let tooltip: SharedString = match traits.is_empty() {
+            true => format!("Index {} on {keys}", found.name).into(),
+            false => format!("Index {} on {keys} · {}", found.name, traits.join(", ")).into(),
+        };
+        let key = format!("{}/i:{}", node_key(index, collection), found.name);
+        let name = found.name.clone();
+        Some(
+            tree_row(
+                SharedString::from(format!("document-index-{key}")),
+                depth,
+                None,
+                false,
+            )
+            .child(
+                Icon::from(AppIcon::Key)
+                    .size(px(12.))
+                    .text_color(color(theme::AMBER)),
+            )
+            .child(div().flex_1().truncate().child(found.name.clone()))
+            .children(traits.into_iter().map(counter))
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+            })
+            .context_menu(move |menu, _, _| menu.item(copy("Copy Name", name.clone())))
+            .into_any_element(),
+        )
     }
 
     pub(super) fn document_more_row(
@@ -394,6 +518,7 @@ fn children_rows(
             rows.push(error_row(depth, error));
             return;
         }
+        Some(Children::Indexes(_)) => return,
         Some(Children::Loaded { items, shown, .. }) => (items, *shown),
     };
     let (items, shown) = items;
@@ -409,9 +534,13 @@ fn children_rows(
         .collect();
     for &(item, node) in listed.iter().take(shown) {
         let path = child(parent, &node.name);
-        let expanded = !node.leaf
-            && (tree.expanded.contains(&node_key(index, &path))
-                || (searching && holds_match(id, &path, tree)));
+        let open = tree.expanded.contains(&node_key(index, &path));
+        // A collection opens on its indexes, and only when asked: a
+        // filter does not open it by itself.
+        let expanded = match has_indexes(node) {
+            true => open,
+            false => !node.leaf && (open || (searching && holds_match(id, &path, tree))),
+        };
         rows.push(Row::DocumentNode {
             index,
             path: parent.to_vec(),
@@ -419,8 +548,10 @@ fn children_rows(
             depth,
             expanded,
         });
-        if expanded {
-            children_rows(index, id, &path, depth + 1, tree, rows);
+        match (expanded, has_indexes(node)) {
+            (false, _) => {}
+            (true, true) => index_rows(index, id, &path, depth + 1, tree, rows),
+            (true, false) => children_rows(index, id, &path, depth + 1, tree, rows),
         }
     }
     if listed.len() > shown {
@@ -429,6 +560,35 @@ fn children_rows(
             parent: parent.to_vec(),
             depth,
         });
+    }
+}
+
+/// The indexes of an open collection, as far as they were read.
+fn index_rows(
+    index: usize,
+    id: &str,
+    collection: &[String],
+    depth: usize,
+    tree: &Tree,
+    rows: &mut Vec<Row>,
+) {
+    match tree.documents.get(&(id.to_string(), collection.to_vec())) {
+        None | Some(Children::Loading(_)) => {
+            rows.push(note(depth, "Loading…", theme::TEXT_TERTIARY));
+        }
+        Some(Children::Failed(error)) => rows.push(error_row(depth, error)),
+        Some(Children::Indexes(indexes)) if indexes.is_empty() => {
+            rows.push(note(depth, "No indexes", theme::TEXT_TERTIARY));
+        }
+        Some(Children::Indexes(indexes)) => {
+            rows.extend((0..indexes.len()).map(|item| Row::DocumentIndex {
+                index,
+                collection: collection.to_vec(),
+                item,
+                depth,
+            }));
+        }
+        Some(Children::Loaded { .. }) => {}
     }
 }
 
@@ -601,6 +761,76 @@ mod tests {
         );
         assert_eq!(rows(&trees, &[], "adm"), [at(&[], 1, 1, false)]);
         assert!(rows(&trees, &[], "nothing").is_empty());
+    }
+
+    fn index(name: &str) -> DocIndex {
+        DocIndex {
+            name: name.into(),
+            keys: Default::default(),
+            unique: false,
+            sparse: false,
+            partial: None,
+            ttl: None,
+            hidden: false,
+            size: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn an_open_collection_lists_its_indexes() {
+        let mut trees = trees();
+        let orders = vec!["shop".to_string(), "orders".to_string()];
+        // Opened, while its indexes are read.
+        let listed = rows(&trees, &["0/d:shop", "0/d:shop/d:orders"], "");
+        assert_eq!(listed[2], note(3, "Loading…", theme::TEXT_TERTIARY));
+        trees.insert(
+            ("m".into(), orders.clone()),
+            Children::Indexes(vec![index("_id_"), index("status_1")]),
+        );
+        let at_index = |item| Row::DocumentIndex {
+            index: 0,
+            collection: orders.clone(),
+            item,
+            depth: 3,
+        };
+        assert_eq!(
+            rows(&trees, &["0/d:shop", "0/d:shop/d:orders"], ""),
+            [
+                at(&[], 0, 1, true),
+                // Its chevron points down.
+                at(&["shop"], 0, 2, true),
+                at_index(0),
+                at_index(1),
+                at(&["shop"], 1, 2, false),
+                at(&[], 1, 1, false),
+            ]
+        );
+        // Closed, or a view (which has none of its own): no index rows.
+        assert_eq!(rows(&trees, &["0/d:shop"], "").len(), 4);
+        let view = rows(&trees, &["0/d:shop", "0/d:shop/d:paid_orders"], "");
+        assert_eq!(view.len(), 4);
+        // While filtering, a collection does not open by itself.
+        assert_eq!(
+            rows(&trees, &["0/d:shop"], "orders"),
+            [
+                at(&[], 0, 1, true),
+                at(&["shop"], 0, 2, false),
+                at(&["shop"], 1, 2, false),
+            ]
+        );
+        trees.insert(("m".into(), orders), Children::Indexes(Vec::new()));
+        let empty = rows(&trees, &["0/d:shop", "0/d:shop/d:orders"], "");
+        assert_eq!(empty[2], note(3, "No indexes", theme::TEXT_TERTIARY));
+    }
+
+    #[test]
+    fn index_rows_say_what_kind_of_index() {
+        let mut ttl = index("at_1");
+        ttl.ttl = Some(60);
+        ttl.unique = true;
+        assert_eq!(index_traits(&ttl), ["unique", "TTL"]);
+        assert!(index_traits(&index("_id_")).is_empty());
     }
 
     #[test]

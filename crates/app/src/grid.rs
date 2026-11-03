@@ -10,6 +10,7 @@ use std::rc::Rc;
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, Styled as _, Window, div, px,
@@ -46,6 +47,9 @@ pub struct BrowseDelegate {
     loading: bool,
     sort: Option<(String, Direction)>,
     edits: HashMap<(usize, usize), Option<String>>,
+    /// Cells whose field an edit removes from its document: a dimmed dash
+    /// with the edit's mark, not NULL.
+    removed: HashSet<(usize, usize)>,
     deleted: HashSet<usize>,
     on_sort: Option<OnSort>,
     on_menu: Option<OnMenu>,
@@ -73,6 +77,17 @@ impl BrowseDelegate {
         self.row_json = row_json;
     }
 
+    /// Whether a column holds numbers, which sit right-aligned in figures
+    /// of one width.
+    fn is_numeric(&self, column: usize) -> bool {
+        self.page_index
+            .get(column)
+            .copied()
+            .flatten()
+            .and_then(|index| self.page.kinds().get(index))
+            .is_some_and(|kind| kind.is_numeric())
+    }
+
     /// What the cell shows: its staged edit if there is one.
     fn shown(&self, row: usize, column: usize) -> Option<Option<&str>> {
         match self.edits.get(&(row, column)) {
@@ -89,7 +104,8 @@ impl BrowseDelegate {
             values: (0..self.columns.len())
                 .map(|index| self.shown(row, index).flatten().map(str::to_owned))
                 .collect(),
-            absent: !self.edits.contains_key(&(row, column)) && self.is_absent(row, column),
+            absent: self.removed.contains(&(row, column))
+                || (!self.edits.contains_key(&(row, column)) && self.is_absent(row, column)),
         }
     }
 
@@ -177,12 +193,19 @@ impl BrowseDelegate {
         self.edits.insert((row, column), value);
     }
 
+    /// Marks a field an edit removes from its row's document.
+    pub fn mark_removed(&mut self, row: usize, column: usize) {
+        self.edits.insert((row, column), None);
+        self.removed.insert((row, column));
+    }
+
     pub fn mark_deleted(&mut self, row: usize) {
         self.deleted.insert(row);
     }
 
     pub fn clear_marks(&mut self) {
         self.edits.clear();
+        self.removed.clear();
         self.deleted.clear();
     }
 
@@ -215,11 +238,13 @@ impl TableDelegate for BrowseDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let numeric = self.is_numeric(col_ix);
         let info = &self.columns[col_ix];
         h_flex()
             .size_full()
             .gap_1()
             .overflow_hidden()
+            .when(numeric, |th| th.justify_end())
             .children(info.primary_key.then(|| {
                 Icon::new(AppIcon::Key)
                     .size(px(12.))
@@ -275,11 +300,14 @@ impl TableDelegate for BrowseDelegate {
         let deleted = self.deleted.contains(&row_ix);
         let edited = self.edits.get(&(row_ix, col_ix));
         let value = self.shown(row_ix, col_ix);
+        let numeric = self.is_numeric(col_ix);
+        let mono = cx.theme().mono_font_family.clone();
         let mut cell = div()
             .size_full()
             .flex()
             .items_center()
             .overflow_hidden()
+            .when(numeric, |cell| cell.justify_end())
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |table, _, _, _| {
@@ -303,7 +331,12 @@ impl TableDelegate for BrowseDelegate {
         let content: AnyElement = match value {
             Some(Some(text)) => div()
                 .truncate()
+                .when(numeric, |value| value.font_family(mono))
                 .child(SharedString::from(text.to_owned()))
+                .into_any_element(),
+            Some(None) if self.removed.contains(&(row_ix, col_ix)) => div()
+                .text_color(color(0xffcf7f))
+                .child("—")
                 .into_any_element(),
             Some(None) if edited.is_none() && self.is_absent(row_ix, col_ix) => div()
                 .text_color(color(theme::TEXT_QUIET))

@@ -1,0 +1,101 @@
+{
+  "explainVersion": "1",
+  "stages": [
+    {
+      "$cursor": {
+        "queryPlanner": {
+          "namespace": "kr_scratch.small",
+          "parsedQuery": {},
+          "indexFilterSet": false,
+          "queryHash": "8F2383EE",
+          "planCacheShapeHash": "8F2383EE",
+          "planCacheKey": "7DF350EE",
+          "optimizationTimeMillis": 0,
+          "maxIndexedOrSolutionsReached": false,
+          "maxIndexedAndSolutionsReached": false,
+          "maxScansToExplodeReached": false,
+          "prunedSimilarIndexes": false,
+          "winningPlan": {
+            "isCached": false,
+            "stage": "COLLSCAN",
+            "direction": "forward"
+          },
+          "rejectedPlans": []
+        },
+        "executionStats": {
+          "executionSuccess": true,
+          "nReturned": 2,
+          "executionTimeMillis": 12,
+          "totalKeysExamined": 0,
+          "totalDocsExamined": 2,
+          "executionStages": {
+            "isCached": false,
+            "stage": "COLLSCAN",
+            "nReturned": 2,
+            "executionTimeMillisEstimate": 0,
+            "works": 3,
+            "advanced": 2,
+            "needTime": 0,
+            "needYield": 0,
+            "saveState": 1,
+            "restoreState": 1,
+            "isEOF": 1,
+            "direction": "forward",
+            "docsExamined": 2
+          }
+        }
+      },
+      "nReturned": 2,
+      "executionTimeMillisEstimate": 0
+    },
+    {
+      "$lookup": {
+        "from": "big",
+        "as": "m",
+        "localField": "n",
+        "foreignField": "t"
+      },
+      "totalDocsExamined": 40000,
+      "totalKeysExamined": 0,
+      "collectionScans": 2,
+      "indexesUsed": [],
+      "nReturned": 2,
+      "executionTimeMillisEstimate": 9
+    }
+  ],
+  "queryShapeHash": "21F3614ED5CA90382A4AE6AAA7E4322024AE70B925C379229D3A7B7D12F824BA",
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 100000,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 100000,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "forceClassicEngine",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "command": {
+    "aggregate": "small",
+    "pipeline": [
+      {
+        "$lookup": {
+          "from": "big",
+          "localField": "n",
+          "foreignField": "t",
+          "as": "m"
+        }
+      }
+    ],
+    "cursor": {},
+    "$db": "kr_scratch"
+  },
+  "ok": 1
+}

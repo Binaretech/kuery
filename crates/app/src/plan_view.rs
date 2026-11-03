@@ -26,10 +26,40 @@ use crate::assets::AppIcon;
 use crate::chrome;
 use crate::theme::{self, color};
 
+/// What the explain buttons and the empty tab say, which differs by the
+/// kind of database the plans come from.
+#[derive(Clone, Copy)]
+pub struct PlanLabels {
+    /// The empty tab's hint.
+    pub hint: &'static str,
+    /// The button that measures a plan by running the statement.
+    pub measure: &'static str,
+    pub measure_tip: &'static str,
+}
+
+impl PlanLabels {
+    /// As a SQL query tab says it.
+    pub const SQL: PlanLabels = PlanLabels {
+        hint: "Explain the statement under the cursor to see how PostgreSQL runs it.",
+        measure: "Explain Analyze",
+        measure_tip: "Runs the query and measures every step",
+    };
+
+    /// As a document console says it: only reads are measured.
+    pub const DOCUMENTS: PlanLabels = PlanLabels {
+        hint: "Explain the statement under the cursor to see the plan the database chose for it.",
+        measure: "Explain with Statistics",
+        measure_tip: "Runs the read and measures every step; a write is only planned, never run",
+    };
+}
+
 /// What the tab asks the query tab for.
 pub enum PlanEvent {
     /// Explain the statement under the cursor, measured or not.
     Explain { analyze: bool },
+    /// Stop the explain on its way (offered only by a tab made
+    /// [`PlanPanel::cancellable`]).
+    Cancel,
 }
 
 enum State {
@@ -67,6 +97,11 @@ pub struct PlanPanel {
     /// Steps showing their details.
     open: HashSet<usize>,
     selected: Option<usize>,
+    labels: PlanLabels,
+    /// Whether the database can measure a plan, so the tab offers it.
+    measures: bool,
+    /// Whether the tab offers to stop an explain on its way.
+    cancellable: bool,
 }
 
 impl EventEmitter<PlanEvent> for PlanPanel {}
@@ -82,11 +117,35 @@ impl Default for PlanPanel {
             collapsed: HashSet::new(),
             open: HashSet::new(),
             selected: None,
+            labels: PlanLabels::SQL,
+            measures: true,
+            cancellable: false,
         }
     }
 }
 
 impl PlanPanel {
+    /// A tab whose buttons and hints say `labels`.
+    pub fn with_labels(labels: PlanLabels) -> Self {
+        Self {
+            labels,
+            ..Self::default()
+        }
+    }
+
+    /// Offers to measure a plan only when the database can.
+    pub fn measuring(self, measures: bool) -> Self {
+        Self { measures, ..self }
+    }
+
+    /// Offers Cancel while an explain is on its way.
+    pub fn cancellable(self) -> Self {
+        Self {
+            cancellable: true,
+            ..self
+        }
+    }
+
     pub fn loading(&mut self, analyze: bool, cx: &mut Context<Self>) {
         self.state = State::Loading { analyze };
         cx.notify();
@@ -118,6 +177,24 @@ impl PlanPanel {
             Err(error) => State::Failed(error),
         };
         cx.notify();
+    }
+
+    /// The plan shown, if one is.
+    #[cfg(test)]
+    pub fn plan(&self) -> Option<&Plan> {
+        match &self.state {
+            State::Ready { plan, .. } => Some(plan),
+            _ => None,
+        }
+    }
+
+    /// Why no plan is shown, if one failed.
+    #[cfg(test)]
+    pub fn failure(&self) -> Option<&str> {
+        match &self.state {
+            State::Failed(error) => Some(error),
+            _ => None,
+        }
     }
 
     pub fn fail(&mut self, error: String, cx: &mut Context<Self>) {
@@ -161,15 +238,20 @@ impl PlanPanel {
                         cx.listener(|_, _, _, cx| cx.emit(PlanEvent::Explain { analyze: false })),
                     ),
             )
-            .child(
-                chrome::pill_button("plan-analyze", "Explain Analyze", false)
-                    .tooltip(|window, cx| {
-                        Tooltip::new("Runs the query and measures every step").build(window, cx)
-                    })
-                    .on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(PlanEvent::Explain { analyze: true })),
-                    ),
-            )
+            .when(self.measures, |row| {
+                row.child(
+                    chrome::pill_button("plan-analyze", self.labels.measure, false)
+                        .tooltip({
+                            let tip = self.labels.measure_tip;
+                            move |window, cx| Tooltip::new(tip).build(window, cx)
+                        })
+                        .on_click(
+                            cx.listener(|_, _, _, cx| {
+                                cx.emit(PlanEvent::Explain { analyze: true })
+                            }),
+                        ),
+                )
+            })
     }
 
     fn render_summary(&self, plan: &Plan, json: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -210,11 +292,14 @@ impl PlanPanel {
             )
             .children(plan.execution_ms.map(|ms| stat("execution", duration(ms))))
             .children(plan.planning_ms.map(|ms| stat("planning", duration(ms))))
-            .child(match root.actual_rows() {
-                Some(rows) => stat("rows", count(rows)),
-                None => stat("estimated rows", count(root.estimated_rows)),
+            .children(match (root.actual_rows(), plan.estimates) {
+                (Some(rows), _) => Some(stat("rows", count(rows))),
+                (None, true) => Some(stat("estimated rows", count(root.estimated_rows))),
+                (None, false) => None,
             })
-            .child(stat("cost", count(root.total_cost)))
+            .when(plan.estimates, |row| {
+                row.child(stat("cost", count(root.total_cost)))
+            })
             .when(buffers.hit + buffers.read > 0, |row| {
                 row.child(stat(
                     "data",
@@ -371,18 +456,18 @@ impl PlanPanel {
                 factor_change(from, to),
             ));
         }
-        totals = totals.child(total_card(
-            "Cost",
-            count(diff.cost.0),
-            count(diff.cost.1),
-            percent_change(diff.cost.0, diff.cost.1),
-        ));
-        let rows = |plan: &Plan| {
-            plan.root
-                .actual_rows()
-                .map_or_else(|| format!("~{}", count(plan.root.estimated_rows)), count)
-        };
-        totals = totals.child(total_card("Rows", rows(before), rows(after), None));
+        if before.estimates && after.estimates {
+            totals = totals.child(total_card(
+                "Cost",
+                count(diff.cost.0),
+                count(diff.cost.1),
+                percent_change(diff.cost.0, diff.cost.1),
+            ));
+        }
+        let numbers = has_numbers(before, after, diff);
+        if let (Some(from), Some(to)) = (total_rows(before), total_rows(after)) {
+            totals = totals.child(total_card("Rows", from, to, None));
+        }
 
         let mut changed: Vec<StepPair> = diff
             .steps
@@ -492,14 +577,16 @@ impl PlanPanel {
                                     .child(types),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .font_family(mono.clone())
-                            .text_size(px(12.))
-                            .text_color(color(theme::TEXT_SECONDARY))
-                            .child(figures),
-                    )
+                    .when(numbers, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(mono.clone())
+                                .text_size(px(12.))
+                                .text_color(color(theme::TEXT_SECONDARY))
+                                .child(figures),
+                        )
+                    })
                     .when_some(target, |row, id| {
                         row.tooltip(|window, cx| {
                             Tooltip::new("Show this step in the plan").build(window, cx)
@@ -642,11 +729,23 @@ impl PlanPanel {
                     .map(|i| insight_row(i, IconName::Minus, theme::TEXT_TERTIARY, "Still there")),
             );
 
+        let one_measured = before.analyzed || after.analyzed;
         let measured_note = (!diff.measured).then(|| {
-            quiet_line(if before.analyzed || after.analyzed {
-                "One of the plans is an estimate, so steps and tables compare by estimated cost."
-            } else {
-                "Both plans are estimates: steps and tables compare by estimated cost."
+            quiet_line(match (numbers, one_measured) {
+                (true, true) => {
+                    "One of the plans is an estimate, so steps and tables compare by estimated \
+                     cost."
+                }
+                (true, false) => {
+                    "Both plans are estimates: steps and tables compare by estimated cost."
+                }
+                (false, true) => {
+                    "One of the plans was not run, and neither has estimates: only their steps \
+                     compare."
+                }
+                (false, false) => {
+                    "Neither plan was run, and neither has estimates: only their steps compare."
+                }
             })
         });
         div()
@@ -672,16 +771,18 @@ impl PlanPanel {
                             .child(section_title("Steps that changed"))
                             .child(steps),
                     )
-                    .child(
-                        v_flex()
-                            .gap(px(6.))
-                            .child(section_title(if diff.measured {
-                                "Time by table"
-                            } else {
-                                "Estimated cost by table"
-                            }))
-                            .child(tables),
-                    )
+                    .when(numbers, |page| {
+                        page.child(
+                            v_flex()
+                                .gap(px(6.))
+                                .child(section_title(if diff.measured {
+                                    "Time by table"
+                                } else {
+                                    "Estimated cost by table"
+                                }))
+                                .child(tables),
+                        )
+                    })
                     .when(
                         !(diff.gone.is_empty() && diff.appeared.is_empty() && diff.kept.is_empty()),
                         |page| {
@@ -749,9 +850,10 @@ impl PlanPanel {
             let share = plan.share(node);
             let tone = share_tone(share);
             let selected = self.selected == Some(id);
-            let rows = match node.actual_rows() {
-                Some(rows) => format!("{} rows", count(rows)),
-                None => format!("~{} rows", count(node.estimated_rows)),
+            let rows = match (node.actual_rows(), plan.estimates) {
+                (Some(rows), _) => format!("{} rows", count(rows)),
+                (None, true) => format!("~{} rows", count(node.estimated_rows)),
+                (None, false) => String::new(),
             };
             let tip = format!("{} · {}", node.node_type, node.title);
             Some(
@@ -894,20 +996,23 @@ impl PlanPanel {
                                     ),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(color(share_tone(share)))
-                            .child(format!(
-                                "{:.0}% of the {} by itself",
-                                share * 100.0,
-                                if node.self_ms.is_some() && plan.analyzed {
-                                    "time"
-                                } else {
-                                    "estimated cost"
-                                }
-                            )),
-                    )
+                    // Without times or costs there is no share to give.
+                    .when(plan.estimates || plan.analyzed, |details| {
+                        details.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(color(share_tone(share)))
+                                .child(format!(
+                                    "{:.0}% of the {} by itself",
+                                    share * 100.0,
+                                    if node.self_ms.is_some() && plan.analyzed {
+                                        "time"
+                                    } else {
+                                        "estimated cost"
+                                    }
+                                )),
+                        )
+                    })
                     .children(insights.into_iter().map(|insight| {
                         h_flex()
                             .items_start()
@@ -933,7 +1038,7 @@ impl PlanPanel {
                             )
                             .child(div().min_w_0().child(insight.title.clone()))
                     }))
-                    .child(facts_grid(facts(node), mono)),
+                    .child(facts_grid(facts(node, plan.estimates), mono)),
             )
     }
 
@@ -959,7 +1064,7 @@ impl PlanPanel {
         let collapsed = self.collapsed.contains(&id);
         let has_children = !node.children.is_empty();
         let tone = share_tone(share);
-        let estimate = row_estimate(node);
+        let estimate = row_estimate(node, plan.estimates);
         let subtitle = [
             Some(node.node_type.clone()),
             node.parent_relationship
@@ -1040,9 +1145,10 @@ impl PlanPanel {
                         .text_right()
                         .text_size(px(12.))
                         .font_family(mono.clone())
-                        .child(match node.inclusive_ms {
-                            Some(ms) => duration(ms),
-                            None => format!("cost {}", count(node.total_cost)),
+                        .child(match (node.inclusive_ms, plan.estimates) {
+                            (Some(ms), _) => duration(ms),
+                            (None, true) => format!("cost {}", count(node.total_cost)),
+                            (None, false) => String::new(),
                         }),
                 )
                 .child(
@@ -1086,7 +1192,7 @@ impl PlanPanel {
         );
         if self.open.contains(&id) {
             rows.push(
-                self.node_details(node, depth, mono.clone())
+                self.node_details(node, depth, mono.clone(), plan.estimates)
                     .into_any_element(),
             );
         }
@@ -1097,7 +1203,13 @@ impl PlanPanel {
         }
     }
 
-    fn node_details(&self, node: &Node, depth: usize, mono: SharedString) -> impl IntoElement {
+    fn node_details(
+        &self,
+        node: &Node,
+        depth: usize,
+        mono: SharedString,
+        estimates: bool,
+    ) -> impl IntoElement {
         div()
             .ml(px(8. + depth as f32 * 22. + 23.))
             .mr_3()
@@ -1107,26 +1219,30 @@ impl PlanPanel {
             .bg(color(theme::SIDEBAR))
             .border_1()
             .border_color(color(theme::HAIRLINE))
-            .child(facts_grid(facts(node), mono))
+            .child(facts_grid(facts(node, estimates), mono))
     }
 }
 
-/// What a step's details list: rows, time, cost, data and its own details.
-fn facts(node: &Node) -> Vec<(String, String)> {
+/// What a step's details list: rows, time, cost (where the planner
+/// estimates), data and its own details.
+fn facts(node: &Node, estimates: bool) -> Vec<(String, String)> {
     let mut facts: Vec<(String, String)> = Vec::new();
     if let Some(actual) = node.actual {
+        let loops = if actual.loops > 1.0 {
+            format!(" × {} loops", count(actual.loops))
+        } else {
+            String::new()
+        };
         facts.push((
             "Rows".into(),
-            format!(
-                "{} estimated per loop, {} actual{}",
-                count(node.estimated_rows),
-                count(actual.rows_per_loop),
-                if actual.loops > 1.0 {
-                    format!(" × {} loops", count(actual.loops))
-                } else {
-                    String::new()
-                }
-            ),
+            match estimates {
+                true => format!(
+                    "{} estimated per loop, {} actual{loops}",
+                    count(node.estimated_rows),
+                    count(actual.rows_per_loop),
+                ),
+                false => format!("{} returned{loops}", count(actual.rows_per_loop)),
+            },
         ));
         if let Some(self_ms) = node.self_ms {
             facts.push((
@@ -1138,21 +1254,23 @@ fn facts(node: &Node) -> Vec<(String, String)> {
                 ),
             ));
         }
-    } else {
+    } else if estimates {
         facts.push((
             "Rows".into(),
             format!("{} estimated", count(node.estimated_rows)),
         ));
     }
-    facts.push((
-        "Cost".into(),
-        format!(
-            "{} to start, {} in all ({} by itself)",
-            count(node.startup_cost),
-            count(node.total_cost),
-            count(node.self_cost)
-        ),
-    ));
+    if estimates {
+        facts.push((
+            "Cost".into(),
+            format!(
+                "{} to start, {} in all ({} by itself)",
+                count(node.startup_cost),
+                count(node.total_cost),
+                count(node.self_cost)
+            ),
+        ));
+    }
     if let Some(removed) = node.rows_removed.filter(|r| *r > 0.0) {
         facts.push(("Discarded".into(), format!("{} rows", count(removed))));
     }
@@ -1218,8 +1336,15 @@ fn share_tone(share: f64) -> u32 {
     }
 }
 
-/// The step's estimated and actual rows, and whether they disagree a lot.
-fn row_estimate(node: &Node) -> (String, bool) {
+/// The step's estimated and actual rows, and whether they disagree a lot;
+/// only the actual ones where the planner does not estimate.
+fn row_estimate(node: &Node, estimates: bool) -> (String, bool) {
+    if !estimates {
+        let rows = node
+            .actual_rows()
+            .map(|rows| format!("{} rows", count(rows)));
+        return (rows.unwrap_or_default(), false);
+    }
     match (node.actual, node.misestimate()) {
         (Some(actual), Some(ratio)) => {
             let off = (ratio >= 10.0 || ratio <= 0.1)
@@ -1326,6 +1451,23 @@ fn place(root: &Node) -> GraphLayout {
 }
 
 /// A step's or table's figure: a duration when measured, a cost otherwise.
+/// Whether two plans have figures to compare step by step: both measured,
+/// or both with the planner's costs. Plans that were neither run nor
+/// estimated (MongoDB's, planned) only compare by their steps.
+fn has_numbers(before: &Plan, after: &Plan, diff: &Comparison) -> bool {
+    diff.measured || (before.estimates && after.estimates)
+}
+
+/// The rows a plan returned, or its estimate of them; none when it has
+/// neither.
+fn total_rows(plan: &Plan) -> Option<String> {
+    match (plan.root.actual_rows(), plan.estimates) {
+        (Some(rows), _) => Some(count(rows)),
+        (None, true) => Some(format!("~{}", count(plan.root.estimated_rows))),
+        (None, false) => None,
+    }
+}
+
 fn measure_text(value: f64, measured: bool) -> String {
     if measured {
         duration(value)
@@ -1458,19 +1600,28 @@ impl Render for PlanPanel {
                 .justify_center()
                 .gap_3()
                 .text_color(color(theme::TEXT_TERTIARY))
-                .child("Explain the statement under the cursor to see how PostgreSQL runs it.")
+                .child(self.labels.hint)
                 .child(self.explain_buttons(cx))
                 .into_any_element(),
-            State::Loading { analyze } => message(
-                if *analyze {
-                    "Running the query to measure its plan…".into()
-                } else {
-                    "Asking for the plan…".into()
-                },
-                theme::TEXT_TERTIARY,
-            )
-            .size_full()
-            .into_any_element(),
+            State::Loading { analyze } => v_flex()
+                .size_full()
+                .child(message(
+                    if *analyze {
+                        "Running the query to measure its plan…".into()
+                    } else {
+                        "Asking for the plan…".into()
+                    },
+                    theme::TEXT_TERTIARY,
+                ))
+                .when(self.cancellable, |tab| {
+                    tab.child(
+                        h_flex().justify_center().pb_4().child(
+                            chrome::pill_button("plan-cancel", "Cancel", false)
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(PlanEvent::Cancel))),
+                        ),
+                    )
+                })
+                .into_any_element(),
             State::Failed(error) => v_flex()
                 .size_full()
                 .child(message(error.clone(), theme::RED))
@@ -1540,6 +1691,54 @@ impl Render for PlanPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plans_without_estimates_show_only_what_was_measured() {
+        let plan = plan::parse(include_str!(
+            "../../core/fixtures/plans/mongo_8_find_stats.json"
+        ))
+        .unwrap();
+        assert!(!plan.estimates);
+        let scan = &plan.root.children[0];
+        let listed = facts(scan, plan.estimates);
+        assert_eq!(listed[0], ("Rows".into(), "1,000 returned".into()));
+        assert!(!listed.iter().any(|(label, _)| label == "Cost"));
+        assert_eq!(row_estimate(scan, false), ("1,000 rows".into(), false));
+        let planned =
+            plan::parse(include_str!("../../core/fixtures/plans/mongo_7_find.json")).unwrap();
+        assert_eq!(row_estimate(&planned.root, false), (String::new(), false));
+        assert!(
+            facts(&planned.root, false)
+                .iter()
+                .all(|(label, _)| label != "Rows" && label != "Cost")
+        );
+    }
+
+    #[test]
+    fn unmeasured_plans_without_estimates_compare_only_by_their_steps() {
+        let planned =
+            plan::parse(include_str!("../../core/fixtures/plans/mongo_7_find.json")).unwrap();
+        let measured = plan::parse(include_str!(
+            "../../core/fixtures/plans/mongo_8_find_stats.json"
+        ))
+        .unwrap();
+        let diff = plan::compare(&planned, &planned);
+        assert!(!has_numbers(&planned, &planned, &diff));
+        assert_eq!(total_rows(&planned), None);
+        let diff = plan::compare(&planned, &measured);
+        assert!(!has_numbers(&planned, &measured, &diff));
+        let diff = plan::compare(&measured, &measured);
+        assert!(has_numbers(&measured, &measured, &diff));
+        assert_eq!(total_rows(&measured).as_deref(), Some("1,000"));
+        // SQL plans always have their estimates.
+        let sql = plan::parse(
+            r#"[{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Plan Rows": 40, "Total Cost": 3.5}}]"#,
+        )
+        .unwrap();
+        let diff = plan::compare(&sql, &sql);
+        assert!(has_numbers(&sql, &sql, &diff));
+        assert_eq!(total_rows(&sql).as_deref(), Some("~40"));
+    }
 
     #[test]
     fn formats_durations() {

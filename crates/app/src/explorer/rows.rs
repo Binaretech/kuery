@@ -103,6 +103,13 @@ pub(super) enum Row {
         depth: usize,
         expanded: bool,
     },
+    /// The `item`th index of the open collection at `collection`.
+    DocumentIndex {
+        index: usize,
+        collection: Vec<String>,
+        item: usize,
+        depth: usize,
+    },
     /// "Load more" under `parent`.
     DocumentMore {
         index: usize,

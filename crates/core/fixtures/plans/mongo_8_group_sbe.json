@@ -1,0 +1,169 @@
+{
+  "explainVersion": "2",
+  "queryPlanner": {
+    "namespace": "kr_scratch.big",
+    "parsedQuery": {
+      "k": {
+        "$eq": 1
+      }
+    },
+    "indexFilterSet": false,
+    "queryHash": "52D9613B",
+    "planCacheShapeHash": "52D9613B",
+    "planCacheKey": "DBCD58F6",
+    "optimizationTimeMillis": 0,
+    "optimizedPipeline": true,
+    "maxIndexedOrSolutionsReached": false,
+    "maxIndexedAndSolutionsReached": false,
+    "maxScansToExplodeReached": false,
+    "prunedSimilarIndexes": false,
+    "winningPlan": {
+      "isCached": false,
+      "queryPlan": {
+        "stage": "GROUP",
+        "planNodeId": 3,
+        "inputStage": {
+          "stage": "COLLSCAN",
+          "planNodeId": 1,
+          "filter": {
+            "k": {
+              "$eq": 1
+            }
+          },
+          "direction": "forward"
+        }
+      },
+      "slotBasedPlan": {
+        "slots": "$$RESULT=s6 env: {  }",
+        "stages": "[3] project [s6 = newBsonObj(\"_id\", s5)] \n[3] group [s5] [] \n[3] project [s5 = (s1 ?: null)] \n[1] filter {traverseF(s2, lambda(l2.0) { ((move(l2.0) == 1) ?: false) }, false)} \n[1] scan s3 s4 none none none none none none lowPriority [s1 = s, s2 = k] @\"68418a6f-737c-49c0-8b02-3bd61d16e92e\" true false "
+      }
+    },
+    "rejectedPlans": []
+  },
+  "executionStats": {
+    "executionSuccess": true,
+    "nReturned": 100,
+    "executionTimeMillis": 5,
+    "totalKeysExamined": 0,
+    "totalDocsExamined": 20000,
+    "executionStages": {
+      "stage": "project",
+      "planNodeId": 3,
+      "nReturned": 100,
+      "executionTimeMillisEstimate": 0,
+      "opens": 1,
+      "closes": 1,
+      "saveState": 0,
+      "restoreState": 0,
+      "isEOF": 1,
+      "projections": {
+        "6": "newBsonObj(\"_id\", s5) "
+      },
+      "inputStage": {
+        "stage": "group",
+        "planNodeId": 3,
+        "nReturned": 100,
+        "executionTimeMillisEstimate": 0,
+        "opens": 1,
+        "closes": 1,
+        "saveState": 0,
+        "restoreState": 0,
+        "isEOF": 1,
+        "groupBySlots": [
+          5
+        ],
+        "usedDisk": false,
+        "spills": 0,
+        "spilledBytes": 0,
+        "spilledRecords": 0,
+        "spilledDataStorageSize": 0,
+        "inputStage": {
+          "stage": "project",
+          "planNodeId": 3,
+          "nReturned": 6667,
+          "executionTimeMillisEstimate": 0,
+          "opens": 1,
+          "closes": 1,
+          "saveState": 0,
+          "restoreState": 0,
+          "isEOF": 1,
+          "projections": {
+            "5": "(s1 ?: null) "
+          },
+          "inputStage": {
+            "stage": "filter",
+            "planNodeId": 1,
+            "nReturned": 6667,
+            "executionTimeMillisEstimate": 0,
+            "opens": 1,
+            "closes": 1,
+            "saveState": 0,
+            "restoreState": 0,
+            "isEOF": 1,
+            "numTested": 20000,
+            "filter": "traverseF(s2, lambda(l2.0) { ((move(l2.0) == 1) ?: false) }, false) ",
+            "inputStage": {
+              "stage": "scan",
+              "planNodeId": 1,
+              "nReturned": 20000,
+              "executionTimeMillisEstimate": 0,
+              "opens": 1,
+              "closes": 1,
+              "saveState": 0,
+              "restoreState": 0,
+              "isEOF": 1,
+              "numReads": 20000,
+              "recordSlot": 3,
+              "recordIdSlot": 4,
+              "scanFieldNames": [
+                "s",
+                "k"
+              ],
+              "scanFieldSlots": [
+                1,
+                2
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "queryShapeHash": "DF54E11058C8484D83C5FA514BF2423BB2B7FA7E2D6254BA9CA1CD49A8A66427",
+  "command": {
+    "aggregate": "big",
+    "pipeline": [
+      {
+        "$match": {
+          "k": 1
+        }
+      },
+      {
+        "$group": {
+          "_id": "$s"
+        }
+      }
+    ],
+    "cursor": {},
+    "$db": "kr_scratch"
+  },
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 100000,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 100000,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "ok": 1
+}

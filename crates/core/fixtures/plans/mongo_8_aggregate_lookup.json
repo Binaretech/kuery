@@ -1,0 +1,288 @@
+{
+  "explainVersion": "1",
+  "stages": [
+    {
+      "$cursor": {
+        "queryPlanner": {
+          "namespace": "shop.orders",
+          "parsedQuery": {
+            "status": {
+              "$eq": "paid"
+            }
+          },
+          "indexFilterSet": false,
+          "queryHash": "498506FF",
+          "planCacheShapeHash": "498506FF",
+          "planCacheKey": "BD48AB74",
+          "optimizationTimeMillis": 0,
+          "maxIndexedOrSolutionsReached": false,
+          "maxIndexedAndSolutionsReached": false,
+          "maxScansToExplodeReached": false,
+          "prunedSimilarIndexes": false,
+          "winningPlan": {
+            "isCached": false,
+            "stage": "PROJECTION_SIMPLE",
+            "transformBy": {
+              "customer": 1,
+              "_id": 0
+            },
+            "inputStage": {
+              "stage": "FETCH",
+              "inputStage": {
+                "stage": "IXSCAN",
+                "keyPattern": {
+                  "status": 1,
+                  "date": -1
+                },
+                "indexName": "status_1_date_-1",
+                "isMultiKey": false,
+                "multiKeyPaths": {
+                  "status": [],
+                  "date": []
+                },
+                "isUnique": false,
+                "isSparse": false,
+                "isPartial": false,
+                "indexVersion": 2,
+                "direction": "forward",
+                "indexBounds": {
+                  "status": [
+                    "[\"paid\", \"paid\"]"
+                  ],
+                  "date": [
+                    "[MaxKey, MinKey]"
+                  ]
+                }
+              }
+            }
+          },
+          "rejectedPlans": []
+        },
+        "executionStats": {
+          "executionSuccess": true,
+          "nReturned": 125,
+          "executionTimeMillis": 10,
+          "totalKeysExamined": 125,
+          "totalDocsExamined": 125,
+          "executionStages": {
+            "isCached": false,
+            "stage": "PROJECTION_SIMPLE",
+            "nReturned": 125,
+            "executionTimeMillisEstimate": 0,
+            "works": 126,
+            "advanced": 125,
+            "needTime": 0,
+            "needYield": 0,
+            "saveState": 3,
+            "restoreState": 3,
+            "isEOF": 1,
+            "transformBy": {
+              "customer": 1,
+              "_id": 0
+            },
+            "inputStage": {
+              "stage": "FETCH",
+              "nReturned": 125,
+              "executionTimeMillisEstimate": 0,
+              "works": 126,
+              "advanced": 125,
+              "needTime": 0,
+              "needYield": 0,
+              "saveState": 3,
+              "restoreState": 3,
+              "isEOF": 1,
+              "docsExamined": 125,
+              "alreadyHasObj": 0,
+              "inputStage": {
+                "stage": "IXSCAN",
+                "nReturned": 125,
+                "executionTimeMillisEstimate": 0,
+                "works": 126,
+                "advanced": 125,
+                "needTime": 0,
+                "needYield": 0,
+                "saveState": 3,
+                "restoreState": 3,
+                "isEOF": 1,
+                "keyPattern": {
+                  "status": 1,
+                  "date": -1
+                },
+                "indexName": "status_1_date_-1",
+                "isMultiKey": false,
+                "multiKeyPaths": {
+                  "status": [],
+                  "date": []
+                },
+                "isUnique": false,
+                "isSparse": false,
+                "isPartial": false,
+                "indexVersion": 2,
+                "direction": "forward",
+                "indexBounds": {
+                  "status": [
+                    "[\"paid\", \"paid\"]"
+                  ],
+                  "date": [
+                    "[MaxKey, MinKey]"
+                  ]
+                },
+                "keysExamined": 125,
+                "seeks": 1,
+                "dupsTested": 0,
+                "dupsDropped": 0
+              }
+            }
+          }
+        }
+      },
+      "nReturned": 125,
+      "executionTimeMillisEstimate": 1
+    },
+    {
+      "$lookup": {
+        "from": "customers",
+        "as": "buyer",
+        "let": {
+          "c": "$customer"
+        },
+        "pipeline": [
+          {
+            "$match": {
+              "$expr": {
+                "$eq": [
+                  "$_id",
+                  "$$c"
+                ]
+              }
+            }
+          },
+          {
+            "$project": {
+              "country": 1
+            }
+          }
+        ],
+        "unwinding": {
+          "preserveNullAndEmptyArrays": false
+        }
+      },
+      "totalDocsExamined": 126,
+      "totalKeysExamined": 126,
+      "collectionScans": 0,
+      "indexesUsed": [
+        "_id_"
+      ],
+      "nReturned": 125,
+      "executionTimeMillisEstimate": 11
+    },
+    {
+      "$group": {
+        "_id": "$buyer.country",
+        "n": {
+          "$sum": {
+            "$const": 1
+          }
+        }
+      },
+      "maxAccumulatorMemoryUsageBytes": {
+        "n": 384
+      },
+      "totalOutputDataSizeBytes": 735,
+      "usedDisk": false,
+      "spills": 0,
+      "spilledDataStorageSize": 0,
+      "numBytesSpilledEstimate": 0,
+      "spilledRecords": 0,
+      "nReturned": 3,
+      "executionTimeMillisEstimate": 11
+    },
+    {
+      "$sort": {
+        "sortKey": {
+          "n": -1
+        }
+      },
+      "totalDataSizeSortedBytesEstimate": 759,
+      "usedDisk": false,
+      "spills": 0,
+      "spilledDataStorageSize": 0,
+      "nReturned": 3,
+      "executionTimeMillisEstimate": 11
+    }
+  ],
+  "queryShapeHash": "AEC3A0D92CF6C26AEBECA352CD366D3752BEBBE10720F7E63093C55E5BB746E3",
+  "serverInfo": {
+    "host": "16e6268ddf67",
+    "port": 27019,
+    "version": "8.0.34",
+    "gitVersion": "51db4515a6597aedcf6188ee4e48a27e65b065ae"
+  },
+  "serverParameters": {
+    "internalQueryFacetBufferSizeBytes": 104857600,
+    "internalQueryFacetMaxOutputDocSizeBytes": 104857600,
+    "internalLookupStageIntermediateDocumentMaxSizeBytes": 104857600,
+    "internalDocumentSourceGroupMaxMemoryBytes": 104857600,
+    "internalQueryMaxBlockingSortMemoryUsageBytes": 104857600,
+    "internalQueryProhibitBlockingMergeOnMongoS": 0,
+    "internalQueryMaxAddToSetBytes": 104857600,
+    "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 104857600,
+    "internalQueryFrameworkControl": "trySbeRestricted",
+    "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1
+  },
+  "command": {
+    "aggregate": "orders",
+    "pipeline": [
+      {
+        "$match": {
+          "status": "paid"
+        }
+      },
+      {
+        "$lookup": {
+          "from": "customers",
+          "let": {
+            "c": "$customer"
+          },
+          "pipeline": [
+            {
+              "$match": {
+                "$expr": {
+                  "$eq": [
+                    "$_id",
+                    "$$c"
+                  ]
+                }
+              }
+            },
+            {
+              "$project": {
+                "country": 1
+              }
+            }
+          ],
+          "as": "buyer"
+        }
+      },
+      {
+        "$unwind": "$buyer"
+      },
+      {
+        "$group": {
+          "_id": "$buyer.country",
+          "n": {
+            "$sum": 1
+          }
+        }
+      },
+      {
+        "$sort": {
+          "n": -1
+        }
+      }
+    ],
+    "cursor": {},
+    "$db": "shop"
+  },
+  "ok": 1
+}
