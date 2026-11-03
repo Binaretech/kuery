@@ -395,10 +395,18 @@ fn save_in(path: &Path, session: &Session) -> std::io::Result<()> {
 fn take_in(path: &Path) -> Option<Session> {
     let text = std::fs::read_to_string(path).ok()?;
     if let Err(error) = std::fs::remove_file(path) {
-        eprintln!("kuery: could not delete {}: {error}", path.display());
+        crate::diagnostics::warn(
+            "Could not delete the saved session",
+            &[("error.type", crate::diagnostics::io_error_type(&error))],
+        );
     }
     serde_json::from_str(&text)
-        .map_err(|error| eprintln!("kuery: could not read {}: {error}", path.display()))
+        .map_err(|error| {
+            crate::diagnostics::warn(
+                "Could not read the saved session",
+                &[("error.type", format!("{:?}", error.classify()).into())],
+            )
+        })
         .ok()
 }
 

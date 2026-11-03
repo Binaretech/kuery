@@ -393,10 +393,15 @@ fn notify_ready(version: &str, cx: &mut App) {
 /// A failure the user asked about is shown; one from a background check only
 /// goes to the log, since nothing is wrong with what they are doing.
 fn report(manual: bool, message: String, cx: &mut App) {
+    crate::diagnostics::warn(
+        "Update failed",
+        &[
+            ("update.manual", manual.into()),
+            ("error.message", message.clone().into()),
+        ],
+    );
     if manual {
         notify(Notification::error(message), cx);
-    } else {
-        eprintln!("kuery: {message}");
     }
 }
 

@@ -2,15 +2,19 @@
 //!
 //! A panic leaves a report next to `panic.log`; on the next start Kuery asks
 //! whether to send it. What leaves the machine is the panic message and
-//! backtrace with quoted text, passwords, URL credentials and the home folder
-//! taken out, plus the version and platform. Builds made without
+//! backtrace and Kuery's latest log lines ([`crate::diagnostics`]), with quoted
+//! text, passwords, URL credentials and the home folder taken out, plus the
+//! version and platform. Builds made without
 //! `KUERY_SENTRY_DSN` never send anything.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::{App, PromptLevel};
-use sentry::protocol::{Envelope, Event, Exception, Level, Mechanism};
+use sentry::protocol::{
+    Context, Envelope, Event, Exception, Level, Log, LogAttribute, LogLevel, Mechanism,
+    TraceContext, TraceId,
+};
 use sentry::types::Dsn;
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +22,9 @@ use serde::{Deserialize, Serialize};
 pub const DSN: Option<&str> = option_env!("KUERY_SENTRY_DSN");
 
 const QUESTION: &str = "Kuery closed unexpectedly. Send a report?";
-const DETAIL: &str = "The report has the error and where in Kuery's code it happened, \
-     with the version and platform. Quoted text such as queries and values, passwords and \
-     your home folder are left out.";
+const DETAIL: &str = "The report has the error, where in Kuery's code it happened and \
+     Kuery's last log messages, with the version and platform. Quoted text such as queries \
+     and values, passwords and your home folder are left out.";
 
 /// What a panic leaves for the next start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,6 +38,9 @@ pub struct Report {
     pub backtrace: String,
     /// Seconds since the Unix epoch.
     pub time: u64,
+    /// Kuery's latest log lines before the crash, sent as Sentry logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<crate::diagnostics::Entry>,
 }
 
 impl Report {
@@ -49,6 +56,7 @@ impl Report {
             time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
+            logs: Vec::new(),
         }
     }
 }
@@ -333,13 +341,75 @@ fn is_panic_machinery(frame: &sentry::protocol::Frame) -> bool {
         .is_none_or(|function| PREFIXES.iter().any(|prefix| function.starts_with(prefix)))
 }
 
+/// The event for `report` and, after it, its log lines as Sentry logs. Both
+/// carry one trace id, so Sentry shows the logs on the crash's trace.
+pub fn envelope(report: &Report, home: Option<&Path>) -> Envelope {
+    let trace_id = TraceId::default();
+    let mut event = event(report, home);
+    event.contexts.insert(
+        "trace".into(),
+        Context::Trace(Box::new(TraceContext {
+            trace_id,
+            ..Default::default()
+        })),
+    );
+    let release = event.release.as_deref().map(str::to_owned);
+    let mut envelope = Envelope::from(event);
+    let logs: Vec<Log> = report
+        .logs
+        .iter()
+        .map(|entry| sentry_log(entry, trace_id, release.as_deref(), home))
+        .collect();
+    if !logs.is_empty() {
+        envelope.add_item(logs);
+    }
+    envelope
+}
+
+fn sentry_log(
+    entry: &crate::diagnostics::Entry,
+    trace_id: TraceId,
+    release: Option<&str>,
+    home: Option<&Path>,
+) -> Log {
+    use crate::diagnostics::Level as Logged;
+    // OpenTelemetry severity numbers: the first of each level's range.
+    let (level, severity) = match entry.level {
+        Logged::Info => (LogLevel::Info, 9),
+        Logged::Warn => (LogLevel::Warn, 13),
+        Logged::Error => (LogLevel::Error, 17),
+    };
+    let mut attributes: sentry::protocol::Map<String, LogAttribute> = entry
+        .attributes
+        .iter()
+        .map(|(key, value)| {
+            let value = match value {
+                serde_json::Value::String(text) => scrub(text, home).into(),
+                other => other.clone(),
+            };
+            (key.clone(), LogAttribute(value))
+        })
+        .collect();
+    if let Some(release) = release {
+        attributes.insert("sentry.release".into(), release.into());
+    }
+    Log {
+        level,
+        body: scrub(&entry.message, home),
+        trace_id: Some(trace_id),
+        timestamp: UNIX_EPOCH + Duration::from_secs_f64(entry.time.max(0.0)),
+        severity_number: severity.try_into().ok(),
+        attributes,
+    }
+}
+
 /// Sends `report` to `dsn`. Blocking: call it off the UI thread.
 pub fn send(dsn: &str, report: &Report) -> Result<(), String> {
     let dsn: Dsn = dsn
         .parse()
         .map_err(|error| format!("invalid DSN: {error}"))?;
     let home = home_in(|name| std::env::var_os(name));
-    let envelope = Envelope::from(event(report, home.as_deref()));
+    let envelope = envelope(report, home.as_deref());
     let mut body = Vec::new();
     envelope
         .to_writer(&mut body)
@@ -389,10 +459,12 @@ fn ask(window: gpui_kit::AnyWindowHandle, report: Report, dsn: &'static str, cx:
         );
         cx.spawn(async move |_| {
             if accepts(answer.await.ok()) {
-                std::thread::spawn(move || {
-                    if let Err(error) = send(dsn, &report) {
-                        eprintln!("kuery: could not send the crash report: {error}");
-                    }
+                std::thread::spawn(move || match send(dsn, &report) {
+                    Ok(()) => crate::diagnostics::info("Crash report sent", &[]),
+                    Err(error) => crate::diagnostics::warn(
+                        "Crash report not sent",
+                        &[("error.message", error.into())],
+                    ),
                 });
             }
         })
@@ -722,5 +794,100 @@ mod tests {
     #[test]
     fn an_invalid_dsn_is_an_error() {
         assert!(send("not a dsn", &report("boom")).is_err());
+    }
+
+    fn entry(
+        level: crate::diagnostics::Level,
+        message: &str,
+        attributes: &[(&str, &str)],
+    ) -> crate::diagnostics::Entry {
+        crate::diagnostics::Entry {
+            level,
+            message: message.into(),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+            time: 1_700_000_000.5,
+        }
+    }
+
+    #[test]
+    fn a_report_from_before_logs_still_loads() {
+        let path = temp_file("before-logs");
+        let mut old = serde_json::to_value(report("boom")).unwrap();
+        old.as_object_mut().unwrap().remove("logs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert_eq!(take(&path).unwrap().logs, Vec::new());
+    }
+
+    #[test]
+    fn the_recent_log_goes_as_scrubbed_sentry_logs_of_the_crash() {
+        use crate::diagnostics::Level as LogLevel;
+        use sentry::protocol::{Context, EnvelopeItem, ItemContainer};
+
+        let home = Path::new("/Users/someone");
+        let mut report = report("boom");
+        report.logs = vec![
+            entry(
+                LogLevel::Info,
+                "Connection opened",
+                &[("db.system.name", "postgres")],
+            ),
+            entry(
+                LogLevel::Warn,
+                "Update check failed",
+                &[(
+                    "error.message",
+                    r#"reading /Users/someone/x: password="hunter2""#,
+                )],
+            ),
+        ];
+        let envelope = envelope(&report, Some(home));
+
+        let mut items = envelope.items();
+        let Some(EnvelopeItem::Event(event)) = items.next() else {
+            panic!("the event comes first");
+        };
+        let Some(Context::Trace(trace)) = event.contexts.get("trace") else {
+            panic!("the event has a trace");
+        };
+        let Some(EnvelopeItem::ItemContainer(ItemContainer::Logs(logs))) = items.next() else {
+            panic!("the logs come after the event");
+        };
+        assert!(items.next().is_none());
+
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].body, "Connection opened");
+        assert_eq!(logs[0].level, sentry::protocol::LogLevel::Info);
+        assert_eq!(logs[1].level, sentry::protocol::LogLevel::Warn);
+        assert_eq!(
+            logs[0].timestamp,
+            UNIX_EPOCH + Duration::from_secs_f64(1_700_000_000.5)
+        );
+        for log in logs {
+            assert_eq!(log.trace_id, Some(trace.trace_id));
+            assert_eq!(
+                log.attributes.get("sentry.release").map(|a| &a.0),
+                Some(&serde_json::Value::from(concat!(
+                    "kuery@",
+                    env!("CARGO_PKG_VERSION")
+                )))
+            );
+        }
+        assert_eq!(
+            logs[0].attributes.get("db.system.name").map(|a| &a.0),
+            Some(&serde_json::Value::from("postgres"))
+        );
+        let text = serde_json::to_string(&logs).unwrap();
+        assert!(!text.contains("someone"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    #[test]
+    fn a_report_without_logs_sends_only_the_event() {
+        let envelope = envelope(&report("boom"), None);
+        assert_eq!(envelope.items().count(), 1);
     }
 }

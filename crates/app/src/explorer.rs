@@ -526,6 +526,13 @@ impl Explorer {
                 if node.spec != spec {
                     return;
                 }
+                // The driver only: hosts, names and the error's words may be
+                // the user's.
+                let system = [("db.system.name", spec.driver.clone().into())];
+                match &result {
+                    Ok(_) => crate::diagnostics::info("Connection opened", &system),
+                    Err(_) => crate::diagnostics::error("Connection failed", &system),
+                }
                 match result {
                     Ok(Connection::Sql(db)) => {
                         node.state = ConnectionState::Ready {
