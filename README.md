@@ -135,8 +135,9 @@ check_automatically = false
 
 If Kuery closes unexpectedly, the next start asks whether to send a crash
 report. Nothing is sent unless you choose **Send Report**. The report holds
-the error message and where in Kuery's code it happened, with the version and
-platform; text in quotes (where error messages put queries and values),
+the error message and where in Kuery's code it happened, Kuery's last log
+messages (such as "Connection opened" with the database type, never its host,
+name or queries), with the version and platform; text in quotes (where error messages put queries and values),
 passwords, credentials in connection URLs and your home folder are taken out
 first. Choosing **Don't Send** discards it. The
 details also stay in `panic.log` in the user config directory, for a bug
