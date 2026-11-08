@@ -278,8 +278,13 @@ impl Adapter for Postgres {
     }
 
     fn limit(&mut self, options: &RunOptions) -> Result<(), QueryError> {
+        // `standard_conforming_strings` on before every run: the read-only
+        // check lexes `'a\'` as a whole string, as the server does only
+        // with it on. Off, the backslash escapes the quote after it, and
+        // what the check took for text inside a string would run as SQL.
         let sql = format!(
-            "set statement_timeout = {}; set lock_timeout = {}",
+            "set statement_timeout = {}; set lock_timeout = {}; \
+             set standard_conforming_strings = on",
             options.statement_timeout.as_millis(),
             options.lock_timeout.as_millis()
         );

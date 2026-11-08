@@ -47,7 +47,11 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "pg_advisory_unlock_shared",
     "pg_advisory_xact_lock",
     "pg_advisory_xact_lock_shared",
+    "pg_backup_start",
+    "pg_backup_stop",
     "pg_cancel_backend",
+    "pg_copy_logical_replication_slot",
+    "pg_copy_physical_replication_slot",
     "pg_create_logical_replication_slot",
     "pg_create_physical_replication_slot",
     "pg_create_restore_point",
@@ -56,21 +60,30 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "pg_file_unlink",
     "pg_file_write",
     "pg_logical_emit_message",
+    "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_get_changes",
     "pg_notify",
     "pg_promote",
     "pg_reload_conf",
+    "pg_replication_slot_advance",
     "pg_rotate_logfile",
     "pg_stat_reset",
     "pg_stat_reset_shared",
     "pg_stat_reset_single_function_counters",
     "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_replication_slot",
     "pg_stat_reset_slru",
+    "pg_stat_statements_reset",
     "pg_switch_wal",
     "pg_terminate_backend",
     "pg_try_advisory_lock",
     "pg_try_advisory_lock_shared",
     "pg_try_advisory_xact_lock",
     "pg_try_advisory_xact_lock_shared",
+    // Run the SQL in their text argument, which the checker never sees.
+    "query_to_xml",
+    "query_to_xml_and_xmlschema",
+    "query_to_xmlschema",
     "set_config",
     "setval",
     // T-SQL: running programs, reading files and other servers, mail.
@@ -657,6 +670,15 @@ mod tests {
         assert_eq!(
             rejected("select * from dblink('host=x', 'delete from t') as t(n int)"),
             Rejection::Function("dblink".into())
+        );
+        // SQL inside a string, run by the function.
+        assert_eq!(
+            rejected("select query_to_xml('select pg_terminate_backend(123)', true, true, '')"),
+            Rejection::Function("query_to_xml".into())
+        );
+        assert_eq!(
+            rejected("select * from pg_logical_slot_get_changes('slot', null, null)"),
+            Rejection::Function("pg_logical_slot_get_changes".into())
         );
     }
 

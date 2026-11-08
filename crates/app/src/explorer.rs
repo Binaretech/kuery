@@ -47,6 +47,7 @@ use crate::drivers::{self, Connection};
 use crate::history::{self, HistoryEntry};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
+use crate::secrets;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
 
@@ -519,10 +520,10 @@ impl Explorer {
         // A database file's relative path starts at the project folder.
         let resolved = spec.resolved(&self.model.read(cx).project.root);
         let state = app::state(cx);
-        let (engines, secrets) = (state.engines(), state.secrets.clone());
+        let (engines, store) = (state.engines(), state.secrets.clone());
         // The keychain may ask the user for permission: read it off the UI thread.
-        let id = spec.id.clone();
-        let password = cx.background_spawn(async move { secrets.get(&id) });
+        let keyed = spec.clone();
+        let password = cx.background_spawn(async move { secrets::password(&*store, &keyed) });
         cx.spawn(async move |this, cx| {
             let result = match password.await {
                 Ok(password) => driver.connect(&resolved, password, &engines).await,
@@ -812,9 +813,19 @@ impl Explorer {
     }
 
     /// Closes the sidebar's connection. Tabs opened on it keep their own
-    /// handle to it until they close.
+    /// handle to it until they close, but writes allowed for it on
+    /// production are revoked in every one of them: the flag is shared, and
+    /// disconnecting ends the connection session it was allowed for.
     fn disconnect(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(node) = self.connections.get_mut(index) {
+            match &node.state {
+                ConnectionState::Ready { db, .. } => db.revoke_writes(),
+                ConnectionState::RedisReady { db, .. } => db.revoke_writes(),
+                ConnectionState::DocumentReady { db } => db.revoke_writes(),
+                ConnectionState::Idle
+                | ConnectionState::Connecting
+                | ConnectionState::Failed(_) => {}
+            }
             node.state = ConnectionState::Idle;
             self.expanded.remove(&index.to_string());
             let id = node.spec.id.clone();
@@ -903,7 +914,7 @@ impl Explorer {
                 });
                 match removed {
                     Ok(()) => {
-                        let _ = app::state(cx).secrets.delete(&spec.id);
+                        let _ = secrets::forget(&*app::state(cx).secrets, &spec);
                     }
                     Err(error) => eprintln!("kuery: {error}"),
                 }

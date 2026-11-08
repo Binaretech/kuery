@@ -86,6 +86,57 @@ fn checks_the_certificate_against_the_server_through_a_tunnel() {
     assert_eq!(tls.tls_hostname_override(), Some("db.example.com"));
 }
 
+/// What [`sql_mode_as_parsed`] sets the mode to, worked out here as the
+/// server does, from a session whose mode is `mode`.
+fn as_parsed(mode: &str) -> String {
+    let wrapped = LEXER_MODES.iter().fold(format!(",{mode},"), |list, lexer| {
+        list.replace(&format!(",{lexer},"), ",")
+    });
+    wrapped.trim_matches(',').to_string()
+}
+
+#[test]
+fn drops_only_the_modes_that_change_how_strings_lex() {
+    assert_eq!(
+        as_parsed("REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"),
+        "REAL_AS_FLOAT,PIPES_AS_CONCAT,IGNORE_SPACE,ONLY_FULL_GROUP_BY"
+    );
+    assert_eq!(
+        as_parsed("NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES"),
+        "STRICT_TRANS_TABLES"
+    );
+    assert_eq!(as_parsed("ANSI_QUOTES"), "");
+    assert_eq!(as_parsed(""), "");
+    assert_eq!(
+        as_parsed("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
+        "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+    );
+    let sql = sql_mode_as_parsed();
+    for mode in LEXER_MODES {
+        assert!(sql.contains(&format!("',{mode},'")), "{sql}");
+    }
+}
+
+#[test]
+#[ignore = "needs the dev MySQL"]
+fn every_run_lexes_strings_as_the_read_only_check_does() {
+    let writer = session(Access::ReadWrite);
+    drain(writer.run_autocommit(
+        "set session sql_mode = 'ANSI,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES'".into(),
+        RunOptions::default(),
+    ))
+    .unwrap();
+    let mode = scalar(&writer, "select @@session.sql_mode").unwrap();
+    assert!(!mode.contains("ANSI"), "{mode}");
+    assert!(!mode.contains("NO_BACKSLASH_ESCAPES"), "{mode}");
+    assert!(mode.contains("STRICT_TRANS_TABLES"), "{mode}");
+    // Read as the check reads it: one string, not a string and a call.
+    assert_eq!(
+        scalar(&writer, r#"select concat("a\"", 'b')"#).as_deref(),
+        Some("a\"b")
+    );
+}
+
 #[test]
 #[ignore = "needs the dev MySQL"]
 fn reads_rows_as_the_server_writes_them() {
