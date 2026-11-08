@@ -136,6 +136,32 @@ pub struct Mysql {
     version: String,
 }
 
+/// The `sql_mode` modes that make the server read quotes and backslashes
+/// otherwise than the read-only check does (it reads `"…"` as a string and
+/// `\'` as an escaped quote), and the combinations that turn them on.
+/// With either on, SQL the check took for text inside a string would run.
+const LEXER_MODES: &[&str] = &[
+    "ANSI_QUOTES",
+    "NO_BACKSLASH_ESCAPES",
+    "ANSI",
+    "ORACLE",
+    "MSSQL",
+    "DB2",
+    "POSTGRESQL",
+    "MAXDB",
+];
+
+/// Sets the session's `sql_mode` to its own without [`LEXER_MODES`]. Each
+/// mode is removed with the commas around it, from the list wrapped in
+/// commas, so no mode is cut out of a longer one's name.
+fn sql_mode_as_parsed() -> String {
+    let list = LEXER_MODES.iter().fold(
+        "concat(',', @@session.sql_mode, ',')".to_string(),
+        |list, mode| format!("replace({list}, ',{mode},', ',')"),
+    );
+    format!("set session sql_mode = trim(both ',' from {list})")
+}
+
 /// Connects. Read-only connections also make every transaction read-only
 /// (`SESSION TRANSACTION READ ONLY`).
 pub fn open(target: &Target, access: Access) -> Result<Box<dyn Adapter>, String> {
@@ -259,7 +285,8 @@ impl Adapter for Mysql {
             format!("set session max_execution_time = {millis}")
         };
         self.run(&format!(
-            "{timeout}; set session innodb_lock_wait_timeout = {lock}"
+            "{timeout}; set session innodb_lock_wait_timeout = {lock}; {}",
+            sql_mode_as_parsed()
         ))
     }
 
