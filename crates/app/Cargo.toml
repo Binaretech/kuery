@@ -25,6 +25,8 @@ rustls.workspace = true
 sentry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Keychain entries are named after a digest of where the password goes.
+sha2.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 

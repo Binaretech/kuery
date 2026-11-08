@@ -28,7 +28,7 @@ use crate::app;
 use crate::connection::Environment;
 use crate::drivers::{self, family_icon};
 use crate::project::{ConnectionSpec, ProjectModel, SshSpec, new_id};
-use crate::secrets::SecretStore;
+use crate::secrets::{self, SecretStore};
 use crate::theme::{self, color};
 use crate::ui::muted;
 
@@ -175,6 +175,9 @@ pub struct ConnectionEditor {
     model: Entity<ProjectModel>,
     /// `None` for a new connection.
     id: Option<String>,
+    /// The connection as saved, whose keychain password the form starts
+    /// from; `None` for a new one.
+    saved: Option<ConnectionSpec>,
     driver: &'static DriverInfo,
     driver_select: Entity<DriverSelect>,
     name: Entity<InputState>,
@@ -364,6 +367,7 @@ impl ConnectionEditor {
         let mut editor = Self {
             model,
             id,
+            saved: spec.clone(),
             driver: info,
             driver_select,
             name,
@@ -646,9 +650,11 @@ impl ConnectionEditor {
     /// Whether the keychain already has a password, read off the UI thread
     /// (macOS may ask the user for permission).
     fn load_password_state(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.id.clone() else { return };
-        let secrets: Arc<dyn SecretStore> = app::state(cx).secrets.clone();
-        let read = cx.background_spawn(async move { secrets.get(&id) });
+        let Some(saved) = self.saved.clone() else {
+            return;
+        };
+        let store: Arc<dyn SecretStore> = app::state(cx).secrets.clone();
+        let read = cx.background_spawn(async move { secrets::password(&*store, &saved) });
         cx.spawn(async move |this, cx| {
             let saved = matches!(read.await, Ok(Some(_)));
             this.update(cx, |this, cx| {
@@ -765,17 +771,19 @@ impl ConnectionEditor {
         let spec = spec.resolved(&self.model.read(cx).project.root);
         let typed = self.password(cx);
         let state = app::state(cx);
-        let (engines, secrets) = (state.engines(), state.secrets.clone());
-        let saved_id = self.id.clone();
+        let (engines, store) = (state.engines(), state.secrets.clone());
+        // The saved password goes wherever the form now points: the user
+        // pointed it there, unlike a project file that changed.
+        let saved = self.saved.clone();
         self.error = None;
         self.test = TestState::Testing;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let password = match typed {
                 Some(password) => Some(password),
-                None => match saved_id {
-                    Some(id) => cx
-                        .background_spawn(async move { secrets.get(&id) })
+                None => match saved {
+                    Some(saved) => cx
+                        .background_spawn(async move { secrets::password(&*store, &saved) })
                         .await
                         .ok()
                         .flatten(),
@@ -804,13 +812,26 @@ impl ConnectionEditor {
                 return;
             }
         };
-        if let Some(password) = self.password(cx) {
-            let secrets = app::state(cx).secrets.clone();
-            if let Err(error) = secrets.set(&spec.id, &password) {
-                self.error = Some(error);
-                cx.notify();
-                return;
-            }
+        // The password follows the connection to wherever the form now
+        // points: typed anew, or the saved one moved along.
+        let store = app::state(cx).secrets.clone();
+        let stored = match (self.password(cx), &self.saved) {
+            (Some(password), saved) => secrets::save(&*store, &spec, &password).map(|()| {
+                if let Some(saved) = saved
+                    && secrets::key(saved) != secrets::key(&spec)
+                {
+                    let _ = secrets::forget(&*store, saved);
+                }
+            }),
+            (None, Some(saved)) => secrets::rebind(&*store, saved, &spec),
+            (None, None) => Ok(()),
+        };
+        if let Err(error) = stored {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        if self.password(cx).is_some() {
             self.has_saved_password = true;
         }
         let saved = self.model.update(cx, |model, cx| {
@@ -847,7 +868,9 @@ impl ConnectionEditor {
         });
         match removed {
             Ok(()) => {
-                let _ = app::state(cx).secrets.delete(&id);
+                if let Some(saved) = &self.saved {
+                    let _ = secrets::forget(&*app::state(cx).secrets, saved);
+                }
                 window.close_dialog(cx);
             }
             Err(error) => {

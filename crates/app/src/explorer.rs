@@ -47,6 +47,7 @@ use crate::drivers::{self, Connection};
 use crate::history::{self, HistoryEntry};
 use crate::project::{ConnectionSpec, ProjectModel, QueryEntry};
 use crate::query_tab::describe_error;
+use crate::secrets;
 use crate::table_tab::TableView;
 use crate::theme::{self, color};
 
@@ -519,10 +520,10 @@ impl Explorer {
         // A database file's relative path starts at the project folder.
         let resolved = spec.resolved(&self.model.read(cx).project.root);
         let state = app::state(cx);
-        let (engines, secrets) = (state.engines(), state.secrets.clone());
+        let (engines, store) = (state.engines(), state.secrets.clone());
         // The keychain may ask the user for permission: read it off the UI thread.
-        let id = spec.id.clone();
-        let password = cx.background_spawn(async move { secrets.get(&id) });
+        let keyed = spec.clone();
+        let password = cx.background_spawn(async move { secrets::password(&*store, &keyed) });
         cx.spawn(async move |this, cx| {
             let result = match password.await {
                 Ok(password) => driver.connect(&resolved, password, &engines).await,
@@ -903,7 +904,7 @@ impl Explorer {
                 });
                 match removed {
                     Ok(()) => {
-                        let _ = app::state(cx).secrets.delete(&spec.id);
+                        let _ = secrets::forget(&*app::state(cx).secrets, &spec);
                     }
                     Err(error) => eprintln!("kuery: {error}"),
                 }
