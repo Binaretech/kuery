@@ -235,6 +235,18 @@ fn streams_a_million_rows_in_growing_batches() {
 
 #[test]
 #[ignore = "needs the dev Postgres"]
+fn every_run_lexes_strings_as_the_read_only_check_does() {
+    let mut adapter = open_postgres(&database_url(), Access::ReadWrite).unwrap();
+    adapter
+        .execute("set standard_conforming_strings = off", &mut Discard)
+        .unwrap();
+    adapter.limit(&RunOptions::default()).unwrap();
+    // A whole string with the setting on; unterminated with it off.
+    adapter.execute(r"select 'a\'", &mut Discard).unwrap();
+}
+
+#[test]
+#[ignore = "needs the dev Postgres"]
 fn rejects_writes_before_reaching_the_server() {
     let engine = Engine::new().unwrap();
     engine.runtime.block_on(async {
