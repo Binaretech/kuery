@@ -813,9 +813,19 @@ impl Explorer {
     }
 
     /// Closes the sidebar's connection. Tabs opened on it keep their own
-    /// handle to it until they close.
+    /// handle to it until they close, but writes allowed for it on
+    /// production are revoked in every one of them: the flag is shared, and
+    /// disconnecting ends the connection session it was allowed for.
     fn disconnect(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(node) = self.connections.get_mut(index) {
+            match &node.state {
+                ConnectionState::Ready { db, .. } => db.revoke_writes(),
+                ConnectionState::RedisReady { db, .. } => db.revoke_writes(),
+                ConnectionState::DocumentReady { db } => db.revoke_writes(),
+                ConnectionState::Idle
+                | ConnectionState::Connecting
+                | ConnectionState::Failed(_) => {}
+            }
             node.state = ConnectionState::Idle;
             self.expanded.remove(&index.to_string());
             let id = node.spec.id.clone();
