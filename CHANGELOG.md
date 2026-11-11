@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/Binaretech/kuery/compare/v0.5.0...v0.6.0) - 2026-11-11
+
+### Added
+
+- open the Profile on every column, with findings, correlations and a click through to the rows
+- *(app)* send Kuery's last log messages with a crash report
+- *(app)* tint the status bar amber while a production connection is active
+- *(app)* right-align numbers and their headers in every results grid
+- *(app)* give File SQL the query tab's Run button, result tabs and table chips
+- watch and stop running MongoDB operations
+- query MongoDB with read-only SQL and see the native query it runs
+- show MongoDB schemas, indexes and query plans
+- edit, insert and delete MongoDB documents with review
+- write to MongoDB from the console with review and audit
+- query MongoDB in a console with completion
+- connect to MongoDB and browse its databases and collections
+
+### Changed
+
+- *(mongo)* keep one check for database names and plain names
+
+### Fixed
+
+- *(app)* revoke production write access in open tabs on disconnect
+- *(app)* keep each saved password for the server it was saved for
+- *(app)* make quiet text readable against the dark background
+- *(core)* refuse query_to_xml and replication slot functions in read-only queries
+- *(mongo)* refuse SQL numbers too large for a Double
+- *(mongo)* keep a script's transaction when a read in it stops early
+- *(mongo)* refuse a pasted connection string whose password holds a bare ?
+- *(mysql)* read strings as the read-only check does whatever the sql_mode
+- *(pg)* read strings as the read-only check does whatever the server setting
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into claude/sentry-configs-merge-42a89c
+
 ## [0.5.0](https://github.com/Binaretech/kuery/compare/v0.4.5...v0.5.0) - 2026-11-01
 
 ### Added
