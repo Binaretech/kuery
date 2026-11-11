@@ -30,6 +30,9 @@ pub struct ResultsDelegate {
     running: bool,
     /// Counts the results shown, so a view can tell they were replaced.
     generation: u64,
+    /// What the grid is narrowed to and the rows left, shown in place of
+    /// all of them. Gone when rows arrive or a new query starts.
+    filtered: Option<(String, ResultSet)>,
     /// The cell last right-clicked, for the row's context menu.
     menu_cell: Option<(usize, usize)>,
     row_menu: Option<RowMenu>,
@@ -103,6 +106,7 @@ impl ResultsDelegate {
     }
 
     pub fn push(&mut self, batch: Batch) {
+        self.filtered = None;
         self.set.push(batch);
     }
 
@@ -118,9 +122,27 @@ impl ResultsDelegate {
         self.set.memory_size()
     }
 
-    /// Everything received so far.
+    /// Everything received so far, whatever the grid is narrowed to.
     pub fn results(&self) -> &ResultSet {
         &self.set
+    }
+
+    /// The rows in the grid: the results, or those a filter leaves.
+    pub fn shown(&self) -> &ResultSet {
+        self.filtered.as_ref().map_or(&self.set, |(_, rows)| rows)
+    }
+
+    /// What the grid is narrowed to, if it is.
+    pub fn filter(&self) -> Option<&str> {
+        self.filtered.as_ref().map(|(label, _)| label.as_str())
+    }
+
+    /// Narrows the grid to `rows` of the results, named `label`; `None`
+    /// shows all of them again. What a view kept about a cell is stale.
+    pub fn set_filtered(&mut self, filtered: Option<(String, ResultSet)>) {
+        self.filtered = filtered;
+        self.generation += 1;
+        self.menu_cell = None;
     }
 
     fn is_numeric(&self, column: usize) -> bool {
@@ -136,7 +158,7 @@ impl ResultsDelegate {
             column,
             columns: self.set.columns().to_vec(),
             values: (0..self.set.columns().len())
-                .map(|index| self.set.cell(row, index).flatten().map(str::to_owned))
+                .map(|index| self.shown().cell(row, index).flatten().map(str::to_owned))
                 .collect(),
             absent: false,
         }
@@ -149,7 +171,7 @@ impl TableDelegate for ResultsDelegate {
     }
 
     fn rows_count(&self, _: &App) -> usize {
-        self.set.rows()
+        self.shown().rows()
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
@@ -183,7 +205,7 @@ impl TableDelegate for ResultsDelegate {
         let numeric = self.is_numeric(col_ix);
         // Numbers in figures of one width; text in the interface face, as in
         // a table's data grid.
-        let cell: AnyElement = match self.set.cell(row_ix, col_ix) {
+        let cell: AnyElement = match self.shown().cell(row_ix, col_ix) {
             Some(Some(text)) => div()
                 .when(numeric, |value| value.font_family(mono))
                 .truncate()
@@ -241,6 +263,8 @@ impl TableDelegate for ResultsDelegate {
             .text_color(theme::color(theme::TEXT_TERTIARY))
             .child(if self.running {
                 "Running…"
+            } else if self.filtered.is_some() {
+                "No rows match"
             } else {
                 "No rows"
             })
@@ -251,7 +275,7 @@ impl TableDelegate for ResultsDelegate {
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
-        match self.set.cell(row_ix, col_ix) {
+        match self.shown().cell(row_ix, col_ix) {
             Some(Some(text)) => text.to_owned(),
             _ => String::new(),
         }
@@ -284,6 +308,33 @@ mod tests {
         assert_eq!(preview.chars().count(), CELL_PREVIEW + 1);
         assert!(preview.ends_with('…'));
         assert_eq!(cell_preview(&"x".repeat(CELL_PREVIEW)).len(), CELL_PREVIEW);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_grid_and_keeps_the_results() {
+        let mut delegate = ResultsDelegate::default();
+        delegate.show(
+            vec!["status".into()],
+            &[
+                vec![Some("paid".into())],
+                vec![Some("failed".into())],
+                vec![Some("paid".into())],
+            ],
+        );
+        let generation = delegate.generation();
+        let paid = delegate.results().keep(|row| row[0] == Some("paid"));
+        delegate.set_filtered(Some(("status = paid".into(), paid)));
+        assert_eq!(delegate.shown().rows(), 2);
+        assert_eq!(delegate.rows(), 3);
+        assert_eq!(delegate.results().rows(), 3);
+        assert_eq!(delegate.filter(), Some("status = paid"));
+        assert_ne!(delegate.generation(), generation);
+        assert_eq!(delegate.cell(1, 0).values, [Some("paid".to_string())]);
+
+        // New results are not narrowed by the old filter.
+        delegate.show(vec!["status".into()], &[vec![Some("new".into())]]);
+        assert_eq!(delegate.filter(), None);
+        assert_eq!(delegate.shown().rows(), 1);
     }
 
     #[test]

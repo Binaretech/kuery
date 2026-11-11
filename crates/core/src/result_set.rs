@@ -214,6 +214,24 @@ impl ResultSet {
         self.batches.iter().map(Batch::memory_size).sum()
     }
 
+    /// A copy with only the rows `keep` accepts, in order, under the same
+    /// columns and kinds.
+    pub fn keep(&self, mut keep: impl FnMut(&[Option<&str>]) -> bool) -> ResultSet {
+        let mut kept = ResultSet::new(self.columns.clone());
+        kept.kinds = self.kinds.clone();
+        let mut builder = BatchBuilder::new(self.columns.len(), 0);
+        let _ = self.try_for_each_row(|row| {
+            if keep(row) {
+                builder.push_row(|index| row[index]);
+            }
+            Ok::<(), std::convert::Infallible>(())
+        });
+        if builder.rows() > 0 {
+            kept.push(builder.finish());
+        }
+        kept
+    }
+
     /// Calls `f` with every row in order, batch by batch (no lookup per
     /// cell). Stops at the first error.
     pub fn try_for_each_row<E>(
@@ -247,6 +265,20 @@ mod tests {
             builder.push_row(|i| row[i]);
         }
         builder.finish()
+    }
+
+    #[test]
+    fn keeps_the_rows_asked_for_under_the_same_columns_and_kinds() {
+        let mut set = ResultSet::new(vec!["a".into(), "b".into()]);
+        set.set_kinds(vec![ColumnKind::Integer, ColumnKind::Text]);
+        set.push(batch(&[[Some("1"), Some("x")], [Some("2"), None]]));
+        set.push(batch(&[[Some("3"), Some("x")]]));
+        let kept = set.keep(|row| row[1] == Some("x"));
+        assert_eq!(kept.columns(), set.columns());
+        assert_eq!(kept.kinds(), set.kinds());
+        assert_eq!(kept.rows(), 2);
+        assert_eq!(kept.cell(1, 0), Some(Some("3")));
+        assert_eq!(set.keep(|_| false).rows(), 0);
     }
 
     #[test]
