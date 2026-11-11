@@ -74,10 +74,22 @@ Data, Profile and Columns; change read options and reload when needed.
 
 ### Understand the result with Profile
 
-Inspect a distribution or compare a measure across groups. Profile works on
-the rows held by the current result, so its scope stays visible.
+Profile opens on every column at once (nulls, distinct values, range and
+distribution) under a line that names what stands out: constant and mostly
+empty columns, outliers, repeated rows, values off their format, columns that
+move together. It works on the rows held by the current result.
 
-![Kuery Profile comparing revenue across regions with box plots and descriptive statistics](docs/screenshots/file-profile.jpg)
+![Kuery Profile listing every column of an orders file with its nulls, distinct values and distribution, under a line naming what stands out](docs/screenshots/file-profile.jpg)
+
+Open a column for its histogram and percentiles; click a bar to see its rows
+in the grid.
+
+![Kuery Profile showing the histogram, quartiles and percentiles of a revenue column with its outliers left out](docs/screenshots/profile-column.jpg)
+
+Correlations compares every two numeric columns; a pair opens its scatter
+plot.
+
+![Kuery Profile listing the strongest correlations between numeric columns over a grid of every pair](docs/screenshots/profile-correlations.jpg)
 
 ### Browse a database
 
