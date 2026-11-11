@@ -52,8 +52,8 @@ file tabs. Opening the same canonical path with the same read options focuses
 its existing tab.
 
 **Data** uses the same virtualized results grid as SQL queries, including copy
-menus. **Profile** uses the existing column summaries, comparisons and charts;
-calculations still wait for Profile all or Analyze. Both views display whether
+menus. **Profile** uses the same column summaries, comparisons and charts as a
+query's results. Both views display whether
 the preview covers the complete file or only its first rows. **Columns** shows
 original types, inference provenance and reader notes.
 
@@ -891,22 +891,52 @@ insights that went away, appeared or are still there. Steps are paired by
 table, index and step type, from the strictest match to the loosest.
 Clicking a changed step shows it in the plan.
 
-Profile computes nothing until asked. The list on the left shows every
-column's name and kind ("Profile all" adds nulls, distinct values and a small
-chart to each). Above the result, a builder picks a column (click it, or the
-first dropdown), optionally a second one to compare (⌘-click, or the "vs"
-dropdown), and an analysis; Analyze runs it. Double-clicking a column
-analyzes it at once. While a result is on screen, its options (bins, groups,
-periods, aggregate…) update it right away; changing the columns or the
-analysis waits for Analyze.
+Profile opens on a table of every column: its share of NULLs, its distinct
+values, what it holds (the median and range of numbers, the most frequent of
+other values, the format of text such as emails or UUIDs) and a small chart.
+The columns are summarized the first time the tab is shown; a result of more
+than five million cells waits for "Summarize columns".
 
-One column, "Analyze as":
+A line over the table names what stands out, and each name opens its column:
+
+- Repeated rows: rows equal to an earlier one in every column (NULL is not
+  the empty text). Clicking it shows every copy in the grid.
+- No values, Constant, Mostly NULL (half the rows or more).
+- Blank (empty or only spaces) and Spaces at the ends, for text.
+- Off format: at least 90% of ten or more text values are written one way
+  (email, UUID, URL, IPv4 address, number or date) and the rest are not.
+- Outliers: a few values (5% at most) beyond 1.5 × IQR.
+- Likely key: every value is different.
+- Related: two numeric columns with a Pearson r of ±0.7 or more.
+
+With two or more numeric columns that vary, "Correlations" replaces the table
+with the pairs that move together (|r| ≥ 0.3) and a grid of every pair,
+shaded by r: blue when they rise together, amber when one rises as the other
+falls. It compares the first 24 such columns; a pair opens its scatter plot.
+
+Clicking a column opens it in depth beside the list; "Compare with" (or a
+⌘-click on another column) sets a second one against it, and the close button
+or "All columns" goes back. There is nothing to run: columns, analysis and
+options (bins, groups, periods, aggregate…) all update what is on screen. In
+the open column, what is about some of its rows (blank values, values off
+their format) has a "Show rows" link.
+
+A click on a bar of a histogram, a value in a list, a period of a timeline or
+a part of a true/false split shows its rows in the grid, under a bar that
+says what the grid is narrowed to and how many rows are left; "Show all rows"
+brings the rest back. The totals and the inspector are then of the rows
+shown. One filter applies at a time, and exports and copies are still of all
+the results.
+
+One column, the analysis picker:
 
 - Auto chooses from the kind and the values: keys get their range,
   booleans a true/false split, integers with few values and short lists of
   text their categories, other numbers a histogram, dates a timeline.
-- Numeric: a histogram (bins, log scale, hiding outliers beyond 1.5 × IQR)
-  with mean, standard deviation and percentiles.
+- Numeric: a histogram (bins, log scale, hiding outliers beyond 1.5 × IQR:
+  a column flagged for outliers opens without them), a strip under it with
+  the middle half, the median and the mean, then the percentiles, mean and
+  standard deviation.
 - Categorical: the most frequent values with their share (top 5 to 50,
   NULL included on request).
 - Temporal: counts by hour, day, week, month or year (too many buckets fall
@@ -931,7 +961,7 @@ numbers and as categories):
   a scatter plot with the least-squares line (up to 4,000 points, spread
   evenly over the rows; the coefficients use every pair).
 
-Hidden columns (the eye on a row) and the builder's choices are kept by
+Hidden columns (the eye on a row), the open column and its options are kept by
 column name while the tab is open, so re-running a query keeps them (the
 previous result is dropped: its rows are gone). Kinds come from Postgres
 when a single read runs (the query is prepared first to learn them; numeric

@@ -41,7 +41,7 @@ use crate::connection::{Db, WriteKind};
 use crate::history::HistoryEntry;
 use crate::plan_view::{PlanEvent, PlanPanel};
 use crate::profile_charts;
-use crate::profile_view::ProfilePanel;
+use crate::profile_view::{ProfileEvent, ProfilePanel};
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::results_pane::ResultsPane;
@@ -271,6 +271,16 @@ impl QueryTab {
             TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
         });
         let results = cx.new(|cx| ResultsPane::new(table.clone(), cx));
+        let profile = cx.new(|_| ProfilePanel::default());
+        // A mark picked in the Profile tab shows its rows in the grid.
+        cx.subscribe(&profile, |this, _, event: &ProfileEvent, cx| {
+            let ProfileEvent::ShowRows(rows) = event;
+            this.results
+                .update(cx, |results, cx| results.filter(rows.clone(), cx));
+            this.panel_tab = PanelTab::Results;
+            cx.notify();
+        })
+        .detach();
         let plan = cx.new(|_| PlanPanel::default());
         cx.subscribe_in(
             &plan,
@@ -305,7 +315,7 @@ impl QueryTab {
             panel_tab: PanelTab::Results,
             output: Vec::new(),
             write: WriteState::Off,
-            profile: cx.new(|_| ProfilePanel::default()),
+            profile,
             plan,
             plan_task: None,
             run_writes: false,

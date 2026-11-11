@@ -4,7 +4,7 @@ use crate::{
     chrome,
     completion::{SharedCatalog, SqlCompletions},
     file_jobs,
-    profile_view::ProfilePanel,
+    profile_view::{ProfileEvent, ProfilePanel},
     query_tab::{CancelQuery, FormatSql, RunQuery},
     results::ResultsDelegate,
     results_pane::ResultsPane,
@@ -162,12 +162,22 @@ impl FileQueryTab {
         let table = cx.new(|cx| {
             TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
         });
+        let profile = cx.new(|_| ProfilePanel::default());
+        // A mark picked in the Profile view shows its rows in the grid.
+        cx.subscribe(&profile, |this, _, event: &ProfileEvent, cx| {
+            let ProfileEvent::ShowRows(rows) = event;
+            this.results
+                .update(cx, |results, cx| results.filter(rows.clone(), cx));
+            this.show_profile = false;
+            cx.notify();
+        })
+        .detach();
         Self {
             sources,
             editor,
             results: cx.new(|cx| ResultsPane::new(table.clone(), cx)),
             table,
-            profile: cx.new(|_| ProfilePanel::default()),
+            profile,
             show_profile: false,
             status: "Ready · full file inputs · read only".into(),
             error: None,

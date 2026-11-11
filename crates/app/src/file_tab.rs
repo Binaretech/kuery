@@ -22,7 +22,7 @@ use crate::chrome;
 use crate::commands::{QueryDataFiles, ReloadDataFile};
 use crate::context_menus::item;
 use crate::file_jobs::{self, LoadState};
-use crate::profile_view::ProfilePanel;
+use crate::profile_view::{ProfileEvent, ProfilePanel};
 use crate::results::ResultsDelegate;
 use crate::results_pane::ResultsPane;
 use crate::theme::{self, color};
@@ -90,6 +90,15 @@ impl FileTab {
         });
         let results = cx.new(|cx| ResultsPane::new(table.clone(), cx));
         let profile = cx.new(|_| ProfilePanel::default());
+        // A mark picked in the Profile view shows its rows in the grid.
+        cx.subscribe(&profile, |this, _, event: &ProfileEvent, cx| {
+            let ProfileEvent::ShowRows(rows) = event;
+            this.results
+                .update(cx, |results, cx| results.filter(rows.clone(), cx));
+            this.view = View::Data;
+            cx.notify();
+        })
+        .detach();
         let null_literal = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Custom NULL value (optional)")
