@@ -954,8 +954,7 @@ impl WorkspaceView {
                 Tab::Diagram(diagram) if diagram.read(cx).db().name == db.name => {
                     diagram.update(cx, |diagram, cx| diagram.set_db(db.clone(), cx));
                 }
-                Tab::Activity(activity)
-                    if matches!(activity.read(cx).source(), ActivitySource::Sql(other) if other.name == db.name) =>
+                Tab::Activity(activity) if matches!(activity.read(cx).source(), ActivitySource::Sql(other) if other.name == db.name) =>
                 {
                     activity.update(cx, |activity, cx| {
                         activity.set_source(ActivitySource::Sql(db.clone()), cx);
@@ -993,8 +992,7 @@ impl WorkspaceView {
                 Tab::DocumentConsole(console) if console.read(cx).db().name == db.name => {
                     console.update(cx, |console, cx| console.set_db(db.clone(), cx));
                 }
-                Tab::Activity(activity)
-                    if matches!(activity.read(cx).source(), ActivitySource::Document(other) if other.name == db.name) =>
+                Tab::Activity(activity) if matches!(activity.read(cx).source(), ActivitySource::Document(other) if other.name == db.name) =>
                 {
                     activity.update(cx, |activity, cx| {
                         activity.set_source(ActivitySource::Document(db.clone()), cx);
