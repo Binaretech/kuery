@@ -3,6 +3,11 @@
 //! value, in an inspector beside it (JSON indented). Double-click a cell, or
 //! use the bar's button, to open the inspector; it then follows the
 //! selection.
+//!
+//! The grid can be narrowed to the rows where a column has some values (a
+//! bar picked in the Profile tab): a bar over it says to what and how many
+//! rows are left, and brings them all back. The totals and the inspector
+//! are of the rows shown; exports and copies are still of all the results.
 
 use gpui_kit::component::table::{DataTable, TableEvent, TableSelection, TableState};
 use gpui_kit::component::{ActiveTheme as _, IconName, h_flex, v_flex};
@@ -13,6 +18,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use kuery_core::inspect::{self, Inspected, Totals};
+use kuery_core::stats::{self, Match};
+
+use crate::assets::AppIcon;
 
 use crate::chrome;
 use crate::profile_charts::format_number;
@@ -23,6 +31,15 @@ use crate::ui::thousands;
 /// Characters of a value the inspector draws; Copy still copies all of it.
 const INSPECTOR_LIMIT: usize = 100_000;
 
+/// The rows a grid is narrowed to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rows {
+    /// Those where `column` is what `matching` stands for.
+    Matching { column: String, matching: Match },
+    /// Those written more than once, every copy.
+    Duplicates,
+}
+
 pub struct ResultsPane {
     table: Entity<TableState<ResultsDelegate>>,
     inspector_open: bool,
@@ -30,6 +47,8 @@ pub struct ResultsPane {
     inspected: Option<((u64, usize, usize), Option<Inspected>)>,
     /// The column the totals are for, as `(generation, column)`.
     totals: Option<((u64, usize), TotalsState)>,
+    /// Picks the rows of a filter, off the UI thread.
+    filtering: Option<Task<()>>,
 }
 
 enum TotalsState {
@@ -54,14 +73,118 @@ impl ResultsPane {
             inspector_open: false,
             inspected: None,
             totals: None,
+            filtering: None,
         }
+    }
+
+    /// Narrows the grid to `rows`, in place of any earlier filter.
+    pub fn filter(&mut self, rows: Rows, cx: &mut Context<Self>) {
+        let delegate = self.table.read(cx).delegate();
+        let set = delegate.results().clone();
+        let generation = delegate.generation();
+        let (label, column) = match &rows {
+            Rows::Matching { column, matching } => {
+                let Some(index) = set.columns().iter().position(|name| name == column) else {
+                    return;
+                };
+                (describe(column, matching), index)
+            }
+            Rows::Duplicates => ("Rows written more than once".to_string(), 0),
+        };
+        self.filtering = Some(cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_spawn(async move {
+                    match rows {
+                        Rows::Matching { matching, .. } => {
+                            stats::rows_matching(&set, column, &matching)
+                        }
+                        Rows::Duplicates => stats::duplicate_rows(&set),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.filtering = None;
+                this.table.update(cx, |table, cx| {
+                    // Other results arrived meanwhile.
+                    if table.delegate().generation() != generation {
+                        return;
+                    }
+                    let any = rows.rows() > 0;
+                    table.delegate_mut().set_filtered(Some((label, rows)));
+                    table.refresh(cx);
+                    if any {
+                        table.scroll_to_row(0, cx);
+                    }
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Shows every row again.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.filtering = None;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().set_filtered(None);
+            table.refresh(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// What the grid is narrowed to and how many rows are left.
+    fn render_filter(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let delegate = self.table.read(cx).delegate();
+        let label = delegate.filter()?.to_string();
+        let (shown, all) = (delegate.shown().rows(), delegate.rows());
+        Some(
+            h_flex()
+                .h(px(32.))
+                .flex_shrink_0()
+                .gap(px(10.))
+                .pl_3()
+                .pr_1()
+                .border_b_1()
+                .border_color(color(theme::HAIRLINE))
+                .bg(color(theme::TOOLBAR))
+                .text_size(px(12.))
+                .child(
+                    gpui_kit::component::Icon::new(AppIcon::Filter)
+                        .size(px(13.))
+                        .text_color(color(theme::ACCENT)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex_shrink_0()
+                        .text_color(color(theme::TEXT_TERTIARY))
+                        .child(format!(
+                            "{} of {} rows",
+                            thousands(shown as u64),
+                            thousands(all as u64)
+                        )),
+                )
+                .child(
+                    chrome::pill_button("results-clear-filter", "Show all rows", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_filter(cx))),
+                ),
+        )
     }
 
     /// The selected cell and column, when they are within the results.
     fn selection(&self, cx: &gpui_kit::App) -> (Option<(usize, usize)>, Option<usize>) {
         let table = self.table.read(cx);
         let delegate = table.delegate();
-        let (rows, columns) = (delegate.rows(), delegate.results().columns().len());
+        let (rows, columns) = (delegate.shown().rows(), delegate.results().columns().len());
         match table.selection() {
             TableSelection::Cell(row, column) if row < rows && column < columns => {
                 (Some((row, column)), Some(column))
@@ -82,7 +205,7 @@ impl ResultsPane {
         let inspected =
             (self.inspected.as_ref().map(|(key, _)| *key) != inspected_key).then(|| {
                 cell.map(|(row, column)| {
-                    let value = delegate.results().cell(row, column).flatten();
+                    let value = delegate.shown().cell(row, column).flatten();
                     ((generation, row, column), value.map(inspect::inspect))
                 })
             });
@@ -92,7 +215,7 @@ impl ResultsPane {
             .filter(|_| !running)
             .map(|column| (generation, column));
         let stale = self.totals.as_ref().map(|(key, _)| *key) != totals_key;
-        let set = (stale && totals_key.is_some()).then(|| delegate.results().clone());
+        let set = (stale && totals_key.is_some()).then(|| delegate.shown().clone());
 
         if let Some(inspected) = inspected {
             self.inspected = inspected;
@@ -313,7 +436,7 @@ impl ResultsPane {
                                 let value = table
                                     .read(cx)
                                     .delegate()
-                                    .results()
+                                    .shown()
                                     .cell(row, column)
                                     .flatten()
                                     .map(str::to_string);
@@ -333,6 +456,7 @@ impl Render for ResultsPane {
         let (_, column) = self.selection(cx);
         v_flex()
             .size_full()
+            .children(self.render_filter(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -349,6 +473,35 @@ impl Render for ResultsPane {
                     }),
             )
             .children(column.map(|column| self.render_bar(column, cx)))
+    }
+}
+
+/// A filter in words: "status = paid", "amount from 10 to 20".
+fn describe(column: &str, matching: &Match) -> String {
+    match matching {
+        Match::Null => format!("{column} is NULL"),
+        Match::Value(value) if value.is_empty() => format!("{column} is empty"),
+        Match::Value(value) => {
+            let mut shown: String = value.chars().take(60).collect();
+            if value.chars().nth(60).is_some() {
+                shown.push('…');
+            }
+            format!("{column} = {shown}")
+        }
+        Match::Bool(value) => format!("{column} is {value}"),
+        Match::Range { start, end, .. } if start == end => {
+            format!("{column} = {}", format_number(*start))
+        }
+        Match::Range { start, end, closed } => format!(
+            "{column} from {} {} {}",
+            format_number(*start),
+            if *closed { "to" } else { "up to" },
+            format_number(*end)
+        ),
+        Match::Period { label, .. } => format!("{column} in {label}"),
+        Match::Blank => format!("{column} is blank"),
+        Match::Padded => format!("{column} has spaces at the ends"),
+        Match::Unlike(format) => format!("{column} is not {}", format.singular()),
     }
 }
 
@@ -414,6 +567,70 @@ mod tests {
             Some((_, TotalsState::Ready(totals))) => totals.numbers.map(|n| n.sum),
             _ => None,
         })
+    }
+
+    #[gpui::test]
+    fn a_filter_narrows_the_grid_its_totals_and_the_inspector(cx: &mut TestAppContext) {
+        let (_, pane) = open(cx);
+        show(
+            cx,
+            &pane,
+            &[
+                [Some("a"), Some("10")],
+                [Some("b"), Some("5")],
+                [Some("a"), Some("1")],
+            ],
+        );
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.filter(
+                    Rows::Matching {
+                        column: "doc".into(),
+                        matching: Match::Value("a".into()),
+                    },
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let delegate = pane.read(cx).table.read(cx).delegate();
+            assert_eq!(delegate.filter(), Some("doc = a"));
+            assert_eq!((delegate.shown().rows(), delegate.rows()), (2, 3));
+        });
+
+        // The second row shown is the third of the results.
+        select(cx, &pane, 1, 1);
+        cx.update(|cx| {
+            let (_, value) = pane.read(cx).inspected.clone().unwrap();
+            assert_eq!(value.unwrap().text, "1");
+        });
+        assert_eq!(sum(cx, &pane), Some(11.0));
+
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.clear_filter(cx)));
+        select(cx, &pane, 2, 1);
+        assert_eq!(sum(cx, &pane), Some(16.0));
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).table.read(cx).delegate().filter(), None);
+        });
+    }
+
+    #[test]
+    fn says_a_filter_in_words() {
+        assert_eq!(describe("c", &Match::Null), "c is NULL");
+        assert_eq!(describe("c", &Match::Value(String::new())), "c is empty");
+        assert_eq!(describe("c", &Match::Value("paid".into())), "c = paid");
+        assert_eq!(
+            describe(
+                "c",
+                &Match::Range {
+                    start: 10.0,
+                    end: 20.5,
+                    closed: false
+                }
+            ),
+            "c from 10 up to 20.5"
+        );
     }
 
     #[gpui::test]

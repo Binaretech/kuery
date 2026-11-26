@@ -4,7 +4,7 @@ use crate::{
     chrome,
     completion::{SharedCatalog, SqlCompletions},
     file_jobs,
-    profile_view::ProfilePanel,
+    profile_view::{ProfileEvent, ProfilePanel},
     query_tab::{CancelQuery, FormatSql, RunQuery},
     results::ResultsDelegate,
     results_pane::ResultsPane,
@@ -27,15 +27,40 @@ use gpui_kit::{
 use kuery_core::{
     catalog::{TableKind, TableRef},
     completion::{Catalog, Column, Table},
-    format, script,
+    format,
+    result_set::ResultSet,
+    script,
 };
-use kuery_files::{ColumnSchema, PreviewRequest, PreviewScope, SqlFile};
-use std::{rc::Rc, time::Instant};
+use kuery_files::{ColumnSchema, PreviewRequest, PreviewScope, SqlFile, SqlSource, SqlTable};
+use std::{collections::HashSet, rc::Rc, time::Instant};
 
+/// A table a File SQL tab reads: a data file, or a result added from a
+/// query tab.
 #[derive(Clone)]
 pub struct Source {
-    pub file: SqlFile,
+    pub sql: SqlSource,
     pub columns: Vec<ColumnSchema>,
+    /// What its chip says on hover: the file, or where the result came from.
+    pub origin: SharedString,
+}
+
+impl Source {
+    pub fn name(&self) -> &str {
+        self.sql.name()
+    }
+
+    /// `results` as a table named after `hint`, renamed if `taken` already
+    /// has one by that name.
+    pub fn result(hint: &str, origin: &str, results: ResultSet, taken: &[Source]) -> Self {
+        let mut used = taken.iter().map(|s| s.name().to_string()).collect();
+        let name = table_name(hint, "result", &mut used);
+        let rows = thousands(results.rows() as u64);
+        Source {
+            columns: kuery_files::result_columns(&results),
+            origin: format!("{origin} · {rows} rows, as they were when added").into(),
+            sql: SqlSource::Table(SqlTable { name, results }),
+        }
+    }
 }
 
 /// What Query files queries: every file with a preview, the one at `active`
@@ -66,7 +91,7 @@ pub fn name_sources(
         Vec<ColumnSchema>,
     )>,
 ) -> Vec<Source> {
-    let mut used = std::collections::HashSet::new();
+    let mut used = HashSet::new();
     sources
         .into_iter()
         .map(|(source, fingerprint, columns)| {
@@ -75,42 +100,77 @@ pub fn name_sources(
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy();
-            let mut base: String = stem
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        c.to_ascii_lowercase()
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            if base.is_empty() {
-                base = "file".into();
-            }
-            if base.as_bytes()[0].is_ascii_digit() {
-                base = format!("file_{base}");
-            }
-            let mut name = base.clone();
-            let mut suffix = 2;
-            while !used.insert(name.clone()) {
-                name = format!("{base}_{suffix}");
-                suffix += 1;
-            }
+            let name = table_name(&stem, "file", &mut used);
+            // The path and options are fixed when the tab opens.
+            let origin = format!("{} · fixed when this tab opened", source.path.display()).into();
             Source {
-                file: SqlFile {
+                sql: SqlSource::File(SqlFile {
                     name,
                     source,
                     fingerprint,
-                },
+                }),
                 columns,
+                origin,
             }
+        })
+        .collect()
+}
+
+/// `text` as a table name SQL reads unquoted: lowercase letters, digits
+/// and `_`, starting with `fallback` when empty or a digit, with a suffix
+/// when `used` has it already.
+fn table_name(text: &str, fallback: &str, used: &mut HashSet<String>) -> String {
+    let mut base: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if base.is_empty() {
+        base = fallback.into();
+    }
+    if base.as_bytes()[0].is_ascii_digit() {
+        base = format!("{fallback}_{base}");
+    }
+    let mut name = base.clone();
+    let mut suffix = 2;
+    while !used.insert(name.clone()) {
+        name = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    name
+}
+
+/// What completion knows of `sources`: each table and its columns.
+fn catalog_tables(sources: &[Source]) -> Vec<Table> {
+    sources
+        .iter()
+        .map(|s| Table {
+            table: TableRef {
+                schema: String::new(),
+                name: s.name().to_string(),
+            },
+            kind: TableKind::Table,
+            columns: s
+                .columns
+                .iter()
+                .map(|c| Column {
+                    name: c.name.clone(),
+                    data_type: c.native_type.clone(),
+                })
+                .collect(),
         })
         .collect()
 }
 
 pub struct FileQueryTab {
     sources: Vec<Source>,
+    /// What completion offers: `sources`' tables, kept in step with them.
+    catalog: SharedCatalog,
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
     results: Entity<ResultsPane>,
@@ -127,28 +187,11 @@ impl FileQueryTab {
     pub fn new(sources: Vec<Source>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sql = format!(
             "-- Queries read entire files; the grid shows up to 10,000 result rows.\nSELECT * FROM \"{}\" LIMIT 100;\n",
-            sources[0].file.name
+            sources[0].name()
         );
         let catalog: SharedCatalog = Rc::new(std::cell::RefCell::new(Catalog {
             search_path: vec![String::new()],
-            tables: sources
-                .iter()
-                .map(|s| Table {
-                    table: TableRef {
-                        schema: String::new(),
-                        name: s.file.name.clone(),
-                    },
-                    kind: TableKind::Table,
-                    columns: s
-                        .columns
-                        .iter()
-                        .map(|c| Column {
-                            name: c.name.clone(),
-                            data_type: c.native_type.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            tables: catalog_tables(&sources),
             ..Default::default()
         }));
         let editor = cx.new(|cx| {
@@ -156,18 +199,30 @@ impl FileQueryTab {
                 .language("sql")
                 .line_number(true)
                 .default_value(sql);
-            editor.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(catalog)));
+            editor.lsp_mut().completion_provider =
+                Some(Rc::new(SqlCompletions::new(catalog.clone())));
             editor
         });
         let table = cx.new(|cx| {
             TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
         });
+        let profile = cx.new(|_| ProfilePanel::default());
+        // A mark picked in the Profile view shows its rows in the grid.
+        cx.subscribe(&profile, |this, _, event: &ProfileEvent, cx| {
+            let ProfileEvent::ShowRows(rows) = event;
+            this.results
+                .update(cx, |results, cx| results.filter(rows.clone(), cx));
+            this.show_profile = false;
+            cx.notify();
+        })
+        .detach();
         Self {
             sources,
+            catalog,
             editor,
             results: cx.new(|cx| ResultsPane::new(table.clone(), cx)),
             table,
-            profile: cx.new(|_| ProfilePanel::default()),
+            profile,
             show_profile: false,
             status: "Ready · full file inputs · read only".into(),
             error: None,
@@ -179,6 +234,24 @@ impl FileQueryTab {
     }
     pub fn title(&self) -> SharedString {
         "File SQL".into()
+    }
+
+    /// Adds `results` as a table named after `hint`, for the queries run
+    /// from now on. Returns the name it got.
+    pub fn add_result(
+        &mut self,
+        hint: &str,
+        origin: &str,
+        results: ResultSet,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let source = Source::result(hint, origin, results, &self.sources);
+        let name = source.name().to_string();
+        self.sources.push(source);
+        self.catalog.borrow_mut().tables = catalog_tables(&self.sources);
+        self.status = format!("Added the table {name}");
+        cx.notify();
+        name
     }
     pub fn status(&self) -> &str {
         &self.status
@@ -211,10 +284,10 @@ impl FileQueryTab {
             table.refresh(cx);
         });
         self.profile.update(cx, |p, cx| p.clear(cx));
-        let files = self
+        let sources = self
             .sources
             .iter()
-            .map(|s| s.file.clone())
+            .map(|s| s.sql.clone())
             .collect::<Vec<_>>();
         self.task = Some(cx.spawn(async move |this, cx| {
             let permit = file_jobs::limiter().acquire().await;
@@ -228,7 +301,7 @@ impl FileQueryTab {
             let result = cx
                 .background_spawn(async move {
                     let _permit = permit;
-                    kuery_files::query_files(&files, &sql, PreviewRequest::default())
+                    kuery_files::query_sources(&sources, &sql, PreviewRequest::default())
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -355,12 +428,11 @@ impl FileQueryTab {
             .child(chrome::toolbar_divider())
             .child(h_flex().min_w_0().gap(px(6.)).overflow_hidden().children(
                 self.sources.iter().enumerate().map(|(i, source)| {
-                    // The path and options are fixed when the tab opens.
-                    let path: SharedString = format!(
-                        "{} · fixed when this tab opened",
-                        source.file.source.path.display()
-                    )
-                    .into();
+                    let origin = source.origin.clone();
+                    let icon = match source.sql {
+                        SqlSource::File(_) => AppIcon::Table,
+                        SqlSource::Table(_) => AppIcon::Database,
+                    };
                     h_flex()
                         .id(("file-sql-source", i))
                         .h(px(24.))
@@ -371,9 +443,9 @@ impl FileQueryTab {
                         .bg(color(theme::CONTROL))
                         .text_size(px(12.))
                         .text_color(color(theme::TEXT_SECONDARY))
-                        .child(Icon::new(AppIcon::Table).size(px(12.)))
-                        .child(source.file.name.clone())
-                        .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+                        .child(Icon::new(icon).size(px(12.)))
+                        .child(SharedString::from(source.name().to_string()))
+                        .tooltip(move |window, cx| Tooltip::new(origin.clone()).build(window, cx))
                 }),
             ))
     }
@@ -475,5 +547,42 @@ impl Render for FileQueryTab {
             } else {
                 self.results.clone().into_any_element()
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kuery_core::result_set::{BatchBuilder, ColumnKind};
+
+    use super::*;
+
+    fn results() -> ResultSet {
+        let mut set = ResultSet::new(vec!["id".into(), "id".into()]);
+        set.set_kinds(vec![ColumnKind::Integer, ColumnKind::Integer]);
+        let mut builder = BatchBuilder::new(2, 1);
+        builder.push_row(|_| Some("1"));
+        set.push(builder.finish());
+        set
+    }
+
+    #[test]
+    fn a_result_is_named_after_its_tab() {
+        let source = Source::result("Query 1", "Query 1 on local-dev", results(), &[]);
+        assert_eq!(source.name(), "query_1");
+        assert_eq!(
+            source.origin.as_ref(),
+            "Query 1 on local-dev · 1 rows, as they were when added"
+        );
+        let names: Vec<_> = source.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "id_2"]);
+    }
+
+    #[test]
+    fn a_result_takes_a_name_no_other_table_has() {
+        let first = Source::result("monthly_sales", "", results(), &[]);
+        let second = Source::result("monthly_sales", "", results(), std::slice::from_ref(&first));
+        assert_eq!(second.name(), "monthly_sales_2");
+        let numbered = Source::result("2026 report", "", results(), &[]);
+        assert_eq!(numbered.name(), "result_2026_report");
     }
 }

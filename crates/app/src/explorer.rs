@@ -681,6 +681,40 @@ impl Explorer {
         true
     }
 
+    /// Tears down the named connection (including its SSH tunnel, if any) and
+    /// opens a fresh one in its place.
+    pub fn reconnect_by_name(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(index) = self.connections.iter().position(|n| n.spec.name == name) {
+            self.reconnect(index, cx);
+        }
+    }
+
+    /// Closes the sidebar's connection and opens a fresh one (including a new
+    /// SSH tunnel, if configured).
+    fn reconnect(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(node) = self.connections.get_mut(index) {
+            if matches!(node.state, ConnectionState::Connecting) {
+                return;
+            }
+            match &node.state {
+                ConnectionState::Ready { db, .. } => db.revoke_writes(),
+                ConnectionState::RedisReady { db, .. } => db.revoke_writes(),
+                ConnectionState::DocumentReady { db } => db.revoke_writes(),
+                ConnectionState::Idle
+                | ConnectionState::Connecting
+                | ConnectionState::Failed(_) => {}
+            }
+            node.state = ConnectionState::Idle;
+            let id = node.spec.id.clone();
+            self.redis_keys.retain(|(other, _), _| *other != id);
+            self.documents.retain(|(other, _), _| *other != id);
+            self.expanded.insert(index.to_string());
+        } else {
+            return;
+        }
+        self.connect(index, cx);
+    }
+
     fn load_catalog(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(db) = self.db(index) else { return };
         let spec = self.connections[index].spec.clone();
@@ -1258,6 +1292,12 @@ impl Explorer {
                         &this,
                         move |this, _, cx| this.load_keyspace(index, cx),
                     ))
+                    .item(item_icon(
+                        "Reconnect",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.reconnect(index, cx),
+                    ))
                     .item(item("Disconnect", &this, move |this, _, cx| {
                         this.disconnect(index, cx)
                     }))
@@ -1282,6 +1322,12 @@ impl Explorer {
                         &this,
                         move |this, _, cx| this.refresh_documents(index, cx),
                     ))
+                    .item(item_icon(
+                        "Reconnect",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.reconnect(index, cx),
+                    ))
                     .item(item("Disconnect", &this, move |this, _, cx| {
                         this.disconnect(index, cx)
                     }))
@@ -1305,6 +1351,12 @@ impl Explorer {
                         AppIcon::Reload,
                         &this,
                         move |this, _, cx| this.load_catalog(index, cx),
+                    ))
+                    .item(item_icon(
+                        "Reconnect",
+                        AppIcon::Reload,
+                        &this,
+                        move |this, _, cx| this.reconnect(index, cx),
                     ))
                     .item(item("Disconnect", &this, move |this, _, cx| {
                         this.disconnect(index, cx)

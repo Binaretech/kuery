@@ -119,6 +119,15 @@ impl ConsoleTab {
         &self.db
     }
 
+    /// Replaces the tab's connection after a reconnect.
+    pub fn set_db(&mut self, db: RedisDb, cx: &mut Context<Self>) {
+        self.db = db;
+        if !self.db.allows_writes() {
+            self.writing = false;
+        }
+        cx.notify();
+    }
+
     pub fn database(&self) -> i64 {
         self.database
     }

@@ -4,34 +4,45 @@
 //! points are painted on a canvas); the options around them live in
 //! `profile_view`.
 
+use std::rc::Rc;
+
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Bounds, ContentMask, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathBuilder, Pixels, Point, SharedString, StatefulInteractiveElement as _,
-    Styled as _, canvas, div, fill, point, px, relative, size,
+    AnyElement, App, Bounds, ContentMask, Div, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, PathBuilder, Pixels, Point, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, fill, point, px, relative,
+    size,
 };
 use kuery_core::compare::{Breakdown, Correlation, CrossTab, GroupTable, Key, Series};
-use kuery_core::stats::{Bin, CategoricalSummary, NumericSummary, TemporalSummary, TextSummary};
+use kuery_core::stats::{
+    Bin, CategoricalSummary, Match, NumericSummary, TemporalSummary, TextSummary,
+};
 
 use crate::assets::AppIcon;
 use crate::theme::{self, color};
 use crate::ui::thousands;
 
-pub const CHART_HEIGHT: f32 = 150.;
+pub const CHART_HEIGHT: f32 = 180.;
 
 /// Series colors for stacked charts; the last is for "Other".
 const PALETTE: [u32; 9] = [
     0x2f86ff, 0x32d74b, 0xffb340, 0xbf5af2, 0x64d2ff, 0xff6482, 0xac8e68, 0x5e5ce6, 0x5a5a61,
 ];
 
-/// One bar: its axis label, its height, and its tooltip.
+/// What a click on a mark does with the values it stands for (the results
+/// grid shows their rows).
+pub type Pick = Rc<dyn Fn(Match, &mut Window, &mut App)>;
+
+/// One bar: its axis label, its height, its tooltip and the values it
+/// stands for, when a click can pick them.
 pub struct Bar {
     pub label: String,
     /// `None` is a gap: a period without values.
     pub value: Option<f64>,
     pub tip: String,
+    pub picks: Option<Match>,
 }
 
 impl Bar {
@@ -40,7 +51,32 @@ impl Bar {
             tip: format!("{label} · {}", thousands(count as u64)),
             label,
             value: Some(count as f64),
+            picks: None,
         }
+    }
+
+    fn picks(mut self, matching: Option<Match>) -> Self {
+        self.picks = matching;
+        self
+    }
+}
+
+/// Makes `mark` pick `matching` on a click, and say so in its tooltip.
+fn pickable(
+    mark: Stateful<Div>,
+    tip: String,
+    matching: Option<Match>,
+    on_pick: &Option<Pick>,
+) -> Stateful<Div> {
+    match (matching, on_pick) {
+        (Some(matching), Some(on_pick)) => {
+            let on_pick = on_pick.clone();
+            let tip = format!("{tip} · click to see the rows");
+            mark.cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .on_click(move |_, window, cx| on_pick(matching.clone(), window, cx))
+        }
+        _ => mark.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
     }
 }
 
@@ -108,6 +144,7 @@ pub fn bars(
     height: f32,
     log_scale: bool,
     mono: SharedString,
+    on_pick: Option<Pick>,
 ) -> impl IntoElement {
     let scale = |value: f64| {
         let value = value.max(0.0);
@@ -138,8 +175,7 @@ pub fn bars(
                 .gap(px(gap))
                 .children(bars.into_iter().enumerate().map(|(index, bar)| {
                     let share = (scale(bar.value.unwrap_or(0.0)) / tallest) as f32;
-                    let tip = bar.tip;
-                    div()
+                    let mark = div()
                         .id((id, index))
                         .flex_1()
                         .h_full()
@@ -156,8 +192,8 @@ pub fn bars(
                                 .rounded_t(px(2.))
                                 .bg(color(theme::ACCENT).opacity(0.7)),
                         )
-                        .hover(|s| s.bg(color(theme::ACTIVE)))
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .hover(|s| s.bg(color(theme::ACTIVE)));
+                    pickable(mark, bar.tip, bar.picks, &on_pick)
                 }))
                 .child(baseline()),
         )
@@ -181,6 +217,7 @@ pub fn line_chart(
     bars: Vec<Bar>,
     height: f32,
     mono: SharedString,
+    on_pick: Option<Pick>,
 ) -> impl IntoElement {
     let values: Vec<Option<f64>> = bars.iter().map(|bar| bar.value).collect();
     let low = values.iter().flatten().copied().fold(0.0, f64::min);
@@ -250,13 +287,12 @@ pub fn line_chart(
                 .h(px(height))
                 .child(plot)
                 .children(bars.into_iter().enumerate().map(|(index, bar)| {
-                    let tip = bar.tip;
-                    div()
+                    let mark = div()
                         .id((id, index))
                         .flex_1()
                         .h_full()
-                        .hover(|s| s.bg(color(theme::ACTIVE).opacity(0.6)))
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .hover(|s| s.bg(color(theme::ACTIVE).opacity(0.6)));
+                    pickable(mark, bar.tip, bar.picks, &on_pick)
                 }))
                 .child(baseline()),
         )
@@ -378,15 +414,12 @@ pub fn bin_label(bin: &Bin, integers: bool) -> String {
     }
 }
 
-fn stat_row(label: &'static str, value: String, mono: SharedString) -> impl IntoElement {
-    h_flex()
-        .justify_between()
-        .gap_4()
-        .child(div().text_color(color(theme::TEXT_TERTIARY)).child(label))
-        .child(div().font_family(mono).child(value))
-}
-
-pub fn numeric(numbers: &NumericSummary, log_scale: bool, mono: SharedString) -> AnyElement {
+pub fn numeric(
+    numbers: &NumericSummary,
+    log_scale: bool,
+    mono: SharedString,
+    on_pick: Option<Pick>,
+) -> AnyElement {
     let integers = numbers
         .histogram
         .iter()
@@ -394,55 +427,165 @@ pub fn numeric(numbers: &NumericSummary, log_scale: bool, mono: SharedString) ->
     let histogram = numbers
         .histogram
         .iter()
-        .map(|bin| Bar::count(bin_label(bin, integers), bin.count))
+        .enumerate()
+        .map(|(index, bin)| {
+            Bar::count(bin_label(bin, integers), bin.count)
+                .picks(Match::bin(&numbers.histogram, index))
+        })
         .collect();
-    let row = |label, value| stat_row(label, format_number(value), mono.clone());
-    let mut chart = panel().child(bars(
+    let chart = panel().child(bars(
         "profile-bin",
         histogram,
         CHART_HEIGHT,
         log_scale,
         mono.clone(),
+        on_pick,
     ));
-    if !integers {
-        chart = chart.child(
-            h_flex()
-                .justify_between()
-                .font_family(mono.clone())
-                .text_size(px(11.))
-                .text_color(color(theme::TEXT_QUIET))
-                .children(numbers.histogram.first().map(|b| format_number(b.start)))
-                .children(numbers.histogram.last().map(|b| format_number(b.end))),
-        );
+    chart.children(quartiles(numbers)).into_any_element()
+}
+
+/// Under the histogram and on its scale: the middle half of the values as a
+/// box, the median as a line in it and the mean as a dot, with a legend made
+/// of the same marks.
+fn quartiles(numbers: &NumericSummary) -> Option<impl IntoElement + use<>> {
+    let (start, end) = (
+        numbers.histogram.first()?.start,
+        numbers.histogram.last()?.end,
+    );
+    if end <= start {
+        return None;
     }
-    v_flex()
-        .gap(px(14.))
-        .child(chart)
-        .child(
-            div()
-                .grid()
-                .grid_cols(3)
-                .gap_x(px(28.))
-                .gap_y(px(6.))
-                .text_size(px(12.5))
-                .child(row("min", numbers.min))
-                .child(row("mean", numbers.mean))
-                .child(row("max", numbers.max))
-                .child(row("p25", numbers.p25))
-                .child(row("median", numbers.p50))
-                .child(row("p75", numbers.p75))
-                .child(row("p90", numbers.p90))
-                .child(row("p99", numbers.p99))
-                .child(row("std dev", numbers.stddev)),
-        )
+    let at = |value: f64| (((value - start) / (end - start)).clamp(0.0, 1.0)) as f32;
+    let (left, right) = (at(numbers.p25), at(numbers.p75));
+    let box_tone = color(theme::ACCENT).opacity(0.3);
+    let key =
+        |mark: Div, text: &'static str| h_flex().gap(px(6.)).child(mark).child(div().child(text));
+    Some(
+        v_flex()
+            .gap(px(8.))
+            .child(
+                div()
+                    .relative()
+                    .h(px(12.))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(5.))
+                            .left_0()
+                            .right_0()
+                            .h(px(2.))
+                            .bg(color(theme::ACTIVE_STRONG)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(left))
+                            .w(relative((right - left).max(0.004)))
+                            .rounded(px(2.))
+                            .bg(box_tone),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(at(numbers.p50)))
+                            .w(px(2.))
+                            .bg(color(theme::TEXT)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(3.))
+                            .left(relative(at(numbers.mean)))
+                            .ml(px(-3.))
+                            .size(px(6.))
+                            .rounded(px(3.))
+                            .bg(color(theme::AMBER)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(16.))
+                    .text_size(px(11.5))
+                    .text_color(color(theme::TEXT_TERTIARY))
+                    .child(key(
+                        div().w(px(12.)).h(px(10.)).rounded(px(2.)).bg(box_tone),
+                        "Middle half",
+                    ))
+                    .child(key(
+                        div().w(px(2.)).h(px(10.)).bg(color(theme::TEXT)),
+                        "Median",
+                    ))
+                    .child(key(
+                        div().size(px(6.)).rounded(px(3.)).bg(color(theme::AMBER)),
+                        "Mean",
+                    )),
+            ),
+    )
+}
+
+/// The figures of a numeric column, as the distribution reads: from the
+/// smallest to the largest on the first line, the rest under it.
+pub fn numeric_figures(numbers: &NumericSummary, mono: SharedString) -> AnyElement {
+    let figure = |label: &'static str, value: String, strong: bool| {
+        v_flex()
+            .gap(px(2.))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(color(theme::TEXT_TERTIARY))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(13.))
+                    .when(strong, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .when(!strong, |d| d.text_color(color(theme::TEXT_SECONDARY)))
+                    .child(value),
+            )
+    };
+    let number = |label, value: f64| figure(label, format_number(value), false);
+    div()
+        .grid()
+        .grid_cols(5)
+        .gap_x(px(24.))
+        .gap_y(px(12.))
+        .child(number("Min", numbers.min))
+        .child(number("25%", numbers.p25))
+        .child(figure("Median", format_number(numbers.p50), true))
+        .child(number("75%", numbers.p75))
+        .child(number("Max", numbers.max))
+        .child(number("Mean", numbers.mean))
+        .child(number("Std dev", numbers.stddev))
+        .child(number("90%", numbers.p90))
+        .child(number("99%", numbers.p99))
+        .child(figure(
+            "Outliers",
+            thousands(numbers.outliers as u64),
+            false,
+        ))
         .into_any_element()
 }
 
-pub fn temporal(timeline: &TemporalSummary, line: bool, mono: SharedString) -> AnyElement {
+pub fn temporal(
+    timeline: &TemporalSummary,
+    line: bool,
+    mono: SharedString,
+    on_pick: Option<Pick>,
+) -> AnyElement {
     let buckets = timeline
         .buckets
         .iter()
-        .map(|(label, count)| Bar::count(label.clone(), *count))
+        .map(|(label, count)| {
+            Bar::count(label.clone(), *count).picks((*count > 0).then(|| Match::Period {
+                granularity: timeline.granularity,
+                label: label.clone(),
+            }))
+        })
         .collect();
     panel()
         .map(|panel| {
@@ -452,6 +595,7 @@ pub fn temporal(timeline: &TemporalSummary, line: bool, mono: SharedString) -> A
                     buckets,
                     CHART_HEIGHT,
                     mono.clone(),
+                    on_pick,
                 ))
             } else {
                 panel.child(bars(
@@ -460,6 +604,7 @@ pub fn temporal(timeline: &TemporalSummary, line: bool, mono: SharedString) -> A
                     CHART_HEIGHT,
                     false,
                     mono.clone(),
+                    on_pick,
                 ))
             }
         })
@@ -484,12 +629,19 @@ fn value_bars(
     top: &[(Option<String>, usize)],
     total: usize,
     mono: SharedString,
+    on_pick: Option<Pick>,
 ) -> impl IntoElement {
     let largest = top.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1) as f32;
     v_flex()
         .gap(px(4.))
         .text_size(px(12.5))
-        .children(top.iter().map(|(value, count)| {
+        .children(top.iter().enumerate().map(|(index, (value, count))| {
+            let picks = on_pick.clone().map(|on_pick| {
+                let matching = value.clone().map_or(Match::Null, Match::Value);
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    on_pick(matching.clone(), window, cx)
+                }
+            });
             let quiet = value.as_ref().is_none_or(|v| v.is_empty());
             let text = match value {
                 None => "NULL".to_string(),
@@ -497,12 +649,21 @@ fn value_bars(
                 Some(v) => v.clone(),
             };
             h_flex()
+                .id(("profile-value", index))
                 .relative()
                 .h(px(26.))
                 .px(px(10.))
                 .gap_3()
                 .rounded(px(5.))
                 .overflow_hidden()
+                .when_some(picks, |row, picks| {
+                    row.cursor_pointer()
+                        .hover(|s| s.bg(color(theme::ACTIVE)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Click to see the rows").build(window, cx)
+                        })
+                        .on_click(picks)
+                })
                 .child(
                     div()
                         .absolute()
@@ -536,9 +697,13 @@ fn value_bars(
         }))
 }
 
-pub fn categorical(categories: &CategoricalSummary, mono: SharedString) -> AnyElement {
+pub fn categorical(
+    categories: &CategoricalSummary,
+    mono: SharedString,
+    on_pick: Option<Pick>,
+) -> AnyElement {
     panel()
-        .child(value_bars(&categories.top, categories.total, mono))
+        .child(value_bars(&categories.top, categories.total, mono, on_pick))
         .when(categories.others > 0, |panel| {
             panel.child(footnote(format!(
                 "+ {} in other values · {:.1}%",
@@ -549,7 +714,7 @@ pub fn categorical(categories: &CategoricalSummary, mono: SharedString) -> AnyEl
         .into_any_element()
 }
 
-pub fn text(summary: &TextSummary, mono: SharedString) -> AnyElement {
+pub fn text(summary: &TextSummary, mono: SharedString, on_pick: Option<Pick>) -> AnyElement {
     let total: usize = summary.lengths.iter().map(|b| b.count).sum();
     let lengths = summary
         .lengths
@@ -577,37 +742,53 @@ pub fn text(summary: &TextSummary, mono: SharedString) -> AnyElement {
                         summary.min_length, summary.max_length, summary.mean_length
                     ),
                 ))
-                .child(bars("profile-length", lengths, 80., false, mono.clone())),
+                .child(bars(
+                    "profile-length",
+                    lengths,
+                    80.,
+                    false,
+                    mono.clone(),
+                    None,
+                )),
         )
         .child(
             panel()
                 .child(heading("Most frequent", ""))
-                .child(value_bars(&top, total, mono)),
+                .child(value_bars(&top, total, mono, on_pick)),
         )
         .into_any_element()
 }
 
-pub fn boolean(trues: usize, falses: usize, nulls: usize) -> AnyElement {
+pub fn boolean(trues: usize, falses: usize, nulls: usize, on_pick: Option<Pick>) -> AnyElement {
     let total = (trues + falses + nulls).max(1);
     let parts = [
         ("true", trues, color(theme::ACCENT)),
         ("false", falses, color(0x5a5a61)),
         ("NULL", nulls, color(theme::HAIRLINE)),
     ];
+    let picks = [Match::Bool(true), Match::Bool(false), Match::Null];
     panel()
         .child(
             h_flex()
                 .h(px(28.))
                 .rounded(px(6.))
                 .overflow_hidden()
-                .children(parts.iter().filter(|(_, count, _)| *count > 0).map(
-                    |(_, count, tone)| {
-                        div()
-                            .h_full()
-                            .w(relative(*count as f32 / total as f32))
-                            .bg(*tone)
-                    },
-                )),
+                .children(
+                    parts
+                        .iter()
+                        .zip(picks)
+                        .enumerate()
+                        .filter(|(_, ((_, count, _), _))| *count > 0)
+                        .map(|(index, ((label, count, tone), matching))| {
+                            let mark = div()
+                                .id(("profile-boolean", index))
+                                .h_full()
+                                .w(relative(*count as f32 / total as f32))
+                                .bg(*tone);
+                            let tip = format!("{label} · {}", thousands(*count as u64));
+                            pickable(mark, tip, Some(matching), &on_pick)
+                        }),
+                ),
         )
         .child(legend(parts.into_iter().map(|(label, count, tone)| {
             (
@@ -666,7 +847,7 @@ pub fn key(min: &str, max: &str, mono: SharedString) -> AnyElement {
 }
 
 /// How strong an association of 0 to 1 is, in words.
-fn strength(value: f64) -> &'static str {
+pub fn strength(value: f64) -> &'static str {
     match value.abs() {
         v if v < 0.1 => "negligible",
         v if v < 0.3 => "weak",
@@ -966,6 +1147,7 @@ pub fn series(series: &Series, measure: &str, line: bool, mono: SharedString) ->
             },
             label: point.label.clone(),
             value: point.value,
+            picks: None,
         })
         .collect();
     let negative = series
@@ -982,9 +1164,22 @@ pub fn series(series: &Series, measure: &str, line: bool, mono: SharedString) ->
         ))
         .map(|panel| {
             if line {
-                panel.child(line_chart("profile-series", points, CHART_HEIGHT, mono))
+                panel.child(line_chart(
+                    "profile-series",
+                    points,
+                    CHART_HEIGHT,
+                    mono,
+                    None,
+                ))
             } else {
-                panel.child(bars("profile-series", points, CHART_HEIGHT, false, mono))
+                panel.child(bars(
+                    "profile-series",
+                    points,
+                    CHART_HEIGHT,
+                    false,
+                    mono,
+                    None,
+                ))
             }
         })
         .when(negative && !line, |panel| {

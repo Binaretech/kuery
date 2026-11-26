@@ -28,6 +28,7 @@ use gpui_kit::{
 };
 use kuery_core::analysis::{self, StatementKind};
 use kuery_core::export::{self, Format};
+use kuery_core::result_set::ResultSet;
 use kuery_core::session::{Access, Event, QueryError, RunOptions, StatementImpact};
 use kuery_core::{format, plan, script};
 
@@ -37,11 +38,11 @@ use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
 use crate::chrome;
 use crate::completion::{SharedCatalog, SqlCompletions};
-use crate::connection::{Db, WriteKind};
+use crate::connection::{Db, ReconnectConnection, WriteKind};
 use crate::history::HistoryEntry;
 use crate::plan_view::{PlanEvent, PlanPanel};
 use crate::profile_charts;
-use crate::profile_view::ProfilePanel;
+use crate::profile_view::{ProfileEvent, ProfilePanel};
 use crate::project::with_connection_header;
 use crate::results::ResultsDelegate;
 use crate::results_pane::ResultsPane;
@@ -63,6 +64,7 @@ actions!(
         UseWrite,
         UseFullWrite,
         ExportResults,
+        QueryResultsInFileSql,
         PreviewImpact,
         CommitTransaction,
         RollbackTransaction,
@@ -198,6 +200,16 @@ pub struct QueryRan(pub HistoryEntry);
 /// Emitted after the query is written to a file.
 pub struct QuerySaved(pub PathBuf);
 
+/// Asks for the results to be queried in File SQL, next to data files and
+/// other results: a copy of the rows as they are now.
+pub struct ResultsToFileSql {
+    /// What the table is named after: the tab's title.
+    pub name: String,
+    /// Where the rows came from, for the table's tooltip.
+    pub origin: String,
+    pub results: ResultSet,
+}
+
 pub struct QueryTab {
     db: Db,
     /// SQL of the run in progress or the last one.
@@ -216,6 +228,8 @@ pub struct QueryTab {
     /// The grid with its totals and cell inspector.
     results: Entity<ResultsPane>,
     run: RunState,
+    /// Whether the last run failed because the connection was lost.
+    connection_lost: bool,
     run_task: Option<Task<()>>,
     editor_height: Pixels,
     panel_collapsed: bool,
@@ -271,6 +285,16 @@ impl QueryTab {
             TableState::new(ResultsDelegate::default(), window, cx).cell_selectable(true)
         });
         let results = cx.new(|cx| ResultsPane::new(table.clone(), cx));
+        let profile = cx.new(|_| ProfilePanel::default());
+        // A mark picked in the Profile tab shows its rows in the grid.
+        cx.subscribe(&profile, |this, _, event: &ProfileEvent, cx| {
+            let ProfileEvent::ShowRows(rows) = event;
+            this.results
+                .update(cx, |results, cx| results.filter(rows.clone(), cx));
+            this.panel_tab = PanelTab::Results;
+            cx.notify();
+        })
+        .detach();
         let plan = cx.new(|_| PlanPanel::default());
         cx.subscribe_in(
             &plan,
@@ -299,13 +323,14 @@ impl QueryTab {
             table,
             results,
             run: RunState::Idle,
+            connection_lost: false,
             run_task: None,
             editor_height: DEFAULT_EDITOR_HEIGHT,
             panel_collapsed: false,
             panel_tab: PanelTab::Results,
             output: Vec::new(),
             write: WriteState::Off,
-            profile: cx.new(|_| ProfilePanel::default()),
+            profile,
             plan,
             plan_task: None,
             run_writes: false,
@@ -649,6 +674,7 @@ impl QueryTab {
         self.run = RunState::Running {
             started: Instant::now(),
         };
+        self.connection_lost = false;
         self.run_writes = writes;
         // A run brings its results into view.
         self.panel_collapsed = false;
@@ -743,6 +769,7 @@ impl QueryTab {
             }
             Event::Failed(error) => {
                 self.finish_table(cx);
+                self.connection_lost = matches!(error, QueryError::Connection(_));
                 let mut message = describe_error(error);
                 if let WriteState::On(write) = &mut self.write {
                     write.last_run = Instant::now();
@@ -952,6 +979,18 @@ impl QueryTab {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Replaces the tab's connection after a reconnect, resetting write mode
+    /// (the previous session and any open transaction belonged to the old
+    /// connection) and reloading completions.
+    pub fn set_db(&mut self, db: Db, cx: &mut Context<Self>) {
+        self.db = db;
+        self.write = WriteState::Off;
+        self.idle_watch = None;
+        self.connection_lost = false;
+        self.load_completion_catalog(cx);
+        cx.notify();
     }
 
     pub fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1271,6 +1310,29 @@ impl QueryTab {
                 }
             }
         }));
+    }
+
+    /// Sends the results to File SQL as a table (see [`ResultsToFileSql`]).
+    fn query_in_file_sql(
+        &mut self,
+        _: &QueryResultsInFileSql,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_running() {
+            return;
+        }
+        let results = self.table.read(cx).delegate().results().clone();
+        if results.columns().is_empty() {
+            self.log("FILE SQL", "There are no results to query".into(), true, cx);
+            cx.notify();
+            return;
+        }
+        cx.emit(ResultsToFileSql {
+            name: self.title.to_string(),
+            origin: format!("{} on {}", self.title, self.db.name),
+            results,
+        });
     }
 
     /// Asks where to save the results (the extension picks CSV, TSV or JSON)
@@ -1695,6 +1757,11 @@ impl QueryTab {
             .menu("Save Query", Box::new(SaveQuery))
             .menu("Save Query As…", Box::new(SaveQueryAs))
             .menu_with_disabled("Export Results…", running, Box::new(ExportResults))
+            .menu_with_disabled(
+                "Query Results in File SQL",
+                running,
+                Box::new(QueryResultsInFileSql),
+            )
             .separator()
             .submenu(
                 "Mode",
@@ -1858,6 +1925,15 @@ impl QueryTab {
                     .truncate()
                     .children(failure),
             )
+            .when(self.connection_lost, |row| {
+                row.child(
+                    chrome::pill_button("reconnect-query", "Reconnect", true).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            cx.emit(ReconnectConnection(this.db.name.clone()));
+                        }),
+                    ),
+                )
+            })
             .child(
                 chrome::icon_button(
                     "copy-results",
@@ -1883,6 +1959,19 @@ impl QueryTab {
                 .when(has_results && !self.is_running(), |b| {
                     b.on_click(cx.listener(|this, _, window, cx| {
                         this.export_results(&ExportResults, window, cx)
+                    }))
+                }),
+            )
+            .child(
+                chrome::icon_button(
+                    "results-file-sql",
+                    AppIcon::Code,
+                    "Query Results in File SQL",
+                    has_results && !self.is_running(),
+                )
+                .when(has_results && !self.is_running(), |b| {
+                    b.on_click(cx.listener(|this, _, window, cx| {
+                        this.query_in_file_sql(&QueryResultsInFileSql, window, cx)
                     }))
                 }),
             )
@@ -2030,6 +2119,8 @@ pub fn describe_error(error: QueryError) -> String {
 
 impl EventEmitter<QueryRan> for QueryTab {}
 impl EventEmitter<QuerySaved> for QueryTab {}
+impl EventEmitter<ReconnectConnection> for QueryTab {}
+impl EventEmitter<ResultsToFileSql> for QueryTab {}
 
 impl Focusable for QueryTab {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -2060,6 +2151,7 @@ impl Render for QueryTab {
             .on_action(cx.listener(Self::use_write))
             .on_action(cx.listener(Self::use_full_write))
             .on_action(cx.listener(Self::export_results))
+            .on_action(cx.listener(Self::query_in_file_sql))
             .on_action(cx.listener(Self::preview_impact))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::format_sql))

@@ -41,12 +41,197 @@ pub struct Overview {
     /// Bar heights from 0 to 1: a histogram for numbers and dates, the most
     /// frequent values for everything else.
     pub spark: Vec<f32>,
+    /// The column in one line. [`Digest::None`] in an [`Analysis`], whose
+    /// summary says more.
+    pub digest: Digest,
+    /// Text values that are empty or only spaces.
+    pub blank: usize,
+    /// Text values with spaces at either end (blank ones aside).
+    pub padded: usize,
+    /// What nearly all the text values are written as, and how many of the
+    /// ones that are not blank fit it. `None` when no format fits
+    /// [`FORMAT_SHARE`] of at least [`FORMAT_MIN`] values.
+    pub format: Option<(Format, usize)>,
+}
+
+/// Text values a column needs before a format is read into them.
+pub const FORMAT_MIN: usize = 10;
+/// The share of them, in percent, that must fit it.
+pub const FORMAT_SHARE: usize = 90;
+
+/// A way text values are written, told by their shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Format {
+    Email,
+    Uuid,
+    Url,
+    Ipv4,
+    /// A number kept as text.
+    Number,
+    /// A date or timestamp kept as text.
+    Date,
+}
+
+impl Format {
+    pub const ALL: [Format; 6] = [
+        Format::Email,
+        Format::Uuid,
+        Format::Url,
+        Format::Ipv4,
+        Format::Number,
+        Format::Date,
+    ];
+
+    /// "emails", "UUIDs"…
+    pub fn plural(self) -> &'static str {
+        match self {
+            Format::Email => "emails",
+            Format::Uuid => "UUIDs",
+            Format::Url => "URLs",
+            Format::Ipv4 => "IP addresses",
+            Format::Number => "numbers",
+            Format::Date => "dates",
+        }
+    }
+
+    /// "an email", "a UUID"…
+    pub fn singular(self) -> &'static str {
+        match self {
+            Format::Email => "an email",
+            Format::Uuid => "a UUID",
+            Format::Url => "a URL",
+            Format::Ipv4 => "an IP address",
+            Format::Number => "a number",
+            Format::Date => "a date",
+        }
+    }
+
+    /// Whether `value`, without spaces around it, is written this way. The
+    /// shape only: an email is not checked to exist.
+    pub fn fits(self, value: &str) -> bool {
+        let no_space = || !value.is_empty() && !value.contains(char::is_whitespace);
+        match self {
+            Format::Email => {
+                no_space()
+                    && value.split_once('@').is_some_and(|(name, host)| {
+                        !name.is_empty()
+                            && !host.contains('@')
+                            && host.split_once('.').is_some_and(|(first, rest)| {
+                                !first.is_empty() && !rest.is_empty() && !rest.ends_with('.')
+                            })
+                    })
+            }
+            Format::Uuid => {
+                let groups: Vec<&str> = value.split('-').collect();
+                groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+                    && groups
+                        .iter()
+                        .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
+            }
+            Format::Url => {
+                no_space()
+                    && ["http://", "https://"]
+                        .iter()
+                        .any(|scheme| value.len() > scheme.len() && value.starts_with(scheme))
+            }
+            Format::Ipv4 => {
+                let parts: Vec<&str> = value.split('.').collect();
+                parts.len() == 4
+                    && parts.iter().all(|part| {
+                        !part.is_empty()
+                            && part.len() <= 3
+                            && part.bytes().all(|b| b.is_ascii_digit())
+                            && part.parse::<u16>().is_ok_and(|n| n <= 255)
+                    })
+            }
+            Format::Number => {
+                value.bytes().any(|b| b.is_ascii_digit()) && parse_number(value).is_some()
+            }
+            Format::Date => wall_clock(value).is_some(),
+        }
+    }
+}
+
+/// What a column holds, in one line of the list of columns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Digest {
+    /// Numbers: their range and median, and how many lie beyond 1.5 × IQR.
+    Range {
+        min: f64,
+        median: f64,
+        max: f64,
+        outliers: usize,
+    },
+    /// Dates and timestamps: the earliest and latest, as written.
+    Span { min: String, max: String },
+    /// Anything else: the most frequent value and how many times it appears.
+    Top { value: String, count: usize },
+    /// No values, or not computed.
+    None,
+}
+
+/// Something about a column worth a look before reading its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flag {
+    /// Every row is NULL.
+    Empty,
+    /// One value, repeated.
+    Constant,
+    /// Half the rows or more are NULL.
+    MostlyNull,
+    /// Text values that are empty or only spaces; how many.
+    Blank(usize),
+    /// Text values with spaces at either end; how many.
+    Padded(usize),
+    /// Nearly all the text values are written one way; how many are not.
+    OffFormat(Format, usize),
+    /// A few values (5% at most) lie beyond 1.5 × IQR; how many.
+    Outliers(usize),
+    /// Every value is different: a likely key.
+    Key,
 }
 
 impl Overview {
     /// Non-NULL values.
     pub fn values(&self) -> usize {
         self.rows - self.nulls
+    }
+
+    /// What stands out in the column, the most telling first.
+    pub fn flags(&self) -> Vec<Flag> {
+        let values = self.values();
+        if self.rows > 0 && values == 0 {
+            return vec![Flag::Empty];
+        }
+        let mut flags = Vec::new();
+        if self.distinct == 1 && values > 1 {
+            flags.push(Flag::Constant);
+        }
+        if self.nulls > 0 && self.nulls * 2 >= self.rows {
+            flags.push(Flag::MostlyNull);
+        }
+        if self.blank > 0 {
+            flags.push(Flag::Blank(self.blank));
+        }
+        if self.padded > 0 {
+            flags.push(Flag::Padded(self.padded));
+        }
+        if let Some((format, fit)) = self.format {
+            let misfits = values - self.blank - fit;
+            if misfits > 0 {
+                flags.push(Flag::OffFormat(format, misfits));
+            }
+        }
+        if let Digest::Range { outliers, .. } = self.digest
+            && outliers > 0
+            && outliers * 20 <= values
+        {
+            flags.push(Flag::Outliers(outliers));
+        }
+        if self.unique {
+            flags.push(Flag::Key);
+        }
+        flags
     }
 }
 
@@ -228,7 +413,7 @@ pub struct NumericSummary {
     pub p90: f64,
     pub p99: f64,
     pub histogram: Vec<Bin>,
-    /// Values left out of the histogram as outliers.
+    /// Values beyond 1.5 × IQR; the histogram leaves them out on request.
     pub outliers: usize,
 }
 
@@ -272,6 +457,104 @@ pub struct Bin {
     pub start: f64,
     pub end: f64,
     pub count: usize,
+}
+
+/// The values a mark of a chart stands for: a bar of a histogram, a value
+/// in a list, a period of a timeline. It picks the rows behind the mark.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Match {
+    Null,
+    /// The value, as written.
+    Value(String),
+    /// A boolean, however it is written (`t` or `true`).
+    Bool(bool),
+    /// Numbers from `start` to `end`: up to but not including `end`, unless
+    /// `closed` (the last bar of a histogram holds its largest value).
+    Range {
+        start: f64,
+        end: f64,
+        closed: bool,
+    },
+    /// Dates and timestamps in the period that reads `label` at this
+    /// granularity, as [`TemporalSummary::buckets`] names it.
+    Period {
+        granularity: Granularity,
+        label: String,
+    },
+    /// Empty or only spaces.
+    Blank,
+    /// With spaces at either end, and not blank.
+    Padded,
+    /// Not written as the format, and not blank.
+    Unlike(Format),
+}
+
+impl Match {
+    pub fn accepts(&self, value: Option<&str>) -> bool {
+        let Some(value) = value else {
+            return *self == Match::Null;
+        };
+        match self {
+            Match::Null => false,
+            Match::Value(wanted) => value == wanted,
+            Match::Bool(true) => matches!(value, "t" | "true"),
+            Match::Bool(false) => matches!(value, "f" | "false"),
+            Match::Range { start, end, closed } => parse_number(value)
+                .is_some_and(|n| n >= *start && (n < *end || (*closed && n == *end))),
+            Match::Period { granularity, label } => wall_clock(value)
+                .is_some_and(|at| bucket_label(bucket(at, *granularity), *granularity) == *label),
+            Match::Blank => value.trim().is_empty(),
+            Match::Padded => !value.trim().is_empty() && value.trim().len() != value.len(),
+            Match::Unlike(format) => !value.trim().is_empty() && !format.fits(value.trim()),
+        }
+    }
+
+    /// The bar of `bin` in a histogram of `bins`.
+    pub fn bin(bins: &[Bin], index: usize) -> Option<Match> {
+        let bin = bins.get(index)?;
+        Some(Match::Range {
+            start: bin.start,
+            end: bin.end,
+            closed: index + 1 == bins.len(),
+        })
+    }
+}
+
+/// The rows of `set` that are written more than once, every copy of each, in
+/// their order.
+pub fn duplicate_rows(set: &ResultSet) -> ResultSet {
+    let mut seen: HashMap<u64, u32> = HashMap::new();
+    let _ = set.try_for_each_row(|row| {
+        *seen.entry(row_hash(row)).or_default() += 1;
+        Ok::<(), std::convert::Infallible>(())
+    });
+    set.keep(|row| seen.get(&row_hash(row)).is_some_and(|count| *count > 1))
+}
+
+/// How many rows of `set` repeat an earlier one.
+pub fn duplicates(set: &ResultSet) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut repeated = 0;
+    let _ = set.try_for_each_row(|row| {
+        if !seen.insert(row_hash(row)) {
+            repeated += 1;
+        }
+        Ok::<(), std::convert::Infallible>(())
+    });
+    repeated
+}
+
+/// A row as one number; NULL differs from the empty text.
+fn row_hash(row: &[Option<&str>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The rows of `set` whose `column` is what `matching` stands for.
+pub fn rows_matching(set: &ResultSet, column: usize, matching: &Match) -> ResultSet {
+    set.keep(|row| matching.accepts(row.get(column).copied().flatten()))
 }
 
 /// The overview of every column of `set`.
@@ -338,7 +621,41 @@ impl Counted<'_> {
         ranked
     }
 
-    fn overview(&self, name: &str, spark: Vec<f32>) -> Overview {
+    /// Blank values, padded ones, and the format nearly all the others
+    /// have. Text only: other kinds say how they are written.
+    fn shapes(&self) -> (usize, usize, Option<(Format, usize)>) {
+        if self.kind != ColumnKind::Text {
+            return (0, 0, None);
+        }
+        let (mut blank, mut padded, mut fits) = (0, 0, [0usize; Format::ALL.len()]);
+        for (value, count) in &self.counts {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                blank += count;
+                continue;
+            }
+            if trimmed.len() != value.len() {
+                padded += count;
+            }
+            for (format, fit) in Format::ALL.iter().zip(&mut fits) {
+                if format.fits(trimmed) {
+                    *fit += count;
+                }
+            }
+        }
+        let written = self.values() - blank;
+        // The first format wins a tie: the list goes from the most telling.
+        let format = Format::ALL
+            .into_iter()
+            .zip(fits)
+            .rev()
+            .max_by_key(|(_, fit)| *fit)
+            .filter(|(_, fit)| written >= FORMAT_MIN && fit * 100 >= written * FORMAT_SHARE);
+        (blank, padded, format)
+    }
+
+    fn overview(&self, name: &str, spark: Vec<f32>, digest: Digest) -> Overview {
+        let (blank, padded, format) = self.shapes();
         Overview {
             name: name.to_string(),
             kind: self.kind,
@@ -348,6 +665,10 @@ impl Counted<'_> {
             distinct: self.counts.len(),
             unique: self.unique(),
             spark,
+            digest,
+            blank,
+            padded,
+            format,
         }
     }
 }
@@ -385,18 +706,66 @@ where
     I: Iterator<Item = Option<&'a str>>,
 {
     let counted = count(kind, &values);
-    let counts: Vec<usize> = if counted.kind.is_numeric() {
-        let numbers: Vec<f64> = values().flatten().filter_map(parse_number).collect();
-        bin_counts(&numbers, SPARK)
+    let (counts, digest): (Vec<usize>, Digest) = if counted.kind.is_numeric() {
+        let mut numbers: Vec<f64> = values().flatten().filter_map(parse_number).collect();
+        numbers.sort_by(f64::total_cmp);
+        let digest = match (numbers.first(), numbers.last()) {
+            (Some(min), Some(max)) => Digest::Range {
+                min: *min,
+                median: percentile(&numbers, 0.50),
+                max: *max,
+                outliers: numbers.len() - within_fences(&numbers).len(),
+            },
+            _ => Digest::None,
+        };
+        (bin_counts(&numbers, SPARK), digest)
     } else if counted.kind.is_temporal() {
-        let seconds: Vec<f64> = values().flatten().filter_map(wall_clock).collect();
-        bin_counts(&seconds, SPARK)
+        // The earliest and latest as written, by the moment they name.
+        type Moment<'a> = (f64, &'a str);
+        let mut ends: Option<(Moment, Moment)> = None;
+        let mut seconds = Vec::new();
+        for value in values().flatten() {
+            let Some(at) = wall_clock(value) else {
+                continue;
+            };
+            seconds.push(at);
+            ends = Some(match ends {
+                None => ((at, value), (at, value)),
+                Some((first, last)) => (
+                    if at < first.0 { (at, value) } else { first },
+                    if at > last.0 { (at, value) } else { last },
+                ),
+            });
+        }
+        let digest = ends.map_or(Digest::None, |(first, last)| Digest::Span {
+            min: first.1.to_string(),
+            max: last.1.to_string(),
+        });
+        (bin_counts(&seconds, SPARK), digest)
     } else {
-        counted.ranked().iter().take(8).map(|(_, c)| *c).collect()
+        let ranked = counted.ranked();
+        let digest = ranked
+            .first()
+            .map_or(Digest::None, |(value, count)| Digest::Top {
+                value: value.to_string(),
+                count: *count,
+            });
+        (ranked.iter().take(8).map(|(_, c)| *c).collect(), digest)
     };
     let tallest = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
     let spark = counts.iter().map(|c| *c as f32 / tallest).collect();
-    counted.overview(name, spark)
+    counted.overview(name, spark, digest)
+}
+
+/// The part of sorted `values` within 1.5 × IQR of the quartiles: what is
+/// left when the outliers are taken out.
+fn within_fences(sorted: &[f64]) -> std::ops::Range<usize> {
+    if sorted.is_empty() {
+        return 0..0;
+    }
+    let (p25, p75) = (percentile(sorted, 0.25), percentile(sorted, 0.75));
+    let fence = 1.5 * (p75 - p25);
+    sorted.partition_point(|v| *v < p25 - fence)..sorted.partition_point(|v| *v <= p75 + fence)
 }
 
 fn bin_counts(values: &[f64], bins: usize) -> Vec<usize> {
@@ -442,7 +811,7 @@ where
         }
     };
     Analysis {
-        overview: counted.overview(name, Vec::new()),
+        overview: counted.overview(name, Vec::new(), Digest::None),
         summary,
     }
 }
@@ -531,11 +900,10 @@ where
     let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
     let (min, max) = (values[0], values[values.len() - 1]);
     let (p25, p75) = (percentile(&values, 0.25), percentile(&values, 0.75));
+    let inliers = within_fences(&values);
+    let outliers = values.len() - inliers.len();
     let shown: &[f64] = if options.hide_outliers {
-        let fence = 1.5 * (p75 - p25);
-        let low = values.partition_point(|v| *v < p25 - fence);
-        let high = values.partition_point(|v| *v <= p75 + fence);
-        &values[low..high]
+        &values[inliers]
     } else {
         &values
     };
@@ -560,7 +928,7 @@ where
         p90: percentile(&values, 0.90),
         p99: percentile(&values, 0.99),
         histogram,
-        outliers: values.len() - shown.len(),
+        outliers,
     })
 }
 
@@ -1162,6 +1530,202 @@ mod tests {
         let overview = overview_column("w", ColumnKind::Text, || words.iter().map(|w| Some(*w)));
         assert_eq!(overview.spark, [1.0, 1.0 / 3.0, 1.0 / 3.0]);
         assert!(!overview.unique);
+    }
+
+    #[test]
+    fn overviews_digest_a_column_in_one_line() {
+        let mut numbers = owned((1..=99).map(|n| n.to_string()));
+        numbers.push("5000".to_string());
+        let overview = overview_column("n", ColumnKind::Integer, || {
+            numbers.iter().map(|v| Some(v.as_str()))
+        });
+        assert_eq!(
+            overview.digest,
+            Digest::Range {
+                min: 1.0,
+                median: 50.5,
+                max: 5000.0,
+                outliers: 1
+            }
+        );
+        assert_eq!(overview.flags(), [Flag::Outliers(1), Flag::Key]);
+
+        let days = ["2024-03-02", "2023-12-31", "2024-01-15"];
+        let overview = overview_column("d", ColumnKind::Date, || days.iter().map(|d| Some(*d)));
+        assert_eq!(
+            overview.digest,
+            Digest::Span {
+                min: "2023-12-31".into(),
+                max: "2024-03-02".into()
+            }
+        );
+
+        let words = [Some("a"), Some("b"), Some("a"), None];
+        let overview = overview_column("w", ColumnKind::Text, || words.iter().copied());
+        assert_eq!(
+            overview.digest,
+            Digest::Top {
+                value: "a".into(),
+                count: 2
+            }
+        );
+        assert_eq!(overview.flags(), []);
+    }
+
+    #[test]
+    fn the_marks_of_a_chart_pick_the_rows_they_count() {
+        // Every bar of a histogram picks as many values as it counts.
+        let values = owned((0..=97).map(|n| (n as f64 * 0.37).to_string()));
+        let numbers = as_numbers(analyze_values(
+            ColumnKind::Number,
+            Options::default(),
+            &borrowed(&values),
+        ));
+        for (index, bin) in numbers.histogram.iter().enumerate() {
+            let matching = Match::bin(&numbers.histogram, index).unwrap();
+            let picked = values
+                .iter()
+                .filter(|v| matching.accepts(Some(v.as_str())))
+                .count();
+            assert_eq!(picked, bin.count, "bin {index}");
+        }
+
+        // So does every period of a timeline.
+        let days = ["2024-01-31", "2024-02-01", "2024-02-29", "2025-02-01"];
+        let Summary::Temporal(timeline) = analyze_values(
+            ColumnKind::Date,
+            Options {
+                granularity: Granularity::Month,
+                ..Default::default()
+            },
+            &days.map(Some),
+        )
+        .summary
+        else {
+            panic!("dates make a timeline");
+        };
+        for (label, count) in &timeline.buckets {
+            let matching = Match::Period {
+                granularity: timeline.granularity,
+                label: label.clone(),
+            };
+            let picked = days.iter().filter(|d| matching.accepts(Some(d))).count();
+            assert_eq!(picked, *count, "{label}");
+        }
+
+        assert!(Match::Null.accepts(None));
+        assert!(!Match::Null.accepts(Some("")));
+        assert!(Match::Value("".into()).accepts(Some("")));
+        assert!(!Match::Value("a".into()).accepts(None));
+        assert!(Match::Bool(true).accepts(Some("t")));
+        assert!(!Match::Bool(false).accepts(Some("true")));
+    }
+
+    #[test]
+    fn text_is_read_for_its_format_blanks_and_padding() {
+        assert!(Format::Email.fits("ana@example.com"));
+        for bad in [
+            "ana@example",
+            "@example.com",
+            "a b@example.com",
+            "a@b@c.com",
+            "a@b.",
+        ] {
+            assert!(!Format::Email.fits(bad), "{bad}");
+        }
+        assert!(Format::Uuid.fits("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!Format::Uuid.fits("123e4567-e89b-12d3-a456-42661417400g"));
+        assert!(Format::Url.fits("https://kuery.dev/docs"));
+        assert!(!Format::Url.fits("https://"));
+        assert!(Format::Ipv4.fits("10.0.0.255"));
+        assert!(!Format::Ipv4.fits("10.0.0.256"));
+        assert!(Format::Number.fits("-12.5"));
+        assert!(!Format::Number.fits("inf"));
+        assert!(Format::Date.fits("2024-02-29"));
+
+        // Nineteen emails and a typo: the typo is what stands out.
+        let mut values = owned((0..19).map(|n| format!("user{n}@example.com")));
+        values.extend(["not an email".to_string(), " ".into(), "".into()]);
+        values.push(" user0@example.com".into());
+        let overview = overview_column("email", ColumnKind::Text, || {
+            values.iter().map(|v| Some(v.as_str()))
+        });
+        assert_eq!((overview.blank, overview.padded), (2, 1));
+        assert_eq!(overview.format, Some((Format::Email, 20)));
+        assert_eq!(
+            overview.flags(),
+            [
+                Flag::Blank(2),
+                Flag::Padded(1),
+                Flag::OffFormat(Format::Email, 1),
+                // No value is written twice.
+                Flag::Key
+            ]
+        );
+        // Each flag picks the rows it counts.
+        let picked = |matching: Match| {
+            values
+                .iter()
+                .filter(|v| matching.accepts(Some(v.as_str())))
+                .count()
+        };
+        assert_eq!(picked(Match::Blank), 2);
+        assert_eq!(picked(Match::Padded), 1);
+        assert_eq!(picked(Match::Unlike(Format::Email)), 1);
+
+        // Free text has no format, and numbers are not read for one.
+        let words = owned((0..30).map(|n| format!("note {n}")));
+        let overview = overview_column("notes", ColumnKind::Text, || {
+            words.iter().map(|v| Some(v.as_str()))
+        });
+        assert_eq!(overview.format, None);
+        let numbers = owned((0..30).map(|n| n.to_string()));
+        let overview = overview_column("n", ColumnKind::Integer, || {
+            numbers.iter().map(|v| Some(v.as_str()))
+        });
+        assert_eq!((overview.format, overview.blank), (None, 0));
+    }
+
+    #[test]
+    fn repeated_rows_are_counted_and_found() {
+        use crate::result_set::BatchBuilder;
+        let mut set = ResultSet::new(vec!["a".into(), "b".into()]);
+        let rows = [
+            [Some("1"), Some("x")],
+            [Some("2"), None],
+            [Some("1"), Some("x")],
+            [Some("2"), Some("")],
+            [Some("1"), Some("x")],
+        ];
+        let mut builder = BatchBuilder::new(2, rows.len());
+        for row in &rows {
+            builder.push_row(|index| row[index]);
+        }
+        set.push(builder.finish());
+        // NULL is not the empty text: rows two and four differ.
+        assert_eq!(duplicates(&set), 2);
+        let copies = duplicate_rows(&set);
+        assert_eq!(copies.rows(), 3);
+        assert_eq!(copies.cell(2, 1), Some(Some("x")));
+    }
+
+    #[test]
+    fn flags_name_what_stands_out() {
+        let flags = |values: &[Option<&str>]| {
+            overview_column("c", ColumnKind::Text, || values.iter().copied()).flags()
+        };
+        assert_eq!(flags(&[None, None]), [Flag::Empty]);
+        assert_eq!(flags(&[Some("x"), Some("x"), Some("x")]), [Flag::Constant]);
+        assert_eq!(
+            flags(&[Some("x"), None, None, Some("x")]),
+            [Flag::Constant, Flag::MostlyNull]
+        );
+        // A skewed column, where a fifth of the values are "outliers", is
+        // not flagged: outliers are rare.
+        let skewed = ["0", "0", "0", "0", "0", "0", "0", "0", "7", "9"];
+        let overview =
+            overview_column("n", ColumnKind::Integer, || skewed.iter().map(|v| Some(*v)));
+        assert_eq!(overview.flags(), []);
     }
 
     #[test]

@@ -242,7 +242,29 @@ impl EventEmitter<ActivityEvent> for ActivityTab {}
 
 impl ActivityTab {
     pub fn new(source: ActivitySource, project: PathBuf, cx: &mut Context<Self>) -> Self {
-        let connecting = source.watch();
+        let mut tab = Self {
+            source,
+            project,
+            monitor: Watching::Connecting,
+            activity: None,
+            error: None,
+            all: false,
+            paused: false,
+            selected: None,
+            fetching: false,
+            notice: None,
+            _poll: None,
+            focus_handle: cx.focus_handle(),
+        };
+        tab.connect_monitor(cx);
+        tab
+    }
+
+    fn connect_monitor(&mut self, cx: &mut Context<Self>) {
+        self.monitor = Watching::Connecting;
+        self.error = None;
+        self._poll = None;
+        let connecting = self.source.watch();
         cx.spawn(async move |this, cx| {
             let result = connecting.await;
             this.update(cx, |this, cx| {
@@ -259,20 +281,14 @@ impl ActivityTab {
             .ok();
         })
         .detach();
-        Self {
-            source,
-            project,
-            monitor: Watching::Connecting,
-            activity: None,
-            error: None,
-            all: false,
-            paused: false,
-            selected: None,
-            fetching: false,
-            notice: None,
-            _poll: None,
-            focus_handle: cx.focus_handle(),
-        }
+    }
+
+    /// Replaces the connection being watched after a reconnect and opens a
+    /// fresh monitor session.
+    pub fn set_source(&mut self, source: ActivitySource, cx: &mut Context<Self>) {
+        self.source = source;
+        self.connect_monitor(cx);
+        cx.notify();
     }
 
     pub fn source(&self) -> &ActivitySource {

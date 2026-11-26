@@ -520,6 +520,31 @@ impl DocumentConsole {
         &self.db
     }
 
+    /// Replaces the tab's connection after a reconnect, resetting write mode
+    /// and opening a fresh read-only session.
+    pub fn set_db(&mut self, db: DocDb, cx: &mut Context<Self>) {
+        self.db = db;
+        self.writing = Writing::Off;
+        self.run_session = None;
+        self.plan_session = None;
+        self.export_session = None;
+        self.session = SessionState::Connecting;
+        let opening = self.db.catalog.reopen(Access::ReadOnly);
+        cx.spawn(async move |this, cx| {
+            let result = opening.await;
+            this.update(cx, |this, cx| {
+                this.session = match result {
+                    Ok(session) => SessionState::Ready(session),
+                    Err(error) => SessionState::Failed(error),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// The container each run starts in.
     pub fn path(&self) -> &[String] {
         &self.path

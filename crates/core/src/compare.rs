@@ -291,6 +291,104 @@ pub struct Correlation {
     pub y_range: (f64, f64),
 }
 
+/// Numeric columns a [`CorrelationMatrix`] compares: the first ones that
+/// vary, when there are more.
+pub const MAX_MATRIX: usize = 24;
+
+/// How every numeric column moves with every other: Pearson's r by pair.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CorrelationMatrix {
+    /// The columns compared, by their index in the results. Columns that
+    /// hold one number only are not here: nothing varies with them.
+    pub columns: Vec<usize>,
+    /// Numeric columns that vary but were left out, beyond [`MAX_MATRIX`].
+    pub left_out: usize,
+    /// `r[i][j]` for `columns[i]` and `columns[j]`, over the rows with a
+    /// number in both. `None` on the diagonal, and when fewer than three
+    /// rows have both or one of the two does not vary over them.
+    pub r: Vec<Vec<Option<f64>>>,
+}
+
+impl CorrelationMatrix {
+    /// Every measured pair as `(column, column, r)`, the strongest first
+    /// (ties in the order of the columns).
+    pub fn strongest(&self) -> Vec<(usize, usize, f64)> {
+        let mut pairs: Vec<(usize, usize, f64)> = (0..self.columns.len())
+            .flat_map(|i| (0..i).map(move |j| (j, i)))
+            .filter_map(|(j, i)| Some((self.columns[j], self.columns[i], self.r[i][j]?)))
+            .collect();
+        pairs.sort_by(|a, b| {
+            b.2.abs()
+                .total_cmp(&a.2.abs())
+                .then((a.0, a.1).cmp(&(b.0, b.1)))
+        });
+        pairs
+    }
+}
+
+/// Pearson's r between every two numeric columns of `set`, whose kinds must
+/// be known (see [`stats::kinds`]).
+pub fn correlations(set: &ResultSet) -> CorrelationMatrix {
+    // Each column as numbers around its own mean (NaN where there is none),
+    // so the sums below stay small.
+    let mut varying: Vec<(usize, Vec<f64>)> = Vec::new();
+    let mut left_out = 0;
+    for (index, kind) in set.kinds().iter().enumerate() {
+        if !kind.is_numeric() {
+            continue;
+        }
+        let mut values: Vec<f64> = set
+            .column_values(index)
+            .map(|value| value.and_then(stats::parse_number).unwrap_or(f64::NAN))
+            .collect();
+        let (mut n, mut sum, mut low, mut high) = (0usize, 0.0, f64::INFINITY, f64::NEG_INFINITY);
+        for value in values.iter().filter(|v| !v.is_nan()) {
+            n += 1;
+            sum += value;
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+        if n == 0 || low == high {
+            continue;
+        }
+        if varying.len() == MAX_MATRIX {
+            left_out += 1;
+            continue;
+        }
+        let mean = sum / n as f64;
+        values.iter_mut().for_each(|value| *value -= mean);
+        varying.push((index, values));
+    }
+    let size = varying.len();
+    let mut r = vec![vec![None; size]; size];
+    for i in 0..size {
+        for j in 0..i {
+            let (mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            for (x, y) in varying[i].1.iter().zip(&varying[j].1) {
+                if x.is_nan() || y.is_nan() {
+                    continue;
+                }
+                n += 1.0;
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                syy += y * y;
+                sxy += x * y;
+            }
+            let (vx, vy) = (sxx - sx * sx / n, syy - sy * sy / n);
+            let found = (n >= 3.0 && vx > 0.0 && vy > 0.0)
+                .then(|| ((sxy - sx * sy / n) / (vx * vy).sqrt()).clamp(-1.0, 1.0));
+            r[i][j] = found;
+            r[j][i] = found;
+        }
+    }
+    CorrelationMatrix {
+        columns: varying.into_iter().map(|(index, _)| index).collect(),
+        left_out,
+        r,
+    }
+}
+
 /// Runs `comparison` over `set`, whose kinds must be known (see
 /// [`stats::kinds`]).
 pub fn compare(set: &ResultSet, comparison: Comparison, options: &CompareOptions) -> Outcome {
@@ -794,6 +892,64 @@ mod tests {
         };
         assert_eq!((flat.pearson, flat.slope), (None, None));
         assert_eq!((flat.x_range, flat.y_range), ((1.0, 1.0), (2.0, 3.0)));
+    }
+
+    #[test]
+    fn a_matrix_correlates_every_two_numeric_columns_that_vary() {
+        use crate::result_set::{BatchBuilder, ColumnKind};
+        let names = ["x", "double", "down", "flat", "word", "sparse"];
+        let mut set = ResultSet::new(names.iter().map(|n| n.to_string()).collect());
+        set.set_kinds(vec![
+            ColumnKind::Integer,
+            ColumnKind::Number,
+            ColumnKind::Integer,
+            ColumnKind::Integer,
+            ColumnKind::Text,
+            ColumnKind::Integer,
+        ]);
+        let rows: Vec<[Option<String>; 6]> = (1..=6)
+            .map(|n: i64| {
+                [
+                    Some(n.to_string()),
+                    Some((n * 2).to_string()),
+                    Some((100 - n * n).to_string()),
+                    Some("7".into()),
+                    Some("w".into()),
+                    // Two rows with a number: too few to measure.
+                    (n <= 2).then(|| n.to_string()),
+                ]
+            })
+            .collect();
+        let mut builder = BatchBuilder::new(6, rows.len());
+        for row in &rows {
+            builder.push_row(|index| row[index].as_deref());
+        }
+        set.push(builder.finish());
+
+        let matrix = correlations(&set);
+        // The flat column and the text one are not compared.
+        assert_eq!(matrix.columns, [0, 1, 2, 5]);
+        assert_eq!(matrix.left_out, 0);
+        assert!((matrix.r[1][0].unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(matrix.r[0][1], matrix.r[1][0]);
+        assert!(matrix.r[2][0].unwrap() < -0.9);
+        assert_eq!(matrix.r[0][0], None);
+        assert_eq!(matrix.r[3][0], None);
+
+        // It agrees with the comparison of two columns.
+        let Outcome::Correlation(pair) = compare(
+            &set,
+            Comparison::Correlation { x: 0, y: 2 },
+            &CompareOptions::default(),
+        ) else {
+            panic!("correlation");
+        };
+        assert!((matrix.r[2][0].unwrap() - pair.pearson.unwrap()).abs() < 1e-9);
+
+        let strongest = matrix.strongest();
+        assert_eq!((strongest[0].0, strongest[0].1), (0, 1));
+        assert_eq!(strongest.len(), 3);
+        assert!(strongest[1].2.abs() >= strongest[2].2.abs());
     }
 
     #[test]

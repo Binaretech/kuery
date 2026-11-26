@@ -125,7 +125,7 @@ a{color:#f3f3f5}a:hover{color:#ffffff}
 .mod-fig::before{content:'';position:absolute;inset:0;background:inherit;transition:transform 1.2s var(--ease)}
 .mod:hover .mod-fig::before{transform:scale(1.035)}
 .f1{background-image:url(assets/screenshots/file-data.jpg);background-size:1280px auto;background-position:-300px -60px}
-.f2{background-image:url(assets/screenshots/file-profile.jpg);background-size:1280px auto;background-position:-500px -440px}
+.f2{background-image:url(assets/screenshots/profile-overview.jpg);background-size:1090px auto;background-position:-306px -138px}
 .f3{background-image:url(assets/screenshots/plan-graph.png);background-size:1100px auto;background-position:-300px -180px}
 .f4{background-image:url(assets/screenshots/write-review.png);background-size:1300px auto;background-position:-265px -40px}
 .f5{background-image:url(assets/screenshots/database-browser.jpg);background-size:1280px auto;background-position:-300px -50px}

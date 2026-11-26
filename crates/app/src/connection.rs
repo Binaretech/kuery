@@ -114,6 +114,11 @@ pub fn status_tone(environment: Environment) -> u32 {
     }
 }
 
+/// Asks the workspace to tear down and reopen the named connection (including
+/// its SSH tunnel, if any) and hand the fresh connection to every open tab.
+#[derive(Clone, Debug)]
+pub struct ReconnectConnection(pub SharedString);
+
 /// What the chrome shows about a tab's connection, whichever its family.
 #[derive(Clone)]
 pub struct ConnMeta {

@@ -392,6 +392,26 @@ impl CollectionTab {
         &self.db
     }
 
+    /// Replaces the tab's connection after a reconnect and opens fresh
+    /// sessions from it.
+    pub fn set_db(&mut self, db: DocDb, cx: &mut Context<Self>) {
+        self.db = db;
+        self.session = SessionState::Connecting;
+        self.counter = None;
+        self.writer = None;
+        self.export_session = None;
+        let opening = self.db.catalog.reopen(self.db.catalog.access());
+        let counting = self.db.catalog.reopen(self.db.catalog.access());
+        cx.spawn(async move |this, cx| {
+            let result = opening.await;
+            let counter = counting.await.ok();
+            this.update(cx, |this, cx| this.opened(result, counter, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub fn collection(&self) -> &CollectionRef {
         &self.collection
     }

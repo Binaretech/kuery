@@ -34,19 +34,21 @@ use crate::commands::{
     OpenDataFile, OpenKeymapFile, OpenProject, OpenSchemaDiagram, ShowServerActivity,
     ToggleSidebar,
 };
-use crate::connection::{ConnMeta, Db, DocDb, Environment, RedisDb, WriteKind, status_tone};
+use crate::connection::{
+    ConnMeta, Db, DocDb, Environment, ReconnectConnection, RedisDb, WriteKind, status_tone,
+};
 use crate::connection_editor::ConnectionEditor;
 use crate::context_menus::{copy, item, reveal};
 use crate::data_file_tabs::DataFileTabs;
 use crate::diagram_tab::{DiagramEvent, DiagramTab};
 use crate::document_console::{DocumentConsole, OpenNative};
 use crate::explorer::{Explorer, ExplorerEvent, Mode as ExplorerMode};
-use crate::file_query_tab::FileQueryTab;
+use crate::file_query_tab::{self, FileQueryTab, Source};
 use crate::file_tab::FileTab;
 use crate::menus::CloseWindow;
 use crate::palette::{CommandPalette, PaletteEvent};
 use crate::project::{ProjectModel, query_connection};
-use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab};
+use crate::query_tab::{self, QueryRan, QuerySaved, QueryTab, ResultsToFileSql};
 use crate::recent::{self, RecentProject};
 use crate::redis_console::ConsoleTab;
 use crate::redis_key_tab::KeyTab;
@@ -327,6 +329,7 @@ impl WorkspaceView {
             window,
             |this, _, event: &ExplorerEvent, window, cx| match event {
                 ExplorerEvent::Connected(db) => {
+                    this.replace_sql_db(db, cx);
                     this.restore_sql_tabs(db, window, cx);
                     let waiting: Vec<PathBuf> = this
                         .waiting_for_connection
@@ -378,6 +381,7 @@ impl WorkspaceView {
                     this.open_diagram(db.clone(), schema.clone(), window, cx)
                 }
                 ExplorerEvent::RedisConnected(db) => {
+                    this.replace_redis_db(db, cx);
                     this.restore_redis_tabs(db, window, cx);
                     // The first connection to open gets a console to start with.
                     if this.tabs.is_empty() && !this.restored_session {
@@ -392,6 +396,7 @@ impl WorkspaceView {
                     this.open_redis_console(db.clone(), *database, window, cx)
                 }
                 ExplorerEvent::DocumentConnected(db) => {
+                    this.replace_doc_db(db, cx);
                     this.restore_document_tabs(db, window, cx);
                     // The first connection to open gets a console to start with.
                     if this.tabs.is_empty() && !this.restored_session {
@@ -788,6 +793,11 @@ impl WorkspaceView {
             explorer.update(cx, |explorer, cx| explorer.record(entry.clone(), cx));
         })
         .detach();
+        let explorer = self.explorer.clone();
+        cx.subscribe(&tab, move |_, _, ReconnectConnection(name), cx| {
+            explorer.update(cx, |explorer, cx| explorer.reconnect_by_name(name, cx));
+        })
+        .detach();
         cx.subscribe(&tab, |this, _, QuerySaved(path), cx| {
             let relative = this.relative_query(path, cx);
             this.explorer.update(cx, |explorer, cx| {
@@ -796,6 +806,14 @@ impl WorkspaceView {
             });
             cx.notify();
         })
+        .detach();
+        cx.subscribe_in(
+            &tab,
+            window,
+            |this, _, sent: &ResultsToFileSql, window, cx| {
+                this.query_results_in_file_sql(sent, window, cx)
+            },
+        )
         .detach();
         Tab::Query(tab)
     }
@@ -913,7 +931,78 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Tab {
         let project = self.model.read(cx).project.root.clone();
-        Tab::Table(cx.new(|cx| TableTab::new(db, project, info, view, window, cx)))
+        let tab = cx.new(|cx| TableTab::new(db, project, info, view, window, cx));
+        let explorer = self.explorer.clone();
+        cx.subscribe(&tab, move |_, _, ReconnectConnection(name), cx| {
+            explorer.update(cx, |explorer, cx| explorer.reconnect_by_name(name, cx));
+        })
+        .detach();
+        Tab::Table(tab)
+    }
+
+    /// Hands a freshly connected SQL `Db` to every open tab on that connection
+    /// so reconnecting from the sidebar (or a tab) revives open tabs too.
+    fn replace_sql_db(&self, db: &Db, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match tab {
+                Tab::Query(query) if query.read(cx).db().name == db.name => {
+                    query.update(cx, |query, cx| query.set_db(db.clone(), cx));
+                }
+                Tab::Table(table) if table.read(cx).db().name == db.name => {
+                    table.update(cx, |table, cx| table.set_db(db.clone(), cx));
+                }
+                Tab::Diagram(diagram) if diagram.read(cx).db().name == db.name => {
+                    diagram.update(cx, |diagram, cx| diagram.set_db(db.clone(), cx));
+                }
+                Tab::Activity(activity)
+                    if matches!(activity.read(cx).source(), ActivitySource::Sql(other) if other.name == db.name) =>
+                {
+                    activity.update(cx, |activity, cx| {
+                        activity.set_source(ActivitySource::Sql(db.clone()), cx);
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Hands a freshly connected Redis `RedisDb` to every open Redis tab on
+    /// that connection.
+    fn replace_redis_db(&self, db: &RedisDb, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match tab {
+                Tab::RedisKey(key) if key.read(cx).db().name == db.name => {
+                    key.update(cx, |key, cx| key.set_db(db.clone(), cx));
+                }
+                Tab::RedisConsole(console) if console.read(cx).db().name == db.name => {
+                    console.update(cx, |console, cx| console.set_db(db.clone(), cx));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Hands a freshly connected document `DocDb` to every open document tab
+    /// on that connection.
+    fn replace_doc_db(&self, db: &DocDb, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match tab {
+                Tab::Collection(collection) if collection.read(cx).db().name == db.name => {
+                    collection.update(cx, |collection, cx| collection.set_db(db.clone(), cx));
+                }
+                Tab::DocumentConsole(console) if console.read(cx).db().name == db.name => {
+                    console.update(cx, |console, cx| console.set_db(db.clone(), cx));
+                }
+                Tab::Activity(activity)
+                    if matches!(activity.read(cx).source(), ActivitySource::Document(other) if other.name == db.name) =>
+                {
+                    activity.update(cx, |activity, cx| {
+                        activity.set_source(ActivitySource::Document(db.clone()), cx);
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Opens a schema's diagram, or shows the tab it is already open in.
@@ -947,18 +1036,55 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Tab {
         let project = self.model.read(cx).project.root.clone();
-        let tab = cx.new(|cx| DiagramTab::new(db.clone(), schema, project, cx));
+        let tab = cx.new(|cx| DiagramTab::new(db, schema, project, cx));
         cx.subscribe_in(
             &tab,
             window,
-            move |this, _, event: &DiagramEvent, window, cx| match event {
+            move |this, diagram, event: &DiagramEvent, window, cx| match event {
                 DiagramEvent::OpenTable(info) => {
-                    this.open_table(db.clone(), info.clone(), TableView::Data, window, cx)
+                    let db = diagram.read(cx).db().clone();
+                    this.open_table(db, info.clone(), TableView::Data, window, cx)
                 }
             },
         )
         .detach();
         Tab::Diagram(tab)
+    }
+
+    /// Adds a query tab's results to the last File SQL tab as a table, or
+    /// opens one on them and the data files open here, and shows it.
+    fn query_results_in_file_sql(
+        &mut self,
+        sent: &ResultsToFileSql,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self
+            .tabs
+            .iter()
+            .rposition(|tab| matches!(tab, Tab::FileQuery(_)));
+        if let Some(index) = existing {
+            if let Some(Tab::FileQuery(query)) = self.tabs.get(index) {
+                query.update(cx, |query, cx| {
+                    query.add_result(&sent.name, &sent.origin, sent.results.clone(), cx)
+                });
+            }
+            self.activate(index, window, cx);
+            return;
+        }
+        let files = file_query_tab::query_sources(
+            self.tabs
+                .iter()
+                .filter_map(Self::as_file)
+                .map(|file| file.read(cx)),
+            None,
+        );
+        let result = Source::result(&sent.name, &sent.origin, sent.results.clone(), &files);
+        let sources = std::iter::once(result).chain(files).collect();
+        let query = cx.new(|cx| FileQueryTab::new(sources, window, cx));
+        cx.observe(&query, |_, _, cx| cx.notify()).detach();
+        self.tabs.push(Tab::FileQuery(query));
+        self.activate(self.tabs.len() - 1, window, cx);
     }
 
     /// Opens a connection's server activity, or shows the tab it is already
@@ -1140,7 +1266,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Entity<DocumentConsole> {
         let project = self.model.read(cx).project.root.clone();
-        let console = cx.new(|cx| DocumentConsole::new(db.clone(), path, project, window, cx));
+        let console = cx.new(|cx| DocumentConsole::new(db, path, project, window, cx));
         // The status bar shows what runs.
         cx.observe(&console, |_, _, cx| cx.notify()).detach();
         let explorer = self.explorer.clone();
@@ -1152,9 +1278,10 @@ impl WorkspaceView {
         cx.subscribe_in(
             &console,
             window,
-            move |this, _, open: &OpenNative, window, cx| {
+            move |this, console, open: &OpenNative, window, cx| {
+                let db = console.read(cx).db().clone();
                 let OpenNative { text, path } = open;
-                let console = this.open_document_console(db.clone(), path.clone(), window, cx);
+                let console = this.open_document_console(db, path.clone(), window, cx);
                 console.update(cx, |console, cx| console.set_text(text.clone(), window, cx));
             },
         )

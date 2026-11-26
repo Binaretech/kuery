@@ -1,6 +1,7 @@
+use kuery_core::result_set::{BatchBuilder, ColumnKind, ResultSet};
 use kuery_files::{
     Error, FileDataset, FileSource, MAX_NDJSON_SQL_BYTES, PreviewRequest, PreviewScope, SqlFile,
-    query_files,
+    SqlSource, SqlTable, query_files, query_sources,
 };
 use polars::prelude::*;
 use std::fs::{self, File};
@@ -171,4 +172,76 @@ fn csv_sql_rejects_lossy_integer_promotion_even_beyond_preview() {
         )
         .is_ok()
     );
+}
+
+/// A database result, kept as text with its columns' kinds.
+fn held(columns: &[(&str, ColumnKind)], rows: &[&[Option<&str>]]) -> ResultSet {
+    let mut set = ResultSet::new(columns.iter().map(|(name, _)| name.to_string()).collect());
+    set.set_kinds(columns.iter().map(|(_, kind)| *kind).collect());
+    let mut builder = BatchBuilder::new(columns.len(), rows.len());
+    for row in rows {
+        builder.push_row(|index| row[index]);
+    }
+    set.push(builder.finish());
+    set
+}
+
+#[test]
+fn a_held_result_joins_a_file_by_its_typed_columns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("targets.csv");
+    fs::write(&path, "region,target\nnorth,100\nsouth,50\n").unwrap();
+    let orders = held(
+        &[
+            ("region", ColumnKind::Text),
+            ("total", ColumnKind::Number),
+            ("placed", ColumnKind::Date),
+        ],
+        &[
+            &[Some("north"), Some("70.5"), Some("2026-01-02")],
+            &[Some("north"), Some("40"), Some("2026-01-20")],
+            &[Some("south"), Some("10"), Some("2026-02-01")],
+            &[Some("south"), None, Some("2026-02-03")],
+        ],
+    );
+    let sources = [
+        SqlSource::Table(SqlTable {
+            name: "orders".into(),
+            results: orders,
+        }),
+        SqlSource::File(binding(&path, "targets")),
+    ];
+    let result = query_sources(
+        &sources,
+        "SELECT o.region, SUM(o.total) AS sold, t.target, MAX(o.placed) AS last \
+         FROM orders o JOIN targets t ON o.region = t.region \
+         GROUP BY o.region, t.target ORDER BY o.region",
+        PreviewRequest::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        result.results.columns(),
+        ["region", "sold", "target", "last"]
+    );
+    assert_eq!(result.results.rows(), 2);
+    assert_eq!(result.results.cell(0, 1), Some(Some("110.5")));
+    assert_eq!(result.results.cell(0, 2), Some(Some("100")));
+    assert_eq!(result.results.cell(1, 1), Some(Some("10")));
+    assert_eq!(result.results.cell(1, 3), Some(Some("2026-02-03")));
+    assert_eq!(result.results.kinds()[1], ColumnKind::Number);
+}
+
+#[test]
+fn table_names_must_differ_across_files_and_results() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a.csv");
+    fs::write(&path, "x\n1\n").unwrap();
+    let sources = [
+        SqlSource::File(binding(&path, "a")),
+        SqlSource::Table(SqlTable {
+            name: "a".into(),
+            results: held(&[("x", ColumnKind::Integer)], &[&[Some("1")]]),
+        }),
+    ];
+    assert!(query_sources(&sources, "SELECT * FROM a", PreviewRequest::default()).is_err());
 }

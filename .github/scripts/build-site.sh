@@ -30,7 +30,7 @@ fi
 rm -rf "$out"
 mkdir -p "$out/assets/screenshots"
 cp -R site/. "$out/"
-cp docs/screenshots/{file-sql,file-data,file-profile,database-browser}.jpg \
+cp docs/screenshots/{file-sql,file-data,profile-overview,database-browser}.jpg \
   docs/screenshots/{plan-graph,write-review,redis-console}.png \
   "$out/assets/screenshots/"
 cp crates/app/assets/branding/kuery.png "$out/assets/kuery.png"
