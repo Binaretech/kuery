@@ -144,6 +144,16 @@ impl DiagramTab {
         &self.db
     }
 
+    /// Replaces the tab's connection after a reconnect, retrying the load if
+    /// it had failed.
+    pub fn set_db(&mut self, db: Db, cx: &mut Context<Self>) {
+        self.db = db;
+        if matches!(self.state, State::Failed(_)) {
+            self.reload(cx);
+        }
+        cx.notify();
+    }
+
     pub fn schema(&self) -> &str {
         &self.schema
     }

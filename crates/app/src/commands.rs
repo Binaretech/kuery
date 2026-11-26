@@ -15,8 +15,8 @@ use crate::collection_tab::ReloadCollection;
 use crate::menus::{CloseWindow, Minimize, Quit, ToggleFullScreen, Zoom};
 use crate::query_tab::{
     CancelQuery, CommitTransaction, ExplainAnalyze, ExplainQuery, ExportResults, FormatSql,
-    PreviewImpact, RollbackTransaction, RunAll, RunQuery, SaveQuery, SaveQueryAs, ToggleResults,
-    UseFullWrite, UseReadOnly, UseWrite,
+    PreviewImpact, QueryResultsInFileSql, RollbackTransaction, RunAll, RunQuery, SaveQuery,
+    SaveQueryAs, ToggleResults, UseFullWrite, UseReadOnly, UseWrite,
 };
 #[cfg(target_os = "macos")]
 use crate::shell_command::InstallShellCommand;
@@ -270,6 +270,14 @@ pub const COMMANDS: &[Command] = &[
         category: "Query",
         action: action!(ExportResults),
         defaults: &["secondary-shift-e"],
+        context: Some("QueryTab"),
+    },
+    Command {
+        id: "query.file_sql",
+        title: "Query Results in File SQL",
+        category: "Query",
+        action: action!(QueryResultsInFileSql),
+        defaults: &[],
         context: Some("QueryTab"),
     },
     Command {

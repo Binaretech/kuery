@@ -17,6 +17,41 @@ pub(crate) fn preview(
     fingerprint: FileFingerprint,
 ) -> Result<PreviewResult> {
     let inferred = source.format != FileFormat::Parquet;
+    let (results, scope, schema) = rows(frame, display, request, inferred, |message| {
+        source.parse_error(message)
+    })?;
+    let mut warnings = Vec::new();
+    if inferred {
+        warnings.push(
+            "Types inferred from at most 1,000 prefix records; records outside the preview are not validated"
+                .into(),
+        );
+    }
+    if schema
+        .iter()
+        .any(|c| c.kind.is_numeric() || c.kind.is_temporal())
+    {
+        warnings.push("Profile uses its existing f64 statistics and written timestamp hours; display values retain native precision/timezone".into());
+    }
+    Ok(PreviewResult {
+        results,
+        scope,
+        schema,
+        warnings,
+        fingerprint,
+    })
+}
+
+/// The first rows of `frame` (or of `display`, its columns as shown) as
+/// text batches, within `request`'s row and byte limits. A value that
+/// cannot be shown becomes `error`'s error.
+pub(crate) fn rows(
+    frame: &DataFrame,
+    display: Option<&DataFrame>,
+    request: PreviewRequest,
+    inferred: bool,
+    error: impl Fn(String) -> Error,
+) -> Result<(ResultSet, PreviewScope, Vec<ColumnSchema>)> {
     let schema: Vec<_> = frame
         .columns()
         .iter()
@@ -42,7 +77,7 @@ pub(crate) fn preview(
                 .iter()
                 .map(|column| column.get(index).and_then(cell))
                 .collect::<PolarsResult<_>>()
-                .map_err(|e| source.parse_error(e.to_string()))?;
+                .map_err(|e| error(e.to_string()))?;
             if row.iter().flatten().any(|s| s.len() > request.byte_limit) {
                 return Err(Error::RowTooLarge(request.byte_limit));
             }
@@ -83,26 +118,7 @@ pub(crate) fn preview(
             reason,
         },
     };
-    let mut warnings = Vec::new();
-    if inferred {
-        warnings.push(
-            "Types inferred from at most 1,000 prefix records; records outside the preview are not validated"
-                .into(),
-        );
-    }
-    if schema
-        .iter()
-        .any(|c| c.kind.is_numeric() || c.kind.is_temporal())
-    {
-        warnings.push("Profile uses its existing f64 statistics and written timestamp hours; display values retain native precision/timezone".into());
-    }
-    Ok(PreviewResult {
-        results,
-        scope,
-        schema,
-        warnings,
-        fingerprint,
-    })
+    Ok((results, scope, schema))
 }
 
 fn build_batch(rows: &[Vec<Option<String>>], width: usize) -> Batch {

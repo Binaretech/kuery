@@ -1,7 +1,9 @@
-//! Read-only SQL against explicit local sources. No file paths in SQL.
+//! Read-only SQL against explicit local sources: files, and results Kuery
+//! already holds. No file paths in SQL.
 
 use crate::{
     Error, FileDataset, FileFingerprint, FileSource, PreviewRequest, PreviewScope, Result, convert,
+    table,
 };
 use kuery_core::result_set::ResultSet;
 use polars::prelude::*;
@@ -21,6 +23,30 @@ pub struct SqlFile {
     pub fingerprint: FileFingerprint,
 }
 
+/// A result already in memory, such as a database query's, queried by
+/// `name` like a file. It is the rows as they were when it was added.
+#[derive(Debug, Clone)]
+pub struct SqlTable {
+    pub name: String,
+    pub results: ResultSet,
+}
+
+/// What a file SQL query can read.
+#[derive(Debug, Clone)]
+pub enum SqlSource {
+    File(SqlFile),
+    Table(SqlTable),
+}
+
+impl SqlSource {
+    pub fn name(&self) -> &str {
+        match self {
+            SqlSource::File(file) => &file.name,
+            SqlSource::Table(table) => &table.name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SqlResult {
     pub results: ResultSet,
@@ -31,53 +57,56 @@ pub struct SqlResult {
 /// Synchronous: call on a worker. The output limit is applied after SQL, so
 /// aggregates and joins see entire inputs. It does not bound engine working memory.
 pub fn query_files(files: &[SqlFile], sql: &str, output: PreviewRequest) -> Result<SqlResult> {
-    crate::contained(|| run_query(files, sql, output))
+    let sources: Vec<_> = files.iter().cloned().map(SqlSource::File).collect();
+    query_sources(&sources, sql, output)
 }
 
-fn run_query(files: &[SqlFile], sql: &str, output: PreviewRequest) -> Result<SqlResult> {
+/// [`query_files`] over files and results together, each by its name.
+pub fn query_sources(
+    sources: &[SqlSource],
+    sql: &str,
+    output: PreviewRequest,
+) -> Result<SqlResult> {
+    crate::contained(|| run_query(sources, sql, output))
+}
+
+fn run_query(sources: &[SqlSource], sql: &str, output: PreviewRequest) -> Result<SqlResult> {
     output.validate()?;
     validate(sql)?;
-    let mut context = SQLContext::new();
-    let mut datasets = Vec::with_capacity(files.len());
-    let mut names = std::collections::HashSet::new();
-    for file in files {
-        if file.name.is_empty() || !names.insert(file.name.clone()) {
-            return Err(Error::Sql(
-                "File table names must be nonempty and unique".into(),
-            ));
-        }
-        let dataset = FileDataset::open(file.source.clone())?;
-        if dataset.fingerprint() != &file.fingerprint {
-            return Err(Error::FileChanged(file.source.path.clone()));
-        }
-        context.register(&file.name, dataset.sql_plan()?);
-        datasets.push(dataset);
+    if sources.is_empty() {
+        return Err(Error::Sql("Open a data file before running SQL".into()));
     }
-    let first = datasets
-        .first()
-        .ok_or_else(|| Error::Sql("Open a data file before running SQL".into()))?;
+    let mut context = SQLContext::new();
+    let mut datasets = Vec::with_capacity(sources.len());
+    let mut names = std::collections::HashSet::new();
+    for source in sources {
+        let name = source.name();
+        if name.is_empty() || !names.insert(name.to_string()) {
+            return Err(Error::Sql("Table names must be nonempty and unique".into()));
+        }
+        match source {
+            SqlSource::File(file) => {
+                let dataset = FileDataset::open(file.source.clone())?;
+                if dataset.fingerprint() != &file.fingerprint {
+                    return Err(Error::FileChanged(file.source.path.clone()));
+                }
+                context.register(name, dataset.sql_plan()?);
+                datasets.push(dataset);
+            }
+            SqlSource::Table(held) => context.register(name, table::frame(&held.results)?.lazy()),
+        }
+    }
     let result = context
         .execute(sql)
         .and_then(|plan| plan.limit((output.row_limit + 1) as IdxSize).collect())
         .map_err(|e| Error::Sql(e.to_string()))
-        .and_then(|frame| {
-            convert::preview(
-                &frame,
-                None,
-                first.source(),
-                output,
-                first.fingerprint().clone(),
-            )
-        });
+        .and_then(|frame| convert::rows(&frame, None, output, false, Error::Sql));
     // Even a failed read may have raced with replacement. Never publish stale data.
     for dataset in &datasets {
         dataset.check_unchanged()?;
     }
-    let preview = result?;
-    Ok(SqlResult {
-        results: preview.results,
-        scope: preview.scope,
-    })
+    let (results, scope, _) = result?;
+    Ok(SqlResult { results, scope })
 }
 
 fn validate(sql: &str) -> Result<()> {

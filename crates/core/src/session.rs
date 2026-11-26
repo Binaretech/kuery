@@ -432,8 +432,20 @@ impl Session {
         signal: Signal,
     ) -> impl Future<Output = Result<bool, QueryError>> + Send + use<> {
         self.call(move |worker| {
-            worker.adapter.limit(&RunOptions::default())?;
-            worker.adapter.signal(&id, signal)
+            worker.ensure_connected()?;
+            if let Err(error) = worker.adapter.limit(&RunOptions::default()) {
+                if matches!(error, QueryError::Connection(_)) {
+                    worker.reconnect()?;
+                    worker.adapter.limit(&RunOptions::default())?;
+                } else {
+                    return Err(error);
+                }
+            }
+            let outcome = worker.adapter.signal(&id, signal);
+            if matches!(outcome, Err(QueryError::Connection(_))) {
+                worker.mark_disconnected();
+            }
+            outcome
         })
     }
 }
@@ -507,6 +519,19 @@ impl Worker<dyn Adapter> {
         options: &RunOptions,
         job: impl FnOnce(&mut Self) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
+        self.ensure_connected()?;
+        let outcome = self.read_with_once(options, job);
+        if matches!(outcome, Err(QueryError::Connection(_))) {
+            self.mark_disconnected();
+        }
+        outcome
+    }
+
+    fn read_with_once<T>(
+        &mut self,
+        options: &RunOptions,
+        job: impl FnOnce(&mut Self) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
         self.adapter.limit(options)?;
         let transactions = &self.dialect().transactions;
         if self.state.in_transaction.load(Ordering::SeqCst) {
@@ -532,6 +557,25 @@ impl Worker<dyn Adapter> {
         outcome
     }
 
+    /// Runs a read-only `job`, reconnecting and retrying once when an idle
+    /// connection dropped before any user transaction was open.
+    fn read_with_retry<T>(
+        &mut self,
+        options: &RunOptions,
+        mut job: impl FnMut(&mut Self) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        let in_tx = self.state.in_transaction.load(Ordering::SeqCst);
+        match self.read_with(options, |worker| job(worker)) {
+            Err(QueryError::Connection(_))
+                if !in_tx && !self.state.cancelled.load(Ordering::SeqCst) =>
+            {
+                self.reconnect()?;
+                self.read_with(options, |worker| job(worker))
+            }
+            outcome => outcome,
+        }
+    }
+
     /// Every step, even after one fails: there is never anything to keep.
     fn end_read_only(&mut self) {
         for sql in self.dialect().transactions.end_read_only {
@@ -541,9 +585,9 @@ impl Worker<dyn Adapter> {
 
     fn catalog<T>(
         &mut self,
-        job: impl FnOnce(&mut dyn Adapter) -> Result<T, QueryError>,
+        mut job: impl FnMut(&mut dyn Adapter) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
-        self.read_with(&RunOptions::default(), |worker| {
+        self.read_with_retry(&RunOptions::default(), |worker| {
             job(worker.adapter.as_mut())
         })
     }
@@ -557,9 +601,22 @@ impl Worker<dyn Adapter> {
     ) -> Result<Summary, QueryError> {
         let started = Instant::now();
         self.begin_run()?;
-        let outcome = self.read_with(options, |worker| {
-            worker.run_script(sql, options, tx, typed, started)
+        let in_tx = self.state.in_transaction.load(Ordering::SeqCst);
+        let emitted = Cell::new(false);
+        let mut outcome = self.read_with(options, |worker| {
+            worker.run_script(sql, options, tx, typed, started, Some(&emitted))
         });
+        if matches!(outcome, Err(QueryError::Connection(_)))
+            && !in_tx
+            && !emitted.get()
+            && !self.state.cancelled.load(Ordering::SeqCst)
+        {
+            outcome = self.reconnect().and_then(|()| {
+                self.read_with(options, |worker| {
+                    worker.run_script(sql, options, tx, typed, started, None)
+                })
+            });
+        }
         self.end_run(outcome)
     }
 
@@ -575,18 +632,36 @@ impl Worker<dyn Adapter> {
         // break it and the transaction with it: a run already cancelled
         // sets up nothing.
         self.may_run()?;
+        self.ensure_connected()?;
         let started = Instant::now();
-        self.adapter.limit(options)?;
-        let dialect = self.dialect();
         let opened = !self.state.in_transaction.load(Ordering::SeqCst);
-        if opened {
-            self.exec(dialect.transactions.begin)?;
-            self.state.in_transaction.store(true, Ordering::SeqCst);
+        let setup = |worker: &mut Self| -> Result<(), QueryError> {
+            worker.adapter.limit(options)?;
+            let dialect = worker.dialect();
+            if opened {
+                worker.exec(dialect.transactions.begin)?;
+                worker.state.in_transaction.store(true, Ordering::SeqCst);
+            }
+            if let Err(error) = worker.exec(&dialect.savepoint(RUN)) {
+                worker.lose_transaction();
+                return Err(error);
+            }
+            Ok(())
+        };
+        if let Err(error) = setup(self) {
+            if matches!(error, QueryError::Connection(_)) {
+                if opened {
+                    self.reconnect()?;
+                    setup(self)?;
+                } else {
+                    self.mark_disconnected();
+                    return Err(error);
+                }
+            } else {
+                return Err(error);
+            }
         }
-        if let Err(error) = self.exec(&dialect.savepoint(RUN)) {
-            self.lose_transaction();
-            return Err(error);
-        }
+        let dialect = self.dialect();
         if let Err(cancelled) = self.begin_run() {
             // Cancelled while it was set up: nothing ran, and the
             // transaction is left as it was.
@@ -598,9 +673,13 @@ impl Worker<dyn Adapter> {
             }
             return Err(cancelled);
         }
-        let outcome = self.run_script(sql, options, tx, false, started);
+        let outcome = self.run_script(sql, options, tx, false, started, None);
         // Cancelled: undone, like any failure.
         let outcome = self.end_run(outcome);
+        if matches!(outcome, Err(QueryError::Connection(_))) {
+            self.mark_disconnected();
+            return outcome;
+        }
         let closed = if outcome.is_ok() {
             self.release(RUN)
         } else {
@@ -610,7 +689,11 @@ impl Worker<dyn Adapter> {
         if let Err(error) = closed {
             // The savepoint is gone only if the transaction is (the script
             // ended it itself, or the connection dropped).
-            self.lose_transaction();
+            if matches!(error, QueryError::Connection(_)) {
+                self.mark_disconnected();
+            } else {
+                self.lose_transaction();
+            }
             return Err(outcome.err().unwrap_or(error));
         }
         outcome
@@ -636,25 +719,58 @@ impl Worker<dyn Adapter> {
         let started = Instant::now();
         let single = statements(self.dialect(), sql).len() <= 1;
         self.begin_run()?;
-        let limited = self.adapter.limit(options);
+        if let Err(error) = self.ensure_connected() {
+            return self.end_run(Err(error));
+        }
+        let mut limited = self.adapter.limit(options);
+        if matches!(limited, Err(QueryError::Connection(_)))
+            && !self.state.cancelled.load(Ordering::SeqCst)
+        {
+            limited = self.reconnect().and_then(|()| self.adapter.limit(options));
+        }
         if single {
-            let outcome = limited.and_then(|()| self.run_script(sql, options, tx, false, started));
+            let outcome =
+                limited.and_then(|()| self.run_script(sql, options, tx, false, started, None));
+            if matches!(outcome, Err(QueryError::Connection(_))) {
+                self.mark_disconnected();
+            }
             // Kept or not, it ran: a late cancel does not undo it.
             self.state.running.store(false, Ordering::SeqCst);
             self.state.cancelled.store(false, Ordering::SeqCst);
             return outcome;
         }
-        if let Err(error) = limited.and_then(|()| self.exec(self.dialect().transactions.begin)) {
+        let mut began = limited.and_then(|()| self.exec(self.dialect().transactions.begin));
+        if matches!(began, Err(QueryError::Connection(_)))
+            && !self.state.cancelled.load(Ordering::SeqCst)
+        {
+            began = self
+                .reconnect()
+                .and_then(|()| self.adapter.limit(options))
+                .and_then(|()| self.exec(self.dialect().transactions.begin));
+        }
+        if let Err(error) = began {
+            if matches!(error, QueryError::Connection(_)) {
+                self.mark_disconnected();
+            }
             return self.end_run(Err(error));
         }
-        let outcome = self.run_script(sql, options, tx, false, started);
+        let outcome = self.run_script(sql, options, tx, false, started, None);
         let outcome = self.end_run(outcome);
+        if matches!(outcome, Err(QueryError::Connection(_))) {
+            self.mark_disconnected();
+            return outcome;
+        }
         let close = if outcome.is_ok() {
             "commit"
         } else {
             "rollback"
         };
-        self.exec(close)?;
+        if let Err(error) = self.exec(close) {
+            if matches!(error, QueryError::Connection(_)) {
+                self.mark_disconnected();
+            }
+            return Err(error);
+        }
         outcome
     }
 
@@ -665,15 +781,36 @@ impl Worker<dyn Adapter> {
         options: &RunOptions,
         job: impl FnOnce(&mut Self) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
-        self.adapter.limit(options)?;
-        let dialect = self.dialect();
+        self.ensure_connected()?;
         let in_transaction = self.state.in_transaction.load(Ordering::SeqCst);
-        if in_transaction {
-            self.exec(&dialect.savepoint(PREVIEW))?;
-        } else {
-            self.exec(dialect.transactions.begin)?;
+        let begin = |worker: &mut Self| -> Result<(), QueryError> {
+            worker.adapter.limit(options)?;
+            let dialect = worker.dialect();
+            if in_transaction {
+                worker.exec(&dialect.savepoint(PREVIEW))
+            } else {
+                worker.exec(dialect.transactions.begin)
+            }
+        };
+        if let Err(error) = begin(self) {
+            if matches!(error, QueryError::Connection(_)) {
+                if !in_transaction {
+                    self.reconnect()?;
+                    begin(self)?;
+                } else {
+                    self.mark_disconnected();
+                    return Err(error);
+                }
+            } else {
+                return Err(error);
+            }
         }
+        let dialect = self.dialect();
         let outcome = job(self);
+        if matches!(outcome, Err(QueryError::Connection(_))) {
+            self.mark_disconnected();
+            return outcome;
+        }
         // Even halfway.
         let undone = if in_transaction {
             self.exec(&dialect.rollback_to(PREVIEW))
@@ -681,8 +818,12 @@ impl Worker<dyn Adapter> {
         } else {
             self.exec("rollback")
         };
-        if undone.is_err() && in_transaction {
-            self.lose_transaction();
+        if let Err(error) = &undone {
+            if matches!(error, QueryError::Connection(_)) {
+                self.mark_disconnected();
+            } else if in_transaction {
+                self.lose_transaction();
+            }
         }
         let value = outcome?;
         undone?;
@@ -733,7 +874,7 @@ impl Worker<dyn Adapter> {
             read_only::check_in(dialect, statement).map_err(QueryError::Rejected)?;
         }
         self.begin_run()?;
-        let outcome = self.read_with(options, |worker| worker.first_value(&sql));
+        let outcome = self.read_with_retry(options, |worker| worker.first_value(&sql));
         self.end_run(outcome)
     }
 
@@ -769,7 +910,11 @@ impl Worker<dyn Adapter> {
         let result = self.exec(command);
         // Whatever happened, the transaction is over: a failed COMMIT ends
         // it too, and so does a lost connection.
-        self.state.in_transaction.store(false, Ordering::SeqCst);
+        if matches!(result, Err(QueryError::Connection(_))) {
+            self.mark_disconnected();
+        } else {
+            self.state.in_transaction.store(false, Ordering::SeqCst);
+        }
         result
     }
 
@@ -781,11 +926,22 @@ impl Worker<dyn Adapter> {
         if self.state.in_transaction.load(Ordering::SeqCst) {
             return Err(QueryError::TransactionOpen);
         }
-        self.adapter.limit(&RunOptions {
-            statement_timeout: Duration::from_secs(15),
-            ..RunOptions::default()
-        })?;
-        self.exec(self.dialect().transactions.begin)?;
+        self.ensure_connected()?;
+        let begin = |worker: &mut Self| -> Result<(), QueryError> {
+            worker.adapter.limit(&RunOptions {
+                statement_timeout: Duration::from_secs(15),
+                ..RunOptions::default()
+            })?;
+            worker.exec(worker.dialect().transactions.begin)
+        };
+        if let Err(error) = begin(self) {
+            if matches!(error, QueryError::Connection(_)) {
+                self.reconnect()?;
+                begin(self)?;
+            } else {
+                return Err(error);
+            }
+        }
         let mut total = 0;
         for statement in statements {
             let failure = match self.adapter.execute(statement.sql(), &mut Discard) {
@@ -803,11 +959,20 @@ impl Worker<dyn Adapter> {
                 }
             };
             if let Some(error) = failure {
-                let _ = self.exec("rollback");
+                if matches!(error, QueryError::Connection(_)) {
+                    self.mark_disconnected();
+                } else {
+                    let _ = self.exec("rollback");
+                }
                 return Err(error);
             }
         }
-        self.exec("commit")?;
+        if let Err(error) = self.exec("commit") {
+            if matches!(error, QueryError::Connection(_)) {
+                self.mark_disconnected();
+            }
+            return Err(error);
+        }
         Ok(total)
     }
 
@@ -820,6 +985,7 @@ impl Worker<dyn Adapter> {
         tx: &async_channel::Sender<Event>,
         typed: bool,
         started: Instant,
+        emitted: Option<&Cell<bool>>,
     ) -> Result<Summary, QueryError> {
         let mut stream = Stream {
             tx,
@@ -831,6 +997,7 @@ impl Worker<dyn Adapter> {
             rows: 0,
             first_batch_after: None,
             reader_gone: Cell::new(false),
+            emitted,
         };
         let mut summary = Summary {
             rows: 0,
@@ -907,10 +1074,16 @@ struct Stream<'a> {
     first_batch_after: Option<Duration>,
     /// Whether a send failed because the receiver was dropped.
     reader_gone: Cell<bool>,
+    /// Marked once any event is sent to the receiver, so a dropped connection
+    /// mid-stream is not retried transparently.
+    emitted: Option<&'a Cell<bool>>,
 }
 
 impl Stream<'_> {
     fn send(&self, event: Event) -> Result<(), QueryError> {
+        if let Some(emitted) = self.emitted {
+            emitted.set(true);
+        }
         self.tx.send_blocking(event).map_err(|_| {
             self.reader_gone.set(true);
             QueryError::Cancelled

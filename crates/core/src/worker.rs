@@ -39,7 +39,6 @@ pub(crate) trait Streamed: Send + 'static {
 type Job<A> = Box<dyn FnOnce(&mut Worker<A>) + Send>;
 
 /// What the worker's thread and its handles both see.
-#[derive(Default)]
 pub(crate) struct State {
     /// A transaction the user opened waits for a commit or a rollback.
     pub(crate) in_transaction: AtomicBool,
@@ -58,11 +57,40 @@ pub(crate) struct State {
     /// Held while a run begins, and while a cancel checks which run is on
     /// and stops it, so the next run cannot begin in between.
     gate: Mutex<()>,
+    /// The current adapter's canceller, updated whenever the worker reconnects.
+    canceller: Mutex<Canceller>,
 }
 
 impl State {
+    fn new(canceller: Canceller) -> Self {
+        Self {
+            in_transaction: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            run: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            sent: AtomicU64::new(0),
+            cancel_before: AtomicU64::new(0),
+            gate: Mutex::new(()),
+            canceller: Mutex::new(canceller),
+        }
+    }
+
     fn gate(&self) -> MutexGuard<'_, ()> {
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn canceller(&self) -> Canceller {
+        self.canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_canceller(&self, canceller: Canceller) {
+        *self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = canceller;
     }
 }
 
@@ -73,6 +101,8 @@ pub(crate) struct Worker<A: ?Sized> {
     pub(crate) access: Access,
     pub(crate) state: Arc<State>,
     pub(crate) canceller: Canceller,
+    opener: Box<dyn Fn() -> Result<Box<A>, String> + Send>,
+    needs_reconnect: bool,
     /// The number of the job on the thread now.
     job: u64,
 }
@@ -83,6 +113,12 @@ impl<A: ?Sized> Worker<A> {
             Access::ReadWrite => Ok(()),
             Access::ReadOnly => Err(QueryError::WritesDisabled),
         }
+    }
+
+    /// Marks the connection as lost so the next job opens a fresh adapter.
+    pub(crate) fn mark_disconnected(&mut self) {
+        self.needs_reconnect = true;
+        self.state.in_transaction.store(false, Ordering::SeqCst);
     }
 
     /// After a panic: nothing runs, and the transaction goes with the
@@ -125,12 +161,35 @@ impl<A: ?Sized> Worker<A> {
     }
 }
 
+impl<A: ?Sized + Driven> Worker<A> {
+    /// Opens a fresh adapter in place of the current one, updating the
+    /// canceller seen by handles.
+    pub(crate) fn reconnect(&mut self) -> Result<(), QueryError> {
+        self.needs_reconnect = true;
+        self.state.in_transaction.store(false, Ordering::SeqCst);
+        let adapter = (self.opener)().map_err(QueryError::Connection)?;
+        let canceller = adapter.canceller();
+        self.adapter = adapter;
+        self.canceller = canceller.clone();
+        self.state.set_canceller(canceller);
+        self.needs_reconnect = false;
+        Ok(())
+    }
+
+    /// Reopens the adapter if a previous job saw the connection drop.
+    pub(crate) fn ensure_connected(&mut self) -> Result<(), QueryError> {
+        if self.needs_reconnect {
+            self.reconnect()?;
+        }
+        Ok(())
+    }
+}
+
 /// The way to a worker's thread. Cheap to clone; the thread ends (and drops
 /// the adapter, closing its connection) when the last clone is dropped.
 pub(crate) struct Handle<A: ?Sized + Driven> {
     jobs: mpsc::Sender<Job<A>>,
     state: Arc<State>,
-    canceller: Canceller,
 }
 
 impl<A: ?Sized + Driven> Clone for Handle<A> {
@@ -138,7 +197,6 @@ impl<A: ?Sized + Driven> Clone for Handle<A> {
         Self {
             jobs: self.jobs.clone(),
             state: self.state.clone(),
-            canceller: self.canceller.clone(),
         }
     }
 }
@@ -148,7 +206,7 @@ impl<A: ?Sized + Driven> Handle<A> {
     /// with what `describe` read from the adapter there.
     pub(crate) fn open<I: Send + 'static>(
         access: Access,
-        open: impl FnOnce() -> Result<Box<A>, String> + Send + 'static,
+        open: impl Fn() -> Result<Box<A>, String> + Send + 'static,
         describe: impl FnOnce(&A) -> I + Send + 'static,
     ) -> impl Future<Output = Result<(Handle<A>, I), String>> + Send + 'static {
         let (sent, received) = oneshot::channel();
@@ -163,12 +221,11 @@ impl<A: ?Sized + Driven> Handle<A> {
                     }
                 };
                 let (jobs, queue) = mpsc::channel::<Job<A>>();
-                let state = Arc::new(State::default());
                 let canceller = adapter.canceller();
+                let state = Arc::new(State::new(canceller.clone()));
                 let handle = Handle {
                     jobs,
                     state: state.clone(),
-                    canceller: canceller.clone(),
                 };
                 let described = describe(&*adapter);
                 if sent.send(Ok((handle, described))).is_err() {
@@ -179,6 +236,8 @@ impl<A: ?Sized + Driven> Handle<A> {
                     access,
                     state,
                     canceller,
+                    opener: Box::new(open),
+                    needs_reconnect: false,
                     job: 0,
                 };
                 while let Ok(job) = queue.recv() {
@@ -288,7 +347,6 @@ impl<A: ?Sized + Driven> Handle<A> {
             state.cancelled.store(true, Ordering::SeqCst);
             state.run.load(Ordering::SeqCst)
         };
-        let canceller = self.canceller.clone();
         let _ = std::thread::Builder::new()
             .name("kuery-cancel".into())
             .spawn(move || {
@@ -300,7 +358,7 @@ impl<A: ?Sized + Driven> Handle<A> {
                         {
                             break;
                         }
-                        canceller();
+                        (state.canceller())();
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }

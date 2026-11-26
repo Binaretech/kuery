@@ -22,21 +22,21 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, actions, div, px,
 };
 use kuery_core::browse::{Browse, Direction, Filter, FilterOp, Sort};
 use kuery_core::catalog::{ColumnInfo, TableDefinition, TableInfo};
 use kuery_core::edit::{self, CellChange, EditTarget, KeyValue, RowChange, WriteStatement};
-use kuery_core::session::RunOptions;
+use kuery_core::session::{QueryError, RunOptions};
 
 actions!(kuery, [ReloadTable, SaveTableChanges]);
 
 use crate::assets::AppIcon;
 use crate::audit::{self, AuditAction, AuditRecord};
 use crate::chrome;
-use crate::connection::Db;
+use crate::connection::{Db, ReconnectConnection};
 use crate::context_menus::{Cell, item};
 use crate::definition;
 use crate::grid::BrowseDelegate;
@@ -123,6 +123,8 @@ pub struct TableTab {
     browse: Option<Browse>,
     grid: Entity<TableState<BrowseDelegate>>,
     page: PageState,
+    /// Whether the last definition or page load failed because the connection was lost.
+    connection_lost: bool,
     total: Option<Result<u64, String>>,
     filters: Vec<FilterRow>,
     show_filters: bool,
@@ -197,17 +199,7 @@ impl TableTab {
         )
         .detach();
 
-        let load = db.session.definition(info.table.clone());
-        cx.spawn(async move |this, cx| {
-            let result = load.await;
-            this.update(cx, |this, cx| {
-                this.on_definition(result.map_err(describe_error), cx)
-            })
-            .ok();
-        })
-        .detach();
-
-        Self {
+        let mut tab = Self {
             db,
             project,
             info,
@@ -216,6 +208,7 @@ impl TableTab {
             browse: None,
             grid,
             page: PageState::Idle,
+            connection_lost: false,
             total: None,
             filters: Vec::new(),
             show_filters: false,
@@ -228,7 +221,24 @@ impl TableTab {
             count_task: None,
             apply_task: None,
             focus_handle: cx.focus_handle(),
-        }
+        };
+        tab.load_definition(cx);
+        tab
+    }
+
+    fn load_definition(&mut self, cx: &mut Context<Self>) {
+        self.definition = Load::Loading;
+        self.connection_lost = false;
+        let load = self.db.session.definition(self.info.table.clone());
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                this.connection_lost = matches!(result, Err(QueryError::Connection(_)));
+                this.on_definition(result.map_err(describe_error), cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The loaded page, for the status bar.
@@ -249,6 +259,19 @@ impl TableTab {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Replaces the tab's connection after a reconnect, retrying the definition
+    /// or page load if it had failed.
+    pub fn set_db(&mut self, db: Db, cx: &mut Context<Self>) {
+        self.db = db;
+        self.connection_lost = false;
+        if matches!(self.definition, Load::Failed(_)) {
+            self.load_definition(cx);
+        } else if matches!(self.page, PageState::Failed(_)) {
+            self.load_page(cx);
+        }
+        cx.notify();
     }
 
     pub fn view(&self) -> TableView {
@@ -347,6 +370,7 @@ impl TableTab {
         };
 
         self.page = PageState::Loading;
+        self.connection_lost = false;
         self.inspector = None;
         self.grid.update(cx, |grid, cx| {
             grid.delegate_mut().set_loading(true);
@@ -372,6 +396,7 @@ impl TableTab {
                         });
                     }
                     Err(error) => {
+                        this.connection_lost = matches!(error, QueryError::Connection(_));
                         this.page = PageState::Failed(describe_error(error));
                         this.grid.update(cx, |grid, cx| {
                             grid.delegate_mut().set_loading(false);
@@ -1437,6 +1462,15 @@ impl TableTab {
                     .text_color(color(theme::RED))
                     .child(error)
             }))
+            .when(self.connection_lost, |row| {
+                row.child(
+                    chrome::pill_button("reconnect-table", "Reconnect", true).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            cx.emit(ReconnectConnection(this.db.name.clone()));
+                        }),
+                    ),
+                )
+            })
             .child(div().flex_1())
             .child(
                 div()
@@ -1482,6 +1516,8 @@ fn describe_key(key: &[KeyValue]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+impl EventEmitter<ReconnectConnection> for TableTab {}
 
 impl Focusable for TableTab {
     fn focus_handle(&self, _: &App) -> FocusHandle {

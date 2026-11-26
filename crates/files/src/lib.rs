@@ -8,7 +8,9 @@ mod preview;
 mod reader;
 mod source;
 mod sql;
-pub use sql::{SqlFile, SqlResult, query_files};
+mod table;
+pub use sql::{SqlFile, SqlResult, SqlSource, SqlTable, query_files, query_sources};
+pub use table::result_columns;
 
 use std::path::PathBuf;
 

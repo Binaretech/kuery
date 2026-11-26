@@ -141,6 +141,16 @@ impl KeyTab {
         &self.db
     }
 
+    /// Replaces the tab's connection after a reconnect, retrying the load if
+    /// it had failed.
+    pub fn set_db(&mut self, db: RedisDb, cx: &mut Context<Self>) {
+        self.db = db;
+        if matches!(self.value, Value::Failed(_)) {
+            self.reload(cx);
+        }
+        cx.notify();
+    }
+
     pub fn database(&self) -> i64 {
         self.database
     }

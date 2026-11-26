@@ -694,3 +694,127 @@ fn a_read_that_ends_the_write_transaction_forgets_it() {
     ));
     assert!(!session.in_transaction());
 }
+
+#[test]
+fn reconnects_transparently_when_an_idle_connection_drops() {
+    use std::sync::atomic::AtomicUsize;
+
+    struct Flaky {
+        generation: usize,
+        broken: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl Adapter for Flaky {
+        fn dialect(&self) -> &'static Dialect {
+            &POSTGRES
+        }
+        fn server(&self) -> String {
+            format!("Flaky {}", self.generation)
+        }
+        fn execute(&mut self, sql: &str, rows: &mut dyn RowSink) -> Result<u64, QueryError> {
+            if self.generation == 1 && self.broken.load(Ordering::SeqCst) {
+                return Err(QueryError::Connection("connection closed".into()));
+            }
+            if sql == "select slow" {
+                rows.columns(vec!["n".into()], None)?;
+                while !self.stop.swap(false, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(QueryError::Cancelled);
+            }
+            if sql.starts_with("select") {
+                rows.columns(vec!["gen".into()], None)?;
+                rows.row(&[Some(&self.generation.to_string())])?;
+            }
+            Ok(0)
+        }
+        fn limit(&mut self, _: &RunOptions) -> Result<(), QueryError> {
+            if self.generation == 1 && self.broken.load(Ordering::SeqCst) {
+                return Err(QueryError::Connection("connection closed".into()));
+            }
+            Ok(())
+        }
+        fn canceller(&self) -> Canceller {
+            let stop = self.stop.clone();
+            let cancels = self.cancels.clone();
+            let generation = self.generation;
+            Arc::new(move || {
+                cancels.store(generation, Ordering::SeqCst);
+                stop.store(true, Ordering::SeqCst);
+            })
+        }
+        fn overview(&mut self) -> Result<CatalogOverview, QueryError> {
+            Ok(CatalogOverview {
+                schemas: vec![format!("gen_{}", self.generation)],
+                ..CatalogOverview::default()
+            })
+        }
+        fn definition(&mut self, _: &TableRef) -> Result<TableDefinition, QueryError> {
+            Ok(TableDefinition::default())
+        }
+        fn columns(&mut self, _: Option<&str>) -> Result<Vec<CatalogColumn>, QueryError> {
+            Ok(Vec::new())
+        }
+        fn foreign_keys(&mut self, _: &str) -> Result<Vec<ForeignKey>, QueryError> {
+            Ok(Vec::new())
+        }
+        fn search_path(&mut self) -> Result<Vec<String>, QueryError> {
+            Ok(vec!["public".into()])
+        }
+    }
+
+    let opened = Arc::new(AtomicUsize::new(0));
+    let broken = Arc::new(AtomicBool::new(false));
+    let refuse_open = Arc::new(AtomicBool::new(false));
+    let cancels = Arc::new(AtomicUsize::new(0));
+
+    let opener: Opener = {
+        let (opened, broken, refuse_open, cancels) = (
+            opened.clone(),
+            broken.clone(),
+            refuse_open.clone(),
+            cancels.clone(),
+        );
+        Arc::new(move |_| {
+            if refuse_open.load(Ordering::SeqCst) {
+                return Err("server is restarting".into());
+            }
+            let generation = opened.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(Flaky {
+                generation,
+                broken: broken.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                cancels: cancels.clone(),
+            }))
+        })
+    };
+
+    let session = block_on(Session::open(opener, Access::ReadWrite)).unwrap();
+    let set = block_on(session.fetch_all("select 1".into(), RunOptions::default())).unwrap();
+    assert_eq!(set.cell(0, 0), Some(Some("1")));
+
+    // Connection drops while the server is down: query reports Connection error.
+    broken.store(true, Ordering::SeqCst);
+    refuse_open.store(true, Ordering::SeqCst);
+    let err = block_on(session.fetch_all("select 1".into(), RunOptions::default()));
+    assert!(matches!(err, Err(QueryError::Connection(_))), "{err:?}");
+
+    // Server comes back: the next query reconnects automatically and succeeds on gen 2.
+    refuse_open.store(false, Ordering::SeqCst);
+    let set = block_on(session.fetch_all("select 1".into(), RunOptions::default())).unwrap();
+    assert_eq!(set.cell(0, 0), Some(Some("2")));
+    let overview = block_on(session.overview()).unwrap();
+    assert_eq!(overview.schemas, ["gen_2"]);
+
+    // Cancelling after reconnect reaches the new adapter's canceller (gen 2).
+    let rx = session.run_read_only("select slow".into(), RunOptions::default());
+    assert!(matches!(block_on(rx.recv()), Ok(Event::Columns(_))));
+    session.cancel();
+    assert!(matches!(
+        block_on(rx.recv()),
+        Ok(Event::Failed(QueryError::Cancelled))
+    ));
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
+}
