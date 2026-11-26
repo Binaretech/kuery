@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/Binaretech/kuery/compare/v0.6.0...v0.7.0) - 2026-11-26
+
+### Added
+
+- query results in File SQL, expand profiling charts, and reconnect dropped connections
+- watch and stop running MongoDB operations
+- query MongoDB with read-only SQL and see the native query it runs
+- show MongoDB schemas, indexes and query plans
+- edit, insert and delete MongoDB documents with review
+- write to MongoDB from the console with review and audit
+- query MongoDB in a console with completion
+- connect to MongoDB and browse its databases and collections
+
+### Changed
+
+- *(mongo)* keep one check for database names and plain names
+
+### Fixed
+
+- *(mongo)* refuse SQL numbers too large for a Double
+- *(mongo)* keep a script's transaction when a read in it stops early
+- *(mongo)* refuse a pasted connection string whose password holds a bare ?
+
 ## [0.6.0](https://github.com/Binaretech/kuery/compare/v0.5.0...v0.6.0) - 2026-11-11
 
 ### Added
